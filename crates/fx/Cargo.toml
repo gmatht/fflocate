@@ -1,0 +1,17 @@
+[package]
+name = "fx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "fx: command-line client for the findex daemon."
+
+[[bin]]
+name = "fx"
+path = "src/main.rs"
+
+[dependencies]
+findex.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+libc.workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "findex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Headless realtime filename index: core library (data model, persistence, query, reconciliation)."
+
+[dependencies]
+libc.workspace = true
+aho-corasick.workspace = true
+memchr.workspace = true
+memmap2.workspace = true
+crossbeam-channel.workspace = true
+crossbeam-utils.workspace = true
+arc-swap.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

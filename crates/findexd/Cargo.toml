@@ -1,0 +1,23 @@
+[package]
+name = "findexd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "findex daemon: watches the filesystem, maintains the index, serves NDJSON IPC."
+
+[[bin]]
+name = "findexd"
+path = "src/main.rs"
+
+[dependencies]
+findex.workspace = true
+libc.workspace = true
+crossbeam-channel.workspace = true
+arc-swap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
