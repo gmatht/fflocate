@@ -320,6 +320,42 @@ impl Query {
         }
         self.terms.iter().any(has)
     }
+
+    /// The literals that a matching name is *required* to contain, as
+    /// `(needle, case_sensitive)` pairs — the raw material for the §17 trigram
+    /// accelerator.
+    ///
+    /// Only positive `Substr` and `Ext` terms qualify:
+    ///
+    /// * a negated term (`-foo`) is not required to be present, so it can only
+    ///   ever *widen* the candidate set — it must not appear here;
+    /// * a `Glob` or `Regex` term has no fixed substring to look up;
+    /// * a `Path` term is a substring of the *materialized path*, not the name,
+    ///   and this accelerator indexes names only (§3/§10) — it is verified the
+    ///   usual way.
+    ///
+    /// A name matches the query only if it contains every one of these needles,
+    /// which is exactly the property [`crate::trigram::TrigramIndex::candidates`]
+    /// exploits — soundly, because it is a superset filter.
+    pub fn required_literals(&self) -> Vec<(&[u8], bool)> {
+        let mut out: Vec<(&[u8], bool)> = Vec::new();
+        for t in &self.terms {
+            match t {
+                Term::Substr { needle, case } => out.push((needle.as_slice(), *case)),
+                Term::Ext { ext, case } => out.push((ext.as_slice(), *case)),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// A [`crate::trigram::TrigramPlan`] for this query: the required literals
+    /// reduced to their distinct trigrams, with too-short and case-sensitive
+    /// literals dropped. An empty plan means "this query has no usable trigram
+    /// constraint — scan as usual".
+    pub fn trigram_plan(&self) -> crate::trigram::TrigramPlan {
+        crate::trigram::TrigramIndex::plan_from_literals(self.required_literals())
+    }
 }
 
 // ------------------------------------------------------------------ parsing
@@ -458,47 +494,106 @@ pub struct Hit {
 /// `limit == 0` means unlimited. When `count_only`, paths are never
 /// materialized and the returned vec is empty with `total` set.
 pub fn execute(index: &Index, root_paths: &[(u32, Vec<u8>)], q: &Query, limit: usize, count_only: bool) -> Results {
+    execute_with_trigram(index, root_paths, q, limit, count_only, None)
+}
+
+/// As [`execute`], but consulting the §17 trigram accelerator when one is
+/// supplied.
+///
+/// The accelerator is a **filter only**: it narrows the set of entries whose
+/// names are worth checking, and every candidate still goes through the full
+/// [`Query::matches`] path. It can therefore never change the result set — only
+/// the time taken to produce it. `None` (or a query with no usable trigram
+/// constraint) restores the plain linear scan.
+pub fn execute_with_trigram(
+    index: &Index,
+    root_paths: &[(u32, Vec<u8>)],
+    q: &Query,
+    limit: usize,
+    count_only: bool,
+    trigram: Option<&crate::trigram::TrigramIndex>,
+) -> Results {
     let mut results = Results { hits: Vec::new(), total: 0 };
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     let use_prefilter = q.ac.is_some();
 
-    for (id, entry) in index.iter_live() {
+    // Ask the accelerator which ids can possibly match. `None` = no usable
+    // constraint (scan everything); `Some(empty)` = the required literals are
+    // unsatisfiable, so nothing can match.
+    let candidates: Option<Vec<u32>> = match trigram {
+        Some(tg) if tg.is_useful() => {
+            let plan = q.trigram_plan();
+            tg.candidates(&plan)
+        }
+        _ => None,
+    };
+    if let Some(c) = &candidates {
+        if c.is_empty() {
+            return results;
+        }
+    }
+
+    // A helper running the shared per-entry body for one id.
+    let consider = |results: &mut Results, buf: &mut Vec<u8>, id: u32| {
+        // Liveness is the accelerator's one blind spot: postings built before a
+        // deletion still name the dead id. The authoritative scan skips
+        // tombstones, so this must too, or a stale posting becomes a phantom hit.
+        if !index.is_alive(id) {
+            return;
+        }
+        let entry = &index.entries[id as usize];
         if entry.flags().is_root_dir() {
-            continue; // the root dir itself is not a search hit
+            return;
         }
         let name = index.name(id);
-        // aho-corasick prefilter over the lowercased name (cheap, one pass)
         if use_prefilter {
             let lower: Vec<u8> = name.iter().map(|c| c.to_ascii_lowercase()).collect();
             if !q.prefilter(&lower) {
-                continue;
+                return;
             }
         }
-        // Which root does this belong to? Needed only for path materialization.
         let root_id = index.root_of(id);
         let root_path = root_id.and_then(|r| root_paths.iter().find(|(rid, _)| *rid == r).map(|(_, p)| p.clone()));
         let matched = q.matches(name, || {
             root_path.as_ref().and_then(|rp| index.path_of(id, rp))
         });
         if !matched {
-            continue;
+            return;
         }
         results.total += 1;
         if count_only {
-            continue;
+            return;
         }
         if limit != 0 && results.hits.len() >= limit {
-            // Keep counting for `total`, but stop materializing.
-            continue;
+            return;
         }
         let path = match &root_path {
-            Some(rp) => match index.materialize_into(id, rp, &mut buf) {
+            Some(rp) => match index.materialize_into(id, rp, buf) {
                 Some(_) => buf.clone(),
-                None => continue,
+                None => return,
             },
             None => name.to_vec(),
         };
         results.hits.push(Hit { id, path });
+    };
+
+    match candidates {
+        // Accelerated: ids are ascending, so result order matches the linear
+        // scan exactly.
+        Some(ids) => {
+            for id in ids {
+                // The accelerator is built over live ids; guard the (impossible
+                // in practice) case of an id past the end after a shrink.
+                if (id as usize) < index.len() {
+                    consider(&mut results, &mut buf, id);
+                }
+            }
+        }
+        None => {
+            for (id, _) in index.iter_live() {
+                consider(&mut results, &mut buf, id);
+            }
+        }
     }
     results
 }
@@ -731,5 +826,52 @@ mod tests {
         assert!(GlobPattern::parse(b"a?c", false).matches(b"abc"));
         assert!(!GlobPattern::parse(b"a?c", false).matches(b"ac"));
         assert!(GlobPattern::parse(b"*.RS", false).matches(b"x.rs"));
+    }
+
+    #[test]
+    fn required_literals_exclude_negation_glob_regex_path() {
+        // Positive substrings and `ext:` are required; everything else is not.
+        let q = Query::compile("main rs -skip *.tmp regex:^x ext:md path:src").unwrap();
+        let lits: Vec<(String, bool)> = q
+            .required_literals()
+            .into_iter()
+            .map(|(n, c)| (String::from_utf8_lossy(n).into_owned(), c))
+            .collect();
+        assert_eq!(
+            lits,
+            vec![
+                ("main".to_string(), false),
+                ("rs".to_string(), false),
+                ("md".to_string(), false),
+            ],
+            "only positive substring/ext literals are required"
+        );
+    }
+
+    #[test]
+    fn required_literals_preserve_case_flag() {
+        // `case:Notes` is an explicitly case-sensitive substring.
+        let q = Query::compile("case:Notes").unwrap();
+        let lits = q.required_literals();
+        assert_eq!(lits.len(), 1);
+        assert_eq!(lits[0].0, b"Notes");
+        assert!(lits[0].1, "smart/explicit case must be preserved");
+    }
+
+    #[test]
+    fn trigram_plan_drops_short_and_case_sensitive() {
+        // "rs" is 2 bytes -> no trigram; "Notes" is case-sensitive -> no
+        // trigram; "main" survives.
+        let q = Query::compile("main rs case:Notes").unwrap();
+        let plan = q.trigram_plan();
+        assert_eq!(plan.literals.len(), 1, "only `main` yields usable trigrams");
+        // "main" -> {"mai", "ain"}, sorted.
+        let mut expected: Vec<[u8; 3]> = vec![[b'm', b'a', b'i'], [b'a', b'i', b'n']];
+        expected.sort_unstable();
+        assert_eq!(plan.literals[0], expected);
+
+        // A query with nothing usable yields an empty plan.
+        let q = Query::compile("ab cd").unwrap();
+        assert!(q.trigram_plan().is_empty());
     }
 }
