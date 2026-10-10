@@ -117,6 +117,7 @@ pub struct Shared {
     /// A broadcast of change events for `subscribe` (cursor-based consumers).
     pub changes: RwLock<crate::health::ChangeLog>,
     /// §17 v2 trigram accelerator, cached against the index it was built from.
+    /// Present only with the default-on `trigram` cargo feature.
     ///
     /// Keyed by `(generation, entry_count)`:
     /// * a generation bump (snapshot load / full rescan / compaction) always
@@ -128,6 +129,7 @@ pub struct Shared {
     /// name tombstoned ids. That is safe by construction: the accelerator is a
     /// filter and the authoritative matcher drops dead ids — a stale posting can
     /// only ever add a candidate, never remove a real hit.
+    #[cfg(feature = "trigram")]
     pub trigram: RwLock<Option<(u64, usize, Arc<crate::trigram::TrigramIndex>)>>,
 }
 
@@ -142,6 +144,7 @@ impl Shared {
             lsn: AtomicU64::new(lsn),
             health: RwLock::new(Health::default()),
             changes: RwLock::new(crate::health::ChangeLog::new(4096)),
+            #[cfg(feature = "trigram")]
             trigram: RwLock::new(None),
         })
     }
@@ -153,6 +156,9 @@ impl Shared {
     /// the cache lock and, on a miss, the index lock to build. Callers must not
     /// hold the index read lock while calling this to avoid a lock-order hazard
     /// — the query path builds the accelerator *before* taking the index lock.
+    ///
+    /// Only available with the default-on `trigram` cargo feature.
+    #[cfg(feature = "trigram")]
     pub fn trigram_index(&self) -> Arc<crate::trigram::TrigramIndex> {
         let (gen, entries) = {
             let ix = self.index.read().unwrap();
@@ -180,6 +186,7 @@ impl Shared {
     }
 
     /// Drop the cached accelerator (used by tests and by explicit invalidation).
+    #[cfg(feature = "trigram")]
     pub fn invalidate_trigram(&self) {
         *self.trigram.write().unwrap() = None;
     }

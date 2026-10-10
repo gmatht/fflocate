@@ -331,12 +331,12 @@ impl Query {
     ///   ever *widen* the candidate set — it must not appear here;
     /// * a `Glob` or `Regex` term has no fixed substring to look up;
     /// * a `Path` term is a substring of the *materialized path*, not the name,
-    ///   and this accelerator indexes names only (§3/§10) — it is verified the
+    ///   and the accelerator indexes names only (§3/§10) — it is verified the
     ///   usual way.
     ///
     /// A name matches the query only if it contains every one of these needles,
-    /// which is exactly the property [`crate::trigram::TrigramIndex::candidates`]
-    /// exploits — soundly, because it is a superset filter.
+    /// which is exactly the property the trigram accelerator exploits — soundly,
+    /// because it is a superset filter.
     pub fn required_literals(&self) -> Vec<(&[u8], bool)> {
         let mut out: Vec<(&[u8], bool)> = Vec::new();
         for t in &self.terms {
@@ -349,10 +349,13 @@ impl Query {
         out
     }
 
-    /// A [`crate::trigram::TrigramPlan`] for this query: the required literals
-    /// reduced to their distinct trigrams, with too-short and case-sensitive
-    /// literals dropped. An empty plan means "this query has no usable trigram
-    /// constraint — scan as usual".
+    /// A trigram plan for this query: the required literals reduced to their
+    /// distinct trigrams, with too-short and case-sensitive literals dropped. An
+    /// empty plan means "this query has no usable trigram constraint — scan as
+    /// usual".
+    ///
+    /// Only available with the default-on `trigram` cargo feature.
+    #[cfg(feature = "trigram")]
     pub fn trigram_plan(&self) -> crate::trigram::TrigramPlan {
         crate::trigram::TrigramIndex::plan_from_literals(self.required_literals())
     }
@@ -493,8 +496,21 @@ pub struct Hit {
 ///
 /// `limit == 0` means unlimited. When `count_only`, paths are never
 /// materialized and the returned vec is empty with `total` set.
+///
+/// With the default-on `trigram` cargo feature this consults the §17
+/// accelerator (building/using the caller's cache is the daemon's job — this
+/// entry point uses none, so it behaves exactly like the plain scan). Without
+/// the feature it is a straight linear scan. Either way the results are
+/// identical.
 pub fn execute(index: &Index, root_paths: &[(u32, Vec<u8>)], q: &Query, limit: usize, count_only: bool) -> Results {
-    execute_with_trigram(index, root_paths, q, limit, count_only, None)
+    #[cfg(feature = "trigram")]
+    {
+        execute_with_trigram(index, root_paths, q, limit, count_only, None)
+    }
+    #[cfg(not(feature = "trigram"))]
+    {
+        execute_scan(index, root_paths, q, limit, count_only)
+    }
 }
 
 /// As [`execute`], but consulting the §17 trigram accelerator when one is
@@ -505,6 +521,9 @@ pub fn execute(index: &Index, root_paths: &[(u32, Vec<u8>)], q: &Query, limit: u
 /// [`Query::matches`] path. It can therefore never change the result set — only
 /// the time taken to produce it. `None` (or a query with no usable trigram
 /// constraint) restores the plain linear scan.
+///
+/// Only available with the `trigram` cargo feature (on by default).
+#[cfg(feature = "trigram")]
 pub fn execute_with_trigram(
     index: &Index,
     root_paths: &[(u32, Vec<u8>)],
@@ -513,89 +532,107 @@ pub fn execute_with_trigram(
     count_only: bool,
     trigram: Option<&crate::trigram::TrigramIndex>,
 ) -> Results {
-    let mut results = Results { hits: Vec::new(), total: 0 };
-    let mut buf: Vec<u8> = Vec::with_capacity(256);
-    let use_prefilter = q.ac.is_some();
-
     // Ask the accelerator which ids can possibly match. `None` = no usable
     // constraint (scan everything); `Some(empty)` = the required literals are
     // unsatisfiable, so nothing can match.
     let candidates: Option<Vec<u32>> = match trigram {
-        Some(tg) if tg.is_useful() => {
-            let plan = q.trigram_plan();
-            tg.candidates(&plan)
-        }
+        Some(tg) if tg.is_useful() => tg.candidates(&q.trigram_plan()),
         _ => None,
     };
     if let Some(c) = &candidates {
         if c.is_empty() {
-            return results;
+            return Results { hits: Vec::new(), total: 0 };
         }
     }
-
-    // A helper running the shared per-entry body for one id.
-    let consider = |results: &mut Results, buf: &mut Vec<u8>, id: u32| {
-        // Liveness is the accelerator's one blind spot: postings built before a
-        // deletion still name the dead id. The authoritative scan skips
-        // tombstones, so this must too, or a stale posting becomes a phantom hit.
-        if !index.is_alive(id) {
-            return;
-        }
-        let entry = &index.entries[id as usize];
-        if entry.flags().is_root_dir() {
-            return;
-        }
-        let name = index.name(id);
-        if use_prefilter {
-            let lower: Vec<u8> = name.iter().map(|c| c.to_ascii_lowercase()).collect();
-            if !q.prefilter(&lower) {
-                return;
-            }
-        }
-        let root_id = index.root_of(id);
-        let root_path = root_id.and_then(|r| root_paths.iter().find(|(rid, _)| *rid == r).map(|(_, p)| p.clone()));
-        let matched = q.matches(name, || {
-            root_path.as_ref().and_then(|rp| index.path_of(id, rp))
-        });
-        if !matched {
-            return;
-        }
-        results.total += 1;
-        if count_only {
-            return;
-        }
-        if limit != 0 && results.hits.len() >= limit {
-            return;
-        }
-        let path = match &root_path {
-            Some(rp) => match index.materialize_into(id, rp, buf) {
-                Some(_) => buf.clone(),
-                None => return,
-            },
-            None => name.to_vec(),
-        };
-        results.hits.push(Hit { id, path });
-    };
-
     match candidates {
         // Accelerated: ids are ascending, so result order matches the linear
         // scan exactly.
         Some(ids) => {
+            let mut results = Results { hits: Vec::new(), total: 0 };
+            let mut buf: Vec<u8> = Vec::with_capacity(256);
             for id in ids {
-                // The accelerator is built over live ids; guard the (impossible
-                // in practice) case of an id past the end after a shrink.
+                // Guard the (impossible in practice) case of an id past the end
+                // after a shrink; the scan body also rechecks liveness.
                 if (id as usize) < index.len() {
-                    consider(&mut results, &mut buf, id);
+                    consider(index, root_paths, q, limit, count_only, id, &mut results, &mut buf);
                 }
             }
+            results
         }
-        None => {
-            for (id, _) in index.iter_live() {
-                consider(&mut results, &mut buf, id);
-            }
-        }
+        None => execute_scan(index, root_paths, q, limit, count_only),
+    }
+}
+
+/// The plain linear scan — the shared body both the unaccelerated and the
+/// accelerated (`None`-candidate) paths run.
+fn execute_scan(
+    index: &Index,
+    root_paths: &[(u32, Vec<u8>)],
+    q: &Query,
+    limit: usize,
+    count_only: bool,
+) -> Results {
+    let mut results = Results { hits: Vec::new(), total: 0 };
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    for (id, _) in index.iter_live() {
+        consider(index, root_paths, q, limit, count_only, id, &mut results, &mut buf);
     }
     results
+}
+
+/// Evaluate one candidate id and fold it into `results`. Shared by the
+/// accelerated path and the linear scan so the two can never drift.
+#[allow(clippy::too_many_arguments)]
+fn consider(
+    index: &Index,
+    root_paths: &[(u32, Vec<u8>)],
+    q: &Query,
+    limit: usize,
+    count_only: bool,
+    id: u32,
+    results: &mut Results,
+    buf: &mut Vec<u8>,
+) {
+    // Liveness is the accelerator's one blind spot: postings built before a
+    // deletion still name the dead id. The authoritative scan skips tombstones,
+    // so this must too, or a stale posting becomes a phantom hit.
+    if !index.is_alive(id) {
+        return;
+    }
+    let entry = &index.entries[id as usize];
+    if entry.flags().is_root_dir() {
+        return;
+    }
+    let name = index.name(id);
+    if q.ac.is_some() {
+        let lower: Vec<u8> = name.iter().map(|c| c.to_ascii_lowercase()).collect();
+        if !q.prefilter(&lower) {
+            return;
+        }
+    }
+    let root_id = index.root_of(id);
+    let root_path = root_id.and_then(|r| root_paths.iter().find(|(rid, _)| *rid == r).map(|(_, p)| p.clone()));
+    let matched = q.matches(name, || {
+        root_path.as_ref().and_then(|rp| index.path_of(id, rp))
+    });
+    if !matched {
+        return;
+    }
+    results.total += 1;
+    if count_only {
+        return;
+    }
+    if limit != 0 && results.hits.len() >= limit {
+        return;
+    }
+    let path = match &root_path {
+        Some(rp) => match index.materialize_into(id, rp, buf) {
+            Some(_) => buf.clone(),
+            None => return,
+        },
+        None => name.to_vec(),
+    };
+    results.hits.push(Hit { id, path });
 }
 
 #[derive(Clone, Debug, Default)]
@@ -858,6 +895,7 @@ mod tests {
         assert!(lits[0].1, "smart/explicit case must be preserved");
     }
 
+    #[cfg(feature = "trigram")]
     #[test]
     fn trigram_plan_drops_short_and_case_sensitive() {
         // "rs" is 2 bytes -> no trigram; "Notes" is case-sensitive -> no

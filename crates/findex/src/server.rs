@@ -115,8 +115,9 @@ fn handle_query(ctx: &ServerCtx, raw: &str, limit: usize, count_only: bool, t0: 
     };
     // §17 v2: fetch (build-once, cached by generation) the trigram accelerator
     // *before* taking the index read lock, so the two locks are never held in a
-    // conflicting order. Only bother when the query has a usable constraint.
-    let trigram = ctx.shared.trigram_index();
+    // conflicting order. Only compiled in with the default-on `trigram` feature.
+    #[cfg(feature = "trigram")]
+    let trigram = Some(ctx.shared.trigram_index());
     let ix = ctx.shared.index.read().unwrap();
     let roots = ctx.shared.roots.read().unwrap();
     // Build the (root_dir_id, root_path) table once.
@@ -129,14 +130,17 @@ fn handle_query(ctx: &ServerCtx, raw: &str, limit: usize, count_only: bool, t0: 
         }
     }
     let effective_limit = if count_only { 0 } else { limit };
+    #[cfg(feature = "trigram")]
     let res = query::execute_with_trigram(
         &ix,
         &root_paths,
         &q,
         effective_limit,
         count_only,
-        Some(trigram.as_ref()),
+        trigram.as_deref(),
     );
+    #[cfg(not(feature = "trigram"))]
+    let res = query::execute(&ix, &root_paths, &q, effective_limit, count_only);
     let cursor = ctx.shared.cursor().to_string_repr();
     let elapsed = t0.elapsed();
     drop(roots);

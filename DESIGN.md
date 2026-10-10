@@ -254,6 +254,8 @@ The contract is that this is a **filter, never an authority**: every candidate s
 
 `crates/findex/tests/trigram_differential.rs` pins the contract against random trees and a corpus spanning every query shape; `crates/findex/examples/trigram_bench.rs` measures it. At 1 M entries the postings cost ~45 MiB against ~13 MiB of name bytes (a name averaging ~13 bytes yields ~11.6 trigrams), so the accelerator roughly quadruples name-side memory and queries run 6–60× faster — a good trade at 10 M+ files, which is why the design gates it at that scale. `path:`-heavy queries see no benefit.
 
+The accelerator is compiled in by default and can be dropped with the `trigram` cargo feature (`--no-default-features`); without it, queries run the plain linear scan and return the same results. It is not persisted across restarts, so a cold start rebuilds it (1.9 s at 1 M entries).
+
 New: every response's meta carries `{gen, lsn, fresh, elapsed_ms, stale_roots[]}` so clients can reason about consistency, not just results.
 
 ---

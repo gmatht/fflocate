@@ -1,5 +1,8 @@
 //! Trigram accelerator benchmark (§17 v2).
 //!
+//! Requires the default-on `trigram` cargo feature; without it the binary is a
+//! no-op stub (so `--no-default-features` still builds the example target).
+//!
 //! Dependency-free (no criterion), so it runs anywhere the crate builds:
 //!
 //! ```sh
@@ -18,11 +21,33 @@
 //! point is the shape (selectivity vs speedup) and that memory stays proportional
 //! to indexed bytes.
 
+#[cfg(feature = "trigram")]
 use std::time::Instant;
 
+#[cfg(feature = "trigram")]
 use findex::index::{EntryFlags, Index, ROOT_ID};
+#[cfg(feature = "trigram")]
 use findex::query::{self, Query};
+#[cfg(feature = "trigram")]
 use findex::trigram::TrigramIndex;
+
+/// Without the `trigram` feature there is nothing to benchmark; keep the
+/// example target buildable.
+#[cfg(not(feature = "trigram"))]
+fn main() {
+    eprintln!("trigram_bench: built without the `trigram` feature; nothing to measure.");
+}
+
+/// With the feature on, `main` runs the benchmark.
+#[cfg(feature = "trigram")]
+fn main() {
+    bench::main();
+}
+
+/// Everything below needs the accelerator, so it lives in a `cfg`-gated module.
+#[cfg(feature = "trigram")]
+mod bench {
+use super::*;
 
 /// A tiny deterministic PRNG so a run reproduces.
 struct Rng(u64);
@@ -89,7 +114,7 @@ fn build_index(n: usize) -> (Index, Vec<(u32, Vec<u8>)>) {
     (ix, vec![(root, root_path)])
 }
 
-fn main() {
+fn main_run() {
     let n: usize = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())
@@ -178,3 +203,9 @@ fn main() {
     println!();
     println!("All accelerated results were asserted identical to the linear scan.");
 }
+
+/// Entry point for the gated outer `main`.
+pub fn main() {
+    main_run();
+}
+} // mod bench

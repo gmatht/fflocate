@@ -96,6 +96,14 @@ globs, regex, `path:`, phrases, negation and their combinations. The deletion
 case is the one that earned its keep: it caught stale postings producing phantom
 hits until liveness was rechecked in the accelerated path.
 
+The accelerator is behind a **default-on cargo feature, `trigram`** (`findex`,
+with passthroughs on `findexd` and `ff`). `cargo build --no-default-features`
+compiles it out entirely — no posting lists, no cache, and queries fall through
+to the plain linear scan with identical results. This is the switch to reach for
+on memory-constrained machines (the ~4× name-byte cost above) or when the
+accelerator is simply not wanted; it is compile-time, so there is no runtime
+toggle and no branch cost when off.
+
 ### `locate` drop-in (`crates/fx/src/locate.rs`)
 
 Invoking the `ff` binary as `locate` (argv\[0\], e.g. a symlink) speaks GNU

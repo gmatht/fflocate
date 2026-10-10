@@ -152,7 +152,9 @@ crates/fx/       CLI client + service install
 **Done:** the §17 **trigram accelerator** (plocate-style name posting lists used
 as a query prefilter). It is filter-only — every candidate is still checked by
 the full matcher, and the differential suite asserts identical results — and its
-cache is keyed by index generation. See `crates/findex/src/trigram.rs`,
+cache is keyed by index generation. It lives behind a default-on `trigram` cargo
+feature, so `--no-default-features` builds it out entirely (plain linear scan,
+same results). See `crates/findex/src/trigram.rs`,
 `crates/findex/tests/trigram_differential.rs`, and
 `cargo run --release -p findex --example trigram_bench` (≈6–60× faster queries;
 postings ≈4× the name bytes — the trade the design gates at 10 M+ files).

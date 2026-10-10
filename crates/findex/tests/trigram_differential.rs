@@ -1,3 +1,5 @@
+#![cfg(feature = "trigram")]
+
 //! Differential test for the §17 v2 trigram accelerator.
 //!
 //! The accelerator is allowed to change *speed*, never *answers*. This suite

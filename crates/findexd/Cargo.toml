@@ -10,6 +10,11 @@ description = "findex daemon: watches the filesystem, maintains the index, serve
 name = "findexd"
 path = "src/main.rs"
 
+[features]
+default = ["trigram"]
+# Passthrough for findex's §17 v2 trigram accelerator.
+trigram = ["findex/trigram"]
+
 [dependencies]
 findex.workspace = true
 libc.workspace = true

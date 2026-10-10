@@ -8,7 +8,8 @@
 //! * [`snapshot`]  — §9 FNX2 snapshot file format
 //! * [`persist`]   — §9 snapshot + journal wiring, load/replay/compaction
 //! * [`query`]     — §10 query engine
-//! * [`trigram`]   — §10/§17 v2 trigram posting-list accelerator (query prefilter)
+//! * `trigram`     — §10/§17 v2 trigram posting-list accelerator (query prefilter;
+//!   behind the default-on `trigram` cargo feature)
 //! * [`cursor`]    — §9 `c:<gen>:<lsn>` cursors
 //! * [`event`]     — §6 internal `FsEvent` language
 //! * [`watch`]     — §6 `WatchBackend` trait, fake backend, inotify backend
@@ -39,6 +40,7 @@ pub mod roots;
 pub mod server;
 pub mod snapshot;
 pub mod sync;
+#[cfg(feature = "trigram")]
 pub mod trigram;
 pub mod util;
 pub mod watch;
