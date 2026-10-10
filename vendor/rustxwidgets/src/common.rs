@@ -53,6 +53,8 @@ mod platform {
 macro_rules! common_types_mod {
     () => {
         use super::platform::*;
+        // Needed only by some backends' generated impls; unused under others.
+        #[allow(unused_imports)]
         use crate::core::Widget;
 
         #[derive(Clone)]

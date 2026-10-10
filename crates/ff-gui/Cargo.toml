@@ -10,13 +10,21 @@ description = "ff-gui: a file-search browser for the findex daemon."
 name = "ff-gui"
 path = "src/main.rs"
 
+[features]
+# On Linux the GUI defaults to the real widget toolkit (GTK), which is what a
+# user expects from `ff --gui`. The `zork` backend is a display-free fallback:
+# it drives the same widget API from a REPL, so the GUI still runs over ssh or
+# in a container with no X server.
+default = ["gtk"]
+gtk = ["rustxwidgets/gtk"]
+zork = ["rustxwidgets/zork"]
+
 [dependencies]
 findex.workspace = true
 serde_json.workspace = true
 
-# The widget toolkit. Only the display-free `zork` backend builds out of the
-# box (see the vendor note in README): it is a pure-Rust, headless model + REPL
-# driver, which is what makes this GUI runnable in a terminal or over ssh with
-# no display server. The GTK backends need a gtk4-rs checkout that is not
-# generally available.
-rustxwidgets = { path = "../../vendor/rustxwidgets", default-features = false, features = ["zork"] }
+# rustxWidgets, vendored with its gtk backend and the gtk_dynamic_loader it
+# needs. Two crates rather than a path into a checkout outside this repository
+# so the build is self-contained; see README.md for why they are vendored and
+# what was fixed in them.
+rustxwidgets = { path = "../../vendor/rustxwidgets", default-features = false }

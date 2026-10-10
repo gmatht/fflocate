@@ -1,0 +1,30 @@
+[package]
+name = "gtk_dynamic_loader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+thiserror = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+libloading = "0.8"
+
+[lib]
+name = "gtk_dynamic_loader"
+path = "src/lib.rs"
+
+
+# Vendored snapshot: first-party lint standards do not apply inside it.
+# This ceiling keeps workspace-wide `cargo build`/`clippy` signal-clean
+# without touching a line of vendored source.
+[lints.rust]
+unexpected_cfgs = "allow"
+dead_code = "allow"
+unused_unsafe = "allow"
+[lints.rustdoc]
+missing_docs = "allow"
+[lints.clippy]
+needless_return = "allow"
+derivable_impl = "allow"
+unused_unit = "allow"
