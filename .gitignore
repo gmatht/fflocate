@@ -2,6 +2,11 @@
 **/*.rs.bk
 .pir/
 
+# Worktrees live inside the main checkout by default (`git worktree add`), and
+# each is a full checkout of its own. Never commit them: `git add -A` at the repo
+# root will otherwise sweep one in as an embedded repository.
+/.worktrees/
+
 # Upstream facebook/watchman checkout, kept only as a reference for the ported
 # tests and expression-language semantics. 51 MB, its own git repo: reference
 # material, not part of this project, never committed.
