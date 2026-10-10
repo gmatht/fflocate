@@ -732,6 +732,22 @@ mod tests {
         use crate::mount::handle_of_path;
 
         let dir = std::path::Path::new("/tmp/findex-fanotify-live");
+        // Unmount any stale tmpfs first. A previous run that panicked before its
+        // cleanup (or a manual experiment) leaves a mount here, and mounting on top
+        // of one stacks the layers: `FAN_MARK_FILESYSTEM` then watches a different
+        // layer from the one the test writes to, and the assertions fail for a
+        // reason that has nothing to do with the code.
+        for _ in 0..8 {
+            let unmounted = std::process::Command::new("umount")
+                .arg(dir)
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !unmounted {
+                break;
+            }
+        }
         let _ = std::fs::remove_dir_all(dir);
         if std::fs::create_dir_all(dir).is_err() {
             eprintln!("skip: cannot create {dir:?}");
@@ -751,7 +767,7 @@ mod tests {
             return;
         }
         let cleanup = || {
-            let _ = std::process::Command::new("umount").arg(dir).status();
+            let _ = std::process::Command::new("umount").arg(dir).stderr(std::process::Stdio::null()).status();
             let _ = std::fs::remove_dir_all(dir);
         };
 
