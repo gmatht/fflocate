@@ -151,6 +151,17 @@ impl Pending {
         }
     }
 
+    /// Forget which directories have been walked.
+    ///
+    /// A restart builds a fresh `Pending`, so the crawl queue is empty and every
+    /// directory will be walked again — which is what re-reads ownership for the
+    /// entries the snapshot restored. This method exists so that re-boot can be
+    /// modelled in-process, and so the dedupe set cannot silently suppress a
+    /// second pass.
+    pub fn reset_for_restart(&mut self) {
+        self.crawl_queued.clear();
+    }
+
     pub fn enqueue_crawl(&mut self, dir: u32) {
         if self.crawl_queued.insert(dir) {
             self.work.push_back(WorkItem::CrawlDir { dir });

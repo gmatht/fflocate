@@ -531,3 +531,68 @@ fn ownership_is_backfilled_after_a_restart() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A restart walks the whole tree, not just the directories that are new.
+///
+/// The snapshot restores *every* directory entry, so after a restart nothing is
+/// new — and a crawl that only descended into new directories would never reach
+/// the files inside the restored ones. Those files would have no ownership
+/// record, so the filter would hide them, and a system daemon that had been
+/// restarted would quietly stop showing any of its contents to non-root users.
+///
+/// This is what the previous test missed: wiping the table and re-crawling the
+/// *root* is not the same as restarting, because the interesting question is
+/// whether the crawl descends into directories it already knows about.
+#[test]
+fn a_restart_walks_into_already_known_directories() {
+    use std::sync::Arc;
+    use findex::applier::{Applier, RealFs};
+
+    let root = std::path::PathBuf::from("/tmp/findex-restart-descent");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub/deep.txt"), b"x").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(root.join("sub"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(root.join("sub/deep.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let d = tempfile::tempdir().unwrap();
+    let store = findex::persist::Store::open(&d.path().join("state")).unwrap();
+    let mut ix = Index::new();
+    let rid = ix.insert(
+        ROOT_ID,
+        b"findex-restart-descent",
+        EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+    );
+    let mut r = Root::new(0, root.clone());
+    r.caps.writable = true;
+    let shared = Shared::new(ix, vec![r]);
+    let mut applier = Applier::new(shared.clone(), store, Arc::new(RealFs), SyncRegistry::new());
+    applier.rebuild_dir_cache();
+    applier.track_ownership(true);
+    applier.pending_mut().enqueue_crawl(rid);
+    applier.drain();
+
+    // Restart: entries survive (nothing is "new" any more), ownership does not.
+    // A fresh `Pending`, as `Daemon::build` makes.
+    *shared.ownership.write().unwrap() = findex::ownership::Ownership::new();
+    applier.pending_mut().reset_for_restart();
+    applier.rebuild_dir_cache();
+    applier.pending_mut().enqueue_crawl(rid);
+    applier.drain();
+
+    let ctx = ServerCtx {
+        shared: shared.clone(),
+        sync: SyncRegistry::new(),
+        backend: "fake".into(),
+        control: None,
+        caller: Some(Caller::new(1000, 1000)),
+    };
+    let got = hits(&ctx, &Request::query("", 0, false, false));
+    assert!(
+        got.iter().any(|p| p.ends_with("/sub/deep.txt")),
+        "a restart must reach files inside directories it already knew; got {got:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -91,13 +91,28 @@ impl FsView for RealFs {
     fn stat(&self, abs_path: &Path) -> io::Result<Option<StatInfo>> {
         match std::fs::symlink_metadata(abs_path) {
             Ok(md) => {
-                use std::os::unix::fs::MetadataExt;
-                Ok(Some(StatInfo {
-                    is_dir: md.is_dir(),
-                    is_symlink: md.file_type().is_symlink(),
-                    dev: md.dev(),
-                    ino: md.ino(),
-                }))
+                // Stable device/inode identity is unix-only (Windows needs
+                // GetFileInformationByHandle); elsewhere report zeros, which
+                // the struct already means as "unavailable".
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    Ok(Some(StatInfo {
+                        is_dir: md.is_dir(),
+                        is_symlink: md.file_type().is_symlink(),
+                        dev: md.dev(),
+                        ino: md.ino(),
+                    }))
+                }
+                #[cfg(not(unix))]
+                {
+                    Ok(Some(StatInfo {
+                        is_dir: md.is_dir(),
+                        is_symlink: md.file_type().is_symlink(),
+                        dev: 0,
+                        ino: 0,
+                    }))
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
@@ -105,6 +120,14 @@ impl FsView for RealFs {
     }
 
     fn attr(&self, abs_path: &Path) -> io::Result<Option<crate::ownership::Attr>> {
+        // uid/gid/mode have no stable-std source off unix: report "cannot
+        // say", exactly like the default implementation.
+        #[cfg(not(unix))]
+        {
+            let _ = abs_path;
+            return Ok(None);
+        }
+        #[cfg(unix)]
         match std::fs::symlink_metadata(abs_path) {
             Ok(md) => {
                 use std::os::unix::fs::MetadataExt;
@@ -644,9 +667,15 @@ impl Applier {
             }
         };
         // Record this dir's own path first, so `note_ownership_for` can resolve a
-        // child's absolute path the moment it is emitted.
+        // child's absolute path the moment it is emitted — and record the
+        // directory's own ownership too. Every visibility check walks the parent
+        // chain, so a directory without a record hides its whole subtree; after a
+        // restart nothing is "new", and the root dir in particular would have no
+        // record at all unless the walk that descends into it records it.
         self.dir_paths.insert(dir, abs.clone());
+        self.note_ownership(dir, &abs);
         let mut new_dirs = Vec::new();
+        let mut known_dirs = Vec::new();
         for it in items {
             if it.name == b"." || it.name == b".." {
                 continue;
@@ -694,9 +723,18 @@ impl Applier {
                 }
             } else if it.is_dir && !it.is_symlink {
                 // A directory we already know: make sure its path is cached so
-                // later `crawl_dir`/`rescan` calls can reach it.
+                // later `crawl_dir`/`rescan` calls can reach it, and queue it for a
+                // walk.
+                //
+                // Queueing a *known* directory matters after a restart: the snapshot
+                // restores the directory entries, so nothing is "new", and a crawl
+                // that only descended into new directories would never reach the
+                // files inside them — leaving them without ownership and therefore
+                // invisible to every unprivileged caller. The queue dedupes, so a
+                // directory already scheduled is not walked twice.
                 if let Some(id) = exists {
                     let _ = self.abs_path_for(id);
+                    known_dirs.push(id);
                 }
             }
             // An entry that already exists still needs its ownership recorded, and
@@ -713,7 +751,7 @@ impl Applier {
                 self.note_ownership(id, &child_abs);
             }
         }
-        for d in new_dirs {
+        for d in new_dirs.into_iter().chain(known_dirs) {
             self.pending.enqueue_crawl(d);
         }
         // Register the dir's path in the cache if we just learned it.
