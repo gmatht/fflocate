@@ -174,7 +174,13 @@ impl Daemon {
 
         let sync = SyncRegistry::new();
         let fs: Arc<dyn FsView> = Arc::new(RealFs);
-        let applier = Applier::new(shared.clone(), store, fs, sync.clone());
+        let mut applier = Applier::new(shared.clone(), store, fs, sync.clone());
+        // §4/§6: exclusions must be installed before the initial crawl, so an
+        // excluded subtree is never enumerated (and, for a whole-mount backend
+        // that cannot decline the watch, never inserted either).
+        if !config.excludes.is_empty() {
+            applier.set_excludes(config.excludes.clone());
+        }
         let (backend, resolved_backend) = make_backend(config.backend)?;
 
         let (incoming_tx, incoming_rx) = bounded::<Vec<FsEvent>>(1000);

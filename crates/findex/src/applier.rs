@@ -234,6 +234,12 @@ pub struct Applier {
     /// Directories the daemon should watch, discovered during crawl/diff.
     watch_requests: Vec<(u32, PathBuf)>,
     watch_requested: std::collections::HashSet<u32>,
+    /// Exclusion rules (§4/§6). An excluded directory is never inserted, which
+    /// is what prunes its whole subtree for a whole-mount backend that cannot
+    /// decline the watch.
+    excludes: crate::excludes::Excludes,
+    /// How many names were dropped by [`Self::excludes`]. For `ff stats`.
+    pub excluded_names: u64,
 }
 
 impl Applier {
@@ -262,12 +268,25 @@ impl Applier {
             next_cookie_token: 1,
             watch_requests: Vec::new(),
             watch_requested: std::collections::HashSet::new(),
+            excludes: crate::excludes::Excludes::new(),
+            excluded_names: 0,
         }
     }
 
     pub fn pending(&self) -> &Pending {
         &self.pending
     }
+
+    /// Install the exclusion rules (§4/§6). Called before the initial crawl so
+    /// an excluded subtree is never enumerated in the first place.
+    pub fn set_excludes(&mut self, e: crate::excludes::Excludes) {
+        self.excludes = e;
+    }
+
+    pub fn excludes(&self) -> &crate::excludes::Excludes {
+        &self.excludes
+    }
+
     pub fn pending_mut(&mut self) -> &mut Pending {
         &mut self.pending
     }
@@ -380,6 +399,14 @@ impl Applier {
         if parent as usize >= ix.entry_count() || !ix.is_alive(parent) || !ix.is_dir(parent) {
             return; // event for a dir we do not (yet) know
         }
+        // The same exclusion rule as the crawl (§4/§6): a whole-mount backend
+        // cannot decline the watch, so an excluded directory must be refused
+        // here too. Because it is never inserted, its children never resolve,
+        // and the subtree stays pruned without an ancestor walk.
+        if is_dir_hint && self.excludes.excludes_dir_name(&name) {
+            self.excluded_names += 1;
+            return;
+        }
         // Use the hint to pick flags; the crawler will correct type later.
         let flags = EntryFlags::EMPTY.with_dir(is_dir_hint);
         match ix.lookup(parent, &name) {
@@ -478,6 +505,22 @@ impl Applier {
             // Sync cookies must never be indexed (§8, §16); `diff_subtree` and
             // the event path filter them, and so must the initial/subtree crawl.
             if crate::util::is_cookie(&it.name) {
+                continue;
+            }
+            // Exclusions (§4/§6): an excluded *directory* is never inserted, and
+            // because events name their parent by id, that one omission prunes
+            // its entire subtree — including for a whole-mount backend that
+            // could not have declined the watch.
+            if it.is_dir && !it.is_symlink && self.excludes.excludes_dir_name(&it.name) {
+                self.excluded_names += 1;
+                continue;
+            }
+            if self.excludes.excludes_path(
+                abs.join(std::ffi::OsString::from(String::from_utf8_lossy(&it.name).into_owned()))
+                    .to_string_lossy()
+                    .as_bytes(),
+            ) {
+                self.excluded_names += 1;
                 continue;
             }
             let exists = {

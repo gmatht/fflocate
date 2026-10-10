@@ -20,6 +20,9 @@ pub struct Config {
     pub sync_timeout_ms: u64,
     /// Directory for the pidfile + lock (§15 stale-lock recovery).
     pub pidfile: PathBuf,
+    /// Exclusion rules (§4/§6): directory names whose subtrees are never
+    /// indexed. Empty by default so nothing is filtered unless asked for.
+    pub excludes: findex::excludes::Excludes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +109,13 @@ impl Config {
             Some(v) if !v.is_empty() => std::env::split_paths(&v).collect(),
             _ => vec![home],
         };
+        // §4/§6: exclusions are opt-in. `FINDEX_EXCLUDE` takes comma/colon
+        // separated names (`build,node_modules`), absolute prefixes (`/proc`)
+        // or suffixes (`*.pyc`).
+        let excludes = match std::env::var("FINDEX_EXCLUDE") {
+            Ok(v) if !v.trim().is_empty() => findex::excludes::Excludes::parse_list(&v),
+            _ => findex::excludes::Excludes::new(),
+        };
         Config {
             socket_path: rd.join("findex.sock"),
             pidfile: rd.join("findex.pid"),
@@ -114,6 +124,7 @@ impl Config {
             backend: BackendChoice::Inotify,
             compaction_threshold: 100_000,
             sync_timeout_ms: 2_000,
+            excludes,
         }
     }
 
