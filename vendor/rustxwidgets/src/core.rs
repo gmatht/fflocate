@@ -162,6 +162,20 @@ pub trait Widget {
     fn raw_handle(&self) -> *mut c_void;
 }
 
+/// A handle to a timer scheduled with [`App::timeout_add`], so it can be cancelled.
+///
+/// On the GTK backend this is glib's source id; elsewhere it is never produced
+/// (scheduling returns `Err`), but the type exists so signatures do not need to be
+/// conditionally compiled.
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+pub type TimeoutHandle = crate::backends_gtk_adapter::TimerHandle;
+
+/// See the GTK definition; on backends without a timer this is only a placeholder
+/// that can never be created by a successful schedule.
+#[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TimeoutHandle(u32);
+
 /// Core App wrapper that holds a boxed backend application.
 #[derive(Clone)]
 pub struct App {
@@ -1205,6 +1219,42 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         let _ = crate::backends_gtk_adapter::quit_main_loop();
         #[cfg(all(windows, not(feature = "zork")))]
         crate::backends_nwg_adapter::quit_main_loop();
+    }
+
+    /// Schedule `cb` to run every `interval_ms` on the main loop.
+    ///
+    /// `cb` returns `true` to keep ticking, `false` to stop. The callback runs on
+    /// the main thread, so it may touch widgets.
+    ///
+    /// This is the primitive a *debounced* UI needs: with only a synchronous
+    /// change callback there is no way to say "wait until the user pauses", and no
+    /// way to read a clock between events. On backends without a timer (zork, and
+    /// any build whose libglib lacks `g_timeout_add_full`) this returns `Err` rather
+    /// than silently never calling back, so the caller can degrade visibly.
+    pub fn timeout_add(
+        interval_ms: u32,
+        cb: Box<dyn FnMut() -> bool>,
+    ) -> Result<TimeoutHandle, Error> {
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        {
+            crate::backends_gtk_adapter::timeout_add(interval_ms, cb)
+        }
+        #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
+        {
+            let _ = (interval_ms, cb);
+            let _: TimeoutHandle = TimeoutHandle::default();
+            Err(Error::Backend(
+                "no timer primitive on this backend".into(),
+            ))
+        }
+    }
+
+    /// Cancel a timer from [`Self::timeout_add`].
+    pub fn cancel_timer(handle: TimeoutHandle) {
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        crate::backends_gtk_adapter::cancel_timer(handle);
+        #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
+        let _ = handle;
     }
 
     /// Pump the backend's event loop for `count` blocking iterations.

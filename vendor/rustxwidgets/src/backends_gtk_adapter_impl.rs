@@ -1415,6 +1415,42 @@ mod gtk_adapter {
         crate::backends::gtk::quit_main_loop().map_err(|e| Error::Backend(format!("{}", e)))
     }
 
+    /// A handle to a scheduled repeating timer, so it can be cancelled.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TimerHandle(u32);
+
+    /// Schedule `cb` every `interval_ms` on the GTK main loop.
+    ///
+    /// `cb` returns `true` to keep going, `false` to stop after this call. This is
+    /// the primitive a debounced "search as you type" needs: there is no way to
+    /// read a clock or post a delayed callback otherwise, and doing the work inline
+    /// on every keystroke would block the UI.
+    ///
+    /// Returns `Err` when this build's libglib has no `g_timeout_add_full`, so a
+    /// caller cannot mistake "did not schedule" for "scheduled". `G_SOURCE_CONTINUE`
+    /// is glib's `1`.
+    pub fn timeout_add(interval_ms: u32, cb: Box<dyn FnMut() -> bool>) -> Result<TimerHandle, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("no GTK loader".into()))?;
+        // SAFETY: `timeout_add` moves the boxed closure onto the main loop and frees
+        // it via glib's `notify` hook; the callback runs on the main thread, so it
+        // never aliases.
+        unsafe { gtk_dynamic_loader::timeout_add(&loader, interval_ms, cb) }
+            .map(TimerHandle)
+            .ok_or_else(|| Error::Backend("g_timeout_add_full unavailable in this libglib".into()))
+    }
+
+    /// Cancel a timer from [`Self::timeout_add`].
+    ///
+    /// Tolerates a stale handle: a timer that stopped itself is already gone, and
+    /// removing it again is harmless.
+    pub fn cancel_timer(handle: TimerHandle) {
+        if let Some(loader) = crate::backends::gtk::loader() {
+            // SAFETY: `source_remove` ignores tags it does not know.
+            unsafe { gtk_dynamic_loader::source_remove(&loader, handle.0) };
+        }
+    }
+
     /// Pump the GTK main context for `count` iterations.
     /// All iterations use blocking waits so poll() returns as soon as
     /// the X11 server or frame clock timer fires.  This ensures frame

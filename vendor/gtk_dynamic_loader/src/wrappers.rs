@@ -2388,6 +2388,69 @@ pub unsafe fn idle_add_once(loader: &Arc<Loader>, cb: Box<dyn FnMut()>) {
     }
 }
 
+/// A repeating timer callback: returns `true` to be called again, `false` to stop.
+type TickFn = Box<dyn FnMut() -> bool>;
+
+/// Trampoline for `g_timeout_add_full`. The `notify` destructor (not this
+/// function) frees the closure, so this must *not* reclaim it.
+extern "C" fn tick_trampoline(data: *mut c_void) -> i32 {
+    if data.is_null() {
+        return 0;
+    }
+    // SAFETY: `data` is the `Box<TickFn>` we handed to glib, and the `notify`
+    // destructor we registered is the only thing that frees it. glib calls this
+    // on the main thread, so no aliasing.
+    let cb = unsafe { &mut *(data as *mut TickFn) };
+    if cb() {
+        1 // G_SOURCE_CONTINUE
+    } else {
+        0 // G_SOURCE_REMOVE
+    }
+}
+
+/// Frees the boxed callback when glib drops the source.
+extern "C" fn tick_destroy(data: *mut c_void) {
+    if data.is_null() {
+        return;
+    }
+    unsafe {
+        drop(Box::from_raw(data as *mut TickFn));
+    }
+}
+
+/// Schedule `cb` to run every `interval_ms` on the main loop, and return a handle
+/// that stops it. `cb` returns `true` to keep ticking, `false` to stop itself.
+///
+/// Returns `None` when the loaded libglib has no `g_timeout_add_full` — the caller
+/// must then degrade rather than assume it scheduled anything. (The `_full` form is
+/// required, not cosmetic: the bare `g_timeout_add` has no `notify` hook, so the
+/// boxed closure could never be freed and would leak on every schedule.)
+pub unsafe fn timeout_add(
+    loader: &Arc<Loader>,
+    interval_ms: u32,
+    cb: Box<dyn FnMut() -> bool>,
+) -> Option<u32> {
+    let add = loader.symbols.g_timeout_add_full?;
+    let raw = Box::into_raw(Box::new(cb)) as *mut c_void;
+    // G_PRIORITY_DEFAULT == 0.
+    let tag = unsafe { add(0, interval_ms, tick_trampoline, raw, Some(tick_destroy)) };
+    if tag == 0 {
+        // glib failed to attach a source; reclaim the closure we just leaked.
+        unsafe { drop(Box::from_raw(raw as *mut TickFn)) };
+        return None;
+    }
+    Some(tag)
+}
+
+/// Cancel a timer scheduled by [`timeout_add`]. Safe to call with a stale tag
+/// (glib returns 0 and we ignore it), which matters because a timer may have
+/// already stopped itself by returning `false`.
+pub unsafe fn source_remove(loader: &Arc<Loader>, tag: u32) {
+    if let Some(remove) = loader.symbols.g_source_remove {
+        unsafe { remove(tag) };
+    }
+}
+
 /// Unparent a widget (GTK4) — remove from its parent container
 pub unsafe fn widget_unparent(loader: &Arc<Loader>, widget: *mut c_void) {
     if let Some(unparent) = loader.symbols.gtk_widget_unparent {

@@ -25,9 +25,19 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use ff_gui::{
-    effective_query, render_count, rows_from_paths, DaemonClient, GuiError, RowAction,
-    SearchOptions, SearchOutcome, ADVANCED_SYNTAX_HELP, DEFAULT_MAX_DISTANCE,
+    effective_query, query_is_searchable, render_count, rows_from_paths, DaemonClient, GuiError,
+    RowAction, SearchGate, SearchOptions, SearchOutcome, ADVANCED_SYNTAX_HELP,
+    DEFAULT_MAX_DISTANCE,
 };
+
+/// A search's result, plus whether the advanced box's query was the one that ran.
+type SearchResult = Result<(SearchOutcome, bool), GuiError>;
+
+/// Runs the query and returns its result. Reads widget text, so main-thread only.
+type FetchFn = Rc<dyn Fn() -> SearchResult>;
+
+/// Applies a result to the widgets. Main-thread only: the widgets are not `Send`.
+type RenderFn = Rc<dyn Fn(SearchResult)>;
 
 /// Which backend this binary was compiled with.
 ///
@@ -175,58 +185,77 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     status.set_text(&initial_status);
 
-    // The search runs synchronously: the protocol is request/response, so there
-    // is nothing to await. (A push feed would use the `subscribe` op, which is
-    // still a v1.5 preview in the daemon.) The same closure backs both the
-    // Search button and the Return key, so the two cannot drift apart.
-    let run_search: Rc<RefCell<Box<dyn FnMut()>>> = {
+    // The search. Two halves, deliberately separated:
+    //
+    // * `fetch` runs the query and returns a plain result;
+    // * `render` applies that result to the widgets.
+    //
+    // Splitting them is what lets the debounce reuse the same query code as the
+    // Search button and the Return key, so the three cannot drift apart. (It also
+    // means the expensive half *could* move to a worker thread, but it is 0.00 s
+    // against a warm daemon, so it does not: see the note at the as-you-type code.)
+    let fetch: FetchFn = {
         let query = query.clone();
         let advanced_query = advanced_query.clone();
-        let status = status.clone();
-        let results = results.clone();
-        let current = current.clone();
         let opt_case = opt_case.clone();
         let opt_fuzzy = opt_fuzzy.clone();
         let opt_count = opt_count.clone();
         let opt_distance = opt_distance.clone();
-        Rc::new(RefCell::new(Box::new(move || {
+        Rc::new(move || {
             let quick = query.get_text().unwrap_or_default();
             let adv = advanced_query.get_text().unwrap_or_default();
             let (q, shadowed) = effective_query(&quick, &adv);
             let opts = gather_options(&opt_case, &opt_fuzzy, &opt_count, &opt_distance);
-            match run_query(&q, &opts) {
-                Ok(outcome) => {
-                    let mut line = outcome.status_line_opts(outcome.paths.len().min(MAX_ROWS), opts.count_only);
-                    if shadowed {
-                        // Say which query ran: the two boxes disagreeing must
-                        // not be silent.
-                        line.push_str("  [advanced query]");
-                    }
-                    status.set_text(&line);
-                    if opts.count_only {
-                        // No paths come back: show the number, not an empty
-                        // list that would read as "no matches".
-                        results.set_rows(&[vec![
-                            CellValue::Text(String::new()),
-                            CellValue::Text(render_count(outcome.total)),
-                            CellValue::Text(String::new()),
-                        ]]);
-                        current.borrow_mut().clear();
-                    } else {
-                        let shown: Vec<String> =
-                            outcome.paths.iter().take(MAX_ROWS).cloned().collect();
-                        results.set_rows(&rows_to_cells(&shown));
-                        // Record only the rows actually shown.
-                        *current.borrow_mut() = shown;
-                    }
+            run_query(&q, &opts).map(|o| (o, shadowed))
+        })
+    };
+
+    let render: RenderFn = {
+        let status = status.clone();
+        let results = results.clone();
+        let current = current.clone();
+        let opt_count = opt_count.clone();
+        Rc::new(move |outcome| match outcome {
+            Ok((outcome, shadowed)) => {
+                let count_only = opt_count.is_active();
+                let mut line = outcome.status_line_opts(outcome.paths.len().min(MAX_ROWS), count_only);
+                if shadowed {
+                    // Say which query ran: the two boxes disagreeing must not be
+                    // silent.
+                    line.push_str("  [advanced query]");
                 }
-                Err(e) => {
-                    status.set_text(&format!("{e}"));
-                    results.set_rows(&[]);
+                status.set_text(&line);
+                if count_only {
+                    // No paths come back: show the number, not an empty list that
+                    // would read as "no matches".
+                    results.set_rows(&[vec![
+                        CellValue::Text(String::new()),
+                        CellValue::Text(render_count(outcome.total)),
+                        CellValue::Text(String::new()),
+                    ]]);
                     current.borrow_mut().clear();
+                } else {
+                    let shown: Vec<String> =
+                        outcome.paths.iter().take(MAX_ROWS).cloned().collect();
+                    results.set_rows(&rows_to_cells(&shown));
+                    // Record only the rows actually shown.
+                    *current.borrow_mut() = shown;
                 }
             }
-        })))
+            Err(e) => {
+                status.set_text(&format!("{e}"));
+                results.set_rows(&[]);
+                current.borrow_mut().clear();
+            }
+        })
+    };
+
+    // The same closure backs the Search button, the Return key and the
+    // as-you-type debounce, so the three cannot drift apart.
+    let run_search: Rc<RefCell<Box<dyn FnMut()>>> = {
+        let fetch = fetch.clone();
+        let render = render.clone();
+        Rc::new(RefCell::new(Box::new(move || render(fetch()))))
     };
 
     {
@@ -236,6 +265,89 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 f();
             }
         })?;
+    }
+
+    // ---------------------------------------------------------------------
+    // Search as you type.
+    //
+    // Each keystroke arms a short timer via the toolkit's `timeout_add` (the
+    // primitive this added to the vendored rustxWidgets). If another key arrives
+    // first the timer is re-armed, so only a pause in typing issues a query.
+    //
+    // The query runs *on the main thread*, deliberately. A worker thread was the
+    // first design, but the widget text to read and the rows to write are both
+    // `Rc`/`RefCell` and cannot cross a thread boundary, so only the socket hop
+    // could move — and that hop is 0.00 s once the daemon's index is warm. A
+    // mailbox plus ordering machinery would buy nothing measurable. What actually
+    // matters is the debounce: without it, holding a key fires a query per repeat.
+    //
+    // `SearchGate` still guards the ordering hazard, because a debounce only
+    // *reduces* overlapping queries rather than eliminating them.
+    // ---------------------------------------------------------------------
+    {
+        let due_at: Rc<RefCell<Option<std::time::Instant>>> = Rc::new(RefCell::new(None));
+        // The gate is what stops a slow query from being overwritten by a newer one
+        // and keeps a burst of keystrokes from queuing a query each. It is plain
+        // logic, tested in `ff_gui::asyou_type_tests`.
+        let gate = Rc::new(RefCell::new(SearchGate::new()));
+
+        const DEBOUNCE_MS: u64 = 150;
+        const PUMP_MS: u32 = 30;
+
+        let arm = {
+            let due_at = due_at.clone();
+            move || {
+                *due_at.borrow_mut() = Some(
+                    std::time::Instant::now() + std::time::Duration::from_millis(DEBOUNCE_MS),
+                );
+            }
+        };
+
+        let pump = {
+            let due_at = due_at.clone();
+            let gate = gate.clone();
+            let fetch = fetch.clone();
+            let render = render.clone();
+            App::timeout_add(PUMP_MS, Box::new(move || {
+                let Some(t) = *due_at.borrow() else { return true };
+                if std::time::Instant::now() < t {
+                    return true; // still typing
+                }
+                // Ask the gate whether a query may go out; it refuses while one is
+                // in flight, and we retry on a later tick.
+                let Some(ticket) = gate.borrow_mut().begin()
+                else {
+                    return true;
+                };
+                *due_at.borrow_mut() = None;
+                // Both ends are main-thread; `fetch` reads the widgets and does the
+                // socket round-trip, which is microseconds once the daemon is warm.
+                let outcome = fetch();
+                if let Some(outcome) = gate.borrow_mut().finish(ticket.seq, outcome) {
+                    render(outcome);
+                }
+                true // keep ticking for the life of the app
+            }))
+        };
+        let _ = pump;
+
+        // Arm the debounce on every change to either box. An emptied box clears the
+        // list at once rather than waiting, since "show everything again" is the
+        // absence of a query, not a query.
+        for entry in [&query, &advanced_query] {
+            let arm = arm.clone();
+            let e = entry.clone();
+            let render = render.clone();
+            entry
+                .connect_changed(move || {
+                    if !query_is_searchable(&e.get_text().unwrap_or_default()) {
+                        render(Ok((SearchOutcome::default(), false)));
+                        return;
+                    }
+                    arm();
+                })
+                .ok();
+        }
     }
 
     // Return in either query field runs the same search.

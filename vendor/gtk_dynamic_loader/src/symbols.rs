@@ -7,6 +7,29 @@ pub type GMainLoopNew = unsafe extern "C" fn(context: *mut c_void, is_running: i
 pub type GMainLoopRun = unsafe extern "C" fn(loop_: *mut c_void);
 pub type GMainLoopQuit = unsafe extern "C" fn(loop_: *mut c_void);
 
+/// `GSourceFunc`: returns TRUE (non-zero) to be called again, FALSE to stop.
+///
+/// This is the callback type for both `g_timeout_add` and `g_idle_add`. A boxed
+/// Rust closure is passed as the `data` pointer and freed when the source stops
+/// (or, for `g_idle_add`, after its single call).
+pub type GSourceFunc = unsafe extern "C" fn(data: *mut c_void) -> i32;
+pub type GTimeoutAdd = unsafe extern "C" fn(interval_ms: u32, func: GSourceFunc, data: *mut c_void) -> u32;
+pub type GTimeoutAddFull = unsafe extern "C" fn(
+    priority: i32,
+    interval_ms: u32,
+    func: GSourceFunc,
+    data: *mut c_void,
+    notify: Option<unsafe extern "C" fn(data: *mut c_void)>,
+) -> u32;
+pub type GIdleAdd = unsafe extern "C" fn(func: GSourceFunc, data: *mut c_void) -> u32;
+pub type GIdleAddFull = unsafe extern "C" fn(
+    priority: i32,
+    func: GSourceFunc,
+    data: *mut c_void,
+    notify: Option<unsafe extern "C" fn(data: *mut c_void)>,
+) -> u32;
+pub type GSourceRemove = unsafe extern "C" fn(tag: u32) -> i32;
+
 pub type GObjectRef = unsafe extern "C" fn(obj: *mut c_void) -> *mut c_void;
 pub type GObjectUnref = unsafe extern "C" fn(obj: *mut c_void);
 pub type GObjectRefSink = unsafe extern "C" fn(obj: *mut c_void) -> *mut c_void;
@@ -330,6 +353,12 @@ pub struct Symbols {
     pub g_main_loop_new: Option<GMainLoopNew>,
     pub g_main_loop_run: Option<GMainLoopRun>,
     pub g_main_loop_quit: Option<GMainLoopQuit>,
+    /// Timer scheduling. Optional: a build against a libglib without these still
+    /// loads, and callers degrade (see `rustxwidgets`'s `timeout_add`). Idle
+    /// scheduling already has `g_idle_add` above.
+    pub g_timeout_add: Option<GTimeoutAdd>,
+    pub g_timeout_add_full: Option<GTimeoutAddFull>,
+    pub g_source_remove: Option<GSourceRemove>,
 
     // gobject
     pub g_object_ref: Option<GObjectRef>,
@@ -632,6 +661,12 @@ impl Symbols {
         let g_main_loop_new = unsafe { sym::<GMainLoopNew>(glib, "g_main_loop_new") };
         let g_main_loop_run = unsafe { sym::<GMainLoopRun>(glib, "g_main_loop_run") };
         let g_main_loop_quit = unsafe { sym::<GMainLoopQuit>(glib, "g_main_loop_quit") };
+        // Timer/idle scheduling (glib). `*_full` variants take a `notify`
+        // destructor so a boxed Rust closure can be freed deterministically; the
+        // plain ones leak it, so we prefer `_full` and fall back.
+        let g_timeout_add = unsafe { sym::<GTimeoutAdd>(glib, "g_timeout_add") };
+        let g_timeout_add_full = unsafe { sym::<GTimeoutAddFull>(glib, "g_timeout_add_full") };
+        let g_source_remove = unsafe { sym::<GSourceRemove>(glib, "g_source_remove") };
 
         // gobject
         let g_object_ref = unsafe { sym::<GObjectRef>(gobject, "g_object_ref") };
@@ -904,6 +939,7 @@ impl Symbols {
 
         Ok(Symbols {
             g_main_loop_new, g_main_loop_run, g_main_loop_quit,
+            g_timeout_add, g_timeout_add_full, g_source_remove,
             g_object_ref, g_object_unref, g_object_ref_sink, g_signal_connect_data, g_signal_connect,
             gtk_window_new, gtk_window_set_title, gtk_button_new_with_label, gtk_label_new, gtk_label_set_text,
             gtk_box_new, gtk_box_append, gtk_box_pack_start, gtk_container_add, gtk_container_remove, gtk_window_set_child,

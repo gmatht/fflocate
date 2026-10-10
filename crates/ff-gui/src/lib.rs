@@ -643,3 +643,143 @@ mod tests {
         assert!(!s.contains('['), "no noise on the happy path: {s}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// As-you-type search.
+//
+// The parts that are easy to get wrong live here, in plain Rust with no widgets,
+// so they can be tested without a display. The GUI supplies three things: a way
+// to read the current query (main thread only — the widgets are `Rc`/`RefCell`),
+// a way to render a result (also main thread only), and a clock.
+// ---------------------------------------------------------------------------
+
+/// A search ticket: the sequence number the gate assigned.
+///
+/// Deliberately carries no query text. The gate's job is *ordering*, and the query
+/// is read from the widgets at the moment it is sent — putting a copy here would
+/// invite a caller to render a result against a query that is no longer in the box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchTicket {
+    /// Monotonic id, so a slow answer cannot overwrite a newer one.
+    pub seq: u64,
+}
+
+/// Decide whether a request may be *issued*: only if no newer one has been issued
+/// and none is in flight.
+///
+/// Without this, holding down a key would queue one socket round-trip per repeat
+/// and the answers would arrive out of order.
+#[derive(Debug, Default)]
+pub struct SearchGate {
+    next_seq: u64,
+    /// Requests issued but not necessarily applied yet.
+    in_flight: u64,
+    /// The highest seq applied to the UI.
+    applied: u64,
+    /// The seq most recently *issued*.
+    issued: u64,
+}
+
+impl SearchGate {
+    pub fn new() -> SearchGate {
+        SearchGate::default()
+    }
+
+    /// Ask permission to issue a query. `None` means one is already in flight —
+    /// the caller should re-arm its debounce and try again, not queue up.
+    pub fn begin(&mut self) -> Option<SearchTicket> {
+        if self.in_flight > 0 {
+            return None;
+        }
+        self.next_seq += 1;
+        self.issued = self.next_seq;
+        self.in_flight += 1;
+        Some(SearchTicket { seq: self.issued })
+    }
+
+    /// A finished request. Returns the outcome to render, or `None` when it is
+    /// stale — an order the user has already moved past.
+    pub fn finish<T>(&mut self, seq: u64, outcome: T) -> Option<T> {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if seq <= self.applied {
+            return None; // a newer result is already on screen
+        }
+        self.applied = seq;
+        Some(outcome)
+    }
+
+    /// The seq most recently issued, for diagnostics/tests.
+    pub fn issued(&self) -> u64 {
+        self.issued
+    }
+
+    /// Whether a request is outstanding.
+    pub fn busy(&self) -> bool {
+        self.in_flight > 0
+    }
+}
+
+/// Is the query worth searching? An empty or whitespace-only box should not hit
+/// the daemon on every backspace to empty.
+pub fn query_is_searchable(q: &str) -> bool {
+    !q.trim().is_empty()
+}
+
+#[cfg(test)]
+mod asyou_type_tests {
+    use super::*;
+
+    #[test]
+    fn a_second_request_is_refused_while_one_is_in_flight() {
+        let mut g = SearchGate::new();
+        assert!(g.begin().is_some(), "first is issued");
+        assert!(g.begin().is_none(), "no pile-up while busy");
+        assert!(g.busy());
+    }
+
+    #[test]
+    fn a_new_request_is_allowed_once_the_first_finishes() {
+        let mut g = SearchGate::new();
+        let r = g.begin().unwrap();
+        assert!(g.finish(r.seq, "A").is_some(), "the first result renders");
+        assert!(!g.busy());
+        assert!(g.begin().is_some(), "now the next may go");
+    }
+
+    #[test]
+    fn a_stale_result_never_overwrites_a_newer_one() {
+        // The ordering hazard: request A takes longer than B. B's answer lands
+        // first; A's must then be dropped, not painted over the top.
+        let mut g = SearchGate::new();
+        let a = g.begin().unwrap();
+        // Simulate A still running by finishing it out of order: reset busy so B can
+        // be issued, which is what happens when the GUI re-arms.
+        g.in_flight = 0;
+        let b = g.begin().unwrap();
+        assert!(b.seq > a.seq);
+        assert_eq!(g.finish(b.seq, "B"), Some("B"), "the newer result renders");
+        assert_eq!(g.finish(a.seq, "A"), None, "the older result is dropped");
+    }
+
+    #[test]
+    fn an_empty_query_is_not_searchable() {
+        assert!(!query_is_searchable(""));
+        assert!(!query_is_searchable("   "));
+        assert!(!query_is_searchable("\t"));
+        assert!(query_is_searchable("a"));
+        assert!(query_is_searchable(" main.rs "));
+    }
+
+    #[test]
+    fn sequence_numbers_are_monotonic() {
+        let mut g = SearchGate::new();
+        let mut last = 0;
+        for _ in 0..5 {
+            let r = g.begin().unwrap();
+            assert!(r.seq > last, "seq must increase");
+            last = r.seq;
+            g.finish(r.seq, ());
+        }
+        assert_eq!(g.issued(), last);
+    }
+}
