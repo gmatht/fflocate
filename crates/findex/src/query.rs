@@ -408,6 +408,7 @@ impl Query {
                 Term::Glob { pattern } => pattern.matches(name),
                 Term::Ext { ext, case } => ext_matches(name, ext, *case),
                 Term::Path { needle, case } => {
+                    #[allow(clippy::redundant_closure)] // FnMut cannot be moved into FnOnce
                     let p = path_cache.get_or_insert_with(|| path_provider());
                     match p {
                         Some(p) => contains(p, needle, *case),
@@ -1177,7 +1178,7 @@ mod tests {
         let q = Query::compile("lib.rs").unwrap();
         let res = execute_fuzzy(&ix, &rp, &q, 2, 0, false, Some(&tg));
         // lib.rs is exact (0); main.rs is further but within 2.
-        assert!(res.hits.len() >= 1);
+        assert!(!res.hits.is_empty());
         assert_eq!(res.hits[0].path, b"/home/me/proj/src/lib.rs".to_vec());
         assert_eq!(res.hits[0].score, 0);
         // Scores are non-decreasing down the list.

@@ -179,13 +179,15 @@ fn run() -> Result<ExitCode, CliError> {
     }
     c.query(
         &q,
-        args.limit,
-        args.json,
-        args.count,
-        args.zero,
-        args.expr,
-        args.fuzzy,
-        args.distance,
+        client::QueryOpts {
+            limit: args.limit,
+            json: args.json,
+            count: args.count,
+            zero: args.zero,
+            expr: args.expr,
+            fuzzy: args.fuzzy,
+            distance: args.distance,
+        },
     )
 }
 

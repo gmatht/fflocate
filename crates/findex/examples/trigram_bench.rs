@@ -202,6 +202,64 @@ fn main_run() {
     }
     println!();
     println!("All accelerated results were asserted identical to the linear scan.");
+
+    // ------------------------------------------------------------------
+    // Fuzzy search (§10/§17): candidate generation vs a full scan.
+    // ------------------------------------------------------------------
+    println!();
+    println!("fuzzy search (edit distance, ranked)");
+    println!("{}", "-".repeat(72));
+    println!(
+        "{:<18} {:>8} {:>8} {:>12} {:>12} {:>9}",
+        "query", "k", "matches", "scan ms", "trigram ms", "speedup"
+    );
+    println!("{}", "-".repeat(72));
+
+    // A mix of a near-miss on a rare word and on a common one.
+    let fuzzy_queries = [
+        ("rare typo", "render_widgte"),
+        ("rare 1-edit", "render_widget"),
+        ("common typo", "mian"),
+        ("short typo", "qurey"),
+    ];
+    for (label, raw) in fuzzy_queries.iter().copied() {
+        for k in [1u32, 2] {
+            let q = Query::compile(raw).unwrap();
+            // Full scan: no trigram passed.
+            let _ = query::execute_fuzzy(&ix, &rp, &q, k, 0, false, None);
+            let _ = query::execute_fuzzy(&ix, &rp, &q, k, 0, false, Some(&tg));
+
+            let reps = 3;
+            let mut scan = f64::MAX;
+            let mut accel = f64::MAX;
+            let mut matches = 0u64;
+            for _ in 0..reps {
+                let t = Instant::now();
+                let a = query::execute_fuzzy(&ix, &rp, &q, k, 0, false, None);
+                scan = scan.min(t.elapsed().as_secs_f64() * 1000.0);
+
+                let t = Instant::now();
+                let b = query::execute_fuzzy(&ix, &rp, &q, k, 0, false, Some(&tg));
+                accel = accel.min(t.elapsed().as_secs_f64() * 1000.0);
+
+                // The accelerator is a superset filter: identical results, always.
+                assert_eq!(a.total, b.total, "fuzzy {raw:?} k={k}: totals diverged");
+                assert_eq!(
+                    a.hits.iter().map(|h| (h.id, h.score)).collect::<Vec<_>>(),
+                    b.hits.iter().map(|h| (h.id, h.score)).collect::<Vec<_>>(),
+                    "fuzzy {raw:?} k={k}: ranked rows diverged"
+                );
+                matches = a.total;
+            }
+            let speedup = if accel > 0.0 { scan / accel } else { f64::INFINITY };
+            println!(
+                "{label:<18} {k:>8} {matches:>8} {scan:>12.1} {accel:>12.1} {speedup:>8.1}x"
+            );
+            println!("    q = {raw:?}");
+        }
+    }
+    println!();
+    println!("Fuzzy accelerated results were asserted identical (count, ids AND scores).");
 }
 
 /// Entry point for the gated outer `main`.

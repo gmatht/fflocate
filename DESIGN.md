@@ -256,6 +256,12 @@ The contract is that this is a **filter, never an authority**: every candidate s
 
 The accelerator is compiled in by default and can be dropped with the `trigram` cargo feature (`--no-default-features`); without it, queries run the plain linear scan and return the same results. It is not persisted across restarts, so a cold start rebuilds it (1.9 s at 1 M entries).
 
+**Fuzzy search — v2, implemented.** Off by default, on with `ff --fuzzy` (or `Request::Query.fuzzy`); `--distance N` sets the edit budget and defaults to **1**. Each plain case-insensitive substring term is matched approximately — a name qualifies when some substring of it lies within `k` edits of the needle (`substring_within`: a free-prefix first DP row, a free-suffix minimum over the last, and an exact `memmem` fast path). Every other term — `ext:`, `path:`, glob, regex, negation and explicit `case:` — still filters **exactly**, so `ext:rs` never drifts into `ext:rz` and `-foo` never starts excluding things it did not before.
+
+Scores are integers (the summed per-needle distance), so ranking by `(score, path)` is total and deterministic — no float ties, no hash order. A consequence worth stating: fuzzy results are a **ranked list**, so their *order* differs from a plain query's index order even at `k = 0`, where the two select the same set.
+
+The accelerator's role here is candidate generation only, via the same sound rule the design names for approximate matching: a name containing an occurrence within `k` edits must share at least `t − 3k` of the pattern's `t` trigrams (one edit destroys at most three). `candidates_sharing_at_least` counts those shares; when `t − 3k ≤ 0` the bound is vacuous, it says so, and the query scans every entry. Measured at 1 M entries: selective patterns run 4–6× faster, while short patterns or an over-generous budget run at roughly 1× — the honest cost of a filter that could not constrain anything.
+
 New: every response's meta carries `{gen, lsn, fresh, elapsed_ms, stale_roots[]}` so clients can reason about consistency, not just results.
 
 ---
@@ -294,6 +300,8 @@ ff -0 "test" | xargs -0 rg TODO  # pipe-friendly; exit 1 on no match
 ff --count ext:pdf
 ff --json --limit 1000 "2024" | fzf
 ff --sync "notes"                # settle, then search — deterministic
+ff --fuzzy mian.rs               # approximate match, ranked by score
+ff --fuzzy --distance 2 "notes"  # wider edit budget
 ff --since c:7:481221            # what changed since
 ff stats --roots                 # entries, backend, queue depth, drops,
                                  # recrawl_count, last_rescan_cause, per-root caps/state
@@ -370,6 +378,6 @@ Lessons from the Watchman/React-Native years, applied pre-emptively:
 
 - **v1**: inotify backend + full reconciliation core (pending collection, diff rescans, backoff, degraded mode) + cookie sync + snapshot/journal with cursors + linear scan + differential/fake-backend test harness. *Reconciliation and sync ship in v1 — v1's lesson from Watchman is that these are correctness, not polish.*
 - **v1.5**: fanotify-FID backend, macOS FSEvents, `since`/`subscribe` ops live, regex/wildcards, `ff watch`, service units.
-- **v2**: trigram accelerator (implemented — §10; filter-only, cached by generation), lazy attr sidecar keyed by stable IDs, GUI client on subscriptions.
+- **v2**: trigram accelerator (implemented — §10; filter-only, cached by generation), fuzzy/approximate search (implemented — §10; `ff --fuzzy`, ranked by edit distance), lazy attr sidecar keyed by stable IDs, GUI client on subscriptions.
 
 The durable insight of this revision: Everything's *index* is easy to replicate; Watchman's *discipline* — one pending collection, diffs over replacements, cookies for settle, clocks over guesses, loud degradation — is what turns a toy into infrastructure. Build both in from the start.

@@ -140,8 +140,8 @@ pub fn substring_lower(hay: &[u8], needle: &[u8], k: u32) -> Option<u32> {
         std::mem::swap(&mut prev, &mut cur);
     }
     // Free suffix: the answer is the best over every end position.
-    for j in 0..=n {
-        best = best.min(prev[j]);
+    for v in prev.iter().take(n + 1) {
+        best = best.min(*v);
     }
     (best <= k).then_some(best)
 }

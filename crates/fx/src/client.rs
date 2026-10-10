@@ -31,6 +31,20 @@ pub struct Client {
     socket: PathBuf,
 }
 
+/// Everything about a `ff` query that is not the query string itself.
+#[derive(Clone, Debug, Default)]
+pub struct QueryOpts {
+    pub limit: usize,
+    pub json: bool,
+    pub count: bool,
+    pub zero: bool,
+    pub expr: Option<serde_json::Value>,
+    /// Approximate matching (§10/§17 v2).
+    pub fuzzy: bool,
+    /// Edit budget for `fuzzy`; `None` uses the server default.
+    pub distance: Option<u32>,
+}
+
 impl Client {
     /// Connect to the daemon, auto-spawning it if it is not running.
     pub fn connect(socket_override: Option<&str>) -> Result<Client, CliError> {
@@ -94,20 +108,11 @@ impl Client {
 
     /// Run a query and print results. Returns the process exit code.
     ///
-    /// When `expr` is `Some`, it is a Watchman-style expression tree or a full
-    /// query object; the JSON is sent as the query and the string `q` is
+    /// When `opts.expr` is `Some`, it is a Watchman-style expression tree or a
+    /// full query object; the JSON is sent as the query and the string `q` is
     /// ignored (§10, expr).
-    pub fn query(
-        &mut self,
-        q: &str,
-        limit: usize,
-        json: bool,
-        count: bool,
-        zero: bool,
-        expr: Option<serde_json::Value>,
-        fuzzy: bool,
-        distance: Option<u32>,
-    ) -> Result<ExitCode, CliError> {
+    pub fn query(&mut self, q: &str, opts: QueryOpts) -> Result<ExitCode, CliError> {
+        let QueryOpts { limit, json, count, zero, expr, fuzzy, distance } = opts;
         let is_string_query = expr.is_none();
         let req = match expr {
             Some(v) => {
@@ -202,8 +207,8 @@ impl Client {
     /// smart-case: an uppercase letter in the query forced sensitive matching,
     /// so a lowercased rerun may find what the user meant. Bounded to a few
     /// hits, stderr only — stdout, the exit code, and determinism are
-    /// untouched. (True edit-distance fuzzy belongs to the v2 trigram
-    /// accelerator, §17, not to a scan.)
+    /// untouched. This is a *suggestion*; for ranked edit-distance matching on
+    /// stdout use `--fuzzy` (§10).
     fn suggest_alternate(&mut self, q: &str) {
         let Some(folded) = folded_query(q) else { return };
         let req = Request::query(&folded, 5, false, false);
