@@ -48,12 +48,13 @@ EXIT STATUS:
     2  error
 ";
 
-/// True when argv\[0\] names this binary `locate` (directly or via symlink).
+/// True when argv\[0\] names this binary `locate` (directly or via symlink;
+/// `locate.exe` on Windows, where symlinks need privileges and tests copy).
 pub fn invoked_as_locate() -> bool {
     std::env::args_os()
         .next()
         .and_then(|a| std::path::Path::new(&a).file_name().map(|n| n.to_owned()))
-        .is_some_and(|n| n == OsStr::new("locate"))
+        .is_some_and(|n| n == OsStr::new("locate") || n == OsStr::new("locate.exe"))
 }
 
 #[derive(Debug, Default)]

@@ -9,9 +9,29 @@ use findexd::config::{BackendChoice, Config};
 use findexd::daemon::Daemon;
 use findexd::net;
 
+
+/// Isolated IPC endpoint for this test. Unix socket file everywhere except
+/// Windows, where it is loopback TCP text (no unix sockets). The port is
+/// OS-assigned per call (bind-then-release; the millisecond TOCTOU is
+/// accepted test-harness practice).
+fn test_socket(dir: &std::path::Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let _ = dir;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let port = l.local_addr().expect("bound addr").port();
+        PathBuf::from(format!("127.0.0.1:{port}"))
+    }
+    #[cfg(not(windows))]
+    {
+        dir.join("findex.sock")
+    }
+}
+
+
 fn test_config(dir: &std::path::Path, root: PathBuf) -> Config {
     Config {
-        socket_path: dir.join("findex.sock"),
+        socket_path: test_socket(dir),
         pidfile: dir.join("findex.pid"),
         state_dir: dir.join("state"),
         roots: vec![root],

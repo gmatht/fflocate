@@ -122,17 +122,27 @@ fn run() -> anyhow::Result<()> {
 }
 
 fn install_signal_handlers(stop: Arc<AtomicBool>) {
-    use std::sync::OnceLock;
-    static STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
-    let _ = STOP.set(stop);
-    extern "C" fn handler(_sig: libc::c_int) {
-        if let Some(s) = STOP.get() {
-            s.store(true, Ordering::Relaxed);
+    #[cfg(unix)]
+    {
+        use std::sync::OnceLock;
+        static STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+        let _ = STOP.set(stop);
+        extern "C" fn handler(_sig: libc::c_int) {
+            if let Some(s) = STOP.get() {
+                s.store(true, Ordering::Relaxed);
+            }
+        }
+        let h = handler as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        unsafe {
+            libc::signal(libc::SIGTERM, h);
+            libc::signal(libc::SIGINT, h);
         }
     }
-    let h = handler as extern "C" fn(libc::c_int) as libc::sighandler_t;
-    unsafe {
-        libc::signal(libc::SIGTERM, h);
-        libc::signal(libc::SIGINT, h);
+    // No libc signals on Windows: Ctrl-C terminates the process without a
+    // graceful drain (the journal replays on next start, §9). The stop flag
+    // stays for a future console handler.
+    #[cfg(windows)]
+    {
+        let _ = stop;
     }
 }

@@ -17,10 +17,23 @@ pub fn runtime_dir() -> PathBuf {
             return PathBuf::from(d);
         }
     }
-    if let Ok(uid) = std::env::var("UID") {
-        return PathBuf::from(format!("/run/user/{uid}"));
+    #[cfg(windows)]
+    {
+        // No socket files on Windows; the runtime dir only holds the pidfile.
+        if let Ok(d) = std::env::var("LOCALAPPDATA") {
+            if !d.is_empty() {
+                return PathBuf::from(d).join("findex");
+            }
+        }
+        state_dir()
     }
-    PathBuf::from("/run")
+    #[cfg(not(windows))]
+    {
+        if let Ok(uid) = std::env::var("UID") {
+            return PathBuf::from(format!("/run/user/{uid}"));
+        }
+        PathBuf::from("/run")
+    }
 }
 
 pub fn state_dir() -> PathBuf {
@@ -29,16 +42,51 @@ pub fn state_dir() -> PathBuf {
             return PathBuf::from(d).join("findex").join(FORMAT_VERSION.to_string());
         }
     }
+    #[cfg(windows)]
+    {
+        for var in ["LOCALAPPDATA", "APPDATA"] {
+            if let Ok(d) = std::env::var(var) {
+                if !d.is_empty() {
+                    return PathBuf::from(d).join("findex").join(FORMAT_VERSION.to_string());
+                }
+            }
+        }
+    }
     if let Ok(h) = std::env::var("HOME") {
         return PathBuf::from(h)
             .join(".local/state/findex")
             .join(FORMAT_VERSION.to_string());
     }
-    PathBuf::from(format!("/var/lib/findex/{FORMAT_VERSION}"))
+    #[cfg(windows)]
+    {
+        // Last resort: temp dir (Git-Bash/MSYS set HOME, so this is rare).
+        std::env::temp_dir().join("findex").join(FORMAT_VERSION.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from(format!("/var/lib/findex/{FORMAT_VERSION}"))
+    }
 }
 
+/// Default TCP port for the loopback IPC endpoint on Windows.
+#[cfg(windows)]
+pub const DEFAULT_PORT: u16 = 18923;
+
 pub fn socket_path() -> PathBuf {
-    runtime_dir().join("findex.sock")
+    #[cfg(windows)]
+    {
+        // No unix sockets on Windows: the "socket path" carries
+        // `127.0.0.1:PORT` text (see `transport`). `FINDEX_PORT` overrides.
+        let port: u16 = std::env::var("FINDEX_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(DEFAULT_PORT);
+        PathBuf::from(format!("127.0.0.1:{port}"))
+    }
+    #[cfg(not(windows))]
+    {
+        runtime_dir().join("findex.sock")
+    }
 }
 
 /// Socket path, honouring `FINDEX_SOCKET`.
@@ -64,8 +112,18 @@ mod tests {
     #[test]
     fn socket_is_not_in_tmp() {
         let p = socket_path();
-        assert!(!p.starts_with("/tmp"), "socket must not live in /tmp: {p:?}");
-        assert!(p.ends_with("findex.sock"));
+        #[cfg(not(windows))]
+        {
+            assert!(!p.starts_with("/tmp"), "socket must not live in /tmp: {p:?}");
+            assert!(p.ends_with("findex.sock"));
+        }
+        // On Windows the "socket path" is loopback TCP text, never a file.
+        #[cfg(windows)]
+        {
+            let addr: std::net::SocketAddr =
+                p.to_str().expect("utf-8").parse().expect("addr text");
+            assert!(addr.ip().is_loopback(), "loopback only: {addr}");
+        }
     }
 
     #[test]

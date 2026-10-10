@@ -38,6 +38,7 @@ pub mod roots;
 pub mod server;
 pub mod snapshot;
 pub mod sync;
+pub mod transport;
 pub mod util;
 pub mod watch;
 

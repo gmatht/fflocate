@@ -23,6 +23,10 @@ pub struct FakeHandle {
 struct FakeInner {
     queue: VecDeque<FsEvent>,
     roots: Vec<u32>,
+    /// (dir id, path) learned from `watch_dir` — the same mapping inotify
+    /// learns from those calls. Only read by the Windows cookie scan.
+    #[cfg(windows)]
+    watched: Vec<(u32, std::path::PathBuf)>,
     /// Number of simulated `IN_Q_OVERFLOW`s, for fault-injection assertions.
     pub overflows: u64,
 }
@@ -94,6 +98,33 @@ impl FakeBackend {
     }
 }
 
+/// Scan `(dir id, path)` pairs for sync-cookie files and emit create events
+/// for them. Wired into `poll` on Windows only (unix watchers deliver cookie
+/// events from the kernel): without a kernel watcher this is what lets
+/// `sync`/`update` complete — the cookie file's presence is observed in
+/// stream order like any other event, and `push_event` routes it to the
+/// cookie marker (never the index; crawl skips cookies too). One
+/// non-recursive readdir per watched dir per poll; watched dirs are roots,
+/// which are small.
+#[cfg(any(windows, test))]
+fn scan_cookie_events(watched: &[(u32, std::path::PathBuf)]) -> Vec<FsEvent> {
+    let mut out = Vec::new();
+    for (id, path) in watched {
+        let Ok(rd) = std::fs::read_dir(path) else { continue };
+        for ent in rd.flatten() {
+            let name = crate::applier::os_str_bytes(&ent.file_name());
+            if crate::util::is_cookie(&name) {
+                out.push(crate::event::FsEvent::upsert(
+                    crate::event::DirKey::new(*id),
+                    name,
+                    false,
+                ));
+            }
+        }
+    }
+    out
+}
+
 impl WatchBackend for FakeBackend {
     fn caps(&self) -> BackendCaps {
         BackendCaps { per_dir_watch: true, whole_mount: false, atomic_rename: true }
@@ -110,13 +141,31 @@ impl WatchBackend for FakeBackend {
         Ok(())
     }
 
-    fn watch_dir(&mut self, _id: u32, _path: &std::path::Path) -> std::io::Result<()> {
-        Ok(()) // no real watches to install
+    fn watch_dir(&mut self, id: u32, path: &std::path::Path) -> std::io::Result<()> {
+        // No real watches to install — but record the mapping (as inotify
+        // would learn it) for the Windows cookie scan below.
+        #[cfg(windows)]
+        {
+            let mut g = self.handle.inner.lock().unwrap();
+            if !g.watched.iter().any(|(i, _)| *i == id) {
+                g.watched.push((id, path.to_path_buf()));
+            }
+        }
+        let _ = (id, path);
+        Ok(())
     }
 
     fn poll(&mut self, _timeout: Duration) -> std::io::Result<Vec<FsEvent>> {
         let mut g = self.handle.inner.lock().unwrap();
-        Ok(g.queue.drain(..).collect())
+        // `mut` for the Windows cookie scan below; plain drain elsewhere.
+        #[allow(unused_mut)]
+        let mut out: Vec<FsEvent> = g.queue.drain(..).collect();
+        #[cfg(windows)]
+        {
+            let watched = g.watched.clone();
+            out.extend(scan_cookie_events(&watched));
+        }
+        Ok(out)
     }
 
     fn name(&self) -> &'static str {
@@ -151,5 +200,35 @@ mod tests {
         assert_eq!(evs.len(), 2);
         assert!(evs.iter().all(|e| matches!(e, FsEvent::RescanSubtree { cause: crate::event::RescanCause::Overflow, .. })));
         assert_eq!(h.inner.lock().unwrap().overflows, 1);
+    }
+
+    #[test]
+    fn cookie_scan_emits_markers_that_complete_a_cookie() {
+        use crate::pending::{Pending, PushOutcome};
+
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".findex-cookie-7"), b"").unwrap();
+        std::fs::write(d.path().join("real.txt"), b"x").unwrap();
+
+        // Only the cookie file is emitted, keyed by the watched dir id.
+        let evs = scan_cookie_events(&[(42, d.path().to_path_buf())]);
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            FsEvent::Upsert { parent, name, .. } => {
+                assert_eq!(parent.0, 42);
+                assert_eq!(name, b".findex-cookie-7");
+            }
+            other => panic!("expected an Upsert marker, got {other:?}"),
+        }
+
+        // And end-to-end through the pending collection: the marker is
+        // recorded (never indexed) and completes the registered cookie once
+        // the queues are drained — the chain `sync` relies on.
+        let mut p = Pending::new(16);
+        p.register_cookie(7, 42, b".findex-cookie-7".to_vec());
+        for e in evs {
+            assert_eq!(p.push_event(e), PushOutcome::CookieMarker);
+        }
+        assert_eq!(p.take_completed_cookies().len(), 1);
     }
 }

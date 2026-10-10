@@ -185,3 +185,34 @@ a restart crawl alone cannot (crawls only add). Exit 1 if any root is not
 `ok`; unknown roots are an error. Covered by `crates/fx/tests/update_e2e.rs`
 (kill -9 → offline delete+add → restart → update converges, with
 `last_rescan_cause=manual` proving the update's rescan did it).
+
+## Windows port (`windows` branch; `x86_64-pc-windows-msvc`)
+
+The workspace type-checks and is clippy-clean for the Windows target; the
+Linux suite stays green (189 tests). Runtime validation needs real Windows
+hardware — nothing here has executed there yet.
+
+* **IPC**: `findex::transport` (`Stream`/`Listener` aliases + `connect`);
+  unix sockets on unix, TCP loopback on Windows. The socket "path" stays a
+  `PathBuf` everywhere: on Windows it carries `127.0.0.1:PORT` text
+  (`FINDEX_PORT`, default 18923). No new dependencies.
+* **Paths**: index stays `/`-canonical; `util::normalize_separators` runs at
+  root ingestion (`Root::new`), `handle_rescan`, and the `ff` sends, so
+  `C:\tree` keys and matches. Non-UTF-8 names go lossy (documented).
+* **Files/defaults**: state under `LOCALAPPDATA`/`APPDATA`, home default from
+  `USERPROFILE`, pidfile without `flock` (the TCP bind is the exclusion),
+  no signal handlers (Ctrl-C kills; the journal replays), default backend
+  `fake` (ReadDirectoryChangesW is future work).
+* **Sync without a watcher**: the fake backend polls watched dirs for cookie
+  files and synthesizes their create events, so `sync`/`update` complete;
+  `ok` means *quiescent*, not *caught up* — `ff update` (rescan + sync) is
+  the sound operation there. Covered by a unit test proving the
+  emit → marker → completion chain.
+* **Deferred**: real watcher backend, stable file IDs (`windows-sys`
+  `GetFileInformationByHandle`), service installation (`ff service install`
+  errors), `find -user/-group/-perm/-inum/-links` (loud errors, never
+  silent), case-insensitivity defaults to the writable-dir probe.
+* **Tests**: e2e harnesses take OS-assigned loopback ports (`test_socket`)
+  and `.exe`-aware binary names; `locate` tests copy to `locate.exe`
+  (argv[0] accepts the `.exe` form); `Child::kill` everywhere (also fixing
+  a Windows hang in the old wait-only harness kill).

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 fn bin_dir() -> Option<PathBuf> {
     let d = std::env::var("FINDEX_BIN_DIR").ok().map(PathBuf::from)?;
-    (d.join("findexd").exists() && d.join("ff").exists()).then_some(d)
+    (d.join(format!("findexd{}", std::env::consts::EXE_SUFFIX)).exists() && d.join(format!("ff{}", std::env::consts::EXE_SUFFIX)).exists()).then_some(d)
 }
 
 /// Watch backend for the spawned daemon (see fault_crash.rs). These tests
@@ -25,6 +25,25 @@ fn backend_arg() -> &'static str {
     #[cfg(not(target_os = "linux"))]
     {
         "fake"
+    }
+}
+
+
+/// Isolated IPC endpoint for this test. Unix socket file everywhere except
+/// Windows, where it is loopback TCP text (no unix sockets). The port is
+/// OS-assigned per call (bind-then-release; the millisecond TOCTOU is
+/// accepted test-harness practice).
+fn test_socket(dir: &std::path::Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let _ = dir;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let port = l.local_addr().expect("bound addr").port();
+        PathBuf::from(format!("127.0.0.1:{port}"))
+    }
+    #[cfg(not(windows))]
+    {
+        dir.join("findex.sock")
     }
 }
 
@@ -56,8 +75,15 @@ impl DaemonProc {
 
     /// Ask the daemon to exit cleanly (SIGTERM) and reap it.
     fn stop_and_wait(&mut self) {
+        #[cfg(unix)]
         unsafe {
             libc::kill(self.child.id() as i32, libc::SIGTERM);
+        }
+        // No graceful signal on Windows; terminate. These tests skip on
+        // Windows before reaching here (no bind mounts).
+        #[cfg(windows)]
+        {
+            let _ = self.child.kill();
         }
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -69,18 +95,14 @@ impl DaemonProc {
                 _ => break,
             }
         }
-        unsafe {
-            libc::kill(self.child.id() as i32, libc::SIGKILL);
-        }
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
 impl Drop for DaemonProc {
     fn drop(&mut self) {
-        unsafe {
-            libc::kill(self.child.id() as i32, libc::SIGKILL);
-        }
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
@@ -138,8 +160,8 @@ fn mount_umount_during_crawl_degrades_and_recovers() {
         eprintln!("skipping (no FINDEX_BIN_DIR): mount/umount during crawl");
         return;
     };
-    let findexd = bins.join("findexd");
-    let fxbin = bins.join("ff");
+    let findexd = bins.join(format!("findexd{}", std::env::consts::EXE_SUFFIX));
+    let fxbin = bins.join(format!("ff{}", std::env::consts::EXE_SUFFIX));
 
     // The *root itself* is a mount point, which is the realistic case: mount a
     // filesystem, index it, unmount it under the daemon, remount it. The backing
@@ -180,7 +202,7 @@ fn mount_umount_during_crawl_degrades_and_recovers() {
     assert!(Command::new("mount").args(["--bind"]).arg(&backing).arg(&root).status().unwrap().success());
 
     let state = d.path().join("state");
-    let socket = d.path().join("findex.sock");
+    let socket = test_socket(d.path());
     let mut daemon = DaemonProc::spawn(&findexd, &socket, &state, &root);
     assert!(wait_serving(&fxbin, &socket, Duration::from_secs(10)), "daemon never served");
 
@@ -256,15 +278,15 @@ fn root_vanishing_degrades_loudly() {
         eprintln!("skipping (no FINDEX_BIN_DIR): root vanishing");
         return;
     };
-    let findexd = bins.join("findexd");
-    let fxbin = bins.join("ff");
+    let findexd = bins.join(format!("findexd{}", std::env::consts::EXE_SUFFIX));
+    let fxbin = bins.join(format!("ff{}", std::env::consts::EXE_SUFFIX));
     let d = tempfile::tempdir().unwrap();
     let root = d.path().join("tree");
     std::fs::create_dir_all(root.join("sub")).unwrap();
     std::fs::write(root.join("sub/a.rs"), b"x").unwrap();
 
     let state = d.path().join("state");
-    let socket = d.path().join("findex.sock");
+    let socket = test_socket(d.path());
     let mut daemon = DaemonProc::spawn(&findexd, &socket, &state, &root);
     assert!(wait_serving(&fxbin, &socket, Duration::from_secs(10)));
     // Let the crawl land.
@@ -301,8 +323,8 @@ fn watch_limit_exhaustion_degrades_loudly_without_panic() {
         eprintln!("skipping (no FINDEX_BIN_DIR): watch-limit exhaustion");
         return;
     };
-    let findexd = bins.join("findexd");
-    let fxbin = bins.join("ff");
+    let findexd = bins.join(format!("findexd{}", std::env::consts::EXE_SUFFIX));
+    let fxbin = bins.join(format!("ff{}", std::env::consts::EXE_SUFFIX));
 
     // Lower the per-user inotify watch limit so our watches run out. Restore it
     // even if the test panics, via a guard.
@@ -344,7 +366,7 @@ fn watch_limit_exhaustion_degrades_loudly_without_panic() {
         std::fs::write(sub.join("f.txt"), b"x").unwrap();
     }
     let state = d.path().join("state");
-    let socket = d.path().join("findex.sock");
+    let socket = test_socket(d.path());
     let daemon = DaemonProc::spawn(&findexd, &socket, &state, &root);
     assert!(wait_serving(&fxbin, &socket, Duration::from_secs(10)), "daemon never served");
 

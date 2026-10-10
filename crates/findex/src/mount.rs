@@ -139,10 +139,19 @@ pub fn probe_root(path: &Path) -> MountCaps {
 }
 
 pub fn is_writable(path: &Path) -> bool {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c) = CString::new(path.as_os_str().as_bytes()) else { return false };
-    unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c) = CString::new(path.as_os_str().as_bytes()) else { return false };
+        unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
+    }
+    // Best-effort: the readonly attribute. ACLs may still deny writes; the
+    // classifier treats this as a hint, not a promise.
+    #[cfg(windows)]
+    {
+        std::fs::metadata(path).map(|m| !m.permissions().readonly()).unwrap_or(false)
+    }
 }
 
 /// `st_dev` of a path, or `None` if it does not exist. Used by the daemon's
@@ -151,8 +160,19 @@ pub fn is_writable(path: &Path) -> bool {
 /// point) — the portable signal, because `IN_UNMOUNT` is not delivered on every
 /// platform (it is missing under WSL2, for instance).
 pub fn probe_dev(path: &Path) -> Option<u64> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).ok().map(|m| m.dev())
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| m.dev())
+    }
+    // No stable volume/file IDs on stable std (`windows_by_handle` is
+    // nightly-only). `None` keeps the mount watchdog inert — its `r.dev != 0`
+    // guard already treats unknown as "don't alarm".
+    #[cfg(windows)]
+    {
+        let _ = path;
+        None
+    }
 }
 
 /// Does `name_to_handle_at` work on `path`? (fanotify-FID viability, §4.)

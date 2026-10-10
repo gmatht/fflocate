@@ -80,13 +80,29 @@ impl FsView for RealFs {
     fn stat(&self, abs_path: &Path) -> io::Result<Option<StatInfo>> {
         match std::fs::symlink_metadata(abs_path) {
             Ok(md) => {
-                use std::os::unix::fs::MetadataExt;
-                Ok(Some(StatInfo {
-                    is_dir: md.is_dir(),
-                    is_symlink: md.file_type().is_symlink(),
-                    dev: md.dev(),
-                    ino: md.ino(),
-                }))
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    Ok(Some(StatInfo {
+                        is_dir: md.is_dir(),
+                        is_symlink: md.file_type().is_symlink(),
+                        dev: md.dev(),
+                        ino: md.ino(),
+                    }))
+                }
+                // Stable file IDs need `GetFileInformationByHandle`
+                // (`windows-sys`); until then report zeros, which the struct
+                // already means as "unavailable" (and no caller consumes
+                // dev/ino today — identity is by path).
+                #[cfg(windows)]
+                {
+                    Ok(Some(StatInfo {
+                        is_dir: md.is_dir(),
+                        is_symlink: md.file_type().is_symlink(),
+                        dev: 0,
+                        ino: 0,
+                    }))
+                }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),

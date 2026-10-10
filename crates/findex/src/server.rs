@@ -387,6 +387,10 @@ fn handle_stats(ctx: &ServerCtx, per_root: bool) -> Vec<Response> {
 }
 
 fn handle_rescan(ctx: &ServerCtx, root: &str) -> Vec<Response> {
+    // Keys are separator-canonical; user input may not be (`C:\tree`).
+    let root = crate::util::normalize_separators(std::path::Path::new(root))
+        .to_string_lossy()
+        .into_owned();
     let (found, rid) = {
         let ix = ctx.shared.index.read().unwrap();
         let roots = ctx.shared.roots.read().unwrap();

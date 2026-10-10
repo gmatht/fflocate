@@ -1,48 +1,67 @@
-//! Unix-socket transport for the NDJSON protocol (§11, §15).
+//! IPC transport for the NDJSON protocol (§11, §15): unix sockets on unix,
+//! TCP loopback on Windows (see `findex::transport`).
 //!
 //! * Socket at `$XDG_RUNTIME_DIR/findex.sock` (0600), never `/tmp`.
 //! * Stale-socket recovery: if the path exists but nobody is listening, unlink
-//!   it and bind afresh.
-//! * The pidfile is `flock`ed so two daemons cannot race for the same socket.
+//!   it and bind afresh (unix); on Windows a failed bind with nobody
+//!   listening is a stale TCP state and surfaces as an error.
+//! * The pidfile is `flock`ed so two daemons cannot race for the same socket
+//!   (unix); on Windows the TCP bind itself is the exclusion.
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use findex::proto::{Request, Response};
 use findex::server::{handle_request, ServerCtx};
+use findex::transport::{Listener, Stream};
 
 /// Bind the listener, recovering a stale socket if present.
-pub fn bind(socket: &Path) -> std::io::Result<UnixListener> {
-    if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if socket.exists() {
-        // Is anyone home?
-        match UnixStream::connect(socket) {
-            Ok(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AddrInUse,
-                    format!("another findexd is listening on {socket:?}"),
-                ));
-            }
-            Err(_) => {
-                // Stale socket: safe to remove.
-                let _ = std::fs::remove_file(socket);
+pub fn bind(socket: &Path) -> std::io::Result<Listener> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(parent) = socket.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if socket.exists() {
+            // Is anyone home?
+            match findex::transport::connect(socket) {
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        format!("another findexd is listening on {socket:?}"),
+                    ));
+                }
+                Err(_) => {
+                    // Stale socket: safe to remove.
+                    let _ = std::fs::remove_file(socket);
+                }
             }
         }
+        let listener = Listener::bind(socket)?;
+        // 0600: only the owner may talk to the daemon.
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+        Ok(listener)
     }
-    let listener = UnixListener::bind(socket)?;
-    // 0600: only the owner may talk to the daemon.
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
-    Ok(listener)
+    #[cfg(windows)]
+    {
+        // Probe-then-bind, mirroring the unix stale-socket check: if someone
+        // answers, the address is taken; otherwise bind (a bind failure with
+        // nobody home is stale TCP state and is reported as-is).
+        match findex::transport::connect(socket) {
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("another findexd is listening on {socket:?}"),
+            )),
+            Err(_) => Listener::bind(findex::transport::parse_addr(socket)?),
+        }
+    }
 }
 
 /// Try to connect to an existing daemon.
-pub fn connect(socket: &Path) -> std::io::Result<UnixStream> {
-    UnixStream::connect(socket)
+pub fn connect(socket: &Path) -> std::io::Result<Stream> {
+    findex::transport::connect(socket)
 }
 
 /// A pidfile guarded by an exclusive `flock`.
@@ -57,49 +76,74 @@ impl PidFile {
     /// Acquire the pidfile lock, or fail if held. Reclaims a stale pidfile
     /// whose owner is gone (§15 stale-lock recovery).
     pub fn acquire(path: &Path) -> std::io::Result<PidFile> {
-        use std::os::unix::io::AsRawFd;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                // Someone holds it. Check whether the owner is still alive.
-                let mut s = String::new();
-                use std::io::Read;
-                let mut f = file.try_clone()?;
-                let _ = f.read_to_string(&mut s);
-                if let Ok(pid) = s.trim().parse::<i32>() {
-                    if process_alive(pid) {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::AddrInUse,
-                            format!("findexd already running as pid {pid}"),
-                        ));
-                    }
-                }
-                // Stale lock: the holder is gone; the flock will be released by
-                // the kernel when its process died, so retry once.
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WouldBlock,
-                    "pidfile lock held; retry",
-                ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
             }
-            return Err(e);
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)?;
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                    // Someone holds it. Check whether the owner is still alive.
+                    let mut s = String::new();
+                    use std::io::Read;
+                    let mut f = file.try_clone()?;
+                    let _ = f.read_to_string(&mut s);
+                    if let Ok(pid) = s.trim().parse::<i32>() {
+                        if process_alive(pid) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::AddrInUse,
+                                format!("findexd already running as pid {pid}"),
+                            ));
+                        }
+                    }
+                    // Stale lock: the holder is gone; the flock will be released by
+                    // the kernel when its process died, so retry once.
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "pidfile lock held; retry",
+                    ));
+                }
+                return Err(e);
+            }
+            Self::write_pid(&file)?;
+            Ok(PidFile { path: path.to_path_buf(), file })
         }
-        let mut f = &file;
+        // No `flock` on Windows: the TCP bind is the mutual exclusion (the OS
+        // releases it on crash, so no stale-lock class exists). The pidfile
+        // still records the owner for operators.
+        #[cfg(windows)]
+        {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)?;
+            Self::write_pid(&file)?;
+            Ok(PidFile { path: path.to_path_buf(), file })
+        }
+    }
+
+    fn write_pid(file: &std::fs::File) -> std::io::Result<()> {
+        let mut f = file;
         f.set_len(0)?;
         use std::io::Seek;
         f.seek(std::io::SeekFrom::Start(0))?;
         write!(f, "{}", std::process::id())?;
         f.sync_all()?;
-        Ok(PidFile { path: path.to_path_buf(), file })
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -114,6 +158,7 @@ impl Drop for PidFile {
     }
 }
 
+#[cfg(unix)]
 fn process_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
@@ -122,7 +167,7 @@ fn process_alive(pid: i32) -> bool {
 }
 
 /// Serve one client connection until it closes.
-pub fn serve_client(ctx: Arc<ServerCtx>, stream: UnixStream) {
+pub fn serve_client(ctx: Arc<ServerCtx>, stream: Stream) {
     let reader = BufReader::new(stream.try_clone().expect("clone stream"));
     let mut writer = stream;
     for line in reader.lines() {
@@ -159,7 +204,7 @@ pub fn serve_client(ctx: Arc<ServerCtx>, stream: UnixStream) {
 /// One request/response exchange over a fresh connection. Used by the CLI and
 /// the tests.
 pub fn roundtrip(socket: &Path, req: &Request) -> std::io::Result<Vec<Response>> {
-    let stream = UnixStream::connect(socket)?;
+    let stream = findex::transport::connect(socket)?;
     let mut writer = stream.try_clone()?;
     writeln!(writer, "{}", serde_json::to_string(req).unwrap())?;
     writer.flush()?;
@@ -183,7 +228,7 @@ pub fn roundtrip(socket: &Path, req: &Request) -> std::io::Result<Vec<Response>>
 
 /// Run the accept loop, spawning a thread per client, until `stop` is set.
 pub fn accept_loop(
-    listener: UnixListener,
+    listener: Listener,
     ctx: Arc<ServerCtx>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {

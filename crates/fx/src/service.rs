@@ -51,10 +51,13 @@ fn install() -> Result<std::process::ExitCode, CliError> {
     }
 }
 
+// Only used by the Linux/macOS install paths.
+#[cfg_attr(windows, allow(dead_code))]
 fn home() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 fn config_home() -> PathBuf {
     if let Ok(d) = std::env::var("XDG_CONFIG_HOME") {
         if !d.is_empty() {

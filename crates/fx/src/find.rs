@@ -57,9 +57,13 @@ EXIT STATUS:
     2  usage error
 ";
 
-/// True when the basename `name` selects `find` mode.
+/// True when the basename `name` selects `find` mode (`.exe` forms for
+/// Windows, where symlinks need privileges and tests copy the binary).
 pub fn is_find_name(name: &OsStr) -> bool {
-    name == OsStr::new("find") || name == OsStr::new("ffind")
+    name == OsStr::new("find")
+        || name == OsStr::new("ffind")
+        || name == OsStr::new("find.exe")
+        || name == OsStr::new("ffind.exe")
 }
 
 /// True when argv\[0\] names this binary `find` or `ffind`.
@@ -144,6 +148,7 @@ pub fn parse_size(s: &str) -> Result<(Sign, u64), String> {
 
 /// Parse an octal `-perm` operand. Returns `(mode, exact)`; `exact` is false for
 /// the `-MODE` "any of these bits" and `/MODE` forms.
+#[cfg_attr(windows, allow(dead_code))] // parse-gated on Windows, but unit-tested
 pub fn parse_perm(s: &str) -> Result<(u32, bool), String> {
     let (exact, digits) = match s.chars().next() {
         Some('-') | Some('/') => (false, &s[1..]),
@@ -283,6 +288,15 @@ impl Plan {
         let mut saw_or = false;
 
         while let Some(a) = it.next() {
+            // No uid/gid/mode/ino/nlink on Windows: reject those tests here,
+            // once, instead of silently ignoring them (the file's rule).
+            #[cfg(windows)]
+            if matches!(a.as_str(), "-perm" | "-user" | "-group" | "-inum" | "-links") {
+                return Err(CliError::Usage(format!(
+                    "find: {} is not supported on Windows (no unix identity metadata)",
+                    a.as_str()
+                )));
+            }
             match a.as_str() {
                 "-name" | "-iname" => {
                     let pat = need(&mut it, a)?;
@@ -458,6 +472,7 @@ fn need<'a, I: Iterator<Item = &'a String>>(it: &mut I, flag: &str) -> Result<St
         .ok_or_else(|| CliError::Usage(format!("find: {flag} requires an argument")))
 }
 
+#[cfg_attr(windows, allow(dead_code))] // parse-gated on Windows
 fn resolve_user(s: &str) -> Result<u32, CliError> {
     if let Ok(n) = s.parse() {
         return Ok(n);
@@ -479,6 +494,7 @@ fn resolve_user(s: &str) -> Result<u32, CliError> {
     }
 }
 
+#[cfg_attr(windows, allow(dead_code))] // parse-gated on Windows
 fn resolve_group(s: &str) -> Result<u32, CliError> {
     if let Ok(n) = s.parse() {
         return Ok(n);
@@ -499,21 +515,46 @@ fn resolve_group(s: &str) -> Result<u32, CliError> {
     }
 }
 
+/// mtime as unix seconds, portably (`Metadata::mtime` is unix-only).
+fn mtime_secs(md: &std::fs::Metadata) -> Option<i64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(md.mtime())
+    }
+    #[cfg(windows)]
+    {
+        md.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|d| i64::try_from(d.as_secs()).ok())
+    }
+}
+
 /// lstat a path into a [`Meta`]. Phase 2 of the plan.
 pub fn lstat(path: &Path, now: i64) -> Option<Meta> {
     let md = std::fs::symlink_metadata(path).ok()?;
-    use std::os::unix::fs::MetadataExt;
-    let mtime = md.mtime();
-    Some(Meta {
+    let mtime = mtime_secs(&md);
+    // `mut` only for the unix identity fill below.
+    #[allow(unused_mut)]
+    let mut m = Meta {
         size: Some(md.len()),
-        mtime: Some(mtime),
-        mmin: Some((now - mtime) / 60),
-        mode: Some(md.mode()),
-        uid: Some(md.uid()),
-        gid: Some(md.gid()),
-        nlink: Some(md.nlink()),
-        ino: Some(md.ino()),
-    })
+        mtime,
+        mmin: mtime.map(|t| (now - t) / 60),
+        ..Default::default()
+    };
+    // uid/gid/mode/ino/nlink have no stable-std Windows source; their tests
+    // are rejected at parse time there, so these stay `None`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        m.mode = Some(md.mode());
+        m.uid = Some(md.uid());
+        m.gid = Some(md.gid());
+        m.nlink = Some(md.nlink());
+        m.ino = Some(md.ino());
+    }
+    Some(m)
 }
 
 /// Evaluate the metadata tests against a candidate's `Meta`. `is_empty_dir` is
@@ -534,10 +575,10 @@ pub fn meta_matches(tests: &[MetaTest], m: &Meta, is_empty_dir: bool, now: i64) 
                 .map(|v| sign.holds(v, *mins))
                 .unwrap_or(false),
             MetaTest::NewerThan { path } => match (m.mtime, std::fs::metadata(path).ok()) {
-                (Some(t), Some(ref_md)) => {
-                    use std::os::unix::fs::MetadataExt;
-                    t > ref_md.mtime()
-                }
+                (Some(t), Some(ref_md)) => match mtime_secs(&ref_md) {
+                    Some(rt) => t > rt,
+                    None => false,
+                },
                 _ => false,
             },
             MetaTest::Perm { mode, exact } => m
@@ -578,8 +619,10 @@ mod tests {
         // The names that select find mode.
         assert!(is_find_name(OsStr::new("find")));
         assert!(is_find_name(OsStr::new("ffind")));
+        assert!(is_find_name(OsStr::new("find.exe")));
+        assert!(is_find_name(OsStr::new("ffind.exe")));
         // These must NOT select find mode.
-        for other in ["ff", "fx", "fxfind", "findx", "locate", "", "FIND"] {
+        for other in ["ff", "fx", "fxfind", "findx", "locate", "locate.exe", "", "FIND"] {
             assert!(!is_find_name(OsStr::new(other)), "{other:?} must not select find mode");
         }
 

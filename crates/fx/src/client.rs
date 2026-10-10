@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 use findex::config_paths::{socket_path_from_env, state_dir_from_env};
 use findex::proto::{Request, Response};
+use findex::transport::{self, Stream};
 
 #[derive(Debug)]
 pub enum CliError {
@@ -26,7 +27,7 @@ impl std::fmt::Display for CliError {
 }
 
 pub struct Client {
-    stream: std::os::unix::net::UnixStream,
+    stream: Stream,
     #[allow(dead_code)]
     socket: PathBuf,
 }
@@ -39,13 +40,13 @@ impl Client {
             .unwrap_or_else(socket_path_from_env);
 
         // Try once, then spawn and retry.
-        match std::os::unix::net::UnixStream::connect(&socket) {
+        match transport::connect(&socket) {
             Ok(stream) => Ok(Client { stream, socket }),
             Err(_) => {
                 spawn_daemon(&socket)?;
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                 loop {
-                    match std::os::unix::net::UnixStream::connect(&socket) {
+                    match transport::connect(&socket) {
                         Ok(stream) => return Ok(Client { stream, socket }),
                         Err(_) if std::time::Instant::now() < deadline => {
                             std::thread::sleep(std::time::Duration::from_millis(25));

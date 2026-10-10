@@ -18,12 +18,30 @@ fn bin_dir() -> Option<PathBuf> {
 
 fn binaries() -> Option<(PathBuf, PathBuf)> {
     let d = bin_dir()?;
-    let findexd = d.join("findexd");
-    let ff = d.join("ff");
+    let findexd = d.join(format!("findexd{}", std::env::consts::EXE_SUFFIX));
+    let ff = d.join(format!("ff{}", std::env::consts::EXE_SUFFIX));
     if findexd.exists() && ff.exists() {
         Some((findexd, ff))
     } else {
         None
+    }
+}
+
+/// Isolated IPC endpoint for this test. Unix socket file everywhere except
+/// Windows, where it is loopback TCP text (no unix sockets). The port is
+/// OS-assigned per call (bind-then-release; the millisecond TOCTOU is
+/// accepted test-harness practice).
+fn test_socket(dir: &std::path::Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let _ = dir;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let port = l.local_addr().expect("bound addr").port();
+        PathBuf::from(format!("127.0.0.1:{port}"))
+    }
+    #[cfg(not(windows))]
+    {
+        dir.join("findex.sock")
     }
 }
 
@@ -83,18 +101,14 @@ impl DaemonProc {
 
     /// `kill -9` — no cleanup, no flush, no chance to handle a signal.
     fn kill9(&mut self) {
-        unsafe {
-            libc::kill(self.child.id() as i32, libc::SIGKILL);
-        }
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
 
 impl Drop for DaemonProc {
     fn drop(&mut self) {
-        unsafe {
-            libc::kill(self.child.id() as i32, libc::SIGKILL);
-        }
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
@@ -150,7 +164,7 @@ fn kill9_mid_write_then_restart_is_consistent_and_converges() {
     let d = tempfile::tempdir().unwrap();
     let root = d.path().join("tree");
     let state = d.path().join("state");
-    let socket = d.path().join("findex.sock");
+    let socket = test_socket(d.path());
     std::fs::create_dir_all(&root).unwrap();
 
     // Seed a known baseline.
@@ -244,7 +258,7 @@ fn torn_journal_tail_after_crash_recovers_without_wedging() {
     let d = tempfile::tempdir().unwrap();
     let root = d.path().join("tree");
     let state = d.path().join("state");
-    let socket = d.path().join("findex.sock");
+    let socket = test_socket(d.path());
     std::fs::create_dir_all(&root).unwrap();
     for i in 0..80 {
         std::fs::write(root.join(format!("f{i:03}.rs")), b"x").unwrap();
@@ -307,7 +321,7 @@ fn kill9_repeatedly_never_wedges_the_store() {
     let d = tempfile::tempdir().unwrap();
     let root = d.path().join("tree");
     let state = d.path().join("state");
-    let socket = d.path().join("findex.sock");
+    let socket = test_socket(d.path());
     std::fs::create_dir_all(&root).unwrap();
     for i in 0..20 {
         std::fs::write(root.join(format!("f{i}.txt")), b"x").unwrap();

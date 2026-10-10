@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 fn bin_dir() -> Option<PathBuf> {
     let d = std::env::var("FINDEX_BIN_DIR").ok().map(PathBuf::from)?;
-    (d.join("findexd").exists() && d.join("ff").exists()).then_some(d)
+(d.join(format!("findexd{}", std::env::consts::EXE_SUFFIX)).exists() && d.join(format!("ff{}", std::env::consts::EXE_SUFFIX)).exists()).then_some(d)
 }
 
 fn backend_arg() -> &'static str {
@@ -27,6 +27,24 @@ fn backend_arg() -> &'static str {
     #[cfg(not(target_os = "linux"))]
     {
         "fake"
+    }
+}
+
+/// Isolated IPC endpoint for this test. Unix socket file everywhere except
+/// Windows, where it is loopback TCP text (no unix sockets). The port is
+/// OS-assigned per call (bind-then-release; the millisecond TOCTOU is
+/// accepted test-harness practice).
+fn test_socket(dir: &std::path::Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let _ = dir;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let port = l.local_addr().expect("bound addr").port();
+        PathBuf::from(format!("127.0.0.1:{port}"))
+    }
+    #[cfg(not(windows))]
+    {
+        dir.join("findex.sock")
     }
 }
 
@@ -54,9 +72,8 @@ fn spawn(findexd: &Path, socket: &Path, state: &Path, root: &Path) -> Child {
 }
 
 fn kill9(child: &mut Child) {
-    unsafe {
-        libc::kill(child.id() as i32, libc::SIGKILL);
-    }
+    // Portable abrupt kill: SIGKILL on unix, TerminateProcess on Windows.
+    let _ = child.kill();
     let _ = child.wait();
 }
 
@@ -95,12 +112,12 @@ fn update_heals_offline_edits_after_downtime() {
         eprintln!("skipping: set FINDEX_BIN_DIR to target/release (see scripts/e2e.sh)");
         return;
     };
-    let findexd = bindir.join("findexd");
-    let fxbin = bindir.join("ff");
+    let findexd = bindir.join(format!("findexd{}", std::env::consts::EXE_SUFFIX));
+    let fxbin = bindir.join(format!("ff{}", std::env::consts::EXE_SUFFIX));
     let d = tempfile::tempdir().unwrap();
     let root = d.path().join("tree");
     let state = d.path().join("state");
-    let socket = d.path().join("findex.sock");
+    let socket = test_socket(d.path());
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("keep.txt"), b"k").unwrap();
     std::fs::write(root.join("gone.txt"), b"g").unwrap();
@@ -152,12 +169,12 @@ fn update_unknown_root_is_an_error() {
         eprintln!("skipping: set FINDEX_BIN_DIR to target/release (see scripts/e2e.sh)");
         return;
     };
-    let findexd = bindir.join("findexd");
-    let fxbin = bindir.join("ff");
+    let findexd = bindir.join(format!("findexd{}", std::env::consts::EXE_SUFFIX));
+    let fxbin = bindir.join(format!("ff{}", std::env::consts::EXE_SUFFIX));
     let d = tempfile::tempdir().unwrap();
     let root = d.path().join("tree");
     let state = d.path().join("state");
-    let socket = d.path().join("findex.sock");
+    let socket = test_socket(d.path());
     std::fs::create_dir_all(&root).unwrap();
     // Seed file: settle() waits on a query hit, which an empty tree never
     // produces.
