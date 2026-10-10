@@ -21,6 +21,7 @@ mod find;
 mod locate;
 mod service;
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use client::{Client, CliError};
@@ -35,6 +36,7 @@ USAGE:
     ff update [--timeout SECS] [ROOT...]
     ff watch [QUERY...]
     ff service install [--socket PATH]
+    ff --gui                         # start the GUI (ff-gui)
     find ...                         # via a `find` or `ffind` symlink
 
 OPTIONS:
@@ -49,6 +51,9 @@ OPTIONS:
         --since CURSOR  report what changed since a cursor
         --expr JSON     Watchman-style expression/query (JSON object or tree)
         --timeout SECS  settle timeout for --sync/--update (default 2/120)
+        --gui           start the GUI instead of searching; finds the
+                        `ff-gui` binary next to ff or on PATH
+                        (override with FF_GUI_BIN)
     -h, --help          show this help
     -V, --version       print version
 
@@ -93,6 +98,8 @@ struct Args {
     fuzzy: bool,
     /// Edit budget for --fuzzy (default 1).
     distance: Option<u32>,
+    /// Launch the GUI (`ff-gui`) instead of searching.
+    gui: bool,
 }
 
 fn main() -> ExitCode {
@@ -119,6 +126,12 @@ fn run() -> Result<ExitCode, CliError> {
     }
 
     let args = parse_args(std::env::args().skip(1))?;
+
+    // `ff --gui` starts the GUI. The GUI is a separate binary (`ff-gui`), so
+    // this is a launcher, not a mode of `ff` itself.
+    if args.gui {
+        return launch_gui();
+    }
 
     match args.command.as_deref() {
         Some("service") => return service::run(&args.query),
@@ -208,6 +221,7 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<Args, CliError> {
             "-j" | "--json" => a.json = true,
             "-0" => a.zero = true,
             "-s" | "--sync" => a.sync = true,
+            "--gui" => a.gui = true,
             "-l" | "--limit" => {
                 let v = it.next().ok_or_else(|| CliError::Usage("--limit needs a number".into()))?;
                 a.limit = v.parse().map_err(|_| CliError::Usage(format!("bad limit: {v}")))?;
@@ -264,6 +278,78 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<Args, CliError> {
     Ok(a)
 }
 
+/// Locate a sibling binary (a `findexd`/`ff-gui` next to `ff`).
+///
+/// Mirrors the daemon lookup: `$<OVERRIDE>`, then the directory of `argv[0]`
+/// (deliberately *not* resolving a symlink, so a `ff` symlinked into a bin dir
+/// finds its siblings there), then `current_exe()`'s directory, then `$PATH`.
+fn sibling_binary(name: &str, override_var: &str) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var(override_var) {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(arg0) = std::env::args_os().next() {
+        if let Some(dir) = Path::new(&arg0).parent() {
+            if !dir.as_os_str().is_empty() {
+                dirs.push(dir.to_path_buf());
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+    for dir in dirs {
+        let cand = dir.join(name);
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+    for dir in std::env::var("PATH").unwrap_or_default().split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let cand = Path::new(dir).join(name);
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// `ff --gui`: hand over to the `ff-gui` binary.
+///
+/// The GUI is a separate process (it links a widget toolkit `ff` does not).
+/// We `exec` it so it replaces this process — no extra shell, and its exit
+/// status is ours.
+fn launch_gui() -> Result<ExitCode, CliError> {
+    let exe = sibling_binary("ff-gui", "FF_GUI_BIN").ok_or_else(|| {
+        CliError::Usage(
+            "ff-gui not found: looked next to ff, next to the invoked path, and on \
+             PATH (set FF_GUI_BIN to override, or build it with `cargo build -p ff-gui`)"
+                .into(),
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // `exec` only returns on failure.
+        let err = std::process::Command::new(&exe).exec();
+        Err(CliError::Io(format!("cannot exec {}: {err}", exe.display())))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = std::process::Command::new(&exe)
+            .status()
+            .map_err(|e| CliError::Io(format!("cannot run {}: {e}", exe.display())))?;
+        Ok(ExitCode::from(status.code().unwrap_or(0) as u8))
+    }
+}
+
 fn is_command(s: &str) -> bool {
     matches!(s, "stats" | "rescan" | "update" | "watch" | "service")
 }
@@ -274,6 +360,20 @@ mod tests {
 
     fn parse(v: &[&str]) -> Args {
         parse_args(v.iter().map(|s| s.to_string())).unwrap()
+    }
+
+    #[test]
+    fn gui_flag_is_a_flag_not_a_query_term() {
+        let a = parse(&["--gui"]);
+        assert!(a.gui);
+        assert!(a.query.is_empty(), "--gui must not leak into the query: {:?}", a.query);
+    }
+
+    #[test]
+    fn gui_flag_can_combine_with_other_flags() {
+        let a = parse(&["--gui", "-j"]);
+        assert!(a.gui && a.json);
+        assert!(a.query.is_empty());
     }
 
     #[test]
