@@ -243,7 +243,16 @@ journal.log:   [op u8][len u32][crc32][payload]   ADD / DEL / MOVE / FENCE / MAR
 
 ## 10. Query engine
 
-Unchanged from v1, briefly: linear scan over the in-memory name arena — this is Everything's model and it's fast enough. Space = AND of substrings; `"..."` phrase; `*`/`?` wildcards; `ext:` `path:` `case:` `regex:` modifiers. ASCII case-folding on bytes; smart-case. One `aho-corasick` pass (SIMD) over all literal tokens, rarest-first with AND short-circuit; regex via the `regex` crate's literal prefilters. Path materialization only for surviving results, into a growable stack buffer. `--count` fast path skips materialization. Trigram posting lists (plocate-style) remain a v2 accelerator if 50 M+ files ever demand it.
+Unchanged from v1, briefly: linear scan over the in-memory name arena — this is Everything's model and it's fast enough. Space = AND of substrings; `"..."` phrase; `*`/`?` wildcards; `ext:` `path:` `case:` `regex:` modifiers. ASCII case-folding on bytes; smart-case. One `aho-corasick` pass (SIMD) over all literal tokens, rarest-first with AND short-circuit; regex via the `regex` crate's literal prefilters. Path materialization only for surviving results, into a growable stack buffer. `--count` fast path skips materialization.
+
+**Trigram posting lists (plocate-style) — v2, implemented.** `trigram.rs` builds, over the live non-root entries, a map from each **lowercased-ASCII name trigram** to a sorted posting list of entry ids. A query's *required* literals (positive `Substr` and `Ext` terms only — negation, glob, regex and `path:` terms carry no fixed substring over the name) are reduced to their trigram sets, and the candidate set is the intersection of those posting lists. The scan then visits only candidates.
+
+The contract is that this is a **filter, never an authority**: every candidate still goes through the full `Query::matches` path, so the accelerator can change only the time taken, never the answer. Two consequences are load-bearing:
+
+- Ids are stable across rescans (§3), so posting lists stay meaningful; the cache is keyed on `(generation, entry_count)`, so any addition or generation bump rebuilds it. A *deletion* leaves postings naming tombstoned ids — safe, because the accelerated path checks liveness and the matcher decides.
+- `path:` terms are not accelerated (the index stores no path strings, §3), and literals shorter than three bytes give no trigram. Both fall through to the linear scan for their part of the query.
+
+`crates/findex/tests/trigram_differential.rs` pins the contract against random trees and a corpus spanning every query shape; `crates/findex/examples/trigram_bench.rs` measures it. At 1 M entries the postings cost ~45 MiB against ~13 MiB of name bytes (a name averaging ~13 bytes yields ~11.6 trigrams), so the accelerator roughly quadruples name-side memory and queries run 6–60× faster — a good trade at 10 M+ files, which is why the design gates it at that scale. `path:`-heavy queries see no benefit.
 
 New: every response's meta carries `{gen, lsn, fresh, elapsed_ms, stale_roots[]}` so clients can reason about consistency, not just results.
 
@@ -359,6 +368,6 @@ Lessons from the Watchman/React-Native years, applied pre-emptively:
 
 - **v1**: inotify backend + full reconciliation core (pending collection, diff rescans, backoff, degraded mode) + cookie sync + snapshot/journal with cursors + linear scan + differential/fake-backend test harness. *Reconciliation and sync ship in v1 — v1's lesson from Watchman is that these are correctness, not polish.*
 - **v1.5**: fanotify-FID backend, macOS FSEvents, `since`/`subscribe` ops live, regex/wildcards, `ff watch`, service units.
-- **v2**: trigram accelerator, lazy attr sidecar keyed by stable IDs, GUI client on subscriptions.
+- **v2**: trigram accelerator (implemented — §10; filter-only, cached by generation), lazy attr sidecar keyed by stable IDs, GUI client on subscriptions.
 
 The durable insight of this revision: Everything's *index* is easy to replicate; Watchman's *discipline* — one pending collection, diffs over replacements, cookies for settle, clocks over guesses, loud degradation — is what turns a toy into infrastructure. Build both in from the start.

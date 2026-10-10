@@ -167,6 +167,12 @@ fn query_corpus() -> Vec<&'static str> {
     ]
 }
 
+/// A single result row: `(id, materialized path)`.
+type Row = (u32, Vec<u8>);
+
+/// The outcome of one query under both paths: `(rows, total)` for each.
+type BothPaths = (Vec<Row>, u64, Vec<Row>, u64);
+
 fn run_both(
     ix: &Index,
     rp: &[(u32, Vec<u8>)],
@@ -174,11 +180,11 @@ fn run_both(
     q: &Query,
     limit: usize,
     count_only: bool,
-) -> (Vec<(u32, Vec<u8>)>, u64, Vec<(u32, Vec<u8>)>, u64) {
+) -> BothPaths {
     let plain = query::execute(ix, rp, q, limit, count_only);
     let accel = query::execute_with_trigram(ix, rp, q, limit, count_only, Some(tg));
-    let plain_rows: Vec<(u32, Vec<u8>)> = plain.hits.iter().map(|h| (h.id, h.path.clone())).collect();
-    let accel_rows: Vec<(u32, Vec<u8>)> = accel.hits.iter().map(|h| (h.id, h.path.clone())).collect();
+    let plain_rows: Vec<Row> = plain.hits.iter().map(|h| (h.id, h.path.clone())).collect();
+    let accel_rows: Vec<Row> = accel.hits.iter().map(|h| (h.id, h.path.clone())).collect();
     (plain_rows, plain.total, accel_rows, accel.total)
 }
 

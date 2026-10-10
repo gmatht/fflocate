@@ -1,4 +1,4 @@
-# DESIGN.md — implementation status (v1)
+# DESIGN.md — implementation status
 
 This file records how the implementation maps onto [`DESIGN.md`](DESIGN.md),
 where it deviates, and what is deliberately not done. It is not a walkthrough;
@@ -16,6 +16,7 @@ it is a status note.
 | §8 Cookie sync | done | `crates/findex/src/sync.rs`, `server.rs` (`handle_sync`) |
 | §9 Snapshot + journal + cursors + compaction | done | `crates/findex/src/{snapshot,journal,persist,cursor}.rs` |
 | §10 Query engine | done | `crates/findex/src/query.rs` |
+| §10/§17 **v2 trigram accelerator** | done | `crates/findex/src/trigram.rs`, `query.rs` (`execute_with_trigram`), `applier.rs` (`Shared::trigram_index`); tests `tests/trigram_differential.rs`; bench `examples/trigram_bench.rs` |
 | §11 IPC protocol v2 | done | `crates/findex/src/proto.rs`, `server.rs` |
 | §12 CLI | done | `crates/fx/src/{main,client,service}.rs` (binary `ff`; the `fx` name collides with the snap JSON viewer. Crate dir kept as `crates/fx`.) |
 | §13 Concurrency model | done | `crates/findex/src/applier.rs`, `crates/findexd/src/daemon.rs` |
@@ -39,13 +40,61 @@ All of the following were exercised against real binaries and a real temp tree:
   the queue drained).
 * Cookie files are cleaned up on completion and on timeout (no leaks).
 
-`cargo test` runs 186 tests, all green, including a 120-step random
+`cargo test` runs 204 tests, all green, including a 120-step random
 differential test against a from-scratch filesystem walk.
 
 Zero-hit `ff` string queries with an uppercase letter get a case-folded
 "did you mean" rerun (bounded, stderr only; stdout/exit codes untouched).
 True edit-distance fuzzy stays out — that belongs to the v2 trigram
 accelerator, not to a scan.
+
+### v2 trigram accelerator (§10/§17)
+
+`crates/findex/src/trigram.rs` maps each lowercased-ASCII **name** trigram to a
+sorted posting list of entry ids; a query's required literals are intersected
+through it and only the survivors are checked. It is a **filter, never an
+authority** — `execute_with_trigram` runs the full `Query::matches` on every
+candidate, so the accelerator changes only speed. The cache lives on `Shared`,
+keyed on `(generation, entry_count)`; any addition or generation bump rebuilds
+it, and stale postings that still name tombstoned ids are harmless because the
+accelerated path rechecks liveness.
+
+Measured with `cargo run --release -p findex --example trigram_bench -- 1000000`
+(1 M entries, this machine):
+
+```
+index build:           488 ms
+trigram build:        1866 ms  (2024 trigrams, 11.6 M postings)
+names arena:          13.1 MiB
+trigram postings:     44.4 MiB  (339% of name bytes)
+
+query               matches   linear ms   trigram ms  speedup
+very selective          781      275         5.1        54x
+word + ext             5663      254        19.7        13x
+common word          56 582      252        38.4         7x
+common + ext           5703      295        26.6        11x
+```
+
+The benchmark asserts accelerated and linear results are identical (count *and*
+id order) on every timed query, so a fast number can never come from a wrong
+answer. Two honest caveats:
+
+* **Memory ~ quadruples** on the name side (44 MiB of postings vs 13 MiB of
+  names; a name averaging ~13 bytes yields ~11.6 trigrams). That is the cost of
+  the accelerator and the reason the design gates it at 10 M+ files — at 50 M
+  files it would be ~2.2 GB. It is currently built eagerly on first query
+  (`Shared::trigram_index`); it is *not* persisted, so a restart rebuilds it
+  (1.9 s at 1 M). Both are deliberate v2 scope cuts.
+* **`path:` terms are not accelerated** (the index stores no path strings, §3),
+  and literals shorter than three bytes carry no trigram; those parts of a query
+  fall through to the linear scan. A query that is *only* such terms sees no
+  speedup.
+
+`crates/findex/tests/trigram_differential.rs` pins the filter contract across
+random trees and a corpus covering substrings (incl. < 3 bytes), smart-case,
+globs, regex, `path:`, phrases, negation and their combinations. The deletion
+case is the one that earned its keep: it caught stale postings producing phantom
+hits until liveness was rechecked in the accelerated path.
 
 ### `locate` drop-in (`crates/fx/src/locate.rs`)
 

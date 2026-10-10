@@ -866,7 +866,7 @@ mod tests {
         let plan = q.trigram_plan();
         assert_eq!(plan.literals.len(), 1, "only `main` yields usable trigrams");
         // "main" -> {"mai", "ain"}, sorted.
-        let mut expected: Vec<[u8; 3]> = vec![[b'm', b'a', b'i'], [b'a', b'i', b'n']];
+        let mut expected: Vec<[u8; 3]> = vec![*b"mai", *b"ain"];
         expected.sort_unstable();
         assert_eq!(plan.literals[0], expected);
 

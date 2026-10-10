@@ -305,7 +305,7 @@ mod tests {
     fn literal_trigrams_are_distinct() {
         // "aaaa" has the trigrams "aaa" twice; only one entry should be planned.
         let t = TrigramIndex::literal_trigrams(b"aaaa", false).unwrap();
-        assert_eq!(t, vec![[b'a', b'a', b'a']]);
+        assert_eq!(t, vec![*b"aaa"]);
     }
 
     #[test]

@@ -107,7 +107,9 @@ like ripgrep/fzf).
   load; journal with `[op|len|crc|payload]` framing and bounded torn-tail
   replay; cursors `c:<gen>:<lsn>`; off-lock compaction.
 * **Query engine (§10)** — linear scan over the name arena with an
-  `aho-corasick` literal prefilter.
+  `aho-corasick` literal prefilter, plus the **v2 trigram accelerator**
+  (plocate-style name posting lists, filter-only, cached by index generation;
+  `crates/findex/src/trigram.rs`).
 * **IPC v2 (§11)** — NDJSON over a unix socket; ops `query`, `sync`, `since`,
   `subscribe`, `stats`, `rescan`, `hello`. Every response's meta carries
   `{gen, lsn, fresh, elapsed_ms, stale_roots[], catching_up, backend, entries}`.
@@ -117,7 +119,7 @@ like ripgrep/fzf).
 ## Testing
 
 ```sh
-cargo test          # 122 tests
+cargo test          # 204 tests
 ```
 
 The suite is the design's §14, and it is the point of the project:
@@ -145,8 +147,17 @@ crates/findexd/  daemon: config, daemon threads, unix-socket transport, binary
 crates/fx/       CLI client + service install
 ```
 
-## v1.5 / v2 (not implemented)
+## v1.5 / v2
 
-fanotify-FID and macOS FSEvents backends, trigram accelerator, lazy attribute
-sidecar keyed by stable ids, a live GUI subscriber feed. `subscribe` currently
-emits the protocol shape (meta + current cursor) as a preview.
+**Done:** the §17 **trigram accelerator** (plocate-style name posting lists used
+as a query prefilter). It is filter-only — every candidate is still checked by
+the full matcher, and the differential suite asserts identical results — and its
+cache is keyed by index generation. See `crates/findex/src/trigram.rs`,
+`crates/findex/tests/trigram_differential.rs`, and
+`cargo run --release -p findex --example trigram_bench` (≈6–60× faster queries;
+postings ≈4× the name bytes — the trade the design gates at 10 M+ files).
+
+**Not implemented:** fanotify-FID and macOS FSEvents backends, the lazy
+attribute sidecar keyed by stable ids, and a live GUI subscriber feed.
+`subscribe` currently emits the protocol shape (meta + current cursor) as a
+preview.
