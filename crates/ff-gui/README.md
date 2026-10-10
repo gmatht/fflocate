@@ -27,6 +27,43 @@ to a REPL rather than a window, so the GUI still runs over ssh or in a container
 with no X server. Both backends are selected at build time via the crate's
 `gtk` / `zork` features.
 
+## As-you-type search, and why the query is not async
+
+Each change to either query box arms a 150 ms deadline; a 30 ms timer runs the
+query once the deadline passes with no further typing, so a burst of keystrokes
+collapses to one query. An emptied box clears the list immediately rather than
+searching for nothing. `SearchGate` (`src/lib.rs`) refuses to start a query while
+one is in flight and drops a result a newer one has superseded, so the answers
+cannot arrive out of order.
+
+The timer is not part of the original toolkit. `connect_changed` fires
+synchronously on every keystroke and there was no timer or idle primitive, so
+`App::timeout_add` was added (see **Vendored dependencies** above); the zork
+backend, having no timer, returns `Err` and the GUI says so rather than silently
+never firing.
+
+The query runs **on the main thread**, and this was measured rather than assumed.
+The first design ran it on a worker thread with a mailbox, but the text to read
+and the rows to write are both `Rc`/`RefCell` and cannot cross a thread boundary,
+so only the socket hop could move — and that hop is 0.00 s against a warm daemon.
+The mailbox bought nothing; the debounce is what matters.
+
+**Async was investigated and is not reachable.** The GTK backend runs glib's own
+`g_main_loop_run` (`vendor/rustxwidgets/src/backends/gtk.rs:33-38`, resolved from
+the dynamic loader and called directly): the application does not own the event
+loop, so there is no executor in which to `.await`. Worse, the one thing that
+would need to yield is exactly the thing that cannot:
+`DaemonClient::request` (`src/lib.rs`) blocks in `reader.lines()` on a Unix
+socket, and there is no yield point inside `g_main_loop_run`.
+
+Making it async would therefore mean inverting the loop — pumping the glib
+context from an executor and having the toolkit's "block until event" call back
+into it, the way `asyncio-glib` does in Python. That is a far larger change to the
+vendored toolkit than the timer was, and it would be to await a query that already
+answers in microseconds. The crate has no async runtime in its dependency tree at
+all. If a query ever becomes genuinely slow, the loop inversion is the prerequisite;
+until then the honest fix is a socket timeout, not an executor.
+
 ## Vendored dependencies
 
 `vendor/rustxwidgets` and `vendor/gtk_dynamic_loader` are copies of those crates
@@ -60,6 +97,9 @@ depend on a checkout outside this repository.
 * Press **Return** in either query field to search — the same code path as the
   Search button, so the two cannot diverge. (In the `zork` fallback, `enter`
   presses Return on the focused field.)
+* Results also update **as you type**, once typing pauses — see the section below.
+  Both the debounce and the button go through the same query code, so a keystroke
+  and a button press cannot disagree.
 * An **Advanced search** foldout (a native disclosure) holds a free-form query
   field for the full syntax (`ext:`, `path:`, `case:`, `regex:`, globs, phrases)
   together with a reminder of that syntax. Its contents are merged into the
@@ -87,4 +127,6 @@ depend on a checkout outside this repository.
   (`fresh`, `stale_roots`, `catching_up`) is shown in the status line, so a
   stale view is never presented as an empty one.
 * `subscribe` (a live push feed) is still a v1.5 preview in the daemon, so the
-  GUI refreshes on demand rather than streaming.
+  GUI re-queries rather than streaming. As-you-type makes that feel live for the
+  index's *contents* changing, but it is still a fresh request each time, not a
+  subscription.
