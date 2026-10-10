@@ -470,3 +470,64 @@ fn ownership_survives_compaction() {
     assert!(!after.contains(&"shut.txt".to_string()), "got {after:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The most common case of all, and the one that broke loudest: a **restart**.
+///
+/// The snapshot restores entries but not ownership (which is derived from the
+/// filesystem). The daemon's startup then re-crawls each root — but a crawl skips
+/// entries that already exist, so without backfilling their attributes the filter
+/// would find no record for anything and show an unprivileged caller *nothing at
+/// all*. A system daemon that appears to work and answers every query with an
+/// empty list is worse than one that refuses to start.
+#[test]
+fn ownership_is_backfilled_after_a_restart() {
+    use std::sync::Arc;
+    use findex::applier::{Applier, RealFs};
+
+    let root = std::path::PathBuf::from("/tmp/findex-restart-ownership");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("visible.txt"), b"x").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(root.join("visible.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let d = tempfile::tempdir().unwrap();
+    let store = findex::persist::Store::open(&d.path().join("state")).unwrap();
+    let mut ix = Index::new();
+    let rid = ix.insert(
+        ROOT_ID,
+        b"findex-restart-ownership",
+        EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+    );
+    let mut r = Root::new(0, root.clone());
+    r.caps.writable = true;
+    let shared = Shared::new(ix, vec![r]);
+    let mut applier = Applier::new(shared.clone(), store, Arc::new(RealFs), SyncRegistry::new());
+    applier.rebuild_dir_cache();
+    applier.track_ownership(true);
+    applier.pending_mut().enqueue_crawl(rid);
+    applier.drain();
+
+    // A restart: the entries survive, the ownership table does not. (A real
+    // `Daemon::build` makes a fresh `Pending`, so the crawl queue is empty; here
+    // the applier is reused, so we drive a rescan instead — which is the stronger
+    // requirement anyway, since it must refresh *survivors*, not just new files.)
+    *shared.ownership.write().unwrap() = findex::ownership::Ownership::new();
+    applier.rebuild_dir_cache(); // as a fresh Daemon::start would
+    applier.pending_mut().enqueue_rescan(rid, findex::event::RescanCause::Manual);
+    applier.drain();
+
+    let ctx = ServerCtx {
+        shared: shared.clone(),
+        sync: SyncRegistry::new(),
+        backend: "fake".into(),
+        control: None,
+        caller: Some(Caller::new(1000, 1000)),
+    };
+    let got = hits(&ctx, &Request::query("", 0, false, false));
+    assert!(
+        got.iter().any(|p| p.ends_with("/visible.txt")),
+        "after a restart the re-crawl must backfill ownership, or the caller sees nothing; got {got:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

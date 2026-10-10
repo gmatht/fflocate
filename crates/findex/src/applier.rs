@@ -699,6 +699,19 @@ impl Applier {
                     let _ = self.abs_path_for(id);
                 }
             }
+            // An entry that already exists still needs its ownership recorded, and
+            // this is the *common* case after a restart: the snapshot restores the
+            // entries, but the ownership table is derived from the filesystem, so a
+            // re-crawl that skipped existing entries would leave every one of them
+            // unrecorded — and the filter, failing closed, would then show an
+            // unprivileged caller nothing at all. Backfill on every pass; it is one
+            // `lstat` per entry, which is what this mode already pays.
+            if let Some(id) = exists {
+                let child_abs = abs.join(std::ffi::OsString::from(
+                    String::from_utf8_lossy(&it.name).into_owned(),
+                ));
+                self.note_ownership(id, &child_abs);
+            }
         }
         for d in new_dirs {
             self.pending.enqueue_crawl(d);
@@ -754,8 +767,12 @@ impl Applier {
 
     fn diff_subtree(&mut self, dir: u32, abs: &Path) {
         // As in `crawl_dir`: the parent's path must be cached before any child is
-        // emitted, so ownership can be resolved for it.
+        // emitted, so ownership can be resolved for it — and the *directory itself*
+        // must be recorded too. Every visibility check walks the parent chain, so a
+        // directory with no record hides everything beneath it; after a restart the
+        // root dir in particular has none, and the whole tree would go dark.
         self.dir_paths.insert(dir, abs.to_path_buf());
+        self.note_ownership(dir, abs);
         // 1. Snapshot the index's children of `dir`.
         let indexed: HashMap<Vec<u8>, u32> = {
             let ix = self.shared.index.read().unwrap();
@@ -816,13 +833,19 @@ impl Applier {
                             let nf = cur.with_dir(it.is_dir);
                             self.shared.index.write().unwrap().entry_mut(*id).flags = nf.0;
                         }
+                        // A survivor's ownership can have changed even though its
+                        // name did not (a chown or a replaced file), and after a
+                        // restart the record may be missing entirely. Either way a
+                        // rescan is the moment to re-read it, or the filter keeps
+                        // answering with the old — or no — answer.
+                        let survivor_abs = abs.join(std::ffi::OsString::from(
+                            String::from_utf8_lossy(name).into_owned(),
+                        ));
+                        self.note_ownership(*id, &survivor_abs);
                         // Recurse into surviving directories.
                         if it.is_dir && !it.is_symlink {
-                            let child_abs = abs.join(std::ffi::OsString::from(
-                                String::from_utf8_lossy(name).into_owned(),
-                            ));
-                            self.dir_paths.insert(*id, child_abs.clone());
-                            self.diff_subtree(*id, &child_abs);
+                            self.dir_paths.insert(*id, survivor_abs.clone());
+                            self.diff_subtree(*id, &survivor_abs);
                         }
                     }
                 }
