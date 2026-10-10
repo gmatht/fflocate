@@ -48,6 +48,8 @@ pub struct ZorkNode {
     /// Raw key handler `(keyval, state) -> handled`. Fired by the `enter`
     /// command (which passes Return), so Enter-to-search works in the REPL.
     pub key_cb: Option<Box<dyn FnMut(u32, u32) -> bool>>,
+    /// Whether the widget is enabled (greyed-out controls report `false`).
+    pub sensitive: bool,
 }
 
 pub struct ZorkState {
@@ -93,6 +95,7 @@ impl ZorkState {
             button_press_cb: None,
             drag_payload_cb: None,
             key_cb: None,
+            sensitive: true,
         });
         if let Some(pid) = parent {
             if let Some(p) = self.nodes.iter_mut().find(|n| n.id == pid) {
@@ -1058,6 +1061,20 @@ pub fn set_button_press_cb(id: usize, cb: Box<dyn FnMut(u32, f64, f64)>) {
             n.button_press_cb = Some(cb);
         }
     });
+}
+
+/// Enable or disable a widget (a disabled control has no effect).
+pub fn set_widget_sensitive(id: usize, sensitive: bool) {
+    with_state(|s| {
+        if let Some(n) = s.node_mut(id) {
+            n.sensitive = sensitive;
+        }
+    });
+}
+
+/// Whether a widget is enabled.
+pub fn widget_sensitive(id: usize) -> bool {
+    with_state(|s| s.node(id).map(|n| n.sensitive).unwrap_or(true))
 }
 
 /// Register a raw key handler on `id` (used for Return-to-search).

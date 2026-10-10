@@ -85,7 +85,9 @@ pub fn handle_request(ctx: &ServerCtx, req: &Request) -> Vec<Response> {
             } else if *fuzzy {
                 handle_fuzzy_query(ctx, q, *max_distance, *limit, *count, t0)
             } else {
-                handle_query(ctx, q, *limit, *count, t0)
+                // On the plain-string path there is no expression to carry
+                // `case_sensitive`, so it must be honoured here.
+                handle_query(ctx, q, *limit, *count, *case_sensitive == Some(true), t0)
             }
         }
         Request::Sync { timeout_ms, roots } => handle_sync(ctx, *timeout_ms, roots.as_deref()),
@@ -117,8 +119,15 @@ fn meta_preamble(ctx: &ServerCtx, fresh: bool, elapsed: Duration) -> Response {
     }
 }
 
-fn handle_query(ctx: &ServerCtx, raw: &str, limit: usize, count_only: bool, t0: Instant) -> Vec<Response> {
-    let q = match Query::compile(raw) {
+fn handle_query(
+    ctx: &ServerCtx,
+    raw: &str,
+    limit: usize,
+    count_only: bool,
+    case_sensitive: bool,
+    t0: Instant,
+) -> Vec<Response> {
+    let q = match Query::compile_with_case(raw, case_sensitive) {
         Ok(q) => q,
         Err(e) => return vec![Response::Error { message: e }],
     };

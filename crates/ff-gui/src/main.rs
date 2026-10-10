@@ -25,8 +25,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use ff_gui::{
-    effective_query, row_at_line, DaemonClient, GuiError, RowAction, SearchOutcome,
-    ADVANCED_SYNTAX_HELP,
+    effective_query, render_count, row_at_line, DaemonClient, GuiError, RowAction, SearchOptions,
+    SearchOutcome, ADVANCED_SYNTAX_HELP, DEFAULT_MAX_DISTANCE,
 };
 
 /// Which backend this binary was compiled with.
@@ -85,18 +85,56 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // The advanced-search foldout: a native disclosure holding a free-form
-    // query field (with the full syntax) and a reminder of that syntax. Its
-    // contents are merged into the effective query, so what runs is always one
-    // readable string.
+    // query field (with the full syntax) plus real controls. Every control maps
+    // to a daemon field — Case sensitive (case_sensitive), Fuzzy (fuzzy), Count
+    // only (count), and the fuzzy maximum edit distance (max_distance).
     let advanced = app.create_expander("Advanced search")?;
     let advanced_query = app.create_entry()?;
     advanced_query.set_text("");
     let advanced_help = app.create_label(ADVANCED_SYNTAX_HELP)?;
+
+    let opt_case = app.create_checkbutton("Case sensitive")?;
+    opt_case.set_active(false);
+    let opt_fuzzy = app.create_checkbutton("Fuzzy matching")?;
+    opt_fuzzy.set_active(false);
+    let opt_count = app.create_checkbutton("Count only (skip the list)")?;
+    opt_count.set_active(false);
+
+    // The max edit distance only means anything with Fuzzy on, so it is
+    // disabled until then rather than silently ignored.
+    let opt_distance = app.create_entry()?;
+    opt_distance.set_text(DEFAULT_MAX_DISTANCE);
+    let distance_row = app.create_box(Orientation::Horizontal, 2)?;
+    let distance_label = app.create_label("max distance:")?;
+    distance_row.append(&distance_label);
+    distance_row.append(&opt_distance);
+
     let advanced_box = app.create_box(Orientation::Vertical, 2)?;
     advanced_box.append(&advanced_query);
     advanced_box.append(&advanced_help);
+    advanced_box.append(&opt_case);
+    advanced_box.append(&opt_fuzzy);
+    advanced_box.append(&distance_row);
+    advanced_box.append(&opt_count);
     advanced.set_child(&advanced_box);
     advanced.set_expanded(false);
+
+    // Fuzzy off => the distance field is inert; grey it out so it is clear the
+    // value has no effect rather than being silently ignored.
+    {
+        opt_distance.set_sensitive(false);
+        distance_label.set_sensitive(false);
+        let d = opt_distance.clone();
+        let l = distance_label.clone();
+        let f = opt_fuzzy.clone();
+        opt_fuzzy
+            .connect_toggled(move || {
+                let on = f.is_active();
+                d.set_sensitive(on);
+                l.set_sensitive(on);
+            })
+            .ok();
+    }
 
     // The rows currently on screen, shared between the Search handler (which
     // fills them) and the right-click handler (which picks one). Also holds the
@@ -135,23 +173,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let status = status.clone();
         let results = results.clone();
         let current = current.clone();
+        let opt_case = opt_case.clone();
+        let opt_fuzzy = opt_fuzzy.clone();
+        let opt_count = opt_count.clone();
+        let opt_distance = opt_distance.clone();
         Rc::new(RefCell::new(Box::new(move || {
             let quick = query.get_text().unwrap_or_default();
             let adv = advanced_query.get_text().unwrap_or_default();
             let (q, shadowed) = effective_query(&quick, &adv);
-            match run_query(&q) {
+            let opts = gather_options(&opt_case, &opt_fuzzy, &opt_count, &opt_distance);
+            match run_query(&q, &opts) {
                 Ok(outcome) => {
-                    let mut line = outcome.status_line(outcome.paths.len().min(MAX_ROWS));
+                    let mut line = outcome.status_line_opts(outcome.paths.len().min(MAX_ROWS), opts.count_only);
                     if shadowed {
                         // Say which query ran: the two boxes disagreeing must
                         // not be silent.
                         line.push_str("  [advanced query]");
                     }
                     status.set_text(&line);
-                    results.set_text(&render_rows(&outcome));
-                    // Record only the rows actually shown (a "no matches" view
-                    // shows a placeholder line, which is not a path).
-                    *current.borrow_mut() = outcome.paths.iter().take(MAX_ROWS).cloned().collect();
+                    if opts.count_only {
+                        // No paths come back: show the number, not an empty
+                        // list that would read as "no matches".
+                        results.set_text(&render_count(outcome.total));
+                        current.borrow_mut().clear();
+                    } else {
+                        results.set_text(&render_rows(&outcome));
+                        // Record only the rows actually shown (a "no matches"
+                        // view shows a placeholder line, which is not a path).
+                        *current.borrow_mut() =
+                            outcome.paths.iter().take(MAX_ROWS).cloned().collect();
+                    }
                 }
                 Err(e) => {
                     status.set_text(&format!("{e}"));
@@ -370,9 +421,109 @@ impl TextViewLike for TextView {
 }
 
 /// Run one search against the daemon.
-fn run_query(query: &str) -> Result<SearchOutcome, GuiError> {
+fn run_query(query: &str, opts: &SearchOptions) -> Result<SearchOutcome, GuiError> {
     let client = DaemonClient::new();
-    client.search(query, FETCH_LIMIT)
+    client.search_with(query, FETCH_LIMIT, opts)
+}
+
+/// Read the foldout's controls into a [`SearchOptions`].
+///
+/// The max-distance field is only consulted when Fuzzy is on; a blank or
+/// unparseable value falls back to the daemon's own default (`None`).
+fn gather_options(
+    case: &impl Active,
+    fuzzy: &impl Active,
+    count: &impl Active,
+    distance: &impl TextValue,
+) -> SearchOptions {
+    let fuzzy_on = fuzzy.is_active();
+    SearchOptions {
+        case_sensitive: case.is_active(),
+        fuzzy: fuzzy_on,
+        max_distance: if fuzzy_on {
+            distance.get_text().and_then(|t| t.trim().parse().ok())
+        } else {
+            None
+        },
+        count_only: count.is_active(),
+    }
+}
+
+/// The bits of a checkbox the option reader needs (lets the logic be tested
+/// without a display).
+pub trait Active {
+    fn is_active(&self) -> bool;
+}
+/// The bits of a text field the option reader needs.
+pub trait TextValue {
+    fn get_text(&self) -> Option<String>;
+}
+
+// These target the adapter types the app actually builds. The prelude also
+// re-exports `common` wrappers of the same name, so name the concrete type
+// explicitly — and per backend, since only one adapter exists in a given build.
+#[cfg(feature = "gtk")]
+mod widget_traits {
+    use super::{Active, TextValue};
+
+    impl Active for rustxwidgets::backends_gtk_adapter::CheckButton {
+        fn is_active(&self) -> bool {
+            rustxwidgets::backends_gtk_adapter::CheckButton::is_active(self)
+        }
+    }
+    impl TextValue for rustxwidgets::backends_gtk_adapter::Entry {
+        fn get_text(&self) -> Option<String> {
+            rustxwidgets::backends_gtk_adapter::Entry::get_text(self)
+        }
+    }
+}
+
+#[cfg(all(feature = "zork", not(feature = "gtk")))]
+mod widget_traits {
+    use super::{Active, TextValue};
+
+    impl Active for rustxwidgets::backends_zork_adapter::CheckButton {
+        fn is_active(&self) -> bool {
+            rustxwidgets::backends_zork_adapter::CheckButton::is_active(self)
+        }
+    }
+    impl TextValue for rustxwidgets::backends_zork_adapter::Entry {
+        fn get_text(&self) -> Option<String> {
+            rustxwidgets::backends_zork_adapter::Entry::get_text(self)
+        }
+    }
+}
+
+// The other targets build the same UI from their own adapter types. These are
+// not built on this host, but must compile there.
+#[cfg(all(windows, not(feature = "zork")))]
+mod widget_traits {
+    use super::{Active, TextValue};
+    impl Active for rustxwidgets::backends_nwg_adapter::CheckButton {
+        fn is_active(&self) -> bool {
+            rustxwidgets::backends_nwg_adapter::CheckButton::is_active(self)
+        }
+    }
+    impl TextValue for rustxwidgets::backends_nwg_adapter::Entry {
+        fn get_text(&self) -> Option<String> {
+            rustxwidgets::backends_nwg_adapter::Entry::get_text(self)
+        }
+    }
+}
+
+#[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
+mod widget_traits {
+    use super::{Active, TextValue};
+    impl Active for rustxwidgets::backends_wasm_adapter::CheckButton {
+        fn is_active(&self) -> bool {
+            rustxwidgets::backends_wasm_adapter::CheckButton::is_active(self)
+        }
+    }
+    impl TextValue for rustxwidgets::backends_wasm_adapter::Entry {
+        fn get_text(&self) -> Option<String> {
+            rustxwidgets::backends_wasm_adapter::Entry::get_text(self)
+        }
+    }
 }
 
 /// Render the result list: one path per line.
@@ -409,6 +560,61 @@ mod tests {
             *self.0.borrow_mut() = Some(text.to_string());
             Ok(())
         }
+    }
+
+    struct FakeActive(bool);
+    impl Active for FakeActive {
+        fn is_active(&self) -> bool { self.0 }
+    }
+    struct FakeText(String);
+    impl TextValue for FakeText {
+        fn get_text(&self) -> Option<String> { Some(self.0.clone()) }
+    }
+
+    #[test]
+    fn gather_options_maps_controls_to_daemon_fields() {
+        let o = gather_options(
+            &FakeActive(true),
+            &FakeActive(true),
+            &FakeActive(true),
+            &FakeText("3".into()),
+        );
+        assert!(o.case_sensitive);
+        assert!(o.fuzzy);
+        assert!(o.count_only);
+        assert_eq!(o.max_distance, Some(3));
+    }
+
+    #[test]
+    fn gather_options_ignores_distance_when_fuzzy_is_off() {
+        // The field is inert with Fuzzy off: whatever it holds must not leak
+        // into the query.
+        let o = gather_options(
+            &FakeActive(false),
+            &FakeActive(false),
+            &FakeActive(false),
+            &FakeText("9".into()),
+        );
+        assert_eq!(o.max_distance, None);
+        assert!(!o.fuzzy);
+    }
+
+    #[test]
+    fn gather_options_tolerates_a_blank_or_bad_distance() {
+        let blank = gather_options(
+            &FakeActive(false),
+            &FakeActive(true),
+            &FakeActive(false),
+            &FakeText("  ".into()),
+        );
+        assert_eq!(blank.max_distance, None);
+        let bad = gather_options(
+            &FakeActive(false),
+            &FakeActive(true),
+            &FakeActive(false),
+            &FakeText("abc".into()),
+        );
+        assert_eq!(bad.max_distance, None);
     }
 
     #[test]

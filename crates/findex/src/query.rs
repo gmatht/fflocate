@@ -172,7 +172,26 @@ impl std::fmt::Debug for Query {
 
 impl Query {
     pub fn compile(raw: &str) -> Result<Query, String> {
-        let terms = parse_terms(raw)?;
+        Self::compile_with_case(raw, false)
+    }
+
+    /// Compile `raw`, optionally forcing every term to match case-sensitively.
+    ///
+    /// This is the daemon-side honouring of the protocol's `case_sensitive`
+    /// field on the plain-string path (an expression query carries it in the
+    /// expression instead). It overrides smart-case: a lowercase term that
+    /// would normally match case-insensitively is made case-sensitive too.
+    pub fn compile_with_case(raw: &str, force_case: bool) -> Result<Query, String> {
+        let mut terms = parse_terms(raw)?;
+        if force_case {
+            for t in terms.iter_mut() {
+                force_term_case(t);
+            }
+        }
+        Self::from_terms(terms, raw)
+    }
+
+    fn from_terms(terms: Vec<Term>, raw: &str) -> Result<Query, String> {
         let mut literals = Vec::new();
         let mut literal_case = Vec::new();
         for t in &terms {
@@ -512,6 +531,17 @@ fn strip_prefix_ci<'a>(tok: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
 /// case-sensitively.
 fn has_upper(tok: &[u8]) -> bool {
     tok.iter().any(|b| b.is_ascii_uppercase())
+}
+
+/// Mark a term (and any negated term inside it) as case-sensitive.
+fn force_term_case(t: &mut Term) {
+    match t {
+        Term::Substr { case, .. } | Term::Ext { case, .. } | Term::Path { case, .. } => *case = true,
+        Term::Glob { pattern } => pattern.case = true,
+        Term::Not(inner) => force_term_case(inner),
+        // A regex carries its own flags: nothing to force.
+        Term::Regex { .. } => {}
+    }
 }
 
 fn contains(hay: &[u8], needle: &[u8], case: bool) -> bool {
@@ -965,6 +995,40 @@ mod tests {
         ix.insert(r, b"Notes.TXT", EntryFlags::EMPTY);
         let root_path = b"/home/me/proj".to_vec();
         (ix, vec![(r, root_path)])
+    }
+
+    #[test]
+    fn compile_with_case_forces_case_sensitivity() {
+        let (ix, roots) = tree();
+        // Smart-case: a lowercase term matches case-insensitively, so "notes"
+        // finds Notes.TXT.
+        let q = Query::compile("notes").unwrap();
+        let res = execute(&ix, &roots, &q, 100, false);
+        assert_eq!(paths(&res), vec!["/home/me/proj/Notes.TXT"]);
+
+        // Forcing case (the protocol's case_sensitive field) must not.
+        let q = Query::compile_with_case("notes", true).unwrap();
+        let res = execute(&ix, &roots, &q, 100, false);
+        assert!(paths(&res).is_empty(), "{:?}", paths(&res));
+
+        // Uppercase already matches case-sensitively either way.
+        let q = Query::compile_with_case("Notes", true).unwrap();
+        let res = execute(&ix, &roots, &q, 100, false);
+        assert_eq!(paths(&res), vec!["/home/me/proj/Notes.TXT"]);
+    }
+
+    #[test]
+    fn compile_with_case_applies_to_modifiers_and_negation() {
+        let (ix, roots) = tree();
+        // ext: is case-insensitive by default, so ext:txt finds Notes.TXT.
+        let q = Query::compile_with_case("ext:rs", false).unwrap();
+        let res = execute(&ix, &roots, &q, 100, false);
+        assert_eq!(paths(&res).len(), 2);
+
+        // Forced case on a negated term still applies to the inner term.
+        let q = Query::compile_with_case("-main ext:rs", true).unwrap();
+        let res = execute(&ix, &roots, &q, 100, false);
+        assert_eq!(paths(&res), vec!["/home/me/proj/src/lib.rs"]);
     }
 
     fn paths(res: &Results) -> Vec<String> {

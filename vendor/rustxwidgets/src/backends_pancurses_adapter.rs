@@ -124,6 +124,9 @@ mod pancurses_adapter {
             crate::backends::pancurses::set_label_visible(self.id, visible);
         }
         pub fn set_xalign(&self, _x: f32) {}
+        /// Enable or disable the widget (no visual effect here; the
+        /// control simply keeps its value).
+        pub fn set_sensitive(&self, _sensitive: bool) {}
     }
 
     // -- BoxWidget --
@@ -248,6 +251,9 @@ mod pancurses_adapter {
             crate::backends::pancurses::add_callback(self.id, Box::new(move || { f(std::ptr::null_mut()); }));
             Ok(0)
         }
+        /// Enable or disable the widget (no visual effect here; the
+        /// control simply keeps its value).
+        pub fn set_sensitive(&self, _sensitive: bool) {}
     }
 
     // -- Menu --
@@ -509,8 +515,6 @@ mod pancurses_adapter {
         }
         pub fn set_wrap_mode(&self, _mode: i32) {}
         pub fn set_size_request(&self, _w: i32, _h: i32) {}
-    }
-
 
         /// No button-press events on this backend: the context menu is
         /// unavailable. Returns a dummy handler id.
@@ -539,6 +543,7 @@ mod pancurses_adapter {
         pub fn clipboard_set_text(&self, _text: &str) -> Result<(), Error> {
             Err(Error::Backend("clipboard not supported on this backend".into()))
         }
+    }
 
     // -- Spreadsheet --
 

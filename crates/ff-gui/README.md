@@ -57,6 +57,12 @@ depend on a checkout outside this repository.
   effective query — one readable string — and when both boxes hold text the
   advanced one runs and the status line says so (live, as you type, and again
   after Search).
+* The foldout also carries **working controls**, each backed by a real daemon
+  field: *Case sensitive* (`case_sensitive`), *Fuzzy matching* (`fuzzy`) with a
+  max-edit-distance field (`max_distance`, greyed out until Fuzzy is ticked),
+  and *Count only* (`count`) which returns just the total — shown as
+  `N matches (count only)` rather than an empty list that would read as "no
+  matches". Ticking them changes what is searched; they are not decoration.
 * **Right-click a result** for a context menu: *Copy path*, *Open*, and *Open
   containing folder*. The row under the cursor is found with GTK's own text
   hit-test, so it stays correct under scrolling. Copy uses the system clipboard

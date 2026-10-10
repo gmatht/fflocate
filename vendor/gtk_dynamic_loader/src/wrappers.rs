@@ -1959,6 +1959,14 @@ pub unsafe fn widget_set_visible(loader: &Arc<Loader>, widget: *mut c_void, visi
     }
 }
 
+/// Enable or disable a widget (GTK3/4). A disabled widget is greyed out and
+/// does not respond to input — used to show that a control has no effect.
+pub unsafe fn widget_set_sensitive(loader: &Arc<Loader>, widget: *mut c_void, sensitive: bool) {
+    if let Some(f) = loader.symbols.gtk_widget_set_sensitive {
+        unsafe { f(widget, if sensitive { 1 } else { 0 }); }
+    }
+}
+
 /// Show a widget and all its descendants (GTK3).
 pub unsafe fn widget_show_all(loader: &Arc<Loader>, widget: *mut c_void) {
     if let Some(show_all) = loader.symbols.gtk_widget_show_all {

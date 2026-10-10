@@ -108,11 +108,25 @@ impl DaemonClient {
 
     /// Run a search and return `(paths, total, meta_summary)`.
     pub fn search(&self, query: &str, limit: usize) -> Result<SearchOutcome, GuiError> {
+        self.search_with(query, limit, &SearchOptions::default())
+    }
+
+    /// Run a search honouring the advanced-search controls.
+    ///
+    /// `count_only` asks the daemon for just the total (it skips path
+    /// materialization), so `paths` comes back empty and only `total` is
+    /// meaningful.
+    pub fn search_with(
+        &self,
+        query: &str,
+        limit: usize,
+        opts: &SearchOptions,
+    ) -> Result<SearchOutcome, GuiError> {
         let resp = self.request(&Request::Query {
             q: query.to_string(),
             limit,
             json: false,
-            count: false,
+            count: opts.count_only,
             expression: None,
             glob: None,
             glob_includedotfiles: None,
@@ -120,9 +134,9 @@ impl DaemonClient {
             suffix: None,
             path: None,
             relative_root: None,
-            case_sensitive: None,
-            fuzzy: false,
-            max_distance: None,
+            case_sensitive: opts.case_sensitive.then_some(true),
+            fuzzy: opts.fuzzy,
+            max_distance: if opts.fuzzy { opts.max_distance } else { None },
         })?;
 
         let mut paths = Vec::new();
@@ -162,6 +176,24 @@ impl DaemonClient {
     }
 }
 
+/// The advanced-search controls, as sent to the daemon.
+///
+/// Each field maps to a real `Query` protocol field — nothing here is
+/// decorative. `Default` is the plain behaviour (smart-case, exact matching,
+/// return the hits).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchOptions {
+    /// Force case-sensitive matching, overriding the daemon's smart-case.
+    pub case_sensitive: bool,
+    /// Approximate (edit-distance) matching, ranked by score.
+    pub fuzzy: bool,
+    /// Maximum edit distance for `fuzzy`; `None` lets the daemon choose.
+    pub max_distance: Option<u32>,
+    /// Ask only for the total, skipping path materialization. `paths` is then
+    /// empty and only `total` is meaningful.
+    pub count_only: bool,
+}
+
 /// What a search returned, including the consistency metadata (§11).
 #[derive(Clone, Debug, Default)]
 pub struct SearchOutcome {
@@ -179,7 +211,16 @@ impl SearchOutcome {
     /// A one-line summary for the status bar. Staleness is stated explicitly:
     /// "loudly stale beats silently wrong" (DESIGN §7).
     pub fn status_line(&self, shown: usize) -> String {
-        let mut s = if self.total as usize == self.paths.len() {
+        self.status_line_opts(shown, false)
+    }
+
+    /// As [`status_line`](Self::status_line), but aware of a count-only search:
+    /// the daemon then sends no paths, so "0 of 6" would be misleading — the
+    /// total *is* the answer.
+    pub fn status_line_opts(&self, shown: usize, count_only: bool) -> String {
+        let mut s = if count_only {
+            format!("{} matches (count only)", self.total)
+        } else if self.total as usize == self.paths.len() {
             format!("{} matches", self.total)
         } else {
             format!("{} of {} matches", self.paths.len().min(shown), self.total)
@@ -215,6 +256,10 @@ pub fn effective_query(quick: &str, advanced: &str) -> (String, bool) {
         (true, true) => (String::new(), false),
     }
 }
+
+/// The max edit distance the foldout offers before the user changes it.
+/// Small numbers keep fuzzy matching useful rather than noisy.
+pub const DEFAULT_MAX_DISTANCE: &str = "2";
 
 /// A one-line reminder of the advanced syntax, shown inside the foldout.
 pub const ADVANCED_SYNTAX_HELP: &str = "ext:rs  path:src  case:Foo  regex:^m.*\\.rs  \"exact phrase\"  *.rs  term1 term2 (all must match)";
@@ -306,9 +351,43 @@ pub fn row_at_line(paths: &[String], line: i32) -> Option<&str> {
     paths.get(line as usize).map(|s| s.as_str())
 }
 
+/// Render the results view for a count-only search: the number on its own line.
+///
+/// A count-only query returns no paths, so this must not look like "no matches".
+pub fn render_count(total: u64) -> String {
+    format!("{total} matches (count only)")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count_only_status_does_not_say_zero_of_n() {
+        // In count mode no paths come back, so the plain status line would
+        // render a misleading "0 of 6".
+        let o = SearchOutcome { paths: vec![], total: 6, fresh: true, ..Default::default() };
+        assert_eq!(o.status_line_opts(0, true), "6 matches (count only)");
+        assert_eq!(o.status_line(0), "0 of 6 matches");
+    }
+
+    #[test]
+    fn render_count_is_not_an_empty_list() {
+        // A count-only result must read as a number, never as "no matches".
+        assert_eq!(render_count(0), "0 matches (count only)");
+        assert_eq!(render_count(42), "42 matches (count only)");
+    }
+
+    #[test]
+    fn search_options_default_is_plain() {
+        let o = SearchOptions::default();
+        assert_eq!(o, SearchOptions {
+            case_sensitive: false,
+            fuzzy: false,
+            max_distance: None,
+            count_only: false,
+        });
+    }
 
     #[test]
     fn effective_query_prefers_whichever_is_filled() {

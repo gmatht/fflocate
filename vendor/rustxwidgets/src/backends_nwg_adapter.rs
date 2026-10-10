@@ -376,6 +376,9 @@ mod nwg_adapter {
         pub fn set_margin_top(&self, _px: i32) {}
         pub fn set_halign(&self, _align: i32) {}
         pub fn set_valign(&self, _align: i32) {}
+        /// Enable or disable the widget (no visual effect here; the
+        /// control simply keeps its value).
+        pub fn set_sensitive(&self, _sensitive: bool) {}
     }
 
     impl AsRef<*mut c_void> for Label {
@@ -756,6 +759,9 @@ mod nwg_adapter {
             *self.focus_out_cb.borrow_mut() = Some(Box::new(f));
             Ok(0)
         }
+        /// Enable or disable the widget (no visual effect here; the
+        /// control simply keeps its value).
+        pub fn set_sensitive(&self, _sensitive: bool) {}
     }
 
     impl AsRef<*mut c_void> for Entry {

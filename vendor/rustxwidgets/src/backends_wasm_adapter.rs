@@ -414,6 +414,9 @@ impl Window {
                 html.style().set_property("text-align", align).ok();
             }
         }
+        /// Enable or disable the widget (no visual effect here; the
+        /// control simply keeps its value).
+        pub fn set_sensitive(&self, _sensitive: bool) {}
     }
 
     pub fn create_label(text: &str) -> Result<Label, Error> {
@@ -776,6 +779,9 @@ impl AsElement for BoxWidget {
             store_closure(Box::new(closure));
             Ok(id)
         }
+        /// Enable or disable the widget (no visual effect here; the
+        /// control simply keeps its value).
+        pub fn set_sensitive(&self, _sensitive: bool) {}
     }
 
     pub fn create_entry() -> Result<Entry, Error> {

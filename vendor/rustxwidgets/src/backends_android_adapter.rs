@@ -155,6 +155,9 @@ mod android_adapter {
         pub fn set_markup(&self, markup: &str) {
             self.set_text(markup);
         }
+        /// Enable or disable the widget (no visual effect here; the
+        /// control simply keeps its value).
+        pub fn set_sensitive(&self, _sensitive: bool) {}
     }
 
     impl Clone for Label {
@@ -251,6 +254,9 @@ mod android_adapter {
         pub fn connect_changed(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
             Ok(0)
         }
+        /// Enable or disable the widget (no visual effect here; the
+        /// control simply keeps its value).
+        pub fn set_sensitive(&self, _sensitive: bool) {}
     }
 
     impl Clone for Entry {

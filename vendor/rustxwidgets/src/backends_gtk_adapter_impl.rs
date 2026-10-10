@@ -189,6 +189,13 @@ mod gtk_adapter {
         pub fn remove_class(&self, class_name: &str) { self.0.remove_class(class_name); }
         pub fn set_markup(&self, markup: &str) { self.0.set_markup(markup); }
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+        /// Grey the label out and stop it responding (for controls that have
+        /// no effect until something else is enabled).
+        pub fn set_sensitive(&self, sensitive: bool) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                unsafe { gtk_dynamic_loader::widget_set_sensitive(&loader, *self.0.as_ref(), sensitive); }
+            }
+        }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
@@ -261,6 +268,12 @@ mod gtk_adapter {
         pub fn set_text(&self, text: &str) { self.inner.set_text(text); }
         pub fn get_text(&self) -> Option<String> { self.inner.get_text() }
         pub fn set_width_chars(&self, n: i32) { self.inner.set_width_chars(n); }
+        /// Enable or disable the entry (a disabled field is greyed out).
+        pub fn set_sensitive(&self, sensitive: bool) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                unsafe { gtk_dynamic_loader::widget_set_sensitive(&loader, *self.inner.as_ref(), sensitive); }
+            }
+        }
         pub fn set_size_request(&self, w: i32, h: i32) { self.inner.set_size_request(w, h); }
         pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> { self.inner.connect_changed(f).map_err(|e| Error::Backend(format!("{}", e))) }
         pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {

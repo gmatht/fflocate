@@ -33,6 +33,7 @@ pub type GtkWindowPresent = unsafe extern "C" fn(window: *mut c_void);
 pub type GtkInit = unsafe extern "C" fn(argc: *mut libc::c_int, argv: *mut *mut *mut libc::c_char);
 pub type GtkLabelSetMarkup = unsafe extern "C" fn(label: *mut c_void, markup: *const i8);
 pub type GtkWidgetSetVisible = unsafe extern "C" fn(widget: *mut c_void, visible: i32);
+pub type GtkWidgetSetSensitive = unsafe extern "C" fn(widget: *mut c_void, sensitive: i32);
 pub type GtkWidgetGrabFocus = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWidgetGetStyleContext = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
 pub type GtkStyleContextAddClass = unsafe extern "C" fn(context: *mut c_void, class_name: *const i8);
@@ -321,6 +322,7 @@ pub struct Symbols {
     pub gtk_drawing_area_new: Option<GtkDrawingAreaNew>,
     pub gtk_label_set_markup: Option<GtkLabelSetMarkup>,
     pub gtk_widget_set_visible: Option<GtkWidgetSetVisible>,
+    pub gtk_widget_set_sensitive: Option<GtkWidgetSetSensitive>,
     pub gtk_widget_grab_focus: Option<GtkWidgetGrabFocus>,
     pub gtk_widget_get_style_context: Option<GtkWidgetGetStyleContext>,
     pub gtk_style_context_add_class: Option<GtkStyleContextAddClass>,
@@ -605,6 +607,7 @@ impl Symbols {
         let gtk_drawing_area_new = unsafe { sym::<GtkDrawingAreaNew>(gtk, "gtk_drawing_area_new") };
         let gtk_label_set_markup = unsafe { sym::<GtkLabelSetMarkup>(gtk, "gtk_label_set_markup") };
         let gtk_widget_set_visible = unsafe { sym::<GtkWidgetSetVisible>(gtk, "gtk_widget_set_visible") };
+        let gtk_widget_set_sensitive = unsafe { sym::<GtkWidgetSetSensitive>(gtk, "gtk_widget_set_sensitive") };
         let gtk_widget_grab_focus = unsafe { sym::<GtkWidgetGrabFocus>(gtk, "gtk_widget_grab_focus") };
         let gtk_widget_get_style_context = unsafe { sym::<GtkWidgetGetStyleContext>(gtk, "gtk_widget_get_style_context") };
         let gtk_style_context_add_class = unsafe { sym::<GtkStyleContextAddClass>(gtk, "gtk_style_context_add_class") };
@@ -805,7 +808,7 @@ impl Symbols {
             gtk_widget_show_all, gtk_window_present,
             gtk_grid_new, gtk_grid_attach, gtk_entry_new, gtk_entry_set_text, gtk_entry_get_text,
             gtk_entry_set_width_chars, gtk_widget_set_size_request, gtk_entry_set_has_frame,
-            gtk_label_set_markup, gtk_widget_set_visible, gtk_widget_grab_focus,
+            gtk_label_set_markup, gtk_widget_set_visible, gtk_widget_set_sensitive, gtk_widget_grab_focus,
             gtk_widget_get_style_context, gtk_style_context_add_class, gtk_style_context_remove_class,
             gtk_css_provider_new, gtk_css_provider_load_from_data, gtk_style_context_add_provider,
             gtk_overlay_new, gtk_overlay_add_overlay, gtk_overlay_set_overlay_pass_through, gtk_overlay_set_child,

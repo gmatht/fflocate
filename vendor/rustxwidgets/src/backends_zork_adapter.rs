@@ -119,6 +119,7 @@ impl Label {
     pub fn remove_class(&self, _class_name: &str) {}
     pub fn set_markup(&self, _markup: &str) {}
     pub fn set_visible(&self, _visible: bool) {}
+    pub fn set_sensitive(&self, _sensitive: bool) {}
     pub fn set_xalign(&self, _x: f32) {}
 }
 
@@ -233,14 +234,17 @@ impl Entry {
     pub fn set_halign(&self, _align: i32) {}
     pub fn set_valign(&self, _align: i32) {}
     pub fn set_visible(&self, _visible: bool) {}
-        pub fn set_size_request(&self, _w: i32, _h: i32) {}
-        pub fn set_width_chars(&self, _w: i32) {}
-        pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
-            // Fired by the REPL `enter` command with Return's keyval.
-            crate::backends::zork::set_key_cb(self.id, cb);
-        }
-        pub fn set_margin_start(&self, _margin: i32) {}
-        pub fn set_margin_top(&self, _margin: i32) {}
+    pub fn set_sensitive(&self, sensitive: bool) {
+        crate::backends::zork::set_widget_sensitive(self.id, sensitive);
+    }
+    pub fn set_size_request(&self, _w: i32, _h: i32) {}
+    pub fn set_width_chars(&self, _w: i32) {}
+    pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
+        // Fired by the REPL `enter` command with Return's keyval.
+        crate::backends::zork::set_key_cb(self.id, cb);
+    }
+    pub fn set_margin_start(&self, _margin: i32) {}
+    pub fn set_margin_top(&self, _margin: i32) {}
     pub fn add_class(&self, _class_name: &str) {}
     pub fn remove_class(&self, _class_name: &str) {}
     pub fn grab_focus(&self) {}
