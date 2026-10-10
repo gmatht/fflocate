@@ -194,7 +194,7 @@ pub fn namespace_event(mask: u64, parent: DirKey, name: &[u8], is_dir: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::watch::fanotify::masks::{FAN_CREATE, FAN_DELETE, FAN_MOVED_FROM, FAN_MOVED_TO};
+    use crate::watch::fanotify::masks::FAN_CREATE;
 
     fn h(bytes: &[u8]) -> HandleId {
         HandleId { mount_id: 1, handle_type: 1, handle: bytes.to_vec() }

@@ -3,7 +3,7 @@
 //! Usage:
 //!
 //! ```text
-//! findexd [--socket PATH] [--state-dir DIR] [--root DIR]... [--backend inotify|fake] [--foreground]
+//! findexd [--socket PATH] [--state-dir DIR] [--root DIR]... [--backend fanotify|inotify|fake|auto] [--foreground]
 //! ```
 //!
 //! With no `--root`, `$HOME` is indexed. The daemon binds its socket, installs
@@ -46,16 +46,13 @@ fn parse_args() -> Result<Config, String> {
             }
             "--backend" => {
                 let b = it.next().ok_or("--backend needs a value")?;
-                cfg.backend = match b.as_str() {
-                    "inotify" => BackendChoice::Inotify,
-                    "fake" => BackendChoice::Fake,
-                    other => return Err(format!("unknown backend: {other}")),
-                };
+                cfg.backend = BackendChoice::parse(&b)
+                    .ok_or_else(|| format!("unknown backend: {b} (want fanotify|inotify|fake|auto)"))?;
             }
             "--foreground" | "-f" => foreground = true,
             "--help" | "-h" => {
                 println!(
-                    "findexd [--socket PATH] [--state-dir DIR] [--root DIR]... [--backend inotify|fake] [--foreground]"
+                    "findexd [--socket PATH] [--state-dir DIR] [--root DIR]... [--backend fanotify|inotify|fake|auto] [--foreground]"
                 );
                 std::process::exit(0);
             }

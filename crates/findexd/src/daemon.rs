@@ -50,9 +50,18 @@ pub struct WatchFailure {
     pub reason: String,
 }
 
-/// Build the configured backend.
-pub fn make_backend(choice: BackendChoice) -> anyhow::Result<SharedBackend> {
-    let b: Box<dyn WatchBackend> = match choice {
+/// Build the configured backend, returning it alongside the **resolved**
+/// concrete choice so callers can report what is actually running (an `auto`
+/// config must not surface as `"auto"` in `ff stats`).
+///
+/// `Auto` picks the best available for this system (§4). A backend that is asked
+/// for explicitly but unavailable is a hard error, not a silent downgrade: if
+/// you asked for fanotify and the kernel cannot do it, you want to know.
+pub fn make_backend(choice: BackendChoice) -> anyhow::Result<(SharedBackend, BackendChoice)> {
+    let resolved = choice
+        .resolve()
+        .ok_or_else(|| anyhow::anyhow!("no usable watcher backend on this platform"))?;
+    let b: Box<dyn WatchBackend> = match resolved {
         #[cfg(target_os = "linux")]
         BackendChoice::Inotify => match InotifyBackend::new() {
             Ok(b) => Box::new(b),
@@ -64,9 +73,22 @@ pub fn make_backend(choice: BackendChoice) -> anyhow::Result<SharedBackend> {
         BackendChoice::Inotify => {
             anyhow::bail!("backend `inotify` is Linux-only; use `fake` on this platform")
         }
+        #[cfg(target_os = "linux")]
+        BackendChoice::Fanotify => match findex::watch::FanotifyBackend::new() {
+            Ok(b) => Box::new(b),
+            Err(e) => anyhow::bail!(
+                "fanotify unavailable: {e} (needs kernel >= 5.13 for FAN_REPORT_DFID_NAME)"
+            ),
+        },
+        #[cfg(not(target_os = "linux"))]
+        BackendChoice::Fanotify => {
+            anyhow::bail!("backend `fanotify` is Linux-only")
+        }
         BackendChoice::Fake => Box::new(FakeBackend::new(findex::watch::fake::FakeHandle::new())),
+        // `resolve` never yields Auto.
+        BackendChoice::Auto => unreachable!("Auto is resolved before this match"),
     };
-    Ok(Arc::new(Mutex::new(b)))
+    Ok((Arc::new(Mutex::new(b)), resolved))
 }
 
 /// A live daemon.
@@ -76,6 +98,8 @@ pub struct Daemon {
     pub sync: Arc<SyncRegistry>,
     applier: Applier,
     backend: SharedBackend,
+    /// The concrete backend in use, after `auto` resolution.
+    resolved_backend: BackendChoice,
     /// Dirs already asked to be watched (dedup).
     watched_dirs: std::collections::HashSet<u32>,
     /// Watch requests from the applier to the watcher thread (new dirs).
@@ -151,7 +175,7 @@ impl Daemon {
         let sync = SyncRegistry::new();
         let fs: Arc<dyn FsView> = Arc::new(RealFs);
         let applier = Applier::new(shared.clone(), store, fs, sync.clone());
-        let backend = make_backend(config.backend)?;
+        let (backend, resolved_backend) = make_backend(config.backend)?;
 
         let (incoming_tx, incoming_rx) = bounded::<Vec<FsEvent>>(1000);
         let (control_tx, control_rx) = bounded::<Control>(64);
@@ -164,6 +188,7 @@ impl Daemon {
             sync,
             applier,
             backend,
+            resolved_backend,
             watched_dirs: std::collections::HashSet::new(),
             watch_tx,
             watch_fail_tx,
@@ -401,7 +426,7 @@ impl Daemon {
         ServerCtx {
             shared: self.shared.clone(),
             sync: self.sync.clone(),
-            backend: self.config.backend.as_str().to_string(),
+            backend: self.resolved_backend.as_str().to_string(),
             control: Some(self.control_tx.clone()),
         }
     }

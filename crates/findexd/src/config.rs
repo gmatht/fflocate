@@ -25,14 +25,56 @@ pub struct Config {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendChoice {
     Inotify,
+    /// fanotify-FID: whole-mount watch, file-handle events (§6, v1.5).
+    Fanotify,
     Fake,
+    /// Pick the best available backend for this system (§4): fanotify when the
+    /// kernel supports it, else inotify on Linux, else nothing (caller errors).
+    Auto,
 }
 
 impl BackendChoice {
     pub fn as_str(&self) -> &'static str {
         match self {
             BackendChoice::Inotify => "inotify",
+            BackendChoice::Fanotify => "fanotify",
             BackendChoice::Fake => "fake",
+            BackendChoice::Auto => "auto",
+        }
+    }
+
+    /// Parse a `--backend` / `$FINDEX_BACKEND` value.
+    pub fn parse(s: &str) -> Option<BackendChoice> {
+        Some(match s {
+            "inotify" => BackendChoice::Inotify,
+            "fanotify" => BackendChoice::Fanotify,
+            "fake" => BackendChoice::Fake,
+            "auto" => BackendChoice::Auto,
+            _ => return None,
+        })
+    }
+
+    /// Resolve `Auto` against what this system actually supports. Returns the
+    /// concrete choice, or `None` when nothing usable exists.
+    pub fn resolve(self) -> Option<BackendChoice> {
+        match self {
+            BackendChoice::Auto => {
+                #[cfg(target_os = "linux")]
+                {
+                    if findex::mount::fanotify_available() {
+                        Some(BackendChoice::Fanotify)
+                    } else {
+                        Some(BackendChoice::Inotify)
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // No kernel watcher is ported off Linux yet (FSEvents is
+                    // v1.5); `fake` is the only honest option.
+                    Some(BackendChoice::Fake)
+                }
+            }
+            other => Some(other),
         }
     }
 }
@@ -135,5 +177,34 @@ mod tests {
         std::env::set_var("FINDEX_SOCKET", "/run/user/1/x.sock");
         assert_eq!(socket_path_from_env(), PathBuf::from("/run/user/1/x.sock"));
         std::env::remove_var("FINDEX_SOCKET");
+    }
+
+    #[test]
+    fn backend_choice_parses_and_round_trips() {
+        for name in ["inotify", "fanotify", "fake", "auto"] {
+            let c = BackendChoice::parse(name).unwrap_or_else(|| panic!("{name} must parse"));
+            assert_eq!(c.as_str(), name);
+        }
+        assert!(BackendChoice::parse("nope").is_none());
+        assert!(BackendChoice::parse("Inotify").is_none(), "case-sensitive, like the CLI flag");
+    }
+
+    #[test]
+    fn auto_resolves_to_a_concrete_backend() {
+        // Auto must never stay Auto past resolution: the daemon needs a
+        // concrete choice, and on a supported Linux box that is fanotify or
+        // inotify, never neither.
+        let r = BackendChoice::Auto.resolve();
+        assert!(r.is_some(), "this platform must resolve Auto to something");
+        assert_ne!(r, Some(BackendChoice::Auto));
+    }
+
+    #[test]
+    fn explicit_choices_resolve_to_themselves() {
+        // Asking for a backend must not silently become a different one; if it
+        // is unavailable, `make_backend` errors instead.
+        for c in [BackendChoice::Inotify, BackendChoice::Fanotify, BackendChoice::Fake] {
+            assert_eq!(c.resolve(), Some(c));
+        }
     }
 }

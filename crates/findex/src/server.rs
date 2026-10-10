@@ -452,6 +452,15 @@ fn handle_stats(ctx: &ServerCtx, per_root: bool) -> Vec<Response> {
     obj.insert("entries".into(), serde_json::json!(ix.live_count()));
     obj.insert("tombstones".into(), serde_json::json!(ix.tombstone_count()));
     obj.insert("backend".into(), serde_json::json!(ctx.backend));
+    // Why the backend is what it is (§4: a mis-probed choice should be visible,
+    // not mysterious). Only meaningful on Linux; elsewhere it says so.
+    obj.insert(
+        "fanotify".into(),
+        serde_json::json!({
+            "available": crate::mount::fanotify_available(),
+            "note": crate::mount::fanotify_availability_note(),
+        }),
+    );
     if per_root {
         let roots_json: Vec<serde_json::Value> = roots
             .iter()

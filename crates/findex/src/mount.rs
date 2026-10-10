@@ -229,6 +229,58 @@ pub fn handle_of_path(_path: &Path) -> Option<HandleId> {
     None
 }
 
+/// Can this system run the fanotify-FID backend at all?
+///
+/// Probes by *doing*: open a fanotify fd with the flags the backend needs, and
+/// close it. This is the honest test — a kernel may support `fanotify_init` but
+/// not `FAN_REPORT_DFID_NAME` (pre-5.13), and a container may deny the syscall
+/// outright (seccomp). Either way the answer is `false` and the caller falls back
+/// to inotify, rather than discovering it when the first event never arrives.
+#[cfg(target_os = "linux")]
+pub fn fanotify_available() -> bool {
+    // The same flag word the backend uses; keep them in sync.
+    const FAN_CLASS_NOTIF: u32 = 0x0000_0000;
+    const FAN_CLOEXEC: u32 = 0x0000_0001;
+    const FAN_NONBLOCK: u32 = 0x0000_0002;
+    const FAN_REPORT_DFID_NAME: u32 = 0x0000_0c00; // DIR_FID | NAME
+    let flags = FAN_CLASS_NOTIF | FAN_REPORT_DFID_NAME | FAN_CLOEXEC | FAN_NONBLOCK;
+    let fd = unsafe {
+        libc::fanotify_init(
+            flags as libc::c_uint,
+            (libc::O_RDONLY | libc::O_LARGEFILE) as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return false;
+    }
+    unsafe {
+        libc::close(fd);
+    }
+    true
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn fanotify_available() -> bool {
+    false
+}
+
+/// A one-line explanation for `ff stats` / startup logs of *why* fanotify is or
+/// is not usable, so a fallback is visible rather than mysterious (§4).
+pub fn fanotify_availability_note() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        if fanotify_available() {
+            "fanotify-FID available (FAN_REPORT_DFID_NAME)"
+        } else {
+            "fanotify-FID unavailable: fanotify_init(FAN_REPORT_DFID_NAME) failed (kernel < 5.13 or restricted)"
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "fanotify-FID unavailable: Linux-only"
+    }
+}
+
 /// Does `name_to_handle_at` work on `path`? (fanotify-FID viability, §4.)
 pub fn has_file_handle(path: &Path) -> bool {
     #[cfg(target_os = "linux")]
