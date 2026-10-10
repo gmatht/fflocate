@@ -255,7 +255,7 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<LocateArgs, CliEr
                 "regexp" | "regex" => a.regexp = true,
                 "statistics" => a.stats = true,
                 "version" => {
-                    println!("fx {} (locate compatible)", env!("CARGO_PKG_VERSION"));
+                    println!("ff {} (locate compatible)", env!("CARGO_PKG_VERSION"));
                     std::process::exit(0);
                 }
                 "help" => {
@@ -283,7 +283,7 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<LocateArgs, CliEr
                     'L' => a.follow = true,
                     'P' => a.follow = false,
                     'V' => {
-                        println!("fx {} (locate compatible)", env!("CARGO_PKG_VERSION"));
+                        println!("ff {} (locate compatible)", env!("CARGO_PKG_VERSION"));
                         std::process::exit(0);
                     }
                     'h' => {

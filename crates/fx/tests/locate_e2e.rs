@@ -1,4 +1,4 @@
-//! `locate` compatibility end-to-end: invoke the `fx` binary through a
+//! `locate` compatibility end-to-end: invoke the `ff` binary through a
 //! `locate` symlink (argv[0] dispatch) against a real daemon and assert
 //! GNU-locate behaviour: substring/glob/regex matching, flags, exit codes.
 //!
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 fn bin_dir() -> Option<PathBuf> {
     let d = std::env::var("FINDEX_BIN_DIR").ok().map(PathBuf::from)?;
-    (d.join("findexd").exists() && d.join("fx").exists()).then_some(d)
+    (d.join("findexd").exists() && d.join("ff").exists()).then_some(d)
 }
 
 fn backend_arg() -> &'static str {
@@ -25,7 +25,7 @@ fn backend_arg() -> &'static str {
     }
 }
 
-/// Spawn a daemon over `root`, and symlink `fx` to `locate` in a fresh dir.
+/// Spawn a daemon over `root`, and symlink `ff` to `locate` in a fresh dir.
 /// Returns (daemon child, socket, locate path).
 fn setup(root: &Path, tag: &str) -> (std::process::Child, PathBuf, PathBuf) {
     let bindir = bin_dir().unwrap();
@@ -57,7 +57,7 @@ fn setup(root: &Path, tag: &str) -> (std::process::Child, PathBuf, PathBuf) {
     std::fs::create_dir_all(&linkdir).unwrap();
     let locate = linkdir.join("locate");
     #[cfg(unix)]
-    std::os::unix::fs::symlink(bindir.join("fx"), &locate).unwrap();
+    std::os::unix::fs::symlink(bindir.join("ff"), &locate).unwrap();
     (child, socket, locate)
 }
 
@@ -69,7 +69,7 @@ fn kill(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// Settle the index via the real `fx`, then run the symlinked `locate`.
+/// Settle the index via the real `ff`, then run the symlinked `locate`.
 fn locate(locate_bin: &Path, socket: &Path, fxbin: &Path, args: &[&str]) -> (String, String, i32) {
     // Deterministic settle first (locate itself has no sync flag).
     let _ = Command::new(fxbin)
@@ -111,7 +111,7 @@ fn locate_substring_glob_and_regex() {
     };
     let (_tree, root) = fixture_tree();
     let (mut daemon, socket, locate_bin) = setup(&root, "basic");
-    let fxbin = bindir.join("fx");
+    let fxbin = bindir.join("ff");
 
     // Bare substring behaves as *PATTERN*.
     let (out, _, code) = locate(&locate_bin, &socket, &fxbin, &["foo"]);
@@ -156,7 +156,7 @@ fn locate_flags_count_limit_case_all_basename() {
     };
     let (_tree, root) = fixture_tree();
     let (mut daemon, socket, locate_bin) = setup(&root, "flags");
-    let fxbin = bindir.join("fx");
+    let fxbin = bindir.join("ff");
     let hit = |p: &str| root.join(p).to_string_lossy().into_owned();
 
     // -c counts.
@@ -211,7 +211,7 @@ fn locate_existing_filters_dangling_symlink() {
     #[cfg(unix)]
     std::os::unix::fs::symlink(root.join("gone-target"), root.join("dangling")).unwrap();
     let (mut daemon, socket, locate_bin) = setup(&root, "existing");
-    let fxbin = bindir.join("fx");
+    let fxbin = bindir.join("ff");
     let hit = root.join("dangling").to_string_lossy().into_owned();
 
     // The symlink itself is indexed, so plain locate lists it.
@@ -241,7 +241,7 @@ fn locate_stats_and_help_do_not_search() {
     };
     let (_tree, root) = fixture_tree();
     let (mut daemon, socket, locate_bin) = setup(&root, "meta");
-    let fxbin = bindir.join("fx");
+    let fxbin = bindir.join("ff");
 
     let (out, _, code) = locate(&locate_bin, &socket, &fxbin, &["-S"]);
     assert_eq!(code, 0);
@@ -251,7 +251,7 @@ fn locate_stats_and_help_do_not_search() {
     assert_eq!(code, 0);
     assert!(out.contains("USAGE"), "help output");
 
-    // Unknown flags are usage errors (exit 2), like fx.
+    // Unknown flags are usage errors (exit 2), like ff.
     let (_, _, code) = locate(&locate_bin, &socket, &fxbin, &["-Z"]);
     assert_eq!(code, 2);
 

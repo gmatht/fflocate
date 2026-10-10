@@ -86,7 +86,7 @@ pub struct InotifyBackend {
     root_dirs: Vec<u32>,
     /// Paths for the watched dirs, for adding watches.
     dir_paths: HashMap<u32, PathBuf>,
-    /// Watch-limit exhaustion count for `fx stats`.
+    /// Watch-limit exhaustion count for `ff stats`.
     pub watch_limit_hits: u64,
 }
 

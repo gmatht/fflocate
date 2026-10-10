@@ -1,14 +1,14 @@
 # findex
 
 A headless, realtime filename index for Linux: a daemon (`findexd`) and a CLI
-(`fx`), speaking NDJSON over a unix socket so a GUI can be built on the same
+(`ff`), speaking NDJSON over a unix socket so a GUI can be built on the same
 protocol.
 
 This is an implementation of [`DESIGN.md`](DESIGN.md) (v1 scope).
 
 ```
 ┌───────────┐  unix socket, NDJSON  ┌───────────────────────────────────────┐
-│ fx (CLI)  │◄─────────────────────►│                findexd                │
+│ ff (CLI)  │◄─────────────────────►│                findexd                │
 └───────────┘  query/sync/since/    │  watcher (inotify) ─► pending ─► applier│
                subscribe/stats      │                      collection   │     │
                                     │  index (snapshot + replayed journal)   │
@@ -23,7 +23,7 @@ ordering domain, which is what makes the sync guarantee provable.
 
 ```sh
 cargo build --release
-# binaries: target/release/findexd and target/release/fx
+# binaries: target/release/findexd and target/release/ff
 ```
 
 Requires a recent stable Rust (edition 2021). Linux only for the v1 watcher
@@ -31,21 +31,21 @@ backend; the core library is portable.
 
 ## Quick start
 
-`fx` auto-spawns `findexd` if it is not already running.
+`ff` auto-spawns `findexd` if it is not already running.
 
 ```sh
-fx main.rs                       # instant search
-fx -0 "test" | xargs -0 rg TODO  # pipe-friendly; exit 1 on no match
-fx --count ext:pdf
-fx --json --limit 1000 "2024" | fzf
-fx --sync "notes"                # settle, then search — deterministic
-fx --since c:7:481221            # what changed since
-fx stats --roots                 # entries, backend, queue depth, caps, state
-fx rescan /data
-fx update [--timeout 120] [ROOT...]  # reconcile missed changes, then settle
-fx watch                         # tail live events (subscribe preview)
-fx service install               # systemd user unit / launchd plist
-ln -s "$(command -v fx)" ~/bin/locate  # drop-in locate replacement (argv[0])
+ff main.rs                       # instant search
+ff -0 "test" | xargs -0 rg TODO  # pipe-friendly; exit 1 on no match
+ff --count ext:pdf
+ff --json --limit 1000 "2024" | fzf
+ff --sync "notes"                # settle, then search — deterministic
+ff --since c:7:481221            # what changed since
+ff stats --roots                 # entries, backend, queue depth, caps, state
+ff rescan /data
+ff update [--timeout 120] [ROOT...]  # reconcile missed changes, then settle
+ff watch                         # tail live events (subscribe preview)
+ff service install               # systemd user unit / launchd plist
+ln -s "$(command -v ff)" ~/bin/locate  # drop-in locate replacement (argv[0])
 ```
 
 By default the daemon indexes `$HOME`. To index something else:
@@ -55,7 +55,7 @@ findexd --root /path/to/tree --socket "$XDG_RUNTIME_DIR/findex.sock" \
         --state-dir "$XDG_STATE_HOME/findex/2"
 ```
 
-`fx` finds `findexd` next to itself or on `$PATH` (override with `FINDEXD_BIN`).
+`ff` finds `findexd` next to itself or on `$PATH` (override with `FINDEXD_BIN`).
 `FINDEX_SOCKET` / `FINDEX_STATE_DIR` override the defaults.
 
 ## Query syntax
@@ -84,7 +84,7 @@ like ripgrep/fzf).
   Stable ids across rescans; ids are never reused.
 * **Per-mount probing (§4)** — fstype from `/proc/self/mountinfo`,
   `name_to_handle_at` probe, writability, case-sensitivity table + temp-file
-  probe. Surfaced in `fx stats --roots`.
+  probe. Surfaced in `ff stats --roots`.
 * **Initial crawl (§5)** — watch first, then enumerate; crawl work flows
   through the same pending collection as watcher events; new directories are
   watched before they are crawled.

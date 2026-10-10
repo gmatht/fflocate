@@ -70,6 +70,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "ff"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "findex",
+ "libc",
+ "regex",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "findex"
 version = "0.1.0"
 dependencies = [
@@ -96,18 +108,6 @@ dependencies = [
  "findex",
  "libc",
  "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "fx"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "findex",
- "libc",
- "regex",
  "serde_json",
  "tempfile",
 ]

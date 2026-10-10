@@ -1,4 +1,4 @@
-//! The `fx` client: connect to the daemon (auto-spawning it), speak the NDJSON
+//! The `ff` client: connect to the daemon (auto-spawning it), speak the NDJSON
 //! protocol, and format results.
 
 use std::io::{BufRead, BufReader, Write};
@@ -144,10 +144,10 @@ impl Client {
             match r {
                 Response::Meta { stale_roots, catching_up, .. } => {
                     if !stale_roots.is_empty() {
-                        eprintln!("fx: warning: stale roots: {}", stale_roots.join(", "));
+                        eprintln!("ff: warning: stale roots: {}", stale_roots.join(", "));
                     }
                     if catching_up == &Some(true) {
-                        eprintln!("fx: warning: daemon is still catching up; results may be incomplete");
+                        eprintln!("ff: warning: daemon is still catching up; results may be incomplete");
                     }
                 }
                 Response::Hit { path, id } => {
@@ -371,7 +371,7 @@ impl Client {
         Ok(ExitCode::SUCCESS)
     }
 
-    /// Settle the index (§8), with an explicit timeout. `fx update` needs
+    /// Settle the index (§8), with an explicit timeout. `ff update` needs
     /// longer than the interactive `--sync` default: a full-tree rescan is
     /// behind the barrier.
     pub fn sync_timeout(
@@ -496,7 +496,7 @@ impl Client {
     }
 
     pub fn watch(&mut self, q: &str) -> Result<ExitCode, CliError> {
-        let resp = self.send(&Request::Subscribe { name: Some("fx-watch".into()), cursor: None })?;
+        let resp = self.send(&Request::Subscribe { name: Some("ff-watch".into()), cursor: None })?;
         for r in resp {
             match r {
                 Response::Meta { gen, lsn, .. } => eprintln!("# watching from c:{gen}:{lsn} q={q:?}"),
@@ -669,7 +669,7 @@ fn spawn_daemon(socket: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Locate the `findexd` binary: next to `fx`, else on `$PATH`.
+/// Locate the `findexd` binary: next to `ff`, else on `$PATH`.
 fn daemon_binary_path() -> Result<PathBuf, CliError> {
     if let Ok(p) = std::env::var("FINDEXD_BIN") {
         return Ok(PathBuf::from(p));
@@ -689,6 +689,6 @@ fn daemon_binary_path() -> Result<PathBuf, CliError> {
         }
     }
     Err(CliError::Io(
-        "findexd not found next to fx or on PATH (set FINDEXD_BIN)".into(),
+        "findexd not found next to ff or on PATH (set FINDEXD_BIN)".into(),
     ))
 }

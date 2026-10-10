@@ -1,6 +1,6 @@
 # findex — Design Document (v2)
 
-Headless, realtime filename index for Linux (macOS later). Daemon (`findexd`) + CLI (`fx`), GUI-ready via IPC. This revision integrates the Watchman lessons: reconciliation as a first-class subsystem, cookie-based sync, journal-as-clock, per-mount probing, and health telemetry. Changes from v1 are summarized in §0; everything else is the complete standalone design.
+Headless, realtime filename index for Linux (macOS later). Daemon (`findexd`) + CLI (`ff`), GUI-ready via IPC. This revision integrates the Watchman lessons: reconciliation as a first-class subsystem, cookie-based sync, journal-as-clock, per-mount probing, and health telemetry. Changes from v1 are summarized in §0; everything else is the complete standalone design.
 
 ---
 
@@ -9,7 +9,7 @@ Headless, realtime filename index for Linux (macOS later). Daemon (`findexd`) + 
 | # | Lesson (source) | Design change |
 |---|---|---|
 | 1 | Reconciliation is core, not error handling (Watchman) | New §7: pending collection, diff-based rescans, backoff, degraded mode |
-| 2 | Cookies give a settle barrier (Watchman) | New §8: `sync` op; `fx --sync`; deterministic tests |
+| 2 | Cookies give a settle barrier (Watchman) | New §8: `sync` op; `ff --sync`; deterministic tests |
 | 3 | The journal is the clock (Watchman `since`) | §9/§11: LSN cursors, `--since`, subscription-ready protocol, `fresh` semantics |
 | 4 | Rescans must diff, not replace (Watchman) | Entry IDs stable across rescans (§3, §7) |
 | 5 | Probe the FS, don't assume (Watchman) | §4: per-mount capability probing, per-root flags |
@@ -41,7 +41,7 @@ Headless, realtime filename index for Linux (macOS later). Daemon (`findexd`) + 
 
 ```
 ┌───────────┐  unix socket, NDJSON  ┌────────────────────────────────────────────┐
-│ fx (CLI)  │◄─────────────────────►│                  findexd                   │
+│ ff (CLI)  │◄─────────────────────►│                  findexd                   │
 │ GUI later │  query/sync/since/    │                                            │
 └───────────┘  subscribe/stats      │  watcher backend (fanotify|inotify|FSEvents)│
                                     │        │ FsEvent                           │
@@ -117,7 +117,7 @@ At root-add (and on mount events), classify the mount from `/proc/self/mountinfo
 
 Exclusions: pseudo-FS (`proc`, `sysfs`, `devtmpfs`, `cgroup*`, `tracefs`, `overlay`), network FS unless opted in, user config excludes. Per-location watch enable/disable mirrors FSearch's monitor toggle.
 
-Surface everything via `fx stats --roots` — a mis-probed mount should be visible, not mysterious.
+Surface everything via `ff stats --roots` — a mis-probed mount should be visible, not mysterious.
 
 ---
 
@@ -215,8 +215,8 @@ The question every consumer eventually asks: *"has the daemon seen everything th
 **Users:**
 
 ```bash
-fx --sync main.rs              # deterministic: create file; fx; see it
-fx --sync && fx --count ext:rs # scriptable settle point
+ff --sync main.rs              # deterministic: create file; ff; see it
+ff --sync && ff --count ext:rs # scriptable settle point
 ```
 
 The same op is what makes the differential test suite (§14) deterministic — no sleeps anywhere.
@@ -278,21 +278,21 @@ Design rules carried from Watchman: coalesce per subscriber, slow clients catch 
 ## 12. CLI
 
 ```bash
-fx main.rs                       # instant search
-fx -0 "test" | xargs -0 rg TODO  # pipe-friendly; exit 1 on no match
-fx --count ext:pdf
-fx --json --limit 1000 "2024" | fzf
-fx --sync "notes"                # settle, then search — deterministic
-fx --since c:7:481221            # what changed since
-fx stats --roots                 # entries, backend, queue depth, drops,
+ff main.rs                       # instant search
+ff -0 "test" | xargs -0 rg TODO  # pipe-friendly; exit 1 on no match
+ff --count ext:pdf
+ff --json --limit 1000 "2024" | fzf
+ff --sync "notes"                # settle, then search — deterministic
+ff --since c:7:481221            # what changed since
+ff stats --roots                 # entries, backend, queue depth, drops,
                                  # recrawl_count, last_rescan_cause, per-root caps/state
-fx rescan /data
-fx update [--timeout 120] [ROOT...]  # reconcile all roots, then settle
-fx watch                         # tail live events (debugging; preview of subscribe)
-fx service install               # systemd user unit / launchd plist
+ff rescan /data
+ff update [--timeout 120] [ROOT...]  # reconcile all roots, then settle
+ff watch                         # tail live events (debugging; preview of subscribe)
+ff service install               # systemd user unit / launchd plist
 ```
 
-`fx` auto-spawns the daemon if not running and streams crawl progress in the meta line. Results stream as found; default order = index order (fastest), `--sort` opt-in.
+`ff` auto-spawns the daemon if not running and streams crawl progress in the meta line. Results stream as found; default order = index order (fastest), `--sort` opt-in.
 
 ---
 
@@ -311,7 +311,7 @@ Still boring, deliberately:
 The reconciliation layer is where this project lives or dies; test it like Watchman does:
 
 1. **Fake watcher backend.** The `WatchBackend` trait has a test implementation that injects arbitrary `FsEvent` sequences without a real filesystem — including events that *lie* (drop a create, duplicate a rename, interleave). Model-based tests assert the index converges to truth after rescans. Runs in milliseconds, 100× faster than FS-backed tests.
-2. **Real differential tests.** Random op sequences (create/delete/rename/move, via a temp dir) applied with `std::fs`; after each step: `fx --sync` (deterministic — no sleeps) → compare full index paths against `find`. This catches ~95% of watcher bugs.
+2. **Real differential tests.** Random op sequences (create/delete/rename/move, via a temp dir) applied with `std::fs`; after each step: `ff --sync` (deterministic — no sleeps) → compare full index paths against `find`. This catches ~95% of watcher bugs.
 3. **Fault injection**: simulated `IN_Q_OVERFLOW`; unpairable `MOVED_FROM`/`MOVED_TO`; `kill -9` mid-journal-write; mount/umount during crawl; watch-limit exhaustion (fill `max_user_watches` in a container).
 4. **Backoff tests**: a pathological event storm must converge to bounded rescan rate — assert the backoff, don't discover it in production.
 5. **24 h soak** with periodic `find` audits; zero drift is the bar.
@@ -324,9 +324,9 @@ Lessons from the Watchman/React-Native years, applied pre-emptively:
 
 - **Socket**: `$XDG_RUNTIME_DIR/findex.sock` (0600); system instance `/run/findex.sock`. Never `/tmp` (stale-socket class of bugs).
 - **State dir**: `$XDG_STATE_HOME/findex/<format-version>/` — versioned so a format change migrates or recrawls instead of corrupting. Stale-lock recovery via pidfile + `flock`.
-- **Health in `fx stats`**: `recrawl_count`, `last_rescan_cause` (not just "a rescan happened"), queue depth, drops, per-root state/caps, last compaction. Every rescan logs its cause.
+- **Health in `ff stats`**: `recrawl_count`, `last_rescan_cause` (not just "a rescan happened"), queue depth, drops, per-root state/caps, last compaction. Every rescan logs its cause.
 - **Backoff**: rate-limited rescans (§7); a pathological workload must not become a recrawl loop.
-- **sysctl guidance** for the inotify fallback documented in `fx doctor`: `fs.inotify.max_user_watches`, `max_queued_events`.
+- **sysctl guidance** for the inotify fallback documented in `ff doctor`: `fs.inotify.max_user_watches`, `max_queued_events`.
 - **Startup UX**: serve queries immediately from snapshot+journal; if the journal was unrecoverable, meta says `catching_up: true` until the rescan lands.
 
 ---
@@ -358,7 +358,7 @@ Lessons from the Watchman/React-Native years, applied pre-emptively:
 **Stack**: Rust — `libc` (getdents64/fanotify), `aho-corasick`, `memchr`, `crossbeam-channel`, `memmap2`, `arc-swap`, `regex`. (FSearch 0.2.x is the reference for the inotify path and GTK virtualization; Watchman docs for clocks/cookies/recrawl; Mercurial fsmonitor for the consumer side of `since`.)
 
 - **v1**: inotify backend + full reconciliation core (pending collection, diff rescans, backoff, degraded mode) + cookie sync + snapshot/journal with cursors + linear scan + differential/fake-backend test harness. *Reconciliation and sync ship in v1 — v1's lesson from Watchman is that these are correctness, not polish.*
-- **v1.5**: fanotify-FID backend, macOS FSEvents, `since`/`subscribe` ops live, regex/wildcards, `fx watch`, service units.
+- **v1.5**: fanotify-FID backend, macOS FSEvents, `since`/`subscribe` ops live, regex/wildcards, `ff watch`, service units.
 - **v2**: trigram accelerator, lazy attr sidecar keyed by stable IDs, GUI client on subscriptions.
 
 The durable insight of this revision: Everything's *index* is easy to replicate; Watchman's *discipline* — one pending collection, diffs over replacements, cookies for settle, clocks over guesses, loud degradation — is what turns a toy into infrastructure. Build both in from the start.

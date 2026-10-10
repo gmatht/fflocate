@@ -59,6 +59,6 @@ pub trait WatchBackend: Send {
     fn watch_dir(&mut self, id: u32, path: &std::path::Path) -> std::io::Result<()>;
     /// Return any events that arrived within `timeout`. Ordered.
     fn poll(&mut self, timeout: Duration) -> std::io::Result<Vec<FsEvent>>;
-    /// Human-readable backend name for `fx stats`.
+    /// Human-readable backend name for `ff stats`.
     fn name(&self) -> &'static str;
 }

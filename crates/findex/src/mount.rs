@@ -2,7 +2,7 @@
 //!
 //! At root-add (and on mount events) classify the mount from
 //! `/proc/self/mountinfo`, then **probe** rather than assume. Everything probed
-//! is surfaced via `fx stats --roots`: a mis-probed mount should be visible, not
+//! is surfaced via `ff stats --roots`: a mis-probed mount should be visible, not
 //! mysterious.
 
 use std::path::Path;

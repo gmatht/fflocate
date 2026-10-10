@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 fn bin_dir() -> Option<PathBuf> {
     let d = std::env::var("FINDEX_BIN_DIR").ok().map(PathBuf::from)?;
-    (d.join("findexd").exists() && d.join("fx").exists()).then_some(d)
+    (d.join("findexd").exists() && d.join("ff").exists()).then_some(d)
 }
 
 /// Watch backend for the spawned daemon (see fault_crash.rs). These tests
@@ -85,22 +85,22 @@ impl Drop for DaemonProc {
     }
 }
 
-fn fx(fxbin: &Path, socket: &Path, args: &[&str]) -> (String, i32) {
+fn ff(fxbin: &Path, socket: &Path, args: &[&str]) -> (String, i32) {
     let out = Command::new(fxbin)
         .args(args)
         .env("FINDEX_SOCKET", socket)
         .output()
-        .expect("run fx");
+        .expect("run ff");
     (String::from_utf8_lossy(&out.stdout).into_owned(), out.status.code().unwrap_or(-1))
 }
 
 fn stats_json(fxbin: &Path, socket: &Path) -> Option<serde_json::Value> {
-    let (o, c) = fx(fxbin, socket, &["stats", "--json", "--roots"]);
+    let (o, c) = ff(fxbin, socket, &["stats", "--json", "--roots"]);
     (c == 0 || !o.is_empty()).then(|| serde_json::from_str(&o).ok()).flatten()
 }
 
 fn paths_under(fxbin: &Path, socket: &Path) -> std::collections::BTreeSet<String> {
-    let (o, _) = fx(fxbin, socket, &["-l", "0", ""]);
+    let (o, _) = ff(fxbin, socket, &["-l", "0", ""]);
     o.lines().filter(|l| !l.is_empty()).map(|s| s.to_string()).collect()
 }
 
@@ -108,7 +108,7 @@ fn paths_under(fxbin: &Path, socket: &Path) -> std::collections::BTreeSet<String
 fn wait_serving(fxbin: &Path, socket: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        let (_, c) = fx(fxbin, socket, &["stats"]);
+        let (_, c) = ff(fxbin, socket, &["stats"]);
         if c == 0 {
             return true;
         }
@@ -139,7 +139,7 @@ fn mount_umount_during_crawl_degrades_and_recovers() {
         return;
     };
     let findexd = bins.join("findexd");
-    let fxbin = bins.join("fx");
+    let fxbin = bins.join("ff");
 
     // The *root itself* is a mount point, which is the realistic case: mount a
     // filesystem, index it, unmount it under the daemon, remount it. The backing
@@ -236,7 +236,7 @@ fn mount_umount_during_crawl_degrades_and_recovers() {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         std::thread::sleep(Duration::from_millis(200));
-        let _ = fx(&fxbin, &socket, &["rescan", &root.to_string_lossy()]);
+        let _ = ff(&fxbin, &socket, &["rescan", &root.to_string_lossy()]);
         std::thread::sleep(Duration::from_millis(200));
         let p = paths_under(&fxbin, &socket);
         if p.iter().any(|x| x.ends_with("mounted.rs")) {
@@ -257,7 +257,7 @@ fn root_vanishing_degrades_loudly() {
         return;
     };
     let findexd = bins.join("findexd");
-    let fxbin = bins.join("fx");
+    let fxbin = bins.join("ff");
     let d = tempfile::tempdir().unwrap();
     let root = d.path().join("tree");
     std::fs::create_dir_all(root.join("sub")).unwrap();
@@ -302,7 +302,7 @@ fn watch_limit_exhaustion_degrades_loudly_without_panic() {
         return;
     };
     let findexd = bins.join("findexd");
-    let fxbin = bins.join("fx");
+    let fxbin = bins.join("ff");
 
     // Lower the per-user inotify watch limit so our watches run out. Restore it
     // even if the test panics, via a guard.

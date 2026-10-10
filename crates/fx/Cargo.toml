@@ -1,13 +1,13 @@
 [package]
-name = "fx"
+name = "ff"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "fx: command-line client for the findex daemon."
+description = "ff: command-line client for the findex daemon."
 
 [[bin]]
-name = "fx"
+name = "ff"
 path = "src/main.rs"
 
 [dependencies]

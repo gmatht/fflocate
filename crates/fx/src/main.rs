@@ -1,20 +1,20 @@
-//! `fx` — the findex command-line client (§12).
+//! `ff` — the findex command-line client (§12).
 //!
 //! ```text
-//! fx main.rs                       # instant search
-//! fx -0 "test" | xargs -0 rg TODO  # pipe-friendly; exit 1 on no match
-//! fx --count ext:pdf
-//! fx --json --limit 1000 "2024"
-//! fx --sync "notes"                # settle, then search — deterministic
-//! fx --since c:7:481221            # what changed since
-//! fx stats --roots
-//! fx rescan /data
-//! fx update [--timeout 120] [ROOT...]  # reconcile all roots, then settle
-//! fx watch                         # tail live events
-//! fx service install               # systemd user unit / launchd plist
+//! ff main.rs                       # instant search
+//! ff -0 "test" | xargs -0 rg TODO  # pipe-friendly; exit 1 on no match
+//! ff --count ext:pdf
+//! ff --json --limit 1000 "2024"
+//! ff --sync "notes"                # settle, then search — deterministic
+//! ff --since c:7:481221            # what changed since
+//! ff stats --roots
+//! ff rescan /data
+//! ff update [--timeout 120] [ROOT...]  # reconcile all roots, then settle
+//! ff watch                         # tail live events
+//! ff service install               # systemd user unit / launchd plist
 //! ```
 //!
-//! `fx` auto-spawns the daemon if not running.
+//! `ff` auto-spawns the daemon if not running.
 
 mod client;
 mod find;
@@ -26,16 +26,16 @@ use std::process::ExitCode;
 use client::{Client, CliError};
 
 const USAGE: &str = "\
-fx — search the findex index
+ff — search the findex index
 
 USAGE:
-    fx [OPTIONS] [QUERY...]
-    fx stats [--roots] [--json]
-    fx rescan <ROOT>
-    fx update [--timeout SECS] [ROOT...]
-    fx watch [QUERY...]
-    fx service install [--socket PATH]
-    find ...                         # via a `find` or `fxfind` symlink
+    ff [OPTIONS] [QUERY...]
+    ff stats [--roots] [--json]
+    ff rescan <ROOT>
+    ff update [--timeout SECS] [ROOT...]
+    ff watch [QUERY...]
+    ff service install [--socket PATH]
+    find ...                         # via a `find` or `ffind` symlink
 
 OPTIONS:
     -c, --count         print only the number of matches
@@ -54,12 +54,12 @@ QUERY:
     wildcards; modifiers: ext:rs  path:src  case:Foo  regex:^a.*z$
 
     --expr runs Watchman's expression-tree language instead, e.g.
-      fx --expr '{\"expression\": [\"allof\", [\"type\",\"f\"], [\"suffix\",\"rs\"]]}'
-      fx --expr '[\"match\", \"**/*.rs\", \"wholename\"]'
-      fx --expr '{\"glob\": [\"**/*.rs\"], \"relative_root\": \"src\"}'
+      ff --expr '{\"expression\": [\"allof\", [\"type\",\"f\"], [\"suffix\",\"rs\"]]}'
+      ff --expr '[\"match\", \"**/*.rs\", \"wholename\"]'
+      ff --expr '{\"glob\": [\"**/*.rs\"], \"relative_root\": \"src\"}'
 
 UPDATE:
-    fx update reconciles every root with the filesystem (rescan, then
+    ff update reconciles every root with the filesystem (rescan, then
     settle) — the manual fix for changes the watcher missed: daemon
     downtime, offline edits, overflow gaps. With no ROOTs all roots are
     updated; otherwise only the named ones. One `status<TAB>root` line per
@@ -92,7 +92,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("fx: {e}");
+            eprintln!("ff: {e}");
             ExitCode::from(2)
         }
     }
@@ -105,7 +105,7 @@ fn run() -> Result<ExitCode, CliError> {
         return locate::run(&argv);
     }
 
-    // Drop-in `find` / `fxfind` replacement when invoked under either name.
+    // Drop-in `find` / `ffind` replacement when invoked under either name.
     if find::invoked_as_find() {
         let argv: Vec<String> = std::env::args().skip(1).collect();
         return find::run(&argv);
@@ -139,7 +139,7 @@ fn run() -> Result<ExitCode, CliError> {
                 println!("{st}\t{root}");
             }
             if !all_ok {
-                eprintln!("fx: update left a root unreconciled (see statuses above)");
+                eprintln!("ff: update left a root unreconciled (see statuses above)");
                 return Ok(ExitCode::from(1));
             }
             return Ok(ExitCode::SUCCESS);
@@ -166,7 +166,7 @@ fn run() -> Result<ExitCode, CliError> {
         // silently wrong (§7), yet the search still answers.
         for (root, st) in &status {
             if st != "ok" {
-                eprintln!("fx: warning: root {root} sync: {st}");
+                eprintln!("ff: warning: root {root} sync: {st}");
             }
         }
     }
@@ -190,7 +190,7 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<Args, CliError> {
                 std::process::exit(0);
             }
             "-V" | "--version" => {
-                println!("fx {}", env!("CARGO_PKG_VERSION"));
+                println!("ff {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "-c" | "--count" => a.count = true,

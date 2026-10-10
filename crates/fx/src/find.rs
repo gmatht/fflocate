@@ -1,6 +1,6 @@
 //! `find` compatibility mode (§12).
 //!
-//! When this binary is invoked as `find` or `fxfind` (argv\[0\], e.g. via a
+//! When this binary is invoked as `find` or `ffind` (argv\[0\], e.g. via a
 //! symlink), it acts as a `find`-compatible front end over the findex index.
 //!
 //! The plan is the two-phase one: translate the `find` expression into a
@@ -53,12 +53,17 @@ EXIT STATUS:
     2  usage error
 ";
 
-/// True when argv\[0\] names this binary `find` or `fxfind`.
+/// True when the basename `name` selects `find` mode.
+pub fn is_find_name(name: &OsStr) -> bool {
+    name == OsStr::new("find") || name == OsStr::new("ffind")
+}
+
+/// True when argv\[0\] names this binary `find` or `ffind`.
 pub fn invoked_as_find() -> bool {
     std::env::args_os()
         .next()
         .and_then(|a| Path::new(&a).file_name().map(|n| n.to_owned()))
-        .is_some_and(|n| n == OsStr::new("find") || n == OsStr::new("fxfind"))
+        .is_some_and(|n| is_find_name(&n))
 }
 
 /// One entry in the *metadata* (phase 2) position, filled by `lstat` on the
@@ -331,7 +336,7 @@ impl Plan {
                 "-exec" | "-execdir" | "-delete" | "-ok" => {
                     return Err(CliError::Usage(format!(
                         "find: {a} is not supported (findex does not run actions); \
-                         this is deliberate — use `fx -0 ... | xargs`"
+                         this is deliberate — use `ff -0 ... | xargs`"
                     )))
                 }
                 "-L" | "-H" | "-P" | "-follow" => {
@@ -512,6 +517,14 @@ mod tests {
 
     #[test]
     fn argv0_detection_helpers() {
+        // The names that select find mode.
+        assert!(is_find_name(OsStr::new("find")));
+        assert!(is_find_name(OsStr::new("ffind")));
+        // These must NOT select find mode.
+        for other in ["ff", "fx", "fxfind", "findx", "locate", "", "FIND"] {
+            assert!(!is_find_name(OsStr::new(other)), "{other:?} must not select find mode");
+        }
+
         // Sanity: the pure helpers we can test without touching argv.
         assert_eq!(parse_size("10c").unwrap(), (Sign::Eq, 10));
         assert_eq!(parse_size("+1k").unwrap(), (Sign::Greater, 1024));

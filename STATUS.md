@@ -17,7 +17,7 @@ it is a status note.
 | §9 Snapshot + journal + cursors + compaction | done | `crates/findex/src/{snapshot,journal,persist,cursor}.rs` |
 | §10 Query engine | done | `crates/findex/src/query.rs` |
 | §11 IPC protocol v2 | done | `crates/findex/src/proto.rs`, `server.rs` |
-| §12 CLI | done | `crates/fx/src/{main,client,service}.rs` |
+| §12 CLI | done | `crates/fx/src/{main,client,service}.rs` (binary `ff`; the `fx` name collides with the snap JSON viewer. Crate dir kept as `crates/fx`.) |
 | §13 Concurrency model | done | `crates/findex/src/applier.rs`, `crates/findexd/src/daemon.rs` |
 | §14 Testing | done (§14.1–.5) | `crates/findex/tests/*`, `crates/findexd/tests/*`, `scripts/e2e.sh` |
 | §15 Operations and hardening | mostly | `config_paths.rs`, `net.rs`, `health.rs` |
@@ -26,14 +26,14 @@ it is a status note.
 
 All of the following were exercised against real binaries and a real temp tree:
 
-* `fx rs`, `fx --count ext:rs`, `fx --json`, `fx -0` — search paths.
-* `fx --sync ext:txt` after creating files with **no sleeps** in between;
+* `ff rs`, `ff --count ext:rs`, `ff --json`, `ff -0` — search paths.
+* `ff --sync ext:txt` after creating files with **no sleeps** in between;
   all files visible afterwards (deterministic settle barrier).
 * **Live inotify**: create a file → visible without `--sync`; rename it (MOVED
   pair) → new name visible, old name gone; delete it → gone. This is real
   kernel inotify, not the fake backend.
-* `fx stats --roots` — gen/lsn/entries/tombstones, per-root state/fstype/caps.
-* `fx rescan <root>`, `fx --since <cursor>` (cursor is `c:<gen>:<lsn>`).
+* `ff stats --roots` — gen/lsn/entries/tombstones, per-root state/fstype/caps.
+* `ff rescan <root>`, `ff --since <cursor>` (cursor is `c:<gen>:<lsn>`).
 * Daemon restart: the index came back from **journal replay** without a
   recrawl (`journal.log` present, no snapshot yet; `catching_up` cleared once
   the queue drained).
@@ -44,11 +44,11 @@ differential test against a from-scratch filesystem walk.
 
 ### `locate` drop-in (`crates/fx/src/locate.rs`)
 
-Invoking the `fx` binary as `locate` (argv\[0\], e.g. a symlink) speaks GNU
+Invoking the `ff` binary as `locate` (argv\[0\], e.g. a symlink) speaks GNU
 locate: substring/`*PATTERN*` semantics, full-path shell globs (`*` crosses
 `/`, translated to anchored `pcre`), `-r/--regex`, `-b`, `-i`, `-A`
 (anyof/allof), `-c`, `-l`, `-0`, `-e` (with `-L`/`-P` symlink handling),
-`-q`, `-S` (maps to `fx stats`), `-d` accepted and ignored — the live index
+`-q`, `-S` (maps to `ff stats`), `-d` accepted and ignored — the live index
 replaces the updatedb snapshot. Same exit statuses (0/1/2). Covered by unit
 tests (parsing, glob→regex) and `crates/fx/tests/locate_e2e.rs` (symlinked
 binary against a real daemon, incl. the dangling-symlink `-e`/`-L` case),
@@ -112,7 +112,7 @@ These are deliberate and small; each is noted so the design stays honest.
 
 2. **`subscribe` is a preview.** Per §11 it is "v1.5". The op is accepted and
    answers with meta + the current cursor, but there is no live per-subscriber
-   feed yet. `fx watch` therefore tails one snapshot, not a stream.
+   feed yet. `ff watch` therefore tails one snapshot, not a stream.
 
 3. **`since` emits coarse deltas.** The change log stores cursors at which the
    index changed, not per-path records, so `--since <cursor>` reports matching
@@ -163,16 +163,16 @@ These are deliberate and small; each is noted so the design stays honest.
 cargo build --release
 cargo test
 # a live demo, real inotify:
-#   see the transcript in the commit/PR message, or run the daemon + fx by hand
+#   see the transcript in the commit/PR message, or run the daemon + ff by hand
 ```
 
 ## Honest health
 
-`fx stats` is the operational surface. If a root is degraded, a rescan was
+`ff stats` is the operational surface. If a root is degraded, a rescan was
 deferred, the journal was corrupt, or the daemon is still catching up, it is
 visible there — the design's "loudly stale beats silently wrong" rule.
 
-`fx update [--timeout 120] [ROOT...]` is the manual update (the updatedb
+`ff update [--timeout 120] [ROOT...]` is the manual update (the updatedb
 equivalent): rescan every root, then settle. A rescan enqueued before the
 sync cookie cannot complete after it (pending ordering), so a root reporting
 `ok` is reconciled with the filesystem — this heals downtime/offline edits

@@ -108,7 +108,7 @@ fn soak_thousands_of_ops_zero_drift() {
 
     let settle = |applier: &mut Applier| {
         // Drain everything, then reconcile with a rescan (the deterministic
-        // equivalent of `fx --sync`, plus the safety rescan a real watcher would
+        // equivalent of `ff --sync`, plus the safety rescan a real watcher would
         // trigger on any missed event).
         for _ in 0..8 {
             applier.drain();

@@ -2,7 +2,7 @@
 //!
 //! The socket and state-dir locations are part of the daemon/client contract,
 //! so they live in the core library. Both honour the `FINDEX_SOCKET` /
-//! `FINDEX_STATE_DIR` environment overrides (used by tests and by `fx` when it
+//! `FINDEX_STATE_DIR` environment overrides (used by tests and by `ff` when it
 //! auto-spawns a daemon).
 
 use std::path::PathBuf;

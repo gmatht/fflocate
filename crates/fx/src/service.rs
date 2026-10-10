@@ -1,4 +1,4 @@
-//! `fx service install` — write a systemd user unit / launchd plist (§12, §15).
+//! `ff service install` — write a systemd user unit / launchd plist (§12, §15).
 //!
 //! We do not enable or start anything automatically; we write the unit and tell
 //! the operator the two commands to run. Silently mutating the user's session is

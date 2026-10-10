@@ -1,9 +1,9 @@
-//! `fx update` end-to-end: the offline-edits scenario (§7/§15).
+//! `ff update` end-to-end: the offline-edits scenario (§7/§15).
 //!
 //! A daemon indexes a tree and dies (kill -9). The tree is edited while no
 //! watcher runs — a file deleted, a file added. After restart the index is
 //! stale (a restart crawl only *adds*; nothing removes the deleted file),
-//! and `fx update` must converge it to filesystem truth. The stats assertion
+//! and `ff update` must converge it to filesystem truth. The stats assertion
 //! (`last_rescan_cause=manual`) proves the update's own rescan did the work,
 //! not startup.
 //!
@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 fn bin_dir() -> Option<PathBuf> {
     let d = std::env::var("FINDEX_BIN_DIR").ok().map(PathBuf::from)?;
-    (d.join("findexd").exists() && d.join("fx").exists()).then_some(d)
+    (d.join("findexd").exists() && d.join("ff").exists()).then_some(d)
 }
 
 fn backend_arg() -> &'static str {
@@ -60,13 +60,13 @@ fn kill9(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Run the real `fx` with an isolated socket; returns (stdout, exit code).
-fn fx(fxbin: &Path, socket: &Path, args: &[&str]) -> (String, i32) {
+/// Run the real `ff` with an isolated socket; returns (stdout, exit code).
+fn ff(fxbin: &Path, socket: &Path, args: &[&str]) -> (String, i32) {
     let out = Command::new(fxbin)
         .args(args)
         .env("FINDEX_SOCKET", socket)
         .output()
-        .expect("run fx");
+        .expect("run ff");
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         out.status.code().unwrap_or(-1),
@@ -74,13 +74,13 @@ fn fx(fxbin: &Path, socket: &Path, args: &[&str]) -> (String, i32) {
 }
 
 fn listing(fxbin: &Path, socket: &Path) -> std::collections::BTreeSet<String> {
-    let (out, _) = fx(fxbin, socket, &["-l", "0", ""]);
+    let (out, _) = ff(fxbin, socket, &["-l", "0", ""]);
     out.lines().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect()
 }
 
 fn settle(fxbin: &Path, socket: &Path) {
     for _ in 0..100 {
-        let (_, code) = fx(fxbin, socket, &["--sync", "", "-l", "1", ""]);
+        let (_, code) = ff(fxbin, socket, &["--sync", "", "-l", "1", ""]);
         if code == 0 {
             return;
         }
@@ -96,7 +96,7 @@ fn update_heals_offline_edits_after_downtime() {
         return;
     };
     let findexd = bindir.join("findexd");
-    let fxbin = bindir.join("fx");
+    let fxbin = bindir.join("ff");
     let d = tempfile::tempdir().unwrap();
     let root = d.path().join("tree");
     let state = d.path().join("state");
@@ -127,7 +127,7 @@ fn update_heals_offline_edits_after_downtime() {
     );
 
     // The manual update converges to filesystem truth.
-    let (out, code) = fx(&fxbin, &socket, &["update", "--timeout", "60"]);
+    let (out, code) = ff(&fxbin, &socket, &["update", "--timeout", "60"]);
     assert_eq!(code, 0, "update output:\n{out}");
     assert!(out.contains("ok"), "per-root status expected:\n{out}");
     assert!(out.contains(&root.to_string_lossy().into_owned()), "output names the root:\n{out}");
@@ -137,7 +137,7 @@ fn update_heals_offline_edits_after_downtime() {
     assert_eq!(got, want, "index must equal filesystem truth after update");
 
     // And it was update's own rescan that did it.
-    let (stats, _) = fx(&fxbin, &socket, &["stats", "--roots"]);
+    let (stats, _) = ff(&fxbin, &socket, &["stats", "--roots"]);
     assert!(
         stats.contains("last_rescan_cause=manual"),
         "update must land a manual rescan:\n{stats}"
@@ -153,7 +153,7 @@ fn update_unknown_root_is_an_error() {
         return;
     };
     let findexd = bindir.join("findexd");
-    let fxbin = bindir.join("fx");
+    let fxbin = bindir.join("ff");
     let d = tempfile::tempdir().unwrap();
     let root = d.path().join("tree");
     let state = d.path().join("state");
@@ -166,11 +166,11 @@ fn update_unknown_root_is_an_error() {
     let mut daemon = spawn(&findexd, &socket, &state, &root);
     settle(&fxbin, &socket);
 
-    let (out, code) = fx(&fxbin, &socket, &["update", "/no-such-root-xyz"]);
+    let (out, code) = ff(&fxbin, &socket, &["update", "/no-such-root-xyz"]);
     assert_eq!(code, 2, "unknown root must be an error, got:\n{out}");
 
     // Scoped update of the real root succeeds.
-    let (out, code) = fx(
+    let (out, code) = ff(
         &fxbin,
         &socket,
         &["update", &root.to_string_lossy()],

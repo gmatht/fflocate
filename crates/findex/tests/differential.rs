@@ -78,7 +78,7 @@ fn fixture() -> Fixture {
 
 impl Fixture {
     /// Settle: drain everything and run a full rescan to reconcile any missed
-    /// events (the deterministic equivalent of `fx --sync` + a safety rescan).
+    /// events (the deterministic equivalent of `ff --sync` + a safety rescan).
     fn settle(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

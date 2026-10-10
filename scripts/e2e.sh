@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the non-hermetic end-to-end tests: the ones that spawn real `findexd`
-# and `fx` binaries and, in some cases, need a real kernel (inotify, and the
+# and `ff` binaries and, in some cases, need a real kernel (inotify, and the
 # crash/mount/watch-limit fault injection from DESIGN.md §14.3).
 #
 # These are kept out of a plain `cargo test` so that `cargo test` stays hermetic
@@ -40,11 +40,11 @@ cargo test -p findexd --test daemon_e2e -- --nocapture
 
 echo
 echo "== locate compatibility via symlinked argv[0] (§12) =="
-cargo test -p fx --test locate_e2e -- --test-threads=1 --nocapture
+cargo test -p ff --test locate_e2e -- --test-threads=1 --nocapture
 
 echo
 echo "== manual update heals offline edits (§7/§15) =="
-cargo test -p fx --test update_e2e -- --test-threads=1 --nocapture
+cargo test -p ff --test update_e2e -- --test-threads=1 --nocapture
 
 echo
 echo "all e2e checks passed"

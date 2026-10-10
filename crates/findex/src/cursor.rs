@@ -35,7 +35,7 @@ impl Cursor {
             }
             Some(Cursor { gen, lsn })
         } else {
-            // Bare LSN is accepted for `fx --since <lsn>` convenience.
+            // Bare LSN is accepted for `ff --since <lsn>` convenience.
             None
         }
     }

@@ -19,9 +19,9 @@ fn bin_dir() -> Option<PathBuf> {
 fn binaries() -> Option<(PathBuf, PathBuf)> {
     let d = bin_dir()?;
     let findexd = d.join("findexd");
-    let fx = d.join("fx");
-    if findexd.exists() && fx.exists() {
-        Some((findexd, fx))
+    let ff = d.join("ff");
+    if findexd.exists() && ff.exists() {
+        Some((findexd, ff))
     } else {
         None
     }
@@ -100,12 +100,12 @@ impl Drop for DaemonProc {
 }
 
 /// Ask the CLI a question; returns the CLI's stdout lines.
-fn fx(fxbin: &Path, socket: &Path, args: &[&str]) -> (String, i32) {
+fn ff(fxbin: &Path, socket: &Path, args: &[&str]) -> (String, i32) {
     let out = Command::new(fxbin)
         .args(args)
         .env("FINDEX_SOCKET", socket)
         .output()
-        .expect("run fx");
+        .expect("run ff");
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         out.status.code().unwrap_or(-1),
@@ -132,11 +132,11 @@ fn indexed(fxbin: &Path, socket: &Path, root: &Path) -> std::collections::BTreeS
     // Force an explicit reconcile first so we compare the *healed* state, which
     // is what the design promises after a crash (§7: degrade to work).
     let root_s = root.to_string_lossy().into_owned();
-    let _ = fx(fxbin, socket, &["rescan", &root_s]);
+    let _ = ff(fxbin, socket, &["rescan", &root_s]);
     std::thread::sleep(Duration::from_millis(50));
-    let (out, _) = fx(fxbin, socket, &["-l", "0", ""]);
+    let (out, _) = ff(fxbin, socket, &["-l", "0", ""]);
     out.lines()
-        .filter(|l| !l.is_empty() && !l.starts_with("fx:"))
+        .filter(|l| !l.is_empty() && !l.starts_with("ff:"))
         .map(|l| l.to_string())
         .collect()
 }
@@ -163,7 +163,7 @@ fn kill9_mid_write_then_restart_is_consistent_and_converges() {
         let mut daemon = DaemonProc::spawn(&findexd, &socket, &state, &root);
         // Let the crawl land.
         for _ in 0..50 {
-            let (_, code) = fx(&fxbin, &socket, &["--sync", "", "-l", "1", ""]);
+            let (_, code) = ff(&fxbin, &socket, &["--sync", "", "-l", "1", ""]);
             if code == 0 {
                 break;
             }
@@ -196,7 +196,7 @@ fn kill9_mid_write_then_restart_is_consistent_and_converges() {
     // Wait for the daemon to be serving (hello).
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let (out, code) = fx(&fxbin, &socket, &["stats"]);
+        let (out, code) = ff(&fxbin, &socket, &["stats"]);
         if code == 0 && out.contains("entries") {
             break;
         }
@@ -210,7 +210,7 @@ fn kill9_mid_write_then_restart_is_consistent_and_converges() {
         indexed(&fxbin, &socket, &root); // triggers a rescan
         std::thread::sleep(Duration::from_millis(100));
         let got = {
-            let (out, _) = fx(&fxbin, &socket, &["-l", "0", ""]);
+            let (out, _) = ff(&fxbin, &socket, &["-l", "0", ""]);
             out.lines().filter(|l| !l.is_empty()).map(|s| s.to_string()).collect::<std::collections::BTreeSet<_>>()
         };
         let want = truth(&root);
@@ -269,7 +269,7 @@ fn torn_journal_tail_after_crash_recovers_without_wedging() {
     let mut daemon = DaemonProc::spawn(&findexd, &socket, &state, &root);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let (out, code) = fx(&fxbin, &socket, &["stats", "--json"]);
+        let (out, code) = ff(&fxbin, &socket, &["stats", "--json"]);
         if code == 0 {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&out) {
                 if v.get("journal_corrupt").and_then(|b| b.as_bool()) == Some(true) {
@@ -284,7 +284,7 @@ fn torn_journal_tail_after_crash_recovers_without_wedging() {
     loop {
         indexed(&fxbin, &socket, &root);
         std::thread::sleep(Duration::from_millis(100));
-        let (out, _) = fx(&fxbin, &socket, &["-l", "0", ""]);
+        let (out, _) = ff(&fxbin, &socket, &["-l", "0", ""]);
         let got: std::collections::BTreeSet<String> =
             out.lines().filter(|l| !l.is_empty()).map(|s| s.to_string()).collect();
         if got == truth(&root) {
@@ -327,7 +327,7 @@ fn kill9_repeatedly_never_wedges_the_store() {
     let mut daemon = DaemonProc::spawn(&findexd, &socket, &state, &root);
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let (out, code) = fx(&fxbin, &socket, &["stats"]);
+        let (out, code) = ff(&fxbin, &socket, &["stats"]);
         if code == 0 && out.contains("entries") {
             break;
         }
@@ -338,7 +338,7 @@ fn kill9_repeatedly_never_wedges_the_store() {
     loop {
         indexed(&fxbin, &socket, &root);
         std::thread::sleep(Duration::from_millis(100));
-        let (out, _) = fx(&fxbin, &socket, &["-l", "0", ""]);
+        let (out, _) = ff(&fxbin, &socket, &["-l", "0", ""]);
         let got: std::collections::BTreeSet<String> =
             out.lines().filter(|l| !l.is_empty()).map(|s| s.to_string()).collect();
         if got == truth(&root) {

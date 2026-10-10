@@ -192,7 +192,7 @@ impl Pending {
     pub fn cookies_len(&self) -> usize {
         self.cookies.len()
     }
-    /// Depth as surfaced in `fx stats` (§15).
+    /// Depth as surfaced in `ff stats` (§15).
     pub fn depth(&self) -> usize {
         self.events.len() + self.work.len()
     }

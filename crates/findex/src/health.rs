@@ -1,7 +1,7 @@
 //! Health counters and telemetry (§7, §15).
 //!
 //! "Loudly stale beats silently wrong." Everything the daemon knows about its
-//! own health lives here, and `fx stats` renders it verbatim.
+//! own health lives here, and `ff stats` renders it verbatim.
 
 use crate::event::RescanCause;
 
@@ -44,7 +44,7 @@ impl ChangeLog {
     }
 }
 
-/// Counters surfaced by `fx stats` and `fx stats --roots`.
+/// Counters surfaced by `ff stats` and `ff stats --roots`.
 #[derive(Clone, Debug, Default)]
 pub struct Health {
     pub recrawl_count: u64,
