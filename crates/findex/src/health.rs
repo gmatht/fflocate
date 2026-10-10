@@ -56,6 +56,11 @@ pub struct Health {
     pub journal_write_errors: u64,
     pub journal_corrupt: bool,
     pub read_dir_errors: u64,
+    /// Watches the kernel refused to install (e.g. watch-limit exhaustion, §15).
+    pub watch_failures: u64,
+    pub watch_limit_hits: u64,
+    /// Mount changes detected by the watchdog (§16 mount churn).
+    pub mount_events: u64,
     pub dropped_events: u64,
     pub escalated_events: u64,
     pub last_compaction_ms: u64,
@@ -78,6 +83,9 @@ impl Health {
             "journal_write_errors": self.journal_write_errors,
             "journal_corrupt": self.journal_corrupt,
             "read_dir_errors": self.read_dir_errors,
+            "watch_failures": self.watch_failures,
+            "watch_limit_hits": self.watch_limit_hits,
+            "mount_events": self.mount_events,
             "dropped_events": self.dropped_events,
             "escalated_events": self.escalated_events,
             "last_compaction_ms": self.last_compaction_ms,

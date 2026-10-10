@@ -81,8 +81,11 @@ pub enum FsEvent {
     /// Re-enumerate the whole subtree rooted at `dir` and diff against the
     /// index (§7). Never a silent drop.
     RescanSubtree { dir: DirKey, cause: RescanCause },
-    /// The mount backing `root` went away; drop the subtree, await remount.
-    RootGone { root: RootId },
+    /// The mount backing the subtree rooted at `dir` went away; drop the
+    /// subtree, await remount. `dir` is a directory id (roots are identified in
+    /// the index by their root-dir entry, not by the roots-table index, which a
+    /// backend cannot know).
+    RootGone { dir: DirKey },
 }
 
 impl FsEvent {

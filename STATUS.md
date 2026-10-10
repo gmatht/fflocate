@@ -19,7 +19,7 @@ it is a status note.
 | §11 IPC protocol v2 | done | `crates/findex/src/proto.rs`, `server.rs` |
 | §12 CLI | done | `crates/fx/src/{main,client,service}.rs` |
 | §13 Concurrency model | done | `crates/findex/src/applier.rs`, `crates/findexd/src/daemon.rs` |
-| §14 Testing | done (§14.1–.4) | `crates/findex/tests/*`, `crates/findexd/tests/*` |
+| §14 Testing | done (§14.1–.5) | `crates/findex/tests/*`, `crates/findexd/tests/*`, `scripts/e2e.sh` |
 | §15 Operations and hardening | mostly | `config_paths.rs`, `net.rs`, `health.rs` |
 
 ## Verified behaviour
@@ -39,8 +39,40 @@ All of the following were exercised against real binaries and a real temp tree:
   the queue drained).
 * Cookie files are cleaned up on completion and on timeout (no leaks).
 
-`cargo test` runs 122 tests, all green, including a 120-step random
+`cargo test` runs 158 tests, all green, including a 120-step random
 differential test against a from-scratch filesystem walk.
+
+### Fault injection and soak (§14.3, §14.5)
+
+These spawn real binaries and need kernel capabilities, so they live behind
+`scripts/e2e.sh` (`FINDEX_BIN_DIR`) or `--ignored`:
+
+* `crates/findexd/tests/fault_crash.rs` — SIGKILL a live `findexd` mid-churn;
+  restart. Plus a **deterministic torn journal tail** (truncate mid-record, which
+  is what a real power loss produces; a page-cache SIGKILL on tmpfs rarely
+  tears) and **four rounds of repeated `kill -9`**. Every restart comes up,
+  reports `journal_corrupt` when torn, never wedges, and converges to filesystem
+  truth after a rescan.
+* `crates/findexd/tests/fault_fsops.rs` — a real bind mount on a distinct tmpfs,
+  unmounted under the daemon; a **mount watchdog** notices the device-id change,
+  logs `cause=mount_event`, and reconciles. Also: a root whose path vanishes is
+  reported `degraded(root_gone)`, and **watch-limit exhaustion** (lowering
+  `fs.inotify.max_user_watches` to 8, restored even on panic) degrades the root
+  loudly in `watch_failures`/`watch_limit_hits` with no panic.
+* `crates/findex/tests/soak.rs` — a bounded soak: 20 000 random namespace ops
+  with live event injection, a full-tree audit every 2 000 ops and a final one,
+  asserting **zero drift** and stable survivor ids. It also drives compaction
+  (threshold lowered to 1 500 records). `FINDEX_SOAK_OPS` / `FINDEX_SOAK_AUDIT`
+  raise the budget for a long run; `#[ignore]`d so `cargo test` stays quick.
+
+### An important finding
+
+**`IN_UNMOUNT` is not delivered on this platform (WSL2)** — verified with a
+standalone inotify probe: unmounting produces no event on either the mount point
+or a subdirectory inside it. The design's `IN_UNMOUNT → RootGone` therefore
+cannot be the only mount-detection mechanism, so the daemon gained a portable
+**mount watchdog** (compare each root's `st_dev` periodically). The backend still
+handles `IN_UNMOUNT` where it is delivered.
 
 ## Deviations from the design
 
@@ -91,6 +123,13 @@ These are deliberate and small; each is noted so the design stays honest.
 * Deferred rescans (backoff) were silently dropped. Fixed to re-enqueue; the
   drain loop stops on a deferral so it does not spin.
 * `since` never emitted a terminal response, hanging the client. Fixed.
+* `FsEvent::RootGone` carried a *root index*, but the inotify backend can only
+  know a *directory id* — so an unmount dropped the wrong thing (or nothing).
+  Changed the event to carry the dir id; the applier drops that subtree.
+* A failed `watch_dir` was silently swallowed (`let _ = ...`), so
+  watch-limit exhaustion produced no degradation and no counter. Now the watcher
+  thread reports failures to the applier, which marks the root degraded and bumps
+  `watch_failures`/`watch_limit_hits` — loudly stale, not silently wrong.
 
 ## Reproducing the checks
 

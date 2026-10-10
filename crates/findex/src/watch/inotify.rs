@@ -187,7 +187,7 @@ impl InotifyBackend {
             }
             if ev.mask & IN_UNMOUNT != 0 {
                 if let Some(dir) = self.dir_of_wd(ev.wd) {
-                    out.push(FsEvent::RootGone { root: dir });
+                    out.push(FsEvent::RootGone { dir: DirKey::new(dir) });
                 }
                 continue;
             }
@@ -400,7 +400,7 @@ mod tests {
         let (mut b, _wd) = backend_with_watches();
         let buf = encode_event(1, IN_UNMOUNT, 0, b"");
         let evs = b.parse_buffer(&buf);
-        assert_eq!(evs, vec![FsEvent::RootGone { root: 100 }]);
+        assert_eq!(evs, vec![FsEvent::RootGone { dir: DirKey::new(100) }]);
     }
 
     #[test]

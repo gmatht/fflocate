@@ -145,6 +145,16 @@ pub fn is_writable(path: &Path) -> bool {
     unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
 }
 
+/// `st_dev` of a path, or `None` if it does not exist. Used by the daemon's
+/// mount watchdog: a change in device id means the mount was replaced
+/// underneath us (a remount or a different filesystem mounted on the same
+/// point) — the portable signal, because `IN_UNMOUNT` is not delivered on every
+/// platform (it is missing under WSL2, for instance).
+pub fn probe_dev(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.dev())
+}
+
 /// Does `name_to_handle_at` work on `path`? (fanotify-FID viability, §4.)
 pub fn has_file_handle(path: &Path) -> bool {
     use std::ffi::CString;

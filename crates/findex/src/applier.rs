@@ -296,10 +296,11 @@ impl Applier {
             FsEvent::RescanSubtree { dir, cause } => {
                 self.pending.enqueue_rescan(dir.0, cause);
             }
-            FsEvent::RootGone { root } => {
-                let rid = self.root_dir_ids.get(root as usize).copied().unwrap_or(ROOT_ID);
-                if rid != ROOT_ID {
-                    self.drop_subtree(rid);
+            FsEvent::RootGone { dir } => {
+                // Drop the subtree rooted at this directory. If it *is* a root
+                // dir, the whole root goes; otherwise just the mounted subtree.
+                if dir.0 != ROOT_ID {
+                    self.drop_subtree(dir.0);
                 }
             }
         }
@@ -413,6 +414,11 @@ impl Applier {
         let mut new_dirs = Vec::new();
         for it in items {
             if it.name == b"." || it.name == b".." {
+                continue;
+            }
+            // Sync cookies must never be indexed (§8, §16); `diff_subtree` and
+            // the event path filter them, and so must the initial/subtree crawl.
+            if crate::util::is_cookie(&it.name) {
                 continue;
             }
             let exists = {
@@ -665,6 +671,74 @@ impl Applier {
     /// Resolve the absolute path of a directory id using the roots table.
     pub fn abs_path_public(&mut self, id: u32) -> Option<PathBuf> {
         self.abs_path_for(id)
+    }
+
+    /// Inverse of the path cache: the directory id whose cached absolute path
+    /// equals `path`. Used by tests that emulate the watcher's `wd -> dir id`
+    /// lookup; `None` if the directory is not known.
+    pub fn dir_id_for_path(&self, path: &Path) -> Option<u32> {
+        self.dir_paths.iter().find(|(_, p)| p.as_path() == path).map(|(id, _)| *id)
+    }
+
+    /// A watch could not be installed for `dir` (e.g. inotify watch-limit
+    /// exhaustion). Mark the owning root degraded and record it in health —
+    /// loudly stale, never silently wrong (§7, §15). The subtree stays in the
+    /// index and remains searchable.
+    pub fn note_watch_failure(&mut self, dir: u32, reason: &str) {
+        let is_limit = reason.contains("No space left") || reason.contains("os error 28");
+        {
+            let mut h = self.shared.health.write().unwrap();
+            if is_limit {
+                h.watch_limit_hits += 1;
+            }
+            h.watch_failures += 1;
+        }
+        if let Some(ri) = self.root_index_of_dir_or_self(dir) {
+            let mut roots = self.shared.roots.write().unwrap();
+            let why = if is_limit {
+                format!("watch_limit_exhausted: {reason}")
+            } else {
+                format!("watch_failed: {reason}")
+            };
+            roots[ri].state = RootState::Degraded { reason: why };
+            roots[ri].last_rescan_cause = Some(crate::event::RescanCause::WatchDropped);
+            roots[ri].last_rescan_at_ms = now_ms();
+        }
+    }
+
+    /// Like `root_index_of_dir`, but falls back to matching `dir` against the
+    /// root dir ids directly (a failed watch may be for a dir we could not
+    /// resolve through the index yet).
+    fn root_index_of_dir_or_self(&self, dir: u32) -> Option<usize> {
+        if let Some(ri) = self.root_index_of_dir(dir) {
+            return Some(ri);
+        }
+        self.root_dir_ids.iter().position(|&r| r == dir)
+    }
+
+    /// The mount backing a root disappeared: mark it degraded, loudly.
+    pub fn note_mount_gone(&mut self, dir: u32, path: &str) {
+        if let Some(ri) = self.root_index_of_dir_or_self(dir) {
+            let mut roots = self.shared.roots.write().unwrap();
+            let mut r = roots.swap_remove(ri);
+            r.state = RootState::Degraded {
+                reason: format!("root_gone: {path}"),
+            };
+            r.last_rescan_cause = Some(RescanCause::MountEvent);
+            r.last_rescan_at_ms = now_ms();
+            roots.insert(ri, r);
+        }
+    }
+
+    /// A different filesystem is now mounted at a root: record the new device id
+    /// and mark the root rescanning.
+    pub fn note_mount_remounted(&mut self, dir: u32, old_dev: u64, new_dev: u64) {
+        if let Some(ri) = self.root_index_of_dir_or_self(dir) {
+            let mut roots = self.shared.roots.write().unwrap();
+            roots[ri].dev = new_dev;
+            roots[ri].state = RootState::Rescanning;
+            let _ = old_dev;
+        }
     }
 
     /// Compact if the journal has grown past the threshold. Returns true if a

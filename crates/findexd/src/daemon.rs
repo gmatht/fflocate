@@ -40,6 +40,14 @@ use crate::config::{BackendChoice, Config};
 /// (install watches).
 pub type SharedBackend = Arc<Mutex<Box<dyn WatchBackend>>>;
 
+/// A watch that could not be installed. Reported from the watcher thread to the
+/// applier so the root can be marked degraded — a failed watch is never silent.
+#[derive(Clone, Debug)]
+pub struct WatchFailure {
+    pub dir: u32,
+    pub reason: String,
+}
+
 /// Build the configured backend.
 pub fn make_backend(choice: BackendChoice) -> anyhow::Result<SharedBackend> {
     let b: Box<dyn WatchBackend> = match choice {
@@ -63,6 +71,9 @@ pub struct Daemon {
     watched_dirs: std::collections::HashSet<u32>,
     /// Watch requests from the applier to the watcher thread (new dirs).
     watch_tx: Sender<(u32, PathBuf)>,
+    /// Watch failures from the watcher thread back to the applier.
+    watch_fail_tx: Sender<WatchFailure>,
+    watch_fail_rx: Receiver<WatchFailure>,
     incoming_rx: Receiver<Vec<FsEvent>>,
     incoming_tx: Sender<Vec<FsEvent>>,
     control_rx: Receiver<Control>,
@@ -70,6 +81,8 @@ pub struct Daemon {
     applier_stop: Arc<AtomicBool>,
     watcher_stop: Arc<AtomicBool>,
     watcher_thread: Option<std::thread::JoinHandle<()>>,
+    /// Last time the mount watchdog ran (ms since epoch).
+    last_mount_check_ms: u64,
     /// Kept until `start()` moves it into the watcher thread.
     watch_rx: Option<Receiver<(u32, PathBuf)>>,
 }
@@ -108,6 +121,7 @@ impl Daemon {
                 }
             }
             root.caps = mount::probe_root(&root.path);
+            root.dev = mount::probe_dev(&root.path).unwrap_or(0);
         }
 
         // Replay the journal tail. `replay` reports the records; we apply them
@@ -133,6 +147,7 @@ impl Daemon {
         let (incoming_tx, incoming_rx) = bounded::<Vec<FsEvent>>(1000);
         let (control_tx, control_rx) = bounded::<Control>(64);
         let (watch_tx, watch_rx) = bounded::<(u32, PathBuf)>(4096);
+        let (watch_fail_tx, watch_fail_rx) = bounded::<WatchFailure>(1024);
 
         Ok(Daemon {
             shared,
@@ -142,6 +157,8 @@ impl Daemon {
             backend,
             watched_dirs: std::collections::HashSet::new(),
             watch_tx,
+            watch_fail_tx,
+            watch_fail_rx,
             incoming_rx,
             incoming_tx,
             control_rx,
@@ -149,6 +166,7 @@ impl Daemon {
             applier_stop: Arc::new(AtomicBool::new(false)),
             watcher_stop: Arc::new(AtomicBool::new(false)),
             watcher_thread: None,
+            last_mount_check_ms: 0,
             watch_rx: Some(watch_rx),
         })
     }
@@ -183,6 +201,7 @@ impl Daemon {
         let backend = self.backend.clone();
         let roots_snapshot = self.shared.roots.read().unwrap().clone();
         let watch_rx = self.watch_rx.take().expect("watch_rx taken twice");
+        let fail_tx = self.watch_fail_tx.clone();
         self.watcher_thread = Some(std::thread::spawn(move || {
             {
                 let mut b = backend.lock().unwrap();
@@ -191,10 +210,14 @@ impl Daemon {
                 }
             }
             while !stop.load(Ordering::Relaxed) {
-                // Service pending watch additions (non-blocking).
+                // Service pending watch additions (non-blocking). A failure is
+                // *never* silent: it is reported so the applier can degrade the
+                // root loudly (§7, §15).
                 while let Ok((id, path)) = watch_rx.try_recv() {
                     let mut b = backend.lock().unwrap();
-                    let _ = b.watch_dir(id, &path);
+                    if let Err(e) = b.watch_dir(id, &path) {
+                        let _ = fail_tx.send(WatchFailure { dir: id, reason: e.to_string() });
+                    }
                 }
                 let evs = {
                     let mut b = backend.lock().unwrap();
@@ -207,7 +230,9 @@ impl Daemon {
                 // before its contents change.
                 while let Ok((id, path)) = watch_rx.try_recv() {
                     let mut b = backend.lock().unwrap();
-                    let _ = b.watch_dir(id, &path);
+                    if let Err(e) = b.watch_dir(id, &path) {
+                        let _ = fail_tx.send(WatchFailure { dir: id, reason: e.to_string() });
+                    }
                 }
             }
         }));
@@ -256,6 +281,19 @@ impl Daemon {
             work_done = true;
         }
 
+        // Watch failures degrade the owning root loudly (§7, §15): queries keep
+        // answering from what is known, and every response meta lists the root.
+        while let Ok(f) = self.watch_fail_rx.try_recv() {
+            self.applier.note_watch_failure(f.dir, &f.reason);
+            work_done = true;
+        }
+
+        // Mount watchdog. `IN_UNMOUNT` is not delivered on every platform (it is
+        // absent under WSL2), so we detect a mount change portably: compare each
+        // root's device id against the probed value. A change means a remount or
+        // a different filesystem on the same point → rescan (cause=mount_event).
+        work_done |= self.mount_watchdog();
+
         let applied = self.applier.drain();
         work_done |= applied > 0;
 
@@ -280,6 +318,53 @@ impl Daemon {
     /// Process pending items once (used by tests and by `run`).
     pub fn drain_once(&mut self) -> usize {
         self.applier.drain()
+    }
+
+    /// Periodically compare each root's device id with the probed value. A
+    /// change (or a vanished root path) means the mount was replaced underneath
+    /// us. This is the portable mount-event detection, because `IN_UNMOUNT` is
+    /// not delivered on every platform. Returns true if it did anything.
+    fn mount_watchdog(&mut self) -> bool {
+        let now = findex::applier::now_ms();
+        if now.saturating_sub(self.last_mount_check_ms) < 1_000 {
+            return false;
+        }
+        self.last_mount_check_ms = now;
+        let mut changed: Vec<(u32, u64, Option<u64>, String)> = Vec::new();
+        {
+            let ix = self.shared.index.read().unwrap();
+            let roots = self.shared.roots.read().unwrap();
+            for r in roots.iter() {
+                if !r.enabled {
+                    continue;
+                }
+                let rid = findex::applier::root_dir_id(&ix, r);
+                let cur = mount::probe_dev(&r.path);
+                if cur != Some(r.dev) && r.dev != 0 {
+                    changed.push((rid, r.dev, cur, r.path.to_string_lossy().into_owned()));
+                }
+            }
+        }
+        if changed.is_empty() {
+            return false;
+        }
+        for (rid, old_dev, cur, path) in changed {
+            self.shared.health.write().unwrap().mount_events += 1;
+            if cur.is_none() {
+                // The root is gone entirely: drop it and mark it degraded.
+                if rid != ROOT_ID {
+                    self.applier.pending_mut().enqueue_drop(rid);
+                }
+                self.applier.note_mount_gone(rid, &path);
+            } else {
+                // A different filesystem is now mounted: rescan the root.
+                if rid != ROOT_ID {
+                    self.applier.pending_mut().enqueue_rescan(rid, RescanCause::MountEvent);
+                }
+                self.applier.note_mount_remounted(rid, old_dev, cur.unwrap_or(0));
+            }
+        }
+        true
     }
 
     /// Wait until the pending queue is empty and the initial crawl reports
