@@ -134,7 +134,15 @@ impl crate::backends::BackendApp for ZorkApp {
                     let trimmed = line.trim().to_string();
                     if !trimmed.is_empty() {
                         rl.add_history_entry(&trimmed)?;
-                        with_state(|s| execute_command(s, &trimmed));
+                        let pending: std::cell::RefCell<Vec<Callback>> =
+                            std::cell::RefCell::new(Vec::new());
+                        with_state(|s| execute_command(s, &trimmed, &pending));
+                        // Now that the state borrow is released, run any
+                        // callbacks the command triggered. They may mutate the
+                        // widget tree (the whole point of a Search button).
+                        for mut cb in pending.into_inner() {
+                            cb();
+                        }
                     }
                 }
                 Err(rustyline::error::ReadlineError::Interrupted)
@@ -322,7 +330,11 @@ fn short_desc(node: &ZorkNode) -> String {
 
 // -- Command execution --
 
-fn execute_command(state: &mut ZorkState, line: &str) {
+fn execute_command(
+    state: &mut ZorkState,
+    line: &str,
+    pending_callbacks: &std::cell::RefCell<Vec<Callback>>,
+) {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
         return;
@@ -360,9 +372,13 @@ fn execute_command(state: &mut ZorkState, line: &str) {
                     match &node.kind {
                         ZorkKind::Button { .. } => {
                             println!("You press the button. It clicks!");
-                            for cb in &mut node.callbacks {
-                                cb();
-                            }
+                            // Run the callbacks *after* releasing the borrow:
+                            // a callback calls back into the widget API (e.g.
+                            // `query.get_text()`), which re-enters
+                            // `with_state` and would panic with "RefCell
+                            // already borrowed" while we still hold it.
+                            let cbs = std::mem::take(&mut node.callbacks);
+                            pending_callbacks.borrow_mut().extend(cbs);
                         }
                         ZorkKind::MenuBar => {
                             println!("You click the MenuBar. Use 'select <n>' to choose an item.");
@@ -405,11 +421,11 @@ fn execute_command(state: &mut ZorkState, line: &str) {
             }
             if !item.action.is_empty() {
                 println!("Action: {}", item.action);
-                // Fire callbacks on the parent menu
+                // Fire callbacks on the parent menu, once the borrow is
+                // released (a callback re-enters the widget API).
                 if let Some(node) = state.node_mut(state.current_id) {
-                    for cb in &mut node.callbacks {
-                        cb();
-                    }
+                    let cbs = std::mem::take(&mut node.callbacks);
+                    pending_callbacks.borrow_mut().extend(cbs);
                 }
             }
         }
@@ -442,11 +458,11 @@ fn execute_command(state: &mut ZorkState, line: &str) {
                 }
             }
             println!("You inscribed \"{}\" into the Entry.", text);
-            // Fire changed callbacks
+            // Fire changed callbacks after the borrow is released (see the
+            // Button arm above): a callback re-enters the widget API.
             if let Some(n) = state.node_mut(state.current_id) {
-                for cb in &mut n.callbacks {
-                    cb();
-                }
+                let cbs = std::mem::take(&mut n.callbacks);
+                pending_callbacks.borrow_mut().extend(cbs);
             }
         }
         "read" => {
@@ -458,18 +474,22 @@ fn execute_command(state: &mut ZorkState, line: &str) {
                     ZorkKind::CheckButton { ref mut checked, .. } => {
                         *checked = !*checked;
                         println!("CheckButton is now {}.", if *checked { "checked" } else { "unchecked" });
-                        for cb in &mut n.callbacks {
-                            cb();
-                        }
                     }
                     ZorkKind::RadioButton { ref mut checked, .. } => {
                         *checked = !*checked;
                         println!("RadioButton is now {}.", if *checked { "selected" } else { "not selected" });
-                        for cb in &mut n.callbacks {
-                            cb();
-                        }
                     }
                     _ => println!("You can't toggle that."),
+                }
+                // Toggling fires the widget's changed callbacks; queue them
+                // for after the borrow is released (a callback re-enters the
+                // widget API).
+                if matches!(
+                    n.kind,
+                    ZorkKind::CheckButton { .. } | ZorkKind::RadioButton { .. }
+                ) {
+                    let cbs = std::mem::take(&mut n.callbacks);
+                    pending_callbacks.borrow_mut().extend(cbs);
                 }
             }
         }

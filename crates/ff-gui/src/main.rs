@@ -21,7 +21,21 @@
 
 use rustxwidgets::prelude::*;
 
-use ff_gui::{format_hit, DaemonClient, GuiError, SearchOutcome};
+use ff_gui::{DaemonClient, GuiError, SearchOutcome};
+
+/// Which backend this binary was compiled with.
+///
+/// `ff --gui` locates `ff-gui` next to itself, and `cargo run --bin ff` builds
+/// *only* `ff` -- so a stale sibling built with different features (e.g.
+/// `--no-default-features --features zork`) can be launched instead. Naming the
+/// backend makes that mismatch visible rather than mysterious.
+const BACKEND: &str = if cfg!(feature = "gtk") {
+    "gtk"
+} else if cfg!(feature = "zork") {
+    "zork"
+} else {
+    "unknown"
+};
 
 /// How many rows to render at most (the daemon may match millions).
 const MAX_ROWS: usize = 200;
@@ -37,6 +51,10 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("ff-gui {} (backend: {BACKEND})", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let app = App::init().map_err(|e| GuiError::Backend(e.to_string()))?;
     let client = DaemonClient::new();
 
@@ -48,7 +66,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     query.set_text("");
     let search = app.create_button("Search")?;
     let status = app.create_label("type a query and press Search")?;
-    let results = app.create_label("")?;
+    // A TextView, not a Label: it renders the hits as a scrollable list
+    // instead of one wrapping paragraph.
+    let results = app.create_textview()?;
+    // A TextView is a scrolling, line-per-row list on gtk. The display-free
+    // zork shim implements only set_text/get_text/set_wrap_mode, so the
+    // sizing calls are gtk-only.
+    #[cfg(feature = "gtk")]
+    {
+        results.set_vexpand(true);
+        results.set_wrap_mode(0); // no wrapping: one hit per line
+    }
 
     // A live connection check up front: an empty list from an absent daemon and
     // an empty list from a real "no matches" must not look the same.
@@ -99,7 +127,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     win.set_child(&layout);
     win.present();
 
-    println!("ff-gui — findex search browser");
+    println!("ff-gui — findex search browser (backend: {BACKEND})");
     println!("Enter a query in the entry, then invoke Search.");
     app.run().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
@@ -110,7 +138,11 @@ fn run_query(query: &str) -> Result<SearchOutcome, GuiError> {
     client.search(query, FETCH_LIMIT)
 }
 
-/// Render the rows for the results label. Each row is `name — dir`.
+/// Render the result list: one path per line.
+///
+/// A list, not prose: the hits go into a TextView, so each line is a row. The
+/// daemon already returns absolute paths, so they are shown verbatim (a
+/// basename-first `name — dir` split reads as prose and wastes the column).
 fn render_rows(outcome: &SearchOutcome) -> String {
     if outcome.paths.is_empty() {
         return "(no matches)".to_string();
@@ -119,7 +151,7 @@ fn render_rows(outcome: &SearchOutcome) -> String {
         .paths
         .iter()
         .take(MAX_ROWS)
-        .map(|p| format_hit(p))
+        .cloned()
         .collect();
     if outcome.total as usize > lines.len() {
         lines.push(format!("… {} more", outcome.total as usize - lines.len()));
@@ -135,6 +167,17 @@ mod tests {
     fn render_empty_is_explicit() {
         let o = SearchOutcome::default();
         assert_eq!(render_rows(&o), "(no matches)");
+    }
+
+    #[test]
+    fn render_is_a_list_one_path_per_line() {
+        let o = SearchOutcome {
+            paths: vec!["/a/x.rs".into(), "/b/y.rs".into(), "/c/z.rs".into()],
+            total: 3,
+            fresh: true,
+            ..Default::default()
+        };
+        assert_eq!(render_rows(&o), "/a/x.rs\n/b/y.rs\n/c/z.rs");
     }
 
     #[test]

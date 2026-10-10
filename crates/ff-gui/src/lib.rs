@@ -197,26 +197,9 @@ impl SearchOutcome {
     }
 }
 
-/// Format one result row: the basename, then the containing directory, so the
-/// narrow list stays readable.
-pub fn format_hit(path: &str) -> String {
-    let p = Path::new(path);
-    let name = p.file_name().map(|s| s.to_string_lossy()).unwrap_or_default();
-    match p.parent().map(|d| d.to_string_lossy()) {
-        Some(dir) if !dir.is_empty() => format!("{name}   —   {dir}"),
-        _ => path.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn format_hit_splits_name_and_dir() {
-        assert_eq!(format_hit("/home/me/src/main.rs"), "main.rs   —   /home/me/src");
-        assert_eq!(format_hit("bare"), "bare");
-    }
 
     #[test]
     fn status_line_reports_totals() {
