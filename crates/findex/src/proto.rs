@@ -10,7 +10,14 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Wire protocol version.
+///
+/// Bumped whenever the *meaning* of a field changes, not only when the shape
+/// does: a client that sends `case_sensitive` depends on the daemon honouring it
+/// on the plain-string query path, and v2 daemons built before that silently
+/// ignored it. v3 marks the behaviour change so an old daemon rejects the
+/// request instead of quietly doing the wrong thing.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// A client request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -184,7 +191,7 @@ mod tests {
 
     #[test]
     fn parse_query() {
-        let r = Request::from_line(r#"{"v":2,"op":"query","q":"src ext:rs","limit":50,"json":true}"#).unwrap();
+        let r = Request::from_line(r#"{"v":3,"op":"query","q":"src ext:rs","limit":50,"json":true}"#).unwrap();
         match r {
             Request::Query { q, limit, json, count, .. } => {
                 assert_eq!(q, "src ext:rs");
