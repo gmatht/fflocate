@@ -105,6 +105,8 @@ impl Client {
         count: bool,
         zero: bool,
         expr: Option<serde_json::Value>,
+        fuzzy: bool,
+        distance: Option<u32>,
     ) -> Result<ExitCode, CliError> {
         let is_string_query = expr.is_none();
         let req = match expr {
@@ -133,9 +135,20 @@ impl Client {
                     path: get("path"),
                     relative_root: get("relative_root").and_then(|v| v.as_str().map(|s| s.to_string())),
                     case_sensitive: get("case_sensitive").and_then(|v| v.as_bool()),
+                    // Fuzzy applies to the string query language, not to
+                    // expression trees (§10).
+                    fuzzy: false,
+                    max_distance: None,
                 }
             }
-            None => Request::query(q, limit, json, count),
+            None => {
+                let mut r = Request::query(q, limit, json, count);
+                if let Request::Query { fuzzy: f, max_distance: d, .. } = &mut r {
+                    *f = fuzzy;
+                    *d = distance;
+                }
+                r
+            }
         };
         let resp = self.send(&req)?;
         let mut printed = 0u64;
@@ -236,6 +249,8 @@ impl Client {
             path: None,
             relative_root: None,
             case_sensitive: None,
+            fuzzy: false,
+            max_distance: None,
         };
         let resp = self.send(&req)?;
         let mut paths: Vec<String> = Vec::new();
@@ -327,6 +342,9 @@ impl Client {
             path: get("path"),
             relative_root: get("relative_root").and_then(|v| v.as_str().map(|s| s.to_string())),
             case_sensitive: get("case_sensitive").and_then(|v| v.as_bool()),
+            // find mode is exact; fuzzy belongs to the ff string query.
+            fuzzy: false,
+            max_distance: None,
         };
         let resp = self.send(&req)?;
 

@@ -231,10 +231,62 @@ impl TrigramIndex {
     pub fn raw_postings(&self, tri: &[u8; 3]) -> Option<&[u32]> {
         self.postings.get(tri).map(|v| v.as_slice())
     }
+
+    /// Candidate ids whose name shares **at least** `min_shared` of the given
+    /// trigrams, ascending. This is the fuzzy generator.
+    ///
+    /// ## Why this is a sound superset
+    ///
+    /// If a name contains an approximate occurrence of a pattern within `k`
+    /// edits, then at most `k` single-character edits separate the two, and a
+    /// single edit can destroy at most **3** trigrams of the pattern (the edit
+    /// lands in a window that covers up to three overlapping trigrams). So of
+    /// the pattern's `t` distinct trigrams, at least `t - 3k` must still appear
+    /// in the name.
+    ///
+    /// When `t - 3k <= 0` the bound says nothing: return `None`, and the caller
+    /// scans everything. That is the honest outcome — a large edit budget on a
+    /// short pattern cannot be accelerated.
+    ///
+    /// Candidate ids come from *counting* how many of the given trigrams each
+    /// name shares (not intersecting), which is why this is a distinct operation
+    /// from [`Self::candidates`].
+    pub fn candidates_sharing_at_least(&self, trigrams: &[[u8; 3]], min_shared: usize) -> Option<Vec<u32>> {
+        if min_shared == 0 || trigrams.is_empty() {
+            return None; // no usable constraint
+        }
+        if min_shared > trigrams.len() {
+            // Cannot possibly be satisfied: fewer trigrams available than needed.
+            return Some(Vec::new());
+        }
+        // Count, per id, how many distinct query trigrams its postings appear in.
+        let mut counts: HashMap<u32, u32> = HashMap::new();
+        for tri in trigrams {
+            if let Some(list) = self.postings.get(tri) {
+                for &id in list {
+                    *counts.entry(id).or_insert(0) += 1;
+                }
+            }
+        }
+        let need = min_shared as u32;
+        let mut out: Vec<u32> = counts
+            .into_iter()
+            .filter(|(_, c)| *c >= need)
+            .map(|(id, _)| id)
+            .collect();
+        out.sort_unstable();
+        Some(out)
+    }
+
+    /// The number of the pattern's distinct trigrams that must survive `k` edits:
+    /// `t - 3k`, saturating at zero. Zero means "no usable trigram constraint".
+    pub fn required_shared_after_edits(pattern_trigrams: usize, max_distance: u32) -> usize {
+        pattern_trigrams.saturating_sub(3 * max_distance as usize)
+    }
 }
 
 /// Intersect two ascending, deduplicated id lists.
-fn intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
+pub(crate) fn intersect(a: &[u32], b: &[u32]) -> Vec<u32> {
     let mut out = Vec::with_capacity(a.len().min(b.len()));
     let (mut i, mut j) = (0usize, 0usize);
     while i < a.len() && j < b.len() {
@@ -362,5 +414,86 @@ mod tests {
         assert!(tg.approx_bytes() >= tg.posting_total() as usize * 4);
         assert!(tg.trigram_count() > 0);
         assert_eq!(tg.posting_total(), tg.postings.values().map(|v| v.len() as u64).sum::<u64>());
+    }
+
+    #[test]
+    fn sharing_bound_is_t_minus_3k() {
+        // A 5-trigram pattern (7 bytes) tolerates 0 edits with all 5 required,
+        // 1 edit with 2 required, 2 edits with none.
+        assert_eq!(TrigramIndex::required_shared_after_edits(5, 0), 5);
+        assert_eq!(TrigramIndex::required_shared_after_edits(5, 1), 2);
+        assert_eq!(TrigramIndex::required_shared_after_edits(5, 2), 0);
+        assert_eq!(TrigramIndex::required_shared_after_edits(2, 1), 0, "saturates at zero");
+    }
+
+    #[test]
+    fn candidates_sharing_counts_rather_than_intersects() {
+        let ix = tree();
+        let tg = TrigramIndex::build(&ix);
+        // "main.rs" -> trigrams {mai, ain, in., n.r, .rs}. Ask which names share
+        // at least 3 of them: "main.rs" (all 5) qualifies; "Notes.TXT" shares
+        // none; "README.md" shares ".md"-> not in the set, so zero.
+        let tris = TrigramIndex::literal_trigrams(b"main.rs", false).unwrap();
+        let cands = tg.candidates_sharing_at_least(&tris, 3).unwrap();
+        let names: Vec<String> = cands
+            .iter()
+            .map(|id| String::from_utf8_lossy(ix.name(*id)).into_owned())
+            .collect();
+        assert_eq!(names, vec!["main.rs".to_string()]);
+
+        // A relaxed threshold pulls in more (superset grows as `min_shared` drops).
+        let loose = tg.candidates_sharing_at_least(&tris, 1).unwrap();
+        assert!(loose.len() >= cands.len());
+    }
+
+    #[test]
+    fn no_constraint_when_bound_vanishes() {
+        let ix = tree();
+        let tg = TrigramIndex::build(&ix);
+        let tris = TrigramIndex::literal_trigrams(b"main.rs", false).unwrap();
+        // min_shared == 0 means "no usable constraint": scan everything.
+        assert!(tg.candidates_sharing_at_least(&tris, 0).is_none());
+        // An impossible ask is empty, not a scan.
+        assert_eq!(tg.candidates_sharing_at_least(&tris, 99).unwrap(), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn sharing_generator_never_drops_an_approximate_match() {
+        // The superset contract: for every name that contains an approximate
+        // occurrence of the pattern within k edits, the generator must return it.
+        use crate::fuzzy::substring_within;
+        let ix = tree();
+        let tg = TrigramIndex::build(&ix);
+
+        for (pattern, k) in [(&b"main.rs"[..], 0u32), (b"main.rs", 1), (b"mian.rs", 1), (b"notes", 1)] {
+            let tris = TrigramIndex::literal_trigrams(pattern, false).unwrap();
+            let need = TrigramIndex::required_shared_after_edits(tris.len(), k);
+            // True matches by brute force over every name.
+            let mut truth: Vec<u32> = Vec::new();
+            for (id, e) in ix.iter_live() {
+                if e.flags().is_root_dir() {
+                    continue;
+                }
+                if substring_within(ix.name(id), pattern, k).is_some() {
+                    truth.push(id);
+                }
+            }
+            if need == 0 {
+                assert!(
+                    tg.candidates_sharing_at_least(&tris, need).is_none(),
+                    "pattern {pattern:?} k={k}: expected 'no constraint', not a candidate list"
+                );
+                continue; // no constraint => the caller scans; nothing to check
+            }
+            let cands = tg.candidates_sharing_at_least(&tris, need).unwrap();
+            let cand_set: std::collections::HashSet<u32> = cands.iter().copied().collect();
+            for id in &truth {
+                assert!(
+                    cand_set.contains(id),
+                    "pattern {pattern:?} k={k}: generator dropped true match {:?}",
+                    String::from_utf8_lossy(ix.name(*id))
+                );
+            }
+        }
     }
 }

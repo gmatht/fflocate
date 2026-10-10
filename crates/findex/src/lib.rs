@@ -27,6 +27,7 @@ pub mod crawl;
 pub mod cursor;
 pub mod event;
 pub mod expr;
+pub mod fuzzy;
 pub mod health;
 pub mod index;
 pub mod journal;

@@ -47,7 +47,7 @@ pub fn handle_request(ctx: &ServerCtx, req: &Request) -> Vec<Response> {
             version: crate::proto::PROTOCOL_VERSION,
             backend: ctx.backend.clone(),
         }],
-        Request::Query { q, limit, json: _, count, expression, glob, glob_includedotfiles, glob_noescape, suffix, path, relative_root, case_sensitive } => {
+        Request::Query { q, limit, json: _, count, expression, glob, glob_includedotfiles, glob_noescape, suffix, path, relative_root, case_sensitive, fuzzy, max_distance } => {
             if expression.is_some() || glob.is_some() || suffix.is_some() || path.is_some() {
                 let mut obj = serde_json::Map::new();
                 if let Some(e) = expression {
@@ -75,6 +75,8 @@ pub fn handle_request(ctx: &ServerCtx, req: &Request) -> Vec<Response> {
                     obj.insert("case_sensitive".into(), serde_json::Value::Bool(*cs));
                 }
                 handle_expr_query(ctx, &serde_json::Value::Object(obj), *limit, *count, t0)
+            } else if *fuzzy {
+                handle_fuzzy_query(ctx, q, *max_distance, *limit, *count, t0)
             } else {
                 handle_query(ctx, q, *limit, *count, t0)
             }
@@ -157,6 +159,82 @@ fn handle_query(ctx: &ServerCtx, raw: &str, limit: usize, count_only: bool, t0: 
     }
     out.push(Response::Done { count: res.total, cursor });
     out
+}
+
+/// Default edit budget for `--fuzzy` when the client does not choose one.
+/// 1 edit absorbs a typo (substitution, missing or extra character) without
+/// turning the search into a different search.
+pub const DEFAULT_FUZZY_DISTANCE: u32 = 1;
+
+/// Fuzzy (approximate) query path (§10/§17 v2). Mirrors [`handle_query`] but
+/// scores names by edit distance and returns them ranked by `(score, path)`.
+///
+/// Without the `trigram` cargo feature this is unavailable; rather than silently
+/// returning exact results (which would look like "fuzzy found nothing"), it
+/// reports an error — a caller that asked for fuzzy deserves to know it is not
+/// there.
+fn handle_fuzzy_query(
+    ctx: &ServerCtx,
+    raw: &str,
+    max_distance: Option<u32>,
+    limit: usize,
+    count_only: bool,
+    t0: Instant,
+) -> Vec<Response> {
+    #[cfg(not(feature = "trigram"))]
+    {
+        let _ = (ctx, raw, max_distance, limit, count_only, t0);
+        return vec![Response::Error {
+            message: "fuzzy search requires the `trigram` feature (not built in)".into(),
+        }];
+    }
+
+    #[cfg(feature = "trigram")]
+    {
+        let q = match Query::compile(raw) {
+            Ok(q) => q,
+            Err(e) => return vec![Response::Error { message: e }],
+        };
+        let k = max_distance.unwrap_or(DEFAULT_FUZZY_DISTANCE);
+        // Same lock-order rule as `handle_query`: build the accelerator before
+        // taking the index read lock.
+        let trigram = ctx.shared.trigram_index();
+        let ix = ctx.shared.index.read().unwrap();
+        let roots = ctx.shared.roots.read().unwrap();
+        let mut root_paths: Vec<(u32, Vec<u8>)> = Vec::new();
+        for r in roots.iter() {
+            let rid = crate::applier::root_dir_id(&ix, r);
+            if rid != crate::index::ROOT_ID {
+                root_paths.push((rid, r.path.as_os_str().to_string_lossy().as_bytes().to_vec()));
+            }
+        }
+        let effective_limit = if count_only { 0 } else { limit };
+        let res = query::execute_fuzzy(
+            &ix,
+            &root_paths,
+            &q,
+            k,
+            effective_limit,
+            count_only,
+            Some(trigram.as_ref()),
+        );
+        let cursor = ctx.shared.cursor().to_string_repr();
+        let elapsed = t0.elapsed();
+        drop(roots);
+        drop(ix);
+
+        let mut out = Vec::new();
+        out.push(meta_preamble(ctx, false, elapsed));
+        if count_only {
+            out.push(Response::Done { count: res.total, cursor });
+            return out;
+        }
+        for h in &res.hits {
+            out.push(Response::Hit { path: bytes_to_string(&h.path), id: h.id });
+        }
+        out.push(Response::Done { count: res.total, cursor });
+        out
+    }
 }
 
 /// The expression-tree query path (§10). Parses the Watchman-style query object
@@ -513,6 +591,8 @@ mod tests {
             path: None,
             relative_root: None,
             case_sensitive: None,
+            fuzzy: false,
+            max_distance: None,
         };
         let out = handle_request(&ctx, &req);
         let hits: Vec<_> = out.iter().filter_map(|r| match r { Response::Hit { path, .. } => Some(path.clone()), _ => None }).collect();
@@ -536,6 +616,8 @@ mod tests {
             path: None,
             relative_root: None,
             case_sensitive: None,
+            fuzzy: false,
+            max_distance: None,
         };
         let out = handle_request(&ctx, &req);
         match &out[0] {
@@ -673,5 +755,107 @@ mod tests {
         drop(ctx);
         let _ = handle.join();
         let _ = rid;
+    }
+
+    #[cfg(feature = "trigram")]
+    #[test]
+    fn fuzzy_query_finds_a_typo_via_the_protocol() {
+        // The tree has src/main.rs and README.md. "main.js" is 1 edit from
+        // "main.rs": an exact query misses, a fuzzy query finds and ranks it.
+        let (ctx, _d, _s) = ctx_with_tree();
+        let exact = handle_request(&ctx, &Request::query("main.js", 0, false, false));
+        assert!(matches!(exact.last(), Some(Response::Done { count: 0, .. })));
+
+        let req = Request::Query {
+            q: "main.js".into(),
+            limit: 0,
+            json: false,
+            count: false,
+            expression: None,
+            glob: None,
+            glob_includedotfiles: None,
+            glob_noescape: None,
+            suffix: None,
+            path: None,
+            relative_root: None,
+            case_sensitive: None,
+            fuzzy: true,
+            max_distance: Some(1),
+        };
+        let out = handle_request(&ctx, &req);
+        assert!(matches!(out.first(), Some(Response::Meta { .. })));
+        let hits: Vec<_> = out
+            .iter()
+            .filter_map(|r| match r {
+                Response::Hit { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hits.len(), 1, "got {hits:?}");
+        assert!(hits[0].ends_with("/src/main.rs"), "got {hits:?}");
+    }
+
+    #[cfg(feature = "trigram")]
+    #[test]
+    fn fuzzy_query_is_deterministic_across_repeats() {
+        let (ctx, _d, _s) = ctx_with_tree();
+        let mk = || Request::Query {
+            q: "main.js".into(),
+            limit: 0,
+            json: false,
+            count: false,
+            expression: None,
+            glob: None,
+            glob_includedotfiles: None,
+            glob_noescape: None,
+            suffix: None,
+            path: None,
+            relative_root: None,
+            case_sensitive: None,
+            fuzzy: true,
+            max_distance: Some(2),
+        };
+        let run = || {
+            let out = handle_request(&ctx, &mk());
+            out.iter()
+                .filter_map(|r| match r {
+                    Response::Hit { path, .. } => Some(path.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = run();
+        for _ in 0..5 {
+            assert_eq!(first, run(), "fuzzy ranking must be reproducible");
+        }
+    }
+
+    #[cfg(feature = "trigram")]
+    #[test]
+    fn fuzzy_count_only_reports_the_ranked_total() {
+        let (ctx, _d, _s) = ctx_with_tree();
+        let req = Request::Query {
+            q: "main.js".into(),
+            limit: 0,
+            json: false,
+            count: true,
+            expression: None,
+            glob: None,
+            glob_includedotfiles: None,
+            glob_noescape: None,
+            suffix: None,
+            path: None,
+            relative_root: None,
+            case_sensitive: None,
+            fuzzy: true,
+            max_distance: Some(1),
+        };
+        let out = handle_request(&ctx, &req);
+        assert!(!out.iter().any(|r| matches!(r, Response::Hit { .. })), "--count skips hits");
+        let count = out.iter().find_map(|r| match r {
+            Response::Done { count, .. } => Some(*count),
+            _ => None,
+        });
+        assert_eq!(count, Some(1));
     }
 }

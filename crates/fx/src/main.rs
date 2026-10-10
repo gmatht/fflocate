@@ -43,6 +43,9 @@ OPTIONS:
     -0                  separate paths with NUL (for xargs -0)
     -l, --limit N       stop after N results (0 = unlimited)
     -s, --sync          settle the index before searching (cookie sync)
+    -f, --fuzzy         approximate match: plain terms within edit distance,
+                        results ranked by score (see --distance)
+        --distance N    max edit distance for --fuzzy (default 1)
         --since CURSOR  report what changed since a cursor
         --expr JSON     Watchman-style expression/query (JSON object or tree)
         --timeout SECS  settle timeout for --sync/--update (default 2/120)
@@ -86,6 +89,10 @@ struct Args {
     expr: Option<serde_json::Value>,
     /// Settle timeout in ms (--timeout SECS; per-command defaults).
     timeout_ms: Option<u64>,
+    /// Approximate (edit-distance) matching (§10/§17 v2).
+    fuzzy: bool,
+    /// Edit budget for --fuzzy (default 1).
+    distance: Option<u32>,
 }
 
 fn main() -> ExitCode {
@@ -177,6 +184,8 @@ fn run() -> Result<ExitCode, CliError> {
         args.count,
         args.zero,
         args.expr,
+        args.fuzzy,
+        args.distance,
     )
 }
 
@@ -212,6 +221,14 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<Args, CliError> {
                 a.timeout_ms = Some(secs.saturating_mul(1000));
             }
             "--roots" => a.roots = true,
+            "-f" | "--fuzzy" => a.fuzzy = true,
+            "--distance" => {
+                let v = it.next().ok_or_else(|| CliError::Usage("--distance needs a number".into()))?;
+                let d: u32 = v
+                    .parse()
+                    .map_err(|_| CliError::Usage(format!("bad distance: {v}")))?;
+                a.distance = Some(d);
+            }
             "--expr" => {
                 let v = it.next().ok_or_else(|| CliError::Usage("--expr needs JSON".into()))?;
                 a.expr = Some(
@@ -309,6 +326,29 @@ mod tests {
         assert_eq!(a.timeout_ms, Some(5_000));
         assert!(a.sync);
         assert!(parse_args(["--timeout", "xx"].iter().map(|s| s.to_string())).is_err());
+    }
+
+    #[test]
+    fn fuzzy_flags_parsed() {
+        let a = parse(&["--fuzzy", "main"]);
+        assert!(a.fuzzy);
+        assert_eq!(a.distance, None, "distance defaults server-side");
+        assert_eq!(a.query, vec!["main"]);
+
+        let a = parse(&["-f", "main"]);
+        assert!(a.fuzzy, "-f is the short form");
+
+        let a = parse(&["--fuzzy", "--distance", "2", "main"]);
+        assert!(a.fuzzy);
+        assert_eq!(a.distance, Some(2));
+
+        // Without --fuzzy the distance is inert but still parsed.
+        let a = parse(&["--distance", "3", "main"]);
+        assert!(!a.fuzzy);
+        assert_eq!(a.distance, Some(3));
+
+        assert!(parse_args(["--distance", "xx"].iter().map(|s| s.to_string())).is_err());
+        assert!(parse_args(["--distance"].iter().map(|s| s.to_string())).is_err());
     }
 
     #[test]
