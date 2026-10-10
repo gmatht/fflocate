@@ -197,6 +197,38 @@ impl SearchOutcome {
     }
 }
 
+/// Build a `file://` URI from an absolute path, percent-encoding the bytes that
+/// are not allowed raw in a URI path.
+///
+/// The drag payload uses this so a file manager or editor receiving the drop
+/// treats it as a real file. Only the characters that actually need escaping in
+/// a path segment are encoded; `/` is left as the separator.
+pub fn path_to_file_uri(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() + 7);
+    out.push_str("file://");
+    for &b in path.as_bytes() {
+        match b {
+            // Unreserved (RFC 3986) plus the path separators and sub-delims that
+            // are legal unescaped in a path.
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-' | b'.' | b'_' | b'~'
+            | b'/' | b'!' | b'$' | b'&' | b'\'' | b'(' | b')'
+            | b'*' | b'+' | b',' | b';' | b'=' | b':' | b'@' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// The `(uris, text)` payload for dragging `path`: a `file://` URI list (what a
+/// file manager wants) and the plain path (what a terminal or text field
+/// wants).
+pub fn drag_payload(path: &str) -> (Vec<String>, String) {
+    (vec![path_to_file_uri(path)], path.to_string())
+}
+
 /// What the results context menu offers for a row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowAction {
@@ -255,6 +287,23 @@ pub fn row_at_line(paths: &[String], line: i32) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_uri_encodes_special_characters() {
+        assert_eq!(path_to_file_uri("/home/me/src/main.rs"), "file:///home/me/src/main.rs");
+        // Spaces and other reserved characters are percent-encoded.
+        assert_eq!(path_to_file_uri("/a/my file.rs"), "file:///a/my%20file.rs");
+        assert_eq!(path_to_file_uri("/a/b#c?d"), "file:///a/b%23c%3Fd");
+        // A leading slash is preserved (three slashes after the scheme).
+        assert_eq!(path_to_file_uri("/"), "file:///");
+    }
+
+    #[test]
+    fn drag_payload_carries_both_forms() {
+        let (uris, text) = drag_payload("/a/b.rs");
+        assert_eq!(uris, vec!["file:///a/b.rs".to_string()]);
+        assert_eq!(text, "/a/b.rs");
+    }
 
     #[test]
     fn row_at_line_picks_the_clicked_row() {

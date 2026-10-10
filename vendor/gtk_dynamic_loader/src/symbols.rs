@@ -109,6 +109,25 @@ pub type GtkClipboardSetText = unsafe extern "C" fn(clipboard: *mut c_void, text
 pub type GtkClipboardStore = unsafe extern "C" fn(clipboard: *mut c_void);
 // Which mouse button produced a GdkEventButton (1=left, 3=right).
 pub type GdkEventGetButton = unsafe extern "C" fn(event: *mut c_void) -> u32;
+// Drag-and-drop: make a widget a drag source carrying file URIs and text.
+// gtk_drag_source_set(widget, start_button_mask, targets, n_targets, actions)
+pub type GtkDragSourceSet = unsafe extern "C" fn(
+    widget: *mut c_void,
+    start_button_mask: i32,
+    targets: *const c_void,
+    n_targets: i32,
+    actions: i32,
+);
+pub type GtkDragSourceAddUriTargets = unsafe extern "C" fn(widget: *mut c_void);
+pub type GtkDragSourceAddTextTargets = unsafe extern "C" fn(widget: *mut c_void);
+// Fill the GtkSelectionData with the dragged payload. set_uris takes a
+// NULL-terminated array of URI strings.
+pub type GtkSelectionDataSetUris = unsafe extern "C" fn(selection_data: *mut c_void, uris: *const *const i8);
+pub type GtkSelectionDataSetText = unsafe extern "C" fn(selection_data: *mut c_void, text: *const i8, len: i32) -> i32;
+// Identify which target the drop is asking for.
+pub type GtkSelectionDataGetTarget = unsafe extern "C" fn(selection_data: *mut c_void) -> *mut c_void;
+pub type GdkAtomInternStaticString = unsafe extern "C" fn(name: *const i8) -> *mut c_void;
+pub type GdkAtomName = unsafe extern "C" fn(atom: *mut c_void) -> *mut i8;
 pub type GtkWidgetSetCanTarget = unsafe extern "C" fn(widget: *mut c_void, can_target: i32);
 pub type GtkWidgetSetHalign = unsafe extern "C" fn(widget: *mut c_void, align: i32);
 pub type GtkWidgetSetValign = unsafe extern "C" fn(widget: *mut c_void, align: i32);
@@ -389,6 +408,14 @@ pub struct Symbols {
     pub gtk_clipboard_set_text: Option<GtkClipboardSetText>,
     pub gtk_clipboard_store: Option<GtkClipboardStore>,
     pub gdk_event_get_button: Option<GdkEventGetButton>,
+    pub gtk_drag_source_set: Option<GtkDragSourceSet>,
+    pub gtk_drag_source_add_uri_targets: Option<GtkDragSourceAddUriTargets>,
+    pub gtk_drag_source_add_text_targets: Option<GtkDragSourceAddTextTargets>,
+    pub gtk_selection_data_set_uris: Option<GtkSelectionDataSetUris>,
+    pub gtk_selection_data_set_text: Option<GtkSelectionDataSetText>,
+    pub gtk_selection_data_get_target: Option<GtkSelectionDataGetTarget>,
+    pub gdk_atom_intern_static_string: Option<GdkAtomInternStaticString>,
+    pub gdk_atom_name: Option<GdkAtomName>,
     pub gtk_scrolled_window_new: Option<GtkScrolledWindowNew>,
     pub gtk_scrolled_window_set_policy: Option<GtkScrolledWindowSetPolicy>,
     pub gtk_scrolled_window_set_child: Option<GtkScrolledWindowSetChild>,
@@ -645,6 +672,14 @@ impl Symbols {
         let gtk_clipboard_set_text = unsafe { sym::<GtkClipboardSetText>(gtk, "gtk_clipboard_set_text") };
         let gtk_clipboard_store = unsafe { sym::<GtkClipboardStore>(gtk, "gtk_clipboard_store") };
         let gdk_event_get_button = open_sym_try!(libs, "libgdk", GdkEventGetButton, "gdk_event_get_button").or_else(|| unsafe { sym::<GdkEventGetButton>(gtk, "gdk_event_get_button") });
+        let gtk_drag_source_set = unsafe { sym::<GtkDragSourceSet>(gtk, "gtk_drag_source_set") };
+        let gtk_drag_source_add_uri_targets = unsafe { sym::<GtkDragSourceAddUriTargets>(gtk, "gtk_drag_source_add_uri_targets") };
+        let gtk_drag_source_add_text_targets = unsafe { sym::<GtkDragSourceAddTextTargets>(gtk, "gtk_drag_source_add_text_targets") };
+        let gtk_selection_data_set_uris = unsafe { sym::<GtkSelectionDataSetUris>(gtk, "gtk_selection_data_set_uris") };
+        let gtk_selection_data_set_text = unsafe { sym::<GtkSelectionDataSetText>(gtk, "gtk_selection_data_set_text") };
+        let gtk_selection_data_get_target = unsafe { sym::<GtkSelectionDataGetTarget>(gtk, "gtk_selection_data_get_target") };
+        let gdk_atom_intern_static_string = open_sym_try!(libs, "libgdk", GdkAtomInternStaticString, "gdk_atom_intern_static_string").or_else(|| unsafe { sym::<GdkAtomInternStaticString>(gtk, "gdk_atom_intern_static_string") });
+        let gdk_atom_name = open_sym_try!(libs, "libgdk", GdkAtomName, "gdk_atom_name").or_else(|| unsafe { sym::<GdkAtomName>(gtk, "gdk_atom_name") });
         let gtk_scrolled_window_new = unsafe { sym::<GtkScrolledWindowNew>(gtk, "gtk_scrolled_window_new") };
         let gtk_scrolled_window_set_policy = unsafe { sym::<GtkScrolledWindowSetPolicy>(gtk, "gtk_scrolled_window_set_policy") };
         let gtk_scrolled_window_set_child = unsafe { sym::<GtkScrolledWindowSetChild>(gtk, "gtk_scrolled_window_set_child") };
@@ -796,6 +831,14 @@ impl Symbols {
             gtk_clipboard_set_text,
             gtk_clipboard_store,
             gdk_event_get_button,
+            gtk_drag_source_set,
+            gtk_drag_source_add_uri_targets,
+            gtk_drag_source_add_text_targets,
+            gtk_selection_data_set_uris,
+            gtk_selection_data_set_text,
+            gtk_selection_data_get_target,
+            gdk_atom_intern_static_string,
+            gdk_atom_name,
             gtk_scrolled_window_new,
             gtk_scrolled_window_set_policy,
             gtk_scrolled_window_set_child,

@@ -1936,6 +1936,110 @@ pub unsafe fn connect_gesture_click_pressed(
     }
 }
 
+/// Make `widget` a drag source that carries file URIs and plain text, started
+/// with the left mouse button and copied (not moved).
+///
+/// The caller must also connect `drag-data-get` (see
+/// [`connect_widget_drag_data_get`]) to fill in the payload.
+pub unsafe fn widget_enable_uri_drag_source(loader: &Arc<Loader>, widget: *mut c_void) -> Result<(), Error> {
+    let set = loader
+        .symbols
+        .gtk_drag_source_set
+        .ok_or(Error::MissingSymbol("gtk_drag_source_set".into()))?;
+    // GDK_BUTTON1_MASK = 1 << 8; GDK_ACTION_COPY = 1 << 1.
+    const GDK_BUTTON1_MASK: i32 = 1 << 8;
+    const GDK_ACTION_COPY: i32 = 1 << 1;
+    // Passing a null target array with n_targets = 0 installs an empty source;
+    // the add_* helpers below then populate it.
+    unsafe { set(widget, GDK_BUTTON1_MASK, std::ptr::null(), 0, GDK_ACTION_COPY); }
+    if let Some(add) = loader.symbols.gtk_drag_source_add_uri_targets {
+        unsafe { add(widget); }
+    }
+    if let Some(add) = loader.symbols.gtk_drag_source_add_text_targets {
+        unsafe { add(widget); }
+    }
+    Ok(())
+}
+
+/// Connect `drag-data-get` on `widget`. `cb` receives
+/// `(selection_data, target_name)` and should fill the selection data with the
+/// payload for that target (`"text/uri-list"` or `"text/plain"`).
+pub unsafe fn connect_widget_drag_data_get(
+    loader: &Arc<Loader>,
+    widget: *mut c_void,
+    mut cb: impl FnMut(*mut c_void, &str) + 'static,
+) -> Result<u64, Error> {
+    let symbols = loader.symbols.clone();
+    let boxed: Box<dyn FnMut(*mut c_void, *mut c_void, u32, u32)> =
+        Box::new(move |_ctx, selection_data, _info, _time| {
+            let target = unsafe { selection_data_target_name(&symbols, selection_data) };
+            cb(selection_data, &target);
+        });
+    unsafe { crate::signals::connect_signal_drag(&loader.symbols, widget, "drag-data-get", boxed) }
+        .map_err(Error::Other)
+}
+
+/// The target name a `GtkSelectionData` is being filled for, e.g.
+/// `"text/uri-list"`. Empty string if it cannot be determined.
+unsafe fn selection_data_target_name(
+    symbols: &crate::symbols::Symbols,
+    selection_data: *mut c_void,
+) -> String {
+    let (Some(get_target), Some(atom_name)) =
+        (symbols.gtk_selection_data_get_target, symbols.gdk_atom_name)
+    else {
+        return String::new();
+    };
+    let atom = unsafe { get_target(selection_data) };
+    if atom.is_null() {
+        return String::new();
+    }
+    let name = unsafe { atom_name(atom) };
+    if name.is_null() {
+        return String::new();
+    }
+    unsafe { std::ffi::CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Fill `selection_data` with `uris` (as `text/uri-list`). `uris` must be
+/// `file://` URLs.
+pub unsafe fn drag_set_uris(
+    loader: &Arc<Loader>,
+    selection_data: *mut c_void,
+    uris: &[String],
+) -> Result<(), Error> {
+    let set = loader
+        .symbols
+        .gtk_selection_data_set_uris
+        .ok_or(Error::MissingSymbol("gtk_selection_data_set_uris".into()))?;
+    let c: Vec<std::ffi::CString> = uris
+        .iter()
+        .map(|u| std::ffi::CString::new(u.as_str()).unwrap_or_default())
+        .collect();
+    let mut ptrs: Vec<*const i8> = c.iter().map(|s| s.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    unsafe { set(selection_data, ptrs.as_ptr()) };
+    Ok(())
+}
+
+/// Fill `selection_data` with `text` (as `text/plain`).
+pub unsafe fn drag_set_text(
+    loader: &Arc<Loader>,
+    selection_data: *mut c_void,
+    text: &str,
+) -> Result<(), Error> {
+    let set = loader
+        .symbols
+        .gtk_selection_data_set_text
+        .ok_or(Error::MissingSymbol("gtk_selection_data_set_text".into()))?;
+    let c = std::ffi::CString::new(text)
+        .map_err(|_| Error::Other("drag text contains NUL".into()))?;
+    unsafe { set(selection_data, c.as_ptr(), text.len() as i32) };
+    Ok(())
+}
+
 /// The 0-based line of the text at `(x, y)` in a `GtkTextView`.
 ///
 /// GTK reports the click position in widget coordinates (already compensating

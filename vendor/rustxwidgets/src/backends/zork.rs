@@ -39,6 +39,10 @@ pub struct ZorkNode {
     /// Handler for a `button-press-event`, invoked by the `rightclick`
     /// command. The REPL has no pointer, so the caller supplies the row.
     pub button_press_cb: Option<Box<dyn FnMut(u32, f64, f64)>>,
+    /// Supplies the drag payload `(uris, text)`. There is no other window in a
+    /// terminal, but storing it lets the `drag` command show what *would* be
+    /// carried.
+    pub drag_payload_cb: Option<Box<dyn FnMut() -> Option<(Vec<String>, String)>>>,
 }
 
 pub struct ZorkState {
@@ -82,6 +86,7 @@ impl ZorkState {
             children: Vec::new(),
             callbacks: Vec::new(),
             button_press_cb: None,
+            drag_payload_cb: None,
         });
         if let Some(pid) = parent {
             if let Some(p) = self.nodes.iter_mut().find(|n| n.id == pid) {
@@ -142,7 +147,11 @@ impl crate::backends::BackendApp for ZorkApp {
                             std::cell::RefCell::new(Vec::new());
                         let pending_press: std::cell::RefCell<Option<(usize, u32, f64)>> =
                             std::cell::RefCell::new(None);
-                        with_state(|s| execute_command(s, &trimmed, &pending, &pending_press));
+                        let pending_drag: std::cell::RefCell<bool> =
+                            std::cell::RefCell::new(false);
+                        with_state(|s| {
+                            execute_command(s, &trimmed, &pending, &pending_press, &pending_drag)
+                        });
                         // Now that the state borrow is released, run any
                         // callbacks the command triggered. They may mutate the
                         // widget tree (the whole point of a Search button).
@@ -153,6 +162,25 @@ impl crate::backends::BackendApp for ZorkApp {
                         // handler, likewise after the borrow is released.
                         if let Some((id, button, line)) = pending_press.into_inner() {
                             fire_button_press(id, button, 0.0, line);
+                        }
+                        // A `drag` command runs the press (to record the row)
+                        // and only then prints the payload.
+                        if pending_drag.into_inner() {
+                            let payload = with_state(|s| {
+                                s.nodes
+                                    .iter()
+                                    .find(|n| n.drag_payload_cb.is_some())
+                                    .map(|n| n.id)
+                            })
+                            .and_then(drag_payload);
+                            match payload {
+                                Some((uris, text)) => {
+                                    println!("Drag payload:");
+                                    println!("  text/uri-list: {}", uris.join(" "));
+                                    println!("  text/plain:    {text}");
+                                }
+                                None => println!("(nothing to drag: no row selected)"),
+                            }
                         }
                     }
                 }
@@ -346,6 +374,7 @@ fn execute_command(
     line: &str,
     pending_callbacks: &std::cell::RefCell<Vec<Callback>>,
     pending_press: &std::cell::RefCell<Option<(usize, u32, f64)>>,
+    pending_drag: &std::cell::RefCell<bool>,
 ) {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
@@ -410,6 +439,34 @@ fn execute_command(
                     }
                 }
             }
+        }
+        "drag" | "dnd" => {
+            // Show what a drag of `line` would carry. There is no other window
+            // in a terminal, so this reports the payload instead of dropping it.
+            // First fire the button-press handler with button 1, which is how
+            // the app records the row a drag would pick up.
+            let line: i32 = match args.first().and_then(|a| a.parse().ok()) {
+                Some(n) => n,
+                None => {
+                    println!("Usage: drag <line>   (0-based row; shows the drag payload)");
+                    return;
+                }
+            };
+            let id = state.current_id;
+            let press_id = if state.node(id).map(|n| n.button_press_cb.is_some()).unwrap_or(false) {
+                Some(id)
+            } else {
+                state.nodes.iter().find(|n| n.button_press_cb.is_some()).map(|n| n.id)
+            };
+            if let Some(pid) = press_id {
+                // Queued and run by the driver, so the app records the row
+                // before we read the payload below -- but the payload must be
+                // read *after* that. Stash the request instead.
+                *pending_press.borrow_mut() = Some((pid, 1, line as f64));
+                *pending_drag.borrow_mut() = true;
+                return;
+            }
+            println!("No widget has a drag source.");
         }
         "rightclick" | "rclick" => {
             // The REPL has no pointer, so the row must be given: `rightclick
@@ -574,6 +631,8 @@ fn execute_command(
             println!("  go <number>           - go to numbered item");
             println!("  north/n, south/s, east/e, west/w - quick move");
             println!("  click / press [n]     - press a button or open menu (default: current)");
+            println!("  rightclick <line>     - right-click a row (context menu)");
+            println!("  drag <line>           - show the drag payload for a row");
             println!("  select / choose <n>   - select a menu item from a MenuBar/Menu");
             println!("  examine / x [n]       - examine something in detail");
             println!("  type / write          - enter text into an Entry (sub-prompt)");
@@ -942,6 +1001,30 @@ pub fn set_button_press_cb(id: usize, cb: Box<dyn FnMut(u32, f64, f64)>) {
             n.button_press_cb = Some(cb);
         }
     });
+}
+
+/// Register a drag-payload supplier on `id`.
+pub fn set_drag_payload_cb(
+    id: usize,
+    cb: Box<dyn FnMut() -> Option<(Vec<String>, String)>>,
+) {
+    with_state(|s| {
+        if let Some(n) = s.node_mut(id) {
+            n.drag_payload_cb = Some(cb);
+        }
+    });
+}
+
+/// Produce the payload `id` would drag, by calling its registered supplier.
+pub fn drag_payload(id: usize) -> Option<(Vec<String>, String)> {
+    let mut cb = with_state(|s| s.node_mut(id).and_then(|n| n.drag_payload_cb.take()));
+    let out = cb.as_mut().and_then(|cb| cb());
+    with_state(|s| {
+        if let Some(n) = s.node_mut(id) {
+            n.drag_payload_cb = cb;
+        }
+    });
+    out
 }
 
 /// Fire the button-press handler registered on `id`, if any. `button` is the

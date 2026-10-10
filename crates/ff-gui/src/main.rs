@@ -87,6 +87,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // keep it alive until the user dismisses it.
     let current: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let live_menu: Rc<RefCell<Option<ContextMenu>>> = Rc::new(RefCell::new(None));
+    // The row a drag would carry. Set on left-press (the drag's start), read
+    // when a drop target asks for the data: `drag-data-get` carries no start
+    // position of its own.
+    let drag_row: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
     // A live connection check up front: an empty list from an absent daemon and
     // an empty list from a real "no matches" must not look the same.
@@ -142,7 +146,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let live_menu = live_menu.clone();
         let cb_results = results.clone();
         let status_for_err = status.clone();
+        let drag_row = drag_row.clone();
         if let Err(e) = results.connect_button_press_event(move |button, x, y, event| {
+            // Left-press starts a potential drag: remember the row grabbed.
+            // (button-press fires before the drag begins, so this is set by the
+            // time `drag-data-get` runs.)
+            if button == 1 {
+                let rows = current.borrow();
+                *drag_row.borrow_mut() = cb_results
+                    .line_at(x, y)
+                    .and_then(|line| row_at_line(&rows, line))
+                    .map(|p| p.to_string());
+                return;
+            }
             if button != 3 {
                 return;
             }
@@ -189,6 +205,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // Not fatal: the list still works, only the context menu is gone.
             // Say so rather than silently doing nothing on right-click.
             status_for_err.set_text(&format!("context menu unavailable: {e}"));
+        }
+    }
+
+    // Dragging a row out of the window carries it as a file URI *and* as plain
+    // text, so it can be dropped on a file manager (which wants the URI) or a
+    // terminal/editor (which wants the path). The payload is read lazily at
+    // drop time from the row recorded on left-press.
+    {
+        let results = results.clone();
+        let status = status.clone();
+        let drag_row = drag_row.clone();
+        if let Err(e) = results.enable_uri_drag_source(move || {
+            drag_row
+                .borrow()
+                .as_deref()
+                .map(ff_gui::drag_payload)
+        }) {
+            // Not fatal: the list still works, only dragging is unavailable.
+            status.set_text(&format!("drag and drop unavailable: {e}"));
         }
     }
 

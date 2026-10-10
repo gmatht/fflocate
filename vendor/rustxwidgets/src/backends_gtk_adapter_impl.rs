@@ -644,6 +644,45 @@ mod gtk_adapter {
             unsafe { gtk_dynamic_loader::text_view_line_at_location(&loader, widget, x, y) }
         }
 
+        /// Make this text view a drag source carrying file URIs and plain text.
+        ///
+        /// `payload` is called when a drop target asks for the data; it should
+        /// return the `(uris, text)` to hand over, or `None` to refuse. The app
+        /// decides *what* is being dragged (e.g. the row recorded at press
+        /// time), since the `drag-data-get` signal carries no start position.
+        pub fn enable_uri_drag_source(
+            &self,
+            mut payload: impl FnMut() -> Option<(Vec<String>, String)> + 'static,
+        ) -> Result<(), Error> {
+            let loader = crate::backends::gtk::loader()
+                .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+            let widget = *self.0.as_ref();
+            unsafe {
+                gtk_dynamic_loader::widget_enable_uri_drag_source(&loader, widget)
+            }
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+            let cb_loader = loader.clone();
+            unsafe {
+                gtk_dynamic_loader::connect_widget_drag_data_get(
+                    &loader,
+                    widget,
+                    move |selection_data, target| {
+                        let Some((uris, text)) = payload() else { return };
+                        // GTK passes the requested target name, so we only
+                        // fill in the form this drop asked for.
+                        let r = if target.contains("uri-list") {
+                            gtk_dynamic_loader::drag_set_uris(&cb_loader, selection_data, &uris)
+                        } else {
+                            gtk_dynamic_loader::drag_set_text(&cb_loader, selection_data, &text)
+                        };
+                        let _ = r;
+                    },
+                )
+            }
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+            Ok(())
+        }
+
         /// Copy `text` to the system clipboard.
         pub fn clipboard_set_text(&self, text: &str) -> Result<(), Error> {
             let loader = crate::backends::gtk::loader()

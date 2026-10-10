@@ -221,6 +221,64 @@ pub unsafe fn connect_signal_motion(lib_symbols: &crate::symbols::Symbols, insta
     } else { Err("no g_signal_connect available".into()) }
 }
 
+// Trampoline for drag signals, e.g. GtkWidget::drag-data-get with
+// (widget, drag_context, selection_data, info, time, user_data). The drag
+// context and selection data are passed straight through to the closure; info
+// and time identify which target was requested and the event timestamp.
+#[no_mangle]
+pub extern "C" fn gtk_compat_trampoline_drag(
+    _instance: *mut c_void,
+    drag_context: *mut c_void,
+    selection_data: *mut c_void,
+    info: u32,
+    time: u32,
+    user_data: *mut c_void,
+) {
+    unsafe {
+        if user_data.is_null() { return; }
+        let inner_ptr = user_data as *mut Box<dyn FnMut(*mut c_void, *mut c_void, u32, u32)>;
+        if inner_ptr.is_null() { return; }
+        let closure_ref: &mut dyn FnMut(*mut c_void, *mut c_void, u32, u32) = &mut **inner_ptr;
+        closure_ref(drag_context, selection_data, info, time);
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gtk_compat_destroy_notify_drag(data: *mut c_void, _closure: *mut c_void) {
+    unsafe {
+        if data.is_null() { return; }
+        let inner_ptr = data as *mut Box<dyn FnMut(*mut c_void, *mut c_void, u32, u32)>;
+        let _boxed: Box<Box<dyn FnMut(*mut c_void, *mut c_void, u32, u32)>> = Box::from_raw(inner_ptr);
+    }
+}
+
+/// Connect a drag signal whose handler receives
+/// `(drag_context, selection_data, info, time)` — notably `drag-data-get`.
+pub unsafe fn connect_signal_drag(
+    lib_symbols: &crate::symbols::Symbols,
+    instance: *mut c_void,
+    signal_name: &str,
+    cb: Box<dyn FnMut(*mut c_void, *mut c_void, u32, u32)>,
+) -> Result<u64, String> {
+    let boxed: Box<Box<dyn FnMut(*mut c_void, *mut c_void, u32, u32)>> = Box::new(Box::new(cb));
+    let raw = Box::into_raw(boxed) as *mut c_void;
+    let sig_name = CString::new(signal_name).unwrap();
+    if let Some(gscd) = lib_symbols.g_signal_connect_data {
+        let handler_ptr = gtk_compat_trampoline_drag as *const () as *mut c_void;
+        let destroy_ptr = Some(
+            gtk_compat_destroy_notify_drag as unsafe extern "C" fn(*mut c_void, *mut c_void),
+        );
+        let id = gscd(instance, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
+        Ok(id)
+    } else if let Some(gsc) = lib_symbols.g_signal_connect {
+        let handler_ptr = gtk_compat_trampoline_drag as *const () as *mut c_void;
+        let id = gsc(instance, sig_name.as_ptr(), handler_ptr, raw);
+        Ok(id)
+    } else {
+        Err("no g_signal_connect available".into())
+    }
+}
+
 // Connect a signal that expects a gboolean/int return from the handler
 pub unsafe fn connect_signal_bool(lib_symbols: &crate::symbols::Symbols, instance: *mut c_void, signal_name: &str, cb: Box<dyn FnMut(*mut c_void) -> i32>) -> Result<u64, String> {
     let boxed: Box<Box<dyn FnMut(*mut c_void) -> i32>> = Box::new(Box::new(cb));

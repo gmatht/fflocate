@@ -984,6 +984,15 @@ mod nwg_adapter {
             None
         }
 
+        /// No drag-and-drop on this backend: there is no other window to
+        /// drop into.
+        pub fn enable_uri_drag_source(
+            &self,
+            _payload: impl FnMut() -> Option<(Vec<String>, String)> + 'static,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
         /// No system clipboard on this backend.
         pub fn clipboard_set_text(&self, _text: &str) -> Result<(), Error> {
             Err(Error::Backend("clipboard not supported on this backend".into()))

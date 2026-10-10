@@ -555,7 +555,18 @@ impl TextView {
         }
     }
 
-    /// Copy `text` using the terminal clipboard escape (OSC 52), so it works
+    /// There is no other window in a terminal, so nothing can be dropped on.
+    /// The payload supplier is still stored so the `drag <line>` command can
+    /// show what a drag would carry.
+    pub fn enable_uri_drag_source(
+        &self,
+        payload: impl FnMut() -> Option<(Vec<String>, String)> + 'static,
+    ) -> Result<(), Error> {
+        crate::backends::zork::set_drag_payload_cb(self.id, Box::new(payload));
+        Ok(())
+    }
+
+        /// Copy `text` using the terminal clipboard escape (OSC 52), so it works
     /// over ssh as well as locally. Does nothing (and reports so) when stdout is
     /// not a terminal.
     pub fn clipboard_set_text(&self, text: &str) -> Result<(), Error> {

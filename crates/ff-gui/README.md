@@ -35,11 +35,11 @@ with the fixes needed for the `zork` backend to run `ff-gui` (`core.rs` had no
 `Clone` impls and delegate methods; and `backends/zork.rs` invoked widget
 callbacks while it still held the state `RefCell`'s `borrow_mut`, so a button
 like Search — whose callback calls back into the widget API — panicked with
-"RefCell already borrowed"). The 3.x widget API also had no context-menu or
-clipboard support at all, so `gtk_dynamic_loader` gained the missing GTK3/GTK4
-bindings and a closure-backed `ContextMenu`. They are vendored rather than
-referenced by path so the build does not depend on a checkout outside this
-repository.
+"RefCell already borrowed"). The 3.x widget API also had no context-menu,
+clipboard, or drag-and-drop support at all, so `gtk_dynamic_loader` gained the
+missing GTK3/GTK4 bindings, a closure-backed `ContextMenu`, and URI/text drag
+sources. They are vendored rather than referenced by path so the build does not
+depend on a checkout outside this repository.
 
 ## Status
 
@@ -54,6 +54,11 @@ repository.
   on GTK and the terminal's OSC 52 escape in the `zork` fallback (so it works
   over ssh); Open and Open-containing-folder invoke `xdg-open` on the file and
   its parent directory respectively.
+* **Drag a result** into another window. The row is picked up from the pointer
+  position at drag start and carried as both a `file://` URI (for a file manager
+  or editor) and plain text (for a terminal or text field), so the drop target
+  can choose. The `zork` fallback has no other window to drop into; its
+  `drag <line>` command prints the payload instead.
 * Results come from the daemon's `query` op; the consistency metadata
   (`fresh`, `stale_roots`, `catching_up`) is shown in the status line, so a
   stale view is never presented as an empty one.
