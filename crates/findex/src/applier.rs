@@ -540,7 +540,7 @@ impl Applier {
         let _ = self.abs_path_for(parent);
         let mut ix = self.shared.index.write().unwrap();
         let lookup = ix.lookup(parent, &name);
-        let _new_id = match lookup {
+        let (created_id, existing_id) = match lookup {
             Some(id) => {
                 // Refresh the type if it changed (e.g. file → dir via rename).
                 let cur = ix.entry(id).unwrap().flags();
@@ -548,17 +548,25 @@ impl Applier {
                     let nf = EntryFlags(cur.0).with_dir(is_dir_hint);
                     ix.entry_mut(id).flags = nf.0;
                 }
-                None
+                (None, Some(id))
             }
             None => {
                 let id = ix.insert(parent, &name, flags);
-                Some(id)
+                (Some(id), None)
             }
         };
         drop(ix);
-        if let Some(id) = _new_id {
+        if let Some(id) = created_id {
             let rec = Record::Add { id, parent, name: name.clone(), flags: flags.0 };
             self.emit(rec);
+        } else if let Some(id) = existing_id {
+            // An upsert for an entry we already have. The name is unchanged, but
+            // the *thing* may not be: a file deleted and recreated, or replaced by
+            // a rename, can have different ownership. Refresh it, or the filter
+            // keeps answering with the old answer — which for a chowned file means
+            // showing it to someone who has since lost access, the one direction
+            // that must not happen.
+            self.note_ownership_for(id, parent, &name);
         }
 
         // A directory, new or re-typed: record its path so a later crawl/diff can

@@ -290,3 +290,66 @@ fn a_file_found_by_rescan_is_still_visible() {
     assert!(got.iter().any(|p| p.ends_with("/crawled.txt")), "got {got:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A file that is replaced under the same name must have its *ownership*
+/// refreshed, not just its existence.
+///
+/// This is the dangerous direction. Ownership that is stale in the "hidden too
+/// much" direction is annoying; stale in the other direction shows a file to
+/// someone who has since lost the right to see it. `apply_upsert` refreshes the
+/// entry's flags for an existing id, and must refresh its attributes too.
+#[test]
+fn re_upsert_refreshes_ownership() {
+    use std::sync::Arc;
+    use findex::applier::{Applier, RealFs};
+
+    let root = std::path::PathBuf::from("/tmp/findex-refresh-ownership");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let victim = root.join("victim.txt");
+    std::fs::write(&victim, b"x").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let d = tempfile::tempdir().unwrap();
+    let store = findex::persist::Store::open(&d.path().join("state")).unwrap();
+    let mut ix = Index::new();
+    let rid = ix.insert(
+        ROOT_ID,
+        b"findex-refresh-ownership",
+        EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+    );
+    let mut r = Root::new(0, root.clone());
+    r.caps.writable = true;
+    let shared = Shared::new(ix, vec![r]);
+    let mut applier = Applier::new(shared.clone(), store, Arc::new(RealFs), SyncRegistry::new());
+    applier.rebuild_dir_cache();
+    applier.track_ownership(true);
+    applier.pending_mut().enqueue_crawl(rid);
+    applier.drain();
+
+    let caller = Caller::new(1000, 1000);
+    // While it is 0600, a stranger must not see it.
+    let id = {
+        let ix = shared.index.read().unwrap();
+        let found = ix.iter_live().find(|(_, e)| !e.flags().is_root_dir()).map(|(id, _)| id);
+        found.unwrap()
+    };
+    assert!(!shared.ownership.read().unwrap().visible_to(id, &caller), "0600 must be hidden");
+
+    // The file is replaced, this time world-readable, under the same name. A
+    // watcher reports this as an upsert for an id we already have.
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+    applier.push(findex::event::FsEvent::upsert(
+        findex::event::DirKey::new(rid),
+        b"victim.txt".to_vec(),
+        false,
+    ));
+    applier.drain();
+
+    assert!(
+        shared.ownership.read().unwrap().visible_to(id, &caller),
+        "after the file became 0644 the filter must say so, not repeat the old answer"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
