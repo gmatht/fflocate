@@ -39,8 +39,13 @@ All of the following were exercised against real binaries and a real temp tree:
   the queue drained).
 * Cookie files are cleaned up on completion and on timeout (no leaks).
 
-`cargo test` runs 185 tests, all green, including a 120-step random
+`cargo test` runs 186 tests, all green, including a 120-step random
 differential test against a from-scratch filesystem walk.
+
+Zero-hit `ff` string queries with an uppercase letter get a case-folded
+"did you mean" rerun (bounded, stderr only; stdout/exit codes untouched).
+True edit-distance fuzzy stays out — that belongs to the v2 trigram
+accelerator, not to a scan.
 
 ### `locate` drop-in (`crates/fx/src/locate.rs`)
 

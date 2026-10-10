@@ -106,6 +106,7 @@ impl Client {
         zero: bool,
         expr: Option<serde_json::Value>,
     ) -> Result<ExitCode, CliError> {
+        let is_string_query = expr.is_none();
         let req = match expr {
             Some(v) => {
                 // Accept either a bare expression tree (array/string) or a full
@@ -175,9 +176,38 @@ impl Client {
             println!("{}", total.max(printed));
         }
         if total == 0 {
+            // Point of no return for results — but stderr may still help.
+            if is_string_query {
+                self.suggest_alternate(q);
+            }
             return Ok(ExitCode::from(1));
         }
         Ok(ExitCode::SUCCESS)
+    }
+
+    /// Case-folded "did you mean" for zero-hit string queries. The engine is
+    /// smart-case: an uppercase letter in the query forced sensitive matching,
+    /// so a lowercased rerun may find what the user meant. Bounded to a few
+    /// hits, stderr only — stdout, the exit code, and determinism are
+    /// untouched. (True edit-distance fuzzy belongs to the v2 trigram
+    /// accelerator, §17, not to a scan.)
+    fn suggest_alternate(&mut self, q: &str) {
+        let Some(folded) = folded_query(q) else { return };
+        let req = Request::query(&folded, 5, false, false);
+        let Ok(resp) = self.send(&req) else { return };
+        let mut hits = Vec::new();
+        for r in &resp {
+            if let Response::Hit { path, .. } = r {
+                hits.push(path.clone());
+            }
+        }
+        if hits.is_empty() {
+            return;
+        }
+        eprintln!("ff: no matches; did you mean:");
+        for h in &hits {
+            eprintln!("  {h}");
+        }
     }
 
     /// Run a prebuilt expression query in `locate` mode: plain absolute paths
@@ -511,6 +541,17 @@ impl Client {
 
 }
 
+/// Lowercased re-query for "did you mean", or `None` when folding changes
+/// nothing: an all-lowercase query never engaged smart-case, so a rerun
+/// would be pointless. Mirrors the engine's ASCII rule (`has_upper`).
+fn folded_query(q: &str) -> Option<String> {
+    if q.bytes().any(|b| b.is_ascii_uppercase()) {
+        Some(q.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
 /// Existence check for `locate -e`: follow symlinks only with `-L`
 /// (default `-P`, like GNU locate).
 fn path_exists(path: &str, follow: bool) -> bool {
@@ -691,4 +732,19 @@ fn daemon_binary_path() -> Result<PathBuf, CliError> {
     Err(CliError::Io(
         "findexd not found next to ff or on PATH (set FINDEXD_BIN)".into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folded_query_only_fires_on_uppercase() {
+        assert_eq!(folded_query("README"), Some("readme".to_string()));
+        assert_eq!(folded_query("MakeFile"), Some("makefile".to_string()));
+        // Already lowercase: smart-case never engaged, rerun pointless.
+        assert_eq!(folded_query("readme"), None);
+        assert_eq!(folded_query(""), None);
+        assert_eq!(folded_query("123-_.rs"), None);
+    }
 }
