@@ -291,6 +291,11 @@ impl App {
         crate::backends_gtk_adapter::create_expander(label)
     }
 
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    pub fn create_treeview(&self, columns: &[(&str, bool)]) -> Result<crate::backends_gtk_adapter::TreeView, Error> {
+        crate::backends_gtk_adapter::create_treeview(columns)
+    }
+
     #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_overlay(&self) -> Result<crate::backends_gtk_adapter::Overlay, Error> {
         crate::backends_gtk_adapter::create_overlay()
@@ -424,6 +429,11 @@ impl App {
     }
 
     #[cfg(all(windows, not(feature = "zork")))]
+    pub fn create_treeview(&self, columns: &[(&str, bool)]) -> Result<crate::backends_nwg_adapter::TreeView, Error> {
+        crate::backends_nwg_adapter::create_treeview(columns)
+    }
+
+    #[cfg(all(windows, not(feature = "zork")))]
     pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
         crate::backends_nwg_adapter::open_file(title, parent)
@@ -532,6 +542,11 @@ impl App {
         crate::backends_pancurses_adapter::create_expander(label)
     }
 
+#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+    pub fn create_treeview(&self, columns: &[(&str, bool)]) -> Result<crate::backends_pancurses_adapter::TreeView, Error> {
+        crate::backends_pancurses_adapter::create_treeview(columns)
+    }
+
     #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
         crate::backends_pancurses_adapter::open_file(title)
@@ -562,6 +577,11 @@ impl App {
 #[cfg(feature = "zork")]
     pub fn create_expander(&self, label: &str) -> Result<crate::backends_zork_adapter::Expander, Error> {
         crate::backends_zork_adapter::create_expander(label)
+    }
+
+#[cfg(feature = "zork")]
+    pub fn create_treeview(&self, columns: &[(&str, bool)]) -> Result<crate::backends_zork_adapter::TreeView, Error> {
+        crate::backends_zork_adapter::create_treeview(columns)
     }
 
     #[cfg(feature = "zork")]
@@ -734,6 +754,11 @@ impl App {
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_expander(&self, label: &str) -> Result<crate::backends_wasm_adapter::Expander, Error> {
         crate::backends_wasm_adapter::create_expander(label)
+    }
+
+#[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
+    pub fn create_treeview(&self, columns: &[(&str, bool)]) -> Result<crate::backends_wasm_adapter::TreeView, Error> {
+        crate::backends_wasm_adapter::create_treeview(columns)
     }
     #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn open_file(&self, _title: &str) -> Result<Option<String>, Error> {

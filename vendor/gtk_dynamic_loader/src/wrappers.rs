@@ -238,6 +238,399 @@ impl Drop for Expander {
     }
 }
 
+/// A real multi-column list: a `GtkTreeView` backed by a `GtkListStore`.
+///
+/// Columns are `(title, attribute, is_pixbuf)`. Text cells show a string; a
+/// pixbuf column shows a `GdkPixbuf` (e.g. an icon-theme icon).
+pub struct TreeView {
+    inner: *mut c_void,
+    store: *mut c_void,
+    loader: Arc<Loader>,
+    columns: Vec<i32>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Clone for TreeView {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref {
+            unsafe { gref(self.inner); }
+            unsafe { gref(self.store); }
+        }
+        TreeView {
+            inner: self.inner,
+            store: self.store,
+            loader: self.loader.clone(),
+            columns: self.columns.clone(),
+            _not_send: PhantomData,
+        }
+    }
+}
+
+impl TreeView {
+    /// Create a tree view with the given columns. The store's column types are
+    /// derived from `columns`: pixbuf columns hold objects, the rest strings.
+    pub fn new(
+        loader: Arc<Loader>,
+        columns: &[(&str, &str, bool)],
+    ) -> Result<Self, Error> {
+        let symbols = &loader.symbols;
+        let view_new = symbols
+            .gtk_tree_view_new
+            .ok_or(Error::MissingSymbol("gtk_tree_view_new".into()))?;
+        let store_new = symbols
+            .gtk_list_store_new
+            .ok_or(Error::MissingSymbol("gtk_list_store_new".into()))?;
+        let set_model = symbols
+            .gtk_tree_view_set_model
+            .ok_or(Error::MissingSymbol("gtk_tree_view_set_model".into()))?;
+        let col_with_attrs = symbols
+            .gtk_tree_view_column_new_with_attributes
+            .ok_or(Error::MissingSymbol("gtk_tree_view_column_new_with_attributes".into()))?;
+        let append_col = symbols
+            .gtk_tree_view_append_column
+            .ok_or(Error::MissingSymbol("gtk_tree_view_append_column".into()))?;
+        let text_new = symbols
+            .gtk_cell_renderer_text_new
+            .ok_or(Error::MissingSymbol("gtk_cell_renderer_text_new".into()))?;
+        let pixbuf_new = symbols
+            .gtk_cell_renderer_pixbuf_new
+            .ok_or(Error::MissingSymbol("gtk_cell_renderer_pixbuf_new".into()))?;
+
+        // The store's type list is variadic and its entries are GType values.
+        // Resolve them by name rather than hardcoding numbers: G_TYPE_STRING is
+        // not a stable constant across GLib builds (it is the registered type of
+        // "gchararray").
+        let g_type_string = type_by_name(&loader, "gchararray")?;
+        let pixbuf_type = type_by_name(&loader, "GdkPixbuf").unwrap_or(0);
+
+        let inner = unsafe { view_new() };
+        if inner.is_null() {
+            return Err(Error::Other("gtk_tree_view_new returned null".into()));
+        }
+        unsafe { take_ownership(symbols, &loader.version, inner); }
+
+        let store = unsafe {
+            match columns.len() {
+                1 => store_new(1, if columns[0].2 { pixbuf_type } else { g_type_string }),
+                2 => store_new(
+                    2,
+                    if columns[0].2 { pixbuf_type } else { g_type_string },
+                    if columns[1].2 { pixbuf_type } else { g_type_string },
+                ),
+                _ => store_new(
+                    3,
+                    if columns[0].2 { pixbuf_type } else { g_type_string },
+                    if columns[1].2 { pixbuf_type } else { g_type_string },
+                    if columns[2].2 { pixbuf_type } else { g_type_string },
+                ),
+            }
+        };
+        if store.is_null() {
+            return Err(Error::Other("gtk_list_store_new returned null".into()));
+        }
+        unsafe { take_ownership(symbols, &loader.version, store); }
+        unsafe { set_model(inner, store); }
+
+        let mut ids = Vec::new();
+        for (i, (title, attr, is_pixbuf)) in columns.iter().enumerate() {
+            let cell = unsafe { if *is_pixbuf { pixbuf_new() } else { text_new() } };
+            if cell.is_null() {
+                continue;
+            }
+            let t = CString::new(*title).unwrap_or_default();
+            let a = CString::new(*attr).unwrap_or_default();
+            // Varargs: (title, cell, attr_name, column_index, NULL).
+            let col = unsafe {
+                col_with_attrs(
+                    t.as_ptr(),
+                    cell,
+                    a.as_ptr(),
+                    i as i32,
+                    std::ptr::null::<i8>(),
+                )
+            };
+            if col.is_null() {
+                continue;
+            }
+            unsafe { append_col(inner, col); }
+            ids.push(i as i32);
+        }
+        if let Some(f) = symbols.gtk_tree_view_set_headers_visible {
+            unsafe { f(inner, 1); }
+        }
+        Ok(TreeView { inner, store, loader, columns: ids, _not_send: PhantomData })
+    }
+
+    /// Remove every row.
+    pub fn clear(&self) {
+        if let Some(f) = self.loader.symbols.gtk_list_store_clear {
+            unsafe { f(self.store); }
+        }
+    }
+
+    /// Append one row. `values` are `Str` (text) or `Pixbuf` (a GdkPixbuf, which
+    /// this takes its own reference to).
+    pub fn append_row(&self, values: &[CellValue]) {
+        let symbols = &self.loader.symbols;
+        let (Some(append), Some(set_valuesv), Some(init), Some(unset)) = (
+            symbols.gtk_list_store_append,
+            symbols.gtk_list_store_set_valuesv,
+            symbols.g_value_init,
+            symbols.g_value_unset,
+        ) else {
+            return;
+        };
+        let Ok(g_type_string) = type_by_name(&self.loader, "gchararray") else { return };
+        let pixbuf_type = type_by_name(&self.loader, "GdkPixbuf").unwrap_or(0);
+
+        // GtkTextIter for GtkListStore rows is the same opaque struct; a
+        // generously sized, pointer-aligned buffer is enough.
+        #[repr(C, align(8))]
+        struct IterBuf([u8; 128]);
+        let mut iter = IterBuf([0u8; 128]);
+
+        unsafe { append(self.store, iter.0.as_mut_ptr() as *mut c_void); }
+
+        let n = values.len().min(self.columns.len());
+        let mut cols: Vec<i32> = Vec::with_capacity(n);
+        // GValue is exactly 24 bytes on LP64 (`GType` + a 16-byte union).
+        // `gtk_list_store_set_valuesv` walks the array at `sizeof(GValue)`
+        // strides, so the elements must be exactly that size — not merely at
+        // least it — or it reads each value from the wrong offset.
+        #[repr(C, align(8))]
+        struct GValueBuf([u8; 24]);
+        let mut vals: Vec<GValueBuf> = (0..n).map(|_| GValueBuf([0u8; 24])).collect();
+        for (i, v) in values.iter().take(n).enumerate() {
+            cols.push(i as i32);
+            let gv = vals[i].0.as_mut_ptr() as *mut c_void;
+            match v {
+                CellValue::Str(text) => {
+                    unsafe {
+                        init(gv, g_type_string);
+                        if let Some(set_s) = symbols.g_value_set_string {
+                            let c = CString::new(text.as_str()).unwrap_or_default();
+                            set_s(gv, c.as_ptr());
+                        }
+                    }
+                }
+                CellValue::Pixbuf(pb) => {
+                    unsafe {
+                        init(gv, pixbuf_type);
+                        if let Some(set_o) = symbols.g_value_set_object {
+                            set_o(gv, *pb);
+                        }
+                    }
+                }
+            }
+        }
+        unsafe {
+            set_valuesv(
+                self.store,
+                iter.0.as_mut_ptr() as *mut c_void,
+                cols.as_mut_ptr(),
+                vals.as_mut_ptr() as *mut c_void,
+                n as i32,
+            );
+        }
+        for v in vals.iter_mut() {
+            unsafe { unset(v.0.as_mut_ptr() as *mut c_void); }
+        }
+    }
+
+    /// The path text of the row currently selected, if any. `path_column` is the
+    /// index of the column holding the full path.
+    pub fn selected_path(&self, path_column: usize) -> Option<String> {
+        let symbols = &self.loader.symbols;
+        let (Some(get_selected), Some(get_string)) =
+            (symbols.gtk_tree_selection_get_selected, symbols.g_value_get_string)
+        else {
+            return None;
+        };
+        // gtk_tree_view_get_selection returns a GtkTreeSelection* (owned by the
+        // view, not a new ref).
+        let get_selection = self
+            .loader
+            .libs
+            .get("libgtk")
+            .and_then(|l| unsafe {
+                l.get::<unsafe extern "C" fn(*mut c_void) -> *mut c_void>(
+                    b"gtk_tree_view_get_selection",
+                )
+                .ok()
+                .map(|s| *s)
+            })?;
+        unsafe {
+            let sel = get_selection(self.inner);
+            if sel.is_null() {
+                return None;
+            }
+            #[repr(C, align(8))]
+            struct IterBuf([u8; 128]);
+            #[repr(C, align(8))]
+            struct GValueBuf([u8; 32]);
+            let mut iter = IterBuf([0u8; 128]);
+            let mut model: *mut c_void = std::ptr::null_mut();
+            // `get_selected` takes the GtkTreeSelection, not the view.
+            if get_selected(sel, &mut model, iter.0.as_mut_ptr() as *mut c_void) == 0 {
+                return None;
+            }
+            // Read the cell with gtk_tree_model_get_value (also variadic-free).
+            type ModelGetValue = unsafe extern "C" fn(*mut c_void, *mut c_void, i32, *mut c_void);
+            let get_value = self
+                .loader
+                .libs
+                .get("libgtk")
+                .and_then(|l| unsafe { l.get::<ModelGetValue>(b"gtk_tree_model_get_value").ok().map(|s| *s) })
+                .or_else(|| {
+                    self.loader.libs.get("libgtk").and_then(|l| unsafe {
+                        l.get::<ModelGetValue>(b"gtk_tree_model_get_value").ok().map(|s| *s)
+                    })
+                })?;
+            let mut gv = GValueBuf([0u8; 32]);
+            let gv_ptr = gv.0.as_mut_ptr() as *mut c_void;
+            // Zero-initialised GValue; get_value fills the type and value.
+            get_value(model, iter.0.as_mut_ptr() as *mut c_void, path_column as i32, gv_ptr);
+            let s = get_string(gv_ptr);
+            let out = if s.is_null() {
+                None
+            } else {
+                Some(std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned())
+            };
+            if let Some(unset) = self.loader.symbols.g_value_unset {
+                unset(gv_ptr);
+            }
+            out
+        }
+    }
+
+    /// The 0-based row index under widget coordinates `(x, y)`, or `None` if the
+    /// click was not on a row. Used to pick the row a right-click refers to.
+    pub fn row_at(&self, x: f64, y: f64) -> Option<i32> {
+        let symbols = &self.loader.symbols;
+        let (Some(get_path), Some(get_indices), Some(free)) = (
+            symbols.gtk_tree_view_get_path_at_pos,
+            symbols.gtk_tree_path_get_indices,
+            symbols.gtk_tree_path_free,
+        ) else {
+            return None;
+        };
+        unsafe {
+            let mut path: *mut c_void = std::ptr::null_mut();
+            if get_path(
+                self.inner,
+                x as i32,
+                y as i32,
+                &mut path,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ) == 0
+                || path.is_null()
+            {
+                return None;
+            }
+            let idx = get_indices(path);
+            let row = if idx.is_null() { None } else { Some(*idx) };
+            free(path);
+            row
+        }
+    }
+
+    /// Select the row at `index` (0-based).
+    pub fn select_row(&self, index: i32) {
+        let symbols = &self.loader.symbols;
+        let (Some(get_selection), Some(new_path), Some(select_path)) = (
+            symbols.gtk_tree_view_get_selection,
+            symbols.gtk_tree_path_new_from_indices,
+            symbols.gtk_tree_selection_select_path,
+        ) else {
+            return;
+        };
+        unsafe {
+            let sel = get_selection(self.inner);
+            if sel.is_null() {
+                return;
+            }
+            // Variadic: (index, -1).
+            let path = new_path(index, -1i32);
+            if !path.is_null() {
+                select_path(sel, path);
+                if let Some(free) = symbols.gtk_tree_path_free {
+                    free(path);
+                }
+            }
+        }
+    }
+
+    /// The tree view with its own scrolled container, so it scrolls.
+    pub fn wrap_scroll(&self, loader: &Arc<Loader>) -> Result<ScrolledWindow, Error> {
+        let sw = ScrolledWindow::new(loader.clone())?;
+        sw.set_child(self);
+        Ok(sw)
+    }
+}
+
+/// A value for one cell of a [`TreeView`] row.
+pub enum CellValue {
+    Str(String),
+    /// A borrowed GdkPixbuf pointer; the store sinks its own reference.
+    Pixbuf(*mut c_void),
+}
+
+impl AsRef<*mut c_void> for TreeView { fn as_ref(&self) -> &*mut c_void { &self.inner } }
+
+impl Drop for TreeView {
+    fn drop(&mut self) {
+        unsafe {
+            unref_widget(&self.loader, self.inner);
+            unref_widget(&self.loader, self.store);
+        }
+        self.inner = std::ptr::null_mut();
+        self.store = std::ptr::null_mut();
+    }
+}
+
+/// Load an icon from the default icon theme, trying `name` and then `fallback`
+/// (so a specific type icon is shown when the theme has it, and a generic one
+/// otherwise). Returns a new GdkPixbuf reference, or null if neither exists.
+pub unsafe fn icon_theme_load_icon_with_fallback(
+    loader: &Arc<Loader>,
+    name: &str,
+    fallback: &str,
+    size: i32,
+) -> *mut c_void {
+    let first = unsafe { icon_theme_load_icon(loader, name, size) };
+    if !first.is_null() {
+        return first;
+    }
+    if name == fallback {
+        return std::ptr::null_mut();
+    }
+    unsafe { icon_theme_load_icon(loader, fallback, size) }
+}
+
+/// Load an icon from the default icon theme at `size` pixels. Returns the
+/// GdkPixbuf pointer (new reference) or null. Used to fill a pixbuf column.
+pub unsafe fn icon_theme_load_icon(loader: &Arc<Loader>, name: &str, size: i32) -> *mut c_void {
+    let Some(get_default) = loader.symbols.gtk_icon_theme_get_default else {
+        return std::ptr::null_mut();
+    };
+    let Some(load) = loader.symbols.gtk_icon_theme_load_icon else {
+        return std::ptr::null_mut();
+    };
+    let theme = unsafe { get_default() };
+    if theme.is_null() {
+        return std::ptr::null_mut();
+    }
+    let c = CString::new(name).unwrap_or_default();
+    // GTK_ICON_LOOKUP_USE_BUILTIN forces a fallback icon so we never get null
+    // for a name the theme does not have... but a missing name still yields
+    // null, which the caller handles by using a fallback name.
+    const GTK_ICON_LOOKUP_USE_BUILTIN: i32 = 8;
+    let mut err: *mut c_void = std::ptr::null_mut();
+    unsafe { load(theme, c.as_ptr(), size, GTK_ICON_LOOKUP_USE_BUILTIN, &mut err) }
+}
+
 pub struct Window {
     inner: *mut c_void,
     loader: Arc<Loader>,
@@ -2141,6 +2534,22 @@ pub unsafe fn drag_set_text(
         .map_err(|_| Error::Other("drag text contains NUL".into()))?;
     unsafe { set(selection_data, c.as_ptr(), text.len() as i32) };
     Ok(())
+}
+
+/// Resolve a GType by its registered name (e.g. `gchararray` for
+/// `G_TYPE_STRING`). Returns `None` if the name is unknown.
+pub fn type_by_name(loader: &Arc<Loader>, name: &str) -> Result<usize, Error> {
+    let f = loader
+        .symbols
+        .g_type_from_name
+        .ok_or(Error::MissingSymbol("g_type_from_name".into()))?;
+    let c = CString::new(name).unwrap_or_default();
+    let t = unsafe { f(c.as_ptr()) };
+    if t == 0 {
+        Err(Error::Other(format!("unknown GType name: {name}")))
+    } else {
+        Ok(t)
+    }
 }
 
 /// The 0-based line of the text at `(x, y)` in a `GtkTextView`.

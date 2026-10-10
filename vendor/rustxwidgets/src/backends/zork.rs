@@ -1063,6 +1063,36 @@ pub fn set_button_press_cb(id: usize, cb: Box<dyn FnMut(u32, f64, f64)>) {
     });
 }
 
+
+thread_local! {
+    /// Rows (path strings) per TreeView node, and the selected index.
+    static TREEVIEW_ROWS: RefCell<HashMap<usize, Vec<String>>> = RefCell::new(HashMap::new());
+    static TREEVIEW_SELECTED: RefCell<HashMap<usize, i32>> = RefCell::new(HashMap::new());
+}
+
+/// Record the path shown in each row of a TreeView, so selection can report it.
+pub fn treeview_set_rows(id: usize, paths: Vec<String>) {
+    TREEVIEW_ROWS.with(|m| { m.borrow_mut().insert(id, paths); });
+}
+
+/// Select a row (0-based) of a TreeView.
+pub fn treeview_select_row(id: usize, index: i32) {
+    TREEVIEW_SELECTED.with(|m| { m.borrow_mut().insert(id, index); });
+}
+
+/// The path of the selected row, or `None` if nothing is selected.
+pub fn treeview_selected_path(id: usize, _path_column: usize) -> Option<String> {
+    let idx = TREEVIEW_SELECTED.with(|m| m.borrow().get(&id).copied())?;
+    if idx < 0 {
+        return None;
+    }
+    TREEVIEW_ROWS.with(|m| {
+        m.borrow()
+            .get(&id)
+            .and_then(|rows| rows.get(idx as usize).cloned())
+    })
+}
+
 /// Enable or disable a widget (a disabled control has no effect).
 pub fn set_widget_sensitive(id: usize, sensitive: bool) {
     with_state(|s| {

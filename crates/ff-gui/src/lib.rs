@@ -351,6 +351,90 @@ pub fn row_at_line(paths: &[String], line: i32) -> Option<&str> {
     paths.get(line as usize).map(|s| s.as_str())
 }
 
+/// One row of the results, as three columns: icon, name, path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Row {
+    /// Icon *name* to look up in the icon theme (e.g. `folder`,
+    /// `text-x-generic`). The GUI loads it; the terminal fallback maps it to a
+    /// glyph.
+    pub icon: String,
+    /// The file name (last path component).
+    pub name: String,
+    /// The containing directory (everything before the last `/`), or the whole
+    /// path when there is no separator.
+    pub dir: String,
+    /// The full path, which is what Copy / Open / drag act on.
+    pub path: String,
+}
+
+/// Split the daemon's paths into icon/name/dir rows.
+///
+/// The daemon returns absolute paths; everything here is derived client-side, so
+/// no protocol change is needed. `is_dir_hint` marks paths the daemon reported as
+/// directories (trailing slash): those always get the folder icon.
+pub fn rows_from_paths(paths: &[String]) -> Vec<Row> {
+    paths.iter().map(|p| row_from_path(p)).collect()
+}
+
+/// Build one row from a path.
+pub fn row_from_path(path: &str) -> Row {
+    let (dir, name) = match path.rfind('/') {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("", path),
+    };
+    // A path with a trailing slash is a directory; its name is the component
+    // before the slash.
+    let (dir, name) = if name.is_empty() {
+        match dir.rfind('/') {
+            Some(i) => (&dir[..i], &dir[i + 1..]),
+            None => ("", dir),
+        }
+    } else {
+        (dir, name)
+    };
+    let is_dir = path.ends_with('/');
+    Row {
+        icon: icon_name_for(name, is_dir).to_string(),
+        name: name.to_string(),
+        dir: dir.to_string(),
+        path: path.to_string(),
+    }
+}
+
+/// The icon-theme name for a file, from its name and type.
+///
+/// A small table of the common cases, falling back to `text-x-generic` (files)
+/// or `folder` (directories). Kept deliberately simple: the icon theme decides
+/// whether a name exists, and the GUI falls back if not.
+pub fn icon_name_for(name: &str, is_dir: bool) -> &'static str {
+    if is_dir {
+        return "folder";
+    }
+    let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    match ext.to_ascii_lowercase().as_str() {
+        "rs" => "text-x-rust",
+        "py" => "text-x-python",
+        "js" | "mjs" | "cjs" => "text-x-javascript",
+        "ts" | "tsx" => "text-x-typescript",
+        "c" | "h" => "text-x-csrc",
+        "cpp" | "cc" | "cxx" | "hpp" => "text-x-c++src",
+        "go" => "text-x-go",
+        "java" => "text-x-java",
+        "rb" => "text-x-ruby",
+        "sh" | "bash" | "zsh" => "text-x-script",
+        "md" | "markdown" => "text-markdown",
+        "json" => "application-json",
+        "toml" | "yaml" | "yml" | "ini" | "cfg" => "text-x-generic",
+        "html" | "htm" => "text-html",
+        "css" => "text-css",
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" => "image-x-generic",
+        "pdf" => "application-pdf",
+        "zip" | "gz" | "xz" | "tar" | "zst" | "bz2" => "package-x-generic",
+        "txt" | "log" => "text-x-generic",
+        _ => "text-x-generic",
+    }
+}
+
 /// Render the results view for a count-only search: the number on its own line.
 ///
 /// A count-only query returns no paths, so this must not look like "no matches".
@@ -361,6 +445,53 @@ pub fn render_count(total: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_splits_path_into_name_and_dir() {
+        let r = row_from_path("/home/me/src/main.rs");
+        assert_eq!(r.name, "main.rs");
+        assert_eq!(r.dir, "/home/me/src");
+        assert_eq!(r.path, "/home/me/src/main.rs");
+        assert_eq!(r.icon, "text-x-rust");
+    }
+
+    #[test]
+    fn row_handles_a_bare_name_and_a_root_child() {
+        let bare = row_from_path("main.rs");
+        assert_eq!(bare.name, "main.rs");
+        assert_eq!(bare.dir, "");
+        let root = row_from_path("/etc");
+        assert_eq!(root.name, "etc");
+        assert_eq!(root.dir, "");
+    }
+
+    #[test]
+    fn row_recognises_directories_by_trailing_slash() {
+        // The daemon marks directories with a trailing slash.
+        let r = row_from_path("/home/me/src/");
+        assert_eq!(r.name, "src");
+        assert_eq!(r.dir, "/home/me");
+        assert_eq!(r.icon, "folder");
+    }
+
+    #[test]
+    fn icon_names_cover_common_types() {
+        assert_eq!(icon_name_for("main.rs", false), "text-x-rust");
+        assert_eq!(icon_name_for("notes.md", false), "text-markdown");
+        assert_eq!(icon_name_for("data.json", false), "application-json");
+        assert_eq!(icon_name_for("logo.png", false), "image-x-generic");
+        assert_eq!(icon_name_for("README", false), "text-x-generic");
+        assert_eq!(icon_name_for("src", true), "folder");
+        // Extension matching is case-insensitive.
+        assert_eq!(icon_name_for("MAIN.RS", false), "text-x-rust");
+    }
+
+    #[test]
+    fn rows_from_paths_keeps_order() {
+        let paths = vec!["/a/x.rs".to_string(), "/a/y.md".to_string()];
+        let rows = rows_from_paths(&paths);
+        assert_eq!(rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), vec!["x.rs", "y.md"]);
+    }
 
     #[test]
     fn count_only_status_does_not_say_zero_of_n() {

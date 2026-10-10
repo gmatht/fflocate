@@ -25,8 +25,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use ff_gui::{
-    effective_query, render_count, row_at_line, DaemonClient, GuiError, RowAction, SearchOptions,
-    SearchOutcome, ADVANCED_SYNTAX_HELP, DEFAULT_MAX_DISTANCE,
+    effective_query, render_count, rows_from_paths, DaemonClient, GuiError, RowAction,
+    SearchOptions, SearchOutcome, ADVANCED_SYNTAX_HELP, DEFAULT_MAX_DISTANCE,
 };
 
 /// Which backend this binary was compiled with.
@@ -72,17 +72,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     query.set_text("");
     let search = app.create_button("Search")?;
     let status = app.create_label("type a query and press Search")?;
-    // A TextView, not a Label: it renders the hits as a scrollable list
-    // instead of one wrapping paragraph.
-    let results = app.create_textview()?;
-    // A TextView is a scrolling, line-per-row list on gtk. The display-free
-    // zork shim implements only set_text/get_text/set_wrap_mode, so the
-    // sizing calls are gtk-only.
+    // The results are a three-column list: icon, name, path. On GTK this is a
+    // real GtkTreeView (so the columns align and the icon column shows a themed
+    // icon); the display-free fallbacks render the same three columns as text.
+    let results = app.create_treeview(&[("", true), ("Name", false), ("Path", false)])?;
+    // Column index of the full path, which Copy / Open / drag act on.
+    const PATH_COLUMN: usize = 2;
+
+    // On GTK the tree view needs its own scrolled container to scroll.
     #[cfg(feature = "gtk")]
-    {
-        results.set_vexpand(true);
-        results.set_wrap_mode(0); // no wrapping: one hit per line
-    }
+    let results_scroll = results.into_scrolled()?;
 
     // The advanced-search foldout: a native disclosure holding a free-form
     // query field (with the full syntax) plus real controls. Every control maps
@@ -194,19 +193,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if opts.count_only {
                         // No paths come back: show the number, not an empty
                         // list that would read as "no matches".
-                        results.set_text(&render_count(outcome.total));
+                        results.set_rows(&[vec![
+                            CellValue::Text(String::new()),
+                            CellValue::Text(render_count(outcome.total)),
+                            CellValue::Text(String::new()),
+                        ]]);
                         current.borrow_mut().clear();
                     } else {
-                        results.set_text(&render_rows(&outcome));
-                        // Record only the rows actually shown (a "no matches"
-                        // view shows a placeholder line, which is not a path).
-                        *current.borrow_mut() =
+                        let shown: Vec<String> =
                             outcome.paths.iter().take(MAX_ROWS).cloned().collect();
+                        results.set_rows(&rows_to_cells(&shown));
+                        // Record only the rows actually shown.
+                        *current.borrow_mut() = shown;
                     }
                 }
                 Err(e) => {
                     status.set_text(&format!("{e}"));
-                    results.set_text("");
+                    results.set_rows(&[]);
                     current.borrow_mut().clear();
                 }
             }
@@ -286,28 +289,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = results.connect_button_press_event(move |button, x, y, event| {
             // Left-press starts a potential drag: remember the row grabbed.
             // (button-press fires before the drag begins, so this is set by the
-            // time `drag-data-get` runs.)
+            // time `drag-data-get` runs.) The row is the one under the pointer.
             if button == 1 {
-                let rows = current.borrow();
-                *drag_row.borrow_mut() = cb_results
-                    .line_at(x, y)
-                    .and_then(|line| row_at_line(&rows, line))
-                    .map(|p| p.to_string());
+                let row = cb_results.row_at(x, y);
+                let path = row
+                    .and_then(|r| current.borrow().get(r.max(0) as usize).cloned());
+                *drag_row.borrow_mut() = path;
                 return;
             }
             if button != 3 {
                 return;
             }
-            let Some(line) = cb_results.line_at(x, y) else {
+            // Right-click acts on the row under the pointer; a click on blank
+            // space below the rows does nothing rather than acting on a
+            // neighbour.
+            let Some(row) = cb_results.row_at(x, y) else {
                 return;
             };
-            // `row_at_line` returns None past the last row, so a click on
-            // blank space (or the "… N more" trailer) does nothing rather than
-            // acting on a neighbour.
-            let path = match row_at_line(&current.borrow(), line) {
-                Some(p) => p.to_string(),
+            let path = match current.borrow().get(row.max(0) as usize) {
+                Some(p) => p.clone(),
                 None => return,
             };
+            // Show the selection too, so it is obvious which row the menu is for.
+            cb_results.select_row(row);
             let mut menu = match app_handle.new_context_menu() {
                 Ok(m) => m,
                 Err(e) => {
@@ -352,11 +356,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let results = results.clone();
         let status = status.clone();
         let drag_row = drag_row.clone();
+        let cb_results = results.clone();
         if let Err(e) = results.enable_uri_drag_source(move || {
-            drag_row
-                .borrow()
-                .as_deref()
-                .map(ff_gui::drag_payload)
+            // Prefer the row recorded on left-press; fall back to the widget's
+            // own selection (which is what the drop target sees).
+            let recorded = drag_row.borrow().clone();
+            let path = recorded.or_else(|| cb_results.selected_path(PATH_COLUMN));
+            path.as_deref().map(ff_gui::drag_payload)
         }) {
             // Not fatal: the list still works, only dragging is unavailable.
             status.set_text(&format!("drag and drop unavailable: {e}"));
@@ -370,6 +376,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     layout.append(&query_row);
     layout.append(&advanced);
     layout.append(&status);
+    // On GTK the tree view lives in its own scrolled container so it scrolls;
+    // elsewhere the widget itself is the list.
+    #[cfg(feature = "gtk")]
+    layout.append(&results_scroll);
+    #[cfg(not(feature = "gtk"))]
     layout.append(&results);
 
     win.set_child(&layout);
@@ -464,7 +475,7 @@ pub trait TextValue {
 // explicitly — and per backend, since only one adapter exists in a given build.
 #[cfg(feature = "gtk")]
 mod widget_traits {
-    use super::{Active, TextValue};
+    use super::{Active, TextViewLike, TextValue};
 
     impl Active for rustxwidgets::backends_gtk_adapter::CheckButton {
         fn is_active(&self) -> bool {
@@ -476,11 +487,17 @@ mod widget_traits {
             rustxwidgets::backends_gtk_adapter::Entry::get_text(self)
         }
     }
+    impl TextViewLike for rustxwidgets::backends_gtk_adapter::TreeView {
+        fn clipboard_set_text(&self, text: &str) -> Result<(), rustxwidgets::Error> {
+            // The tree view is a widget; the clipboard is process-wide.
+            rustxwidgets::backends_gtk_adapter::clipboard_set_text(text)
+        }
+    }
 }
 
 #[cfg(all(feature = "zork", not(feature = "gtk")))]
 mod widget_traits {
-    use super::{Active, TextValue};
+    use super::{Active, TextViewLike, TextValue};
 
     impl Active for rustxwidgets::backends_zork_adapter::CheckButton {
         fn is_active(&self) -> bool {
@@ -492,13 +509,19 @@ mod widget_traits {
             rustxwidgets::backends_zork_adapter::Entry::get_text(self)
         }
     }
+    impl TextViewLike for rustxwidgets::backends_zork_adapter::TreeView {
+        fn clipboard_set_text(&self, text: &str) -> Result<(), rustxwidgets::Error> {
+            // The REPL copies with the terminal clipboard escape.
+            rustxwidgets::backends_zork_adapter::clipboard_set_text(text)
+        }
+    }
 }
 
 // The other targets build the same UI from their own adapter types. These are
 // not built on this host, but must compile there.
 #[cfg(all(windows, not(feature = "zork")))]
 mod widget_traits {
-    use super::{Active, TextValue};
+    use super::{Active, TextViewLike, TextValue};
     impl Active for rustxwidgets::backends_nwg_adapter::CheckButton {
         fn is_active(&self) -> bool {
             rustxwidgets::backends_nwg_adapter::CheckButton::is_active(self)
@@ -513,7 +536,7 @@ mod widget_traits {
 
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
 mod widget_traits {
-    use super::{Active, TextValue};
+    use super::{Active, TextViewLike, TextValue};
     impl Active for rustxwidgets::backends_wasm_adapter::CheckButton {
         fn is_active(&self) -> bool {
             rustxwidgets::backends_wasm_adapter::CheckButton::is_active(self)
@@ -527,24 +550,22 @@ mod widget_traits {
 }
 
 /// Render the result list: one path per line.
+/// Build the three-column cells (icon, name, path) for a list of paths.
 ///
-/// A list, not prose: the hits go into a TextView, so each line is a row. The
-/// daemon already returns absolute paths, so they are shown verbatim (a
-/// basename-first `name — dir` split reads as prose and wastes the column).
-fn render_rows(outcome: &SearchOutcome) -> String {
-    if outcome.paths.is_empty() {
-        return "(no matches)".to_string();
-    }
-    let mut lines: Vec<String> = outcome
-        .paths
-        .iter()
-        .take(MAX_ROWS)
-        .cloned()
-        .collect();
-    if outcome.total as usize > lines.len() {
-        lines.push(format!("… {} more", outcome.total as usize - lines.len()));
-    }
-    lines.join("\n")
+/// The icon is given as a theme name plus a generic fallback, since a minimal
+/// icon theme may not carry the specific name.
+fn rows_to_cells(paths: &[String]) -> Vec<Vec<CellValue>> {
+    rows_from_paths(paths)
+        .into_iter()
+        .map(|r| {
+            let fallback = if r.icon == "folder" { "folder" } else { "text-x-generic" };
+            vec![
+                CellValue::Icon { name: r.icon, fallback: fallback.to_string() },
+                CellValue::Text(r.name),
+                CellValue::Text(r.path),
+            ]
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -648,30 +669,45 @@ mod tests {
     }
 
     #[test]
-    fn render_empty_is_explicit() {
-        let o = SearchOutcome::default();
-        assert_eq!(render_rows(&o), "(no matches)");
+    fn rows_to_cells_builds_the_three_columns() {
+        let paths = vec!["/a/b/main.rs".to_string()];
+        let cells = rows_to_cells(&paths);
+        assert_eq!(cells.len(), 1);
+        let row = &cells[0];
+        // Column 0 is the icon (with a sensible generic fallback), 1 the name,
+        // 2 the full path.
+        match &row[0] {
+            CellValue::Icon { name, fallback } => {
+                assert_eq!(name, "text-x-rust");
+                assert_eq!(fallback, "text-x-generic");
+            }
+            _ => panic!("column 0 must be the icon"),
+        }
+        match &row[1] {
+            CellValue::Text(t) => assert_eq!(t, "main.rs"),
+            _ => panic!("column 1 must be the name"),
+        }
+        match &row[2] {
+            CellValue::Text(t) => assert_eq!(t, "/a/b/main.rs"),
+            _ => panic!("column 2 must be the path"),
+        }
     }
 
     #[test]
-    fn render_is_a_list_one_path_per_line() {
-        let o = SearchOutcome {
-            paths: vec!["/a/x.rs".into(), "/b/y.rs".into(), "/c/z.rs".into()],
-            total: 3,
-            fresh: true,
-            ..Default::default()
-        };
-        assert_eq!(render_rows(&o), "/a/x.rs\n/b/y.rs\n/c/z.rs");
+    fn rows_to_cells_gives_directories_the_folder_icon() {
+        let cells = rows_to_cells(&["/a/src/".to_string()]);
+        match &cells[0][0] {
+            CellValue::Icon { name, fallback } => {
+                assert_eq!(name, "folder");
+                // A folder falls back to itself, not to a generic file icon.
+                assert_eq!(fallback, "folder");
+            }
+            _ => panic!("expected an icon"),
+        }
     }
 
     #[test]
-    fn render_truncates_and_counts_the_remainder() {
-        let paths: Vec<String> = (0..MAX_ROWS + 50).map(|i| format!("/t/f{i}.rs")).collect();
-        let total = paths.len() as u64;
-        let o = SearchOutcome { paths, total, fresh: true, ..Default::default() };
-        let text = render_rows(&o);
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), MAX_ROWS + 1);
-        assert!(lines.last().unwrap().contains("50 more"), "{:?}", lines.last());
+    fn rows_to_cells_is_empty_for_no_paths() {
+        assert!(rows_to_cells(&[]).is_empty());
     }
 }

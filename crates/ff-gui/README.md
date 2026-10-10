@@ -36,18 +36,24 @@ with the fixes needed for the `zork` backend to run `ff-gui` (`core.rs` had no
 callbacks while it still held the state `RefCell`'s `borrow_mut`, so a button
 like Search — whose callback calls back into the widget API — panicked with
 "RefCell already borrowed"). The 3.x widget API also had no
-context-menu, clipboard, drag-and-drop, or disclosure support at all, so
-`gtk_dynamic_loader` gained the missing GTK3/GTK4 bindings, a closure-backed
-`ContextMenu`, URI/text drag sources, and an `Expander` foldout. They are vendored rather than referenced by path so the build does not
+context-menu, clipboard, drag-and-drop, disclosure, or multi-column-list support
+at all, so `gtk_dynamic_loader` gained the missing GTK3/GTK4 bindings, a
+closure-backed `ContextMenu`, URI/text drag sources, an `Expander` foldout, a
+`TreeView` (with `GValue`-based row insertion and icon-theme loading), and
+free-function clipboard helpers. They are vendored rather than referenced by path so the build does not
 depend on a checkout outside this repository.
 
 ## Status
 
 * Query box + Search button + a status line and a results list, driven by
   `App::run()`.
-* Results render into a `TextView`, one path per row — a real scrollable list
-  rather than one wrapping paragraph. `(no matches)` is shown as an explicit
-  single line so it is never confused with an empty/absent daemon.
+* Results are a **three-column list — Icon / Name / Path**. On GTK this is a
+  real `GtkTreeView` backed by a `GtkListStore`, so the columns actually align
+  and the icon column shows a real themed icon (picked from the file's name and
+  type, with a generic fallback when the theme lacks a specific one). The
+  display-free fallback renders the same three columns as aligned text (glyph,
+  padded name, path). Clicking blank space below the rows does nothing rather
+  than acting on a neighbour; `(no matches)` stays an explicit line.
 * Press **Return** in either query field to search — the same code path as the
   Search button, so the two cannot diverge. (In the `zork` fallback, `enter`
   presses Return on the focused field.)

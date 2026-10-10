@@ -1117,6 +1117,170 @@ mod gtk_adapter {
         Ok(Expander(e))
     }
 
+    // ---- TreeView (multi-column list) ----
+
+    #[repr(transparent)]
+    pub struct TreeView(pub gtk_dynamic_loader::TreeView);
+
+    impl Clone for TreeView { fn clone(&self) -> Self { TreeView(self.0.clone()) } }
+
+    /// A cell value: text, or a themed icon loaded from the icon theme.
+    pub enum CellValue {
+        Text(String),
+        /// An icon by theme name, with a fallback name if the theme lacks it.
+        Icon { name: String, fallback: String },
+    }
+
+    impl TreeView {
+        /// Create a tree view with `columns`: `(title, is_icon)`.
+        pub fn new(&self, columns: &[(&str, bool)]) -> Result<TreeView, Error> {
+            let loader = crate::backends::gtk::loader()
+                .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+            let specs: Vec<(&str, &str, bool)> = columns
+                .iter()
+                .map(|(title, is_icon)| (*title, if *is_icon { "pixbuf" } else { "text" }, *is_icon))
+                .collect();
+            gtk_dynamic_loader::TreeView::new(loader, &specs)
+                .map(TreeView)
+                .map_err(|e| Error::Backend(format!("{}", e)))
+        }
+
+        /// Replace the rows. Each row's values line up with the columns.
+        pub fn set_rows(&self, rows: &[Vec<CellValue>]) {
+            self.0.clear();
+            for row in rows {
+                let mut vals = Vec::with_capacity(row.len());
+                // Keep any icon pixbufs alive for the duration of the append; GTK
+                // sinks its own reference into the store.
+                for v in row {
+                    match v {
+                        CellValue::Text(t) => vals.push(gtk_dynamic_loader::CellValue::Str(t.clone())),
+                        CellValue::Icon { name, fallback } => {
+                            let loader = crate::backends::gtk::loader();
+                            let pixbuf = match loader {
+                                Some(l) => unsafe {
+                                    gtk_dynamic_loader::icon_theme_load_icon_with_fallback(
+                                        &l, name, fallback, 16,
+                                    )
+                                },
+                                None => std::ptr::null_mut(),
+                            };
+                            vals.push(gtk_dynamic_loader::CellValue::Pixbuf(pixbuf));
+                        }
+                    }
+                }
+                self.0.append_row(&vals);
+            }
+        }
+
+        /// The full path of the selected row (column `path_column`), if any.
+        pub fn selected_path(&self, path_column: usize) -> Option<String> {
+            self.0.selected_path(path_column)
+        }
+
+        /// Wrap in a scrolled window and return it.
+        /// The 0-based row under widget coordinates `(x, y)`, if any.
+        pub fn row_at(&self, x: f64, y: f64) -> Option<i32> {
+            self.0.row_at(x, y)
+        }
+
+        /// Select the row at `index` (0-based).
+        pub fn select_row(&self, index: i32) {
+            self.0.select_row(index);
+        }
+
+        /// Run `cb` on a `button-press-event` with `(button, x, y, event)`.
+        pub fn connect_button_press_event(
+            &self,
+            mut cb: impl FnMut(u32, f64, f64, *mut std::ffi::c_void) + 'static,
+        ) -> Result<u64, Error> {
+            let loader = crate::backends::gtk::loader()
+                .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+            let widget = *self.0.as_ref();
+            let cb_loader = loader.clone();
+            let wrapper: Box<dyn FnMut(*mut std::ffi::c_void)> = Box::new(move |event| {
+                if event.is_null() {
+                    return;
+                }
+                let button = unsafe { gtk_dynamic_loader::gdk_event_get_button(&cb_loader, event) }
+                    .unwrap_or(0);
+                let (x, y) = unsafe { gtk_dynamic_loader::gdk_event_get_coords(&cb_loader, event) }
+                    .unwrap_or((0.0, 0.0));
+                cb(button, x, y, event);
+            });
+            let id = unsafe {
+                gtk_dynamic_loader::connect_widget_button_press_event(&loader, widget, wrapper)
+            }
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+            Ok(id)
+        }
+
+        /// Make the list a drag source carrying the payload returned by
+        /// `payload` (file URIs plus plain text) when a drop target asks.
+        pub fn enable_uri_drag_source(
+            &self,
+            mut payload: impl FnMut() -> Option<(Vec<String>, String)> + 'static,
+        ) -> Result<(), Error> {
+            let loader = crate::backends::gtk::loader()
+                .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+            let widget = *self.0.as_ref();
+            unsafe { gtk_dynamic_loader::widget_enable_uri_drag_source(&loader, widget) }
+                .map_err(|e| Error::Backend(format!("{}", e)))?;
+            let cb_loader = loader.clone();
+            let connect = loader.clone();
+            unsafe {
+                gtk_dynamic_loader::connect_widget_drag_data_get(
+                    &connect,
+                    widget,
+                    move |selection_data, target| {
+                        let Some((uris, text)) = payload() else { return };
+                        let r = if target.contains("uri-list") {
+                            gtk_dynamic_loader::drag_set_uris(&cb_loader, selection_data, &uris)
+                        } else {
+                            gtk_dynamic_loader::drag_set_text(&cb_loader, selection_data, &text)
+                        };
+                        let _ = r;
+                    },
+                )
+            }
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+            Ok(())
+        }
+
+        pub fn into_scrolled(&self) -> Result<crate::backends_gtk_adapter::ScrolledWindow, Error> {
+            let loader = crate::backends::gtk::loader()
+                .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+            self.0
+                .wrap_scroll(&loader)
+                .map(|sw| crate::backends_gtk_adapter::ScrolledWindow(sw))
+                .map_err(|e| Error::Backend(format!("{}", e)))
+        }
+    }
+
+    impl AsRef<*mut c_void> for TreeView { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+    impl Widget for TreeView { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+
+    /// Put `text` on the system clipboard. Free function: the clipboard is
+    /// process-wide, not per-widget, so anything can use it.
+    pub fn clipboard_set_text(text: &str) -> Result<(), Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+        unsafe { gtk_dynamic_loader::clipboard_set_text(&loader, text) }
+            .map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
+    pub fn create_treeview(columns: &[(&str, bool)]) -> Result<TreeView, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+        let specs: Vec<(&str, &str, bool)> = columns
+            .iter()
+            .map(|(title, is_icon)| (*title, if *is_icon { "pixbuf" } else { "text" }, *is_icon))
+            .collect();
+        gtk_dynamic_loader::TreeView::new(loader, &specs)
+            .map(TreeView)
+            .map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
     // ---- Overlay (cross-platform stacking container) ----
 
     #[repr(transparent)]

@@ -67,6 +67,52 @@ pub type GtkExpanderSetExpanded = unsafe extern "C" fn(expander: *mut c_void, ex
 pub type GtkExpanderGetExpanded = unsafe extern "C" fn(expander: *mut c_void) -> i32;
 pub type GtkExpanderSetLabel = unsafe extern "C" fn(expander: *mut c_void, label: *const i8);
 pub type GtkExpanderSetChild = unsafe extern "C" fn(expander: *mut c_void, child: *mut c_void);
+// GtkTreeView / GtkListStore: a real multi-column list.
+pub type GtkTreeViewNew = unsafe extern "C" fn() -> *mut c_void;
+pub type GtkListStoreNew = unsafe extern "C" fn(n_columns: i32, ...) -> *mut c_void;
+pub type GtkListStoreAppend = unsafe extern "C" fn(store: *mut c_void, iter: *mut c_void);
+pub type GtkListStoreClear = unsafe extern "C" fn(store: *mut c_void);
+pub type GtkListStoreSetValuesv =
+    unsafe extern "C" fn(store: *mut c_void, iter: *mut c_void, columns: *mut i32, values: *mut c_void, n: i32);
+pub type GtkTreeViewSetModel = unsafe extern "C" fn(tree: *mut c_void, model: *mut c_void);
+pub type GtkTreeViewAppendColumn = unsafe extern "C" fn(tree: *mut c_void, column: *mut c_void) -> i32;
+// Varargs: (title, cell, attr_name_1, column_1, ..., NULL). Must be declared
+// variadic so the ABI passes the trailing NULL correctly.
+pub type GtkTreeViewColumnNewWithAttributes =
+    unsafe extern "C" fn(title: *const i8, cell: *mut c_void, ...) -> *mut c_void;
+pub type GtkTreeViewColumnSetResizable = unsafe extern "C" fn(column: *mut c_void, resizable: i32);
+pub type GtkTreeViewColumnSetExpand = unsafe extern "C" fn(column: *mut c_void, expand: i32);
+pub type GtkTreeViewSetHeadersVisible = unsafe extern "C" fn(tree: *mut c_void, visible: i32);
+pub type GtkCellRendererPixbufNew = unsafe extern "C" fn() -> *mut c_void;
+pub type GtkCellRendererTextNew = unsafe extern "C" fn() -> *mut c_void;
+// GtkTextIter is used as the row iterator for GtkListStore; the same opaque
+// buffer trick as the text view applies.
+pub type GtkTreeViewGetPathAtPos =
+    unsafe extern "C" fn(tree: *mut c_void, x: i32, y: i32, path: *mut *mut c_void, column: *mut *mut c_void, cell_x: *mut i32, cell_y: *mut i32) -> i32;
+pub type GtkTreeViewGetSelection = unsafe extern "C" fn(tree: *mut c_void) -> *mut c_void;
+pub type GtkTreePathGetIndices = unsafe extern "C" fn(path: *mut c_void) -> *mut i32;
+// Variadic: (first_index, ..., -1).
+pub type GtkTreePathNewFromIndices = unsafe extern "C" fn(first: i32, ...) -> *mut c_void;
+pub type GtkTreeSelectionSelectPath = unsafe extern "C" fn(selection: *mut c_void, path: *mut c_void);
+pub type GtkTreePathFree = unsafe extern "C" fn(path: *mut c_void);
+pub type GtkTreeSelectionGetSelected =
+    unsafe extern "C" fn(tree: *mut c_void, model: *mut *mut c_void, iter: *mut c_void) -> i32;
+// GObject values, for gtk_list_store_set_valuesv.
+pub type GValueInit = unsafe extern "C" fn(value: *mut c_void, g_type: usize);
+pub type GValueUnset = unsafe extern "C" fn(value: *mut c_void);
+pub type GValueSetString = unsafe extern "C" fn(value: *mut c_void, s: *const i8);
+pub type GValueSetObject = unsafe extern "C" fn(value: *mut c_void, obj: *mut c_void);
+pub type GValueGetString = unsafe extern "C" fn(value: *const c_void) -> *const i8;
+pub type GTypeFromName = unsafe extern "C" fn(name: *const i8) -> usize;
+// Icon theme.
+pub type GtkIconThemeGetDefault = unsafe extern "C" fn() -> *mut c_void;
+pub type GtkIconThemeLoadIcon = unsafe extern "C" fn(
+    theme: *mut c_void,
+    name: *const i8,
+    size: i32,
+    flags: i32,
+    error: *mut *mut c_void,
+) -> *mut c_void;
 pub type GtkMenuItemNewWithLabel = unsafe extern "C" fn(label: *const i8) -> *mut c_void;
 pub type GtkMenuShellAppend = unsafe extern "C" fn(shell: *mut c_void, child: *mut c_void);
 pub type GtkMenuItemSetSubmenu = unsafe extern "C" fn(item: *mut c_void, submenu: *mut c_void);
@@ -372,6 +418,34 @@ pub struct Symbols {
     pub gtk_expander_get_expanded: Option<GtkExpanderGetExpanded>,
     pub gtk_expander_set_label: Option<GtkExpanderSetLabel>,
     pub gtk_expander_set_child: Option<GtkExpanderSetChild>,
+    pub gtk_tree_view_new: Option<GtkTreeViewNew>,
+    pub gtk_list_store_new: Option<GtkListStoreNew>,
+    pub gtk_list_store_append: Option<GtkListStoreAppend>,
+    pub gtk_list_store_clear: Option<GtkListStoreClear>,
+    pub gtk_list_store_set_valuesv: Option<GtkListStoreSetValuesv>,
+    pub gtk_tree_view_set_model: Option<GtkTreeViewSetModel>,
+    pub gtk_tree_view_append_column: Option<GtkTreeViewAppendColumn>,
+    pub gtk_tree_view_column_new_with_attributes: Option<GtkTreeViewColumnNewWithAttributes>,
+    pub gtk_tree_view_column_set_resizable: Option<GtkTreeViewColumnSetResizable>,
+    pub gtk_tree_view_column_set_expand: Option<GtkTreeViewColumnSetExpand>,
+    pub gtk_tree_view_set_headers_visible: Option<GtkTreeViewSetHeadersVisible>,
+    pub gtk_cell_renderer_pixbuf_new: Option<GtkCellRendererPixbufNew>,
+    pub gtk_cell_renderer_text_new: Option<GtkCellRendererTextNew>,
+    pub gtk_tree_view_get_path_at_pos: Option<GtkTreeViewGetPathAtPos>,
+    pub gtk_tree_view_get_selection: Option<GtkTreeViewGetSelection>,
+    pub gtk_tree_path_get_indices: Option<GtkTreePathGetIndices>,
+    pub gtk_tree_path_free: Option<GtkTreePathFree>,
+    pub gtk_tree_path_new_from_indices: Option<GtkTreePathNewFromIndices>,
+    pub gtk_tree_selection_select_path: Option<GtkTreeSelectionSelectPath>,
+    pub gtk_tree_selection_get_selected: Option<GtkTreeSelectionGetSelected>,
+    pub g_value_init: Option<GValueInit>,
+    pub g_value_unset: Option<GValueUnset>,
+    pub g_value_set_string: Option<GValueSetString>,
+    pub g_value_set_object: Option<GValueSetObject>,
+    pub g_value_get_string: Option<GValueGetString>,
+    pub g_type_from_name: Option<GTypeFromName>,
+    pub gtk_icon_theme_get_default: Option<GtkIconThemeGetDefault>,
+    pub gtk_icon_theme_load_icon: Option<GtkIconThemeLoadIcon>,
     pub gtk_menu_item_new_with_label: Option<GtkMenuItemNewWithLabel>,
     pub gtk_menu_shell_append: Option<GtkMenuShellAppend>,
     pub gtk_menu_item_set_submenu: Option<GtkMenuItemSetSubmenu>,
@@ -726,6 +800,34 @@ impl Symbols {
         let gtk_expander_get_expanded = unsafe { sym::<GtkExpanderGetExpanded>(gtk, "gtk_expander_get_expanded") };
         let gtk_expander_set_label = unsafe { sym::<GtkExpanderSetLabel>(gtk, "gtk_expander_set_label") };
         let gtk_expander_set_child = unsafe { sym::<GtkExpanderSetChild>(gtk, "gtk_expander_set_child") };
+        let gtk_tree_view_new = unsafe { sym::<GtkTreeViewNew>(gtk, "gtk_tree_view_new") };
+        let gtk_list_store_new = unsafe { sym::<GtkListStoreNew>(gtk, "gtk_list_store_new") };
+        let gtk_list_store_append = unsafe { sym::<GtkListStoreAppend>(gtk, "gtk_list_store_append") };
+        let gtk_list_store_clear = unsafe { sym::<GtkListStoreClear>(gtk, "gtk_list_store_clear") };
+        let gtk_list_store_set_valuesv = unsafe { sym::<GtkListStoreSetValuesv>(gtk, "gtk_list_store_set_valuesv") };
+        let gtk_tree_view_set_model = unsafe { sym::<GtkTreeViewSetModel>(gtk, "gtk_tree_view_set_model") };
+        let gtk_tree_view_append_column = unsafe { sym::<GtkTreeViewAppendColumn>(gtk, "gtk_tree_view_append_column") };
+        let gtk_tree_view_column_new_with_attributes = unsafe { sym::<GtkTreeViewColumnNewWithAttributes>(gtk, "gtk_tree_view_column_new_with_attributes") };
+        let gtk_tree_view_column_set_resizable = unsafe { sym::<GtkTreeViewColumnSetResizable>(gtk, "gtk_tree_view_column_set_resizable") };
+        let gtk_tree_view_column_set_expand = unsafe { sym::<GtkTreeViewColumnSetExpand>(gtk, "gtk_tree_view_column_set_expand") };
+        let gtk_tree_view_set_headers_visible = unsafe { sym::<GtkTreeViewSetHeadersVisible>(gtk, "gtk_tree_view_set_headers_visible") };
+        let gtk_cell_renderer_pixbuf_new = unsafe { sym::<GtkCellRendererPixbufNew>(gtk, "gtk_cell_renderer_pixbuf_new") };
+        let gtk_cell_renderer_text_new = unsafe { sym::<GtkCellRendererTextNew>(gtk, "gtk_cell_renderer_text_new") };
+        let gtk_tree_view_get_path_at_pos = unsafe { sym::<GtkTreeViewGetPathAtPos>(gtk, "gtk_tree_view_get_path_at_pos") };
+        let gtk_tree_view_get_selection = unsafe { sym::<GtkTreeViewGetSelection>(gtk, "gtk_tree_view_get_selection") };
+        let gtk_tree_path_get_indices = unsafe { sym::<GtkTreePathGetIndices>(gtk, "gtk_tree_path_get_indices") };
+        let gtk_tree_path_free = unsafe { sym::<GtkTreePathFree>(gtk, "gtk_tree_path_free") };
+        let gtk_tree_path_new_from_indices = unsafe { sym::<GtkTreePathNewFromIndices>(gtk, "gtk_tree_path_new_from_indices") };
+        let gtk_tree_selection_select_path = unsafe { sym::<GtkTreeSelectionSelectPath>(gtk, "gtk_tree_selection_select_path") };
+        let gtk_tree_selection_get_selected = unsafe { sym::<GtkTreeSelectionGetSelected>(gtk, "gtk_tree_selection_get_selected") };
+        let g_value_init = unsafe { sym::<GValueInit>(gobject, "g_value_init") };
+        let g_value_unset = unsafe { sym::<GValueUnset>(gobject, "g_value_unset") };
+        let g_value_set_string = unsafe { sym::<GValueSetString>(gobject, "g_value_set_string") };
+        let g_value_set_object = unsafe { sym::<GValueSetObject>(gobject, "g_value_set_object") };
+        let g_value_get_string = unsafe { sym::<GValueGetString>(gobject, "g_value_get_string") };
+        let g_type_from_name = unsafe { sym::<GTypeFromName>(gobject, "g_type_from_name") };
+        let gtk_icon_theme_get_default = unsafe { sym::<GtkIconThemeGetDefault>(gtk, "gtk_icon_theme_get_default") };
+        let gtk_icon_theme_load_icon = unsafe { sym::<GtkIconThemeLoadIcon>(gtk, "gtk_icon_theme_load_icon") };
         let gtk_menu_item_new_with_label = unsafe { sym::<GtkMenuItemNewWithLabel>(gtk, "gtk_menu_item_new_with_label") };
         let gtk_menu_shell_append = unsafe { sym::<GtkMenuShellAppend>(gtk, "gtk_menu_shell_append") };
         let gtk_menu_item_set_submenu = unsafe { sym::<GtkMenuItemSetSubmenu>(gtk, "gtk_menu_item_set_submenu") };
@@ -826,7 +928,7 @@ impl Symbols {
             gtk_widget_set_can_focus,
             gtk_file_chooser_native_new, gtk_native_dialog_run, gtk_file_chooser_get_filename, gtk_widget_destroy, gtk_window_close, g_free, gdk_display_get_default, gdk_screen_get_default, gtk_style_context_add_provider_for_display, gtk_style_context_add_provider_for_screen, gdk_event_get_keyval, gdk_event_get_state, gdk_keyval_from_name,
             gtk_application_new, g_application_run, g_application_register, g_simple_action_new, g_action_map_add_action, g_action_group_activate_action, g_action_map_lookup_action, g_action_activate,
-            g_menu_new, g_menu_append, g_application_set_app_menu, g_application_set_menubar, g_menu_append_submenu, gtk_popover_menu_bar_new_from_model, gtk_menu_bar_new, gtk_menu_new, gtk_expander_new, gtk_expander_set_expanded, gtk_expander_get_expanded, gtk_expander_set_label, gtk_expander_set_child, gtk_menu_item_new_with_label, gtk_menu_shell_append, gtk_menu_item_set_submenu, gtk_window_set_application, gtk_widget_insert_action_group, gtk_actionable_set_detailed_action_name, g_menu_model_get_n_items, g_menu_model_get_item_attribute_value, g_menu_model_get_item_link, g_variant_get_string, g_variant_unref,
+            g_menu_new, g_menu_append, g_application_set_app_menu, g_application_set_menubar, g_menu_append_submenu, gtk_popover_menu_bar_new_from_model, gtk_menu_bar_new, gtk_menu_new, gtk_expander_new, gtk_expander_set_expanded, gtk_expander_get_expanded, gtk_expander_set_label, gtk_expander_set_child, gtk_tree_view_new, gtk_list_store_new, gtk_list_store_append, gtk_list_store_clear, gtk_list_store_set_valuesv, gtk_tree_view_set_model, gtk_tree_view_append_column, gtk_tree_view_column_new_with_attributes, gtk_tree_view_column_set_resizable, gtk_tree_view_column_set_expand, gtk_tree_view_set_headers_visible, gtk_cell_renderer_pixbuf_new, gtk_cell_renderer_text_new, gtk_tree_view_get_path_at_pos, gtk_tree_view_get_selection, gtk_tree_path_get_indices, gtk_tree_path_free, gtk_tree_path_new_from_indices, gtk_tree_selection_select_path, gtk_tree_selection_get_selected, g_value_init, g_value_unset, g_value_set_string, g_value_set_object, g_value_get_string, g_type_from_name, gtk_icon_theme_get_default, gtk_icon_theme_load_icon, gtk_menu_item_new_with_label, gtk_menu_shell_append, gtk_menu_item_set_submenu, gtk_window_set_application, gtk_widget_insert_action_group, gtk_actionable_set_detailed_action_name, g_menu_model_get_n_items, g_menu_model_get_item_attribute_value, g_menu_model_get_item_link, g_variant_get_string, g_variant_unref,
             gtk_label_set_xalign,
             gtk_event_controller_key_new,
             gtk_event_controller_focus_new,

@@ -1444,6 +1444,14 @@ impl SimpleAction {
             Ok(0)
         }
 
+        /// No drag-and-drop on this backend.
+        pub fn enable_uri_drag_source(
+            &self,
+            _payload: impl FnMut() -> Option<(Vec<String>, String)> + 'static,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+
         /// No pixel coordinates on this backend.
         pub fn line_at(&self, _x: f64, _y: f64) -> Option<i32> {
             None
@@ -1848,6 +1856,50 @@ impl SimpleAction {
             if h > 0 { set_css(self.elem.as_ref(), "height", &format!("{}px", h)); }
         }
     }
+
+        // ---- TreeView (multi-column list) ----
+
+        /// A cell value: text, or an icon by theme name.
+        pub enum CellValue {
+            Text(String),
+            Icon { name: String, fallback: String },
+        }
+
+        /// No multi-column list on this backend; the rows are rendered as text.
+        pub struct TreeView {
+            _id: usize,
+        }
+
+        impl Clone for TreeView {
+            fn clone(&self) -> Self { TreeView { _id: self._id } }
+        }
+
+        impl TreeView {
+            pub fn set_rows(&self, _rows: &[Vec<CellValue>]) {}
+            pub fn selected_path(&self, _path_column: usize) -> Option<String> { None }
+        pub fn row_at(&self, _x: f64, _y: f64) -> Option<i32> { None }
+        pub fn select_row(&self, _index: i32) {}
+        pub fn connect_button_press_event(
+            &self,
+            _cb: impl FnMut(u32, f64, f64, *mut std::ffi::c_void) + 'static,
+        ) -> Result<u64, Error> {
+            Ok(0)
+        }
+        }
+
+        impl Widget for TreeView {
+            fn raw_handle(&self) -> *mut c_void { &self._id as *const usize as *mut c_void }
+        }
+
+        impl AsRef<*mut c_void> for TreeView {
+            fn as_ref(&self) -> &*mut c_void {
+                unsafe { &*(&self._id as *const usize as *const *mut c_void) }
+            }
+        }
+
+        pub fn create_treeview(_columns: &[(&str, bool)]) -> Result<TreeView, Error> {
+            Ok(TreeView { _id: 0 })
+        }
 
     pub fn create_expander(label: &str) -> Result<Expander, Error> {
         let details: HtmlElement = create_element("details").dyn_into().map_err(|e| {

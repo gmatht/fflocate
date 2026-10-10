@@ -3,7 +3,7 @@
 // Platform-specific type re-exports using cfg
 macro_rules! platform_module {
     ($backend:path, $Orientation:ident) => {
-        pub use $backend::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, ContextMenu, Expander, Orientation as $Orientation};
+        pub use $backend::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, ContextMenu, Expander, TreeView, CellValue, Orientation as $Orientation};
         pub type PlatformWindow = Window;
         pub type PlatformWidgetBox = BoxWidget;
         pub type PlatformLabel = Label;
@@ -19,6 +19,8 @@ macro_rules! platform_module {
         pub type PlatformTextView = TextView;
         pub type PlatformContextMenu = ContextMenu;
         pub type PlatformExpander = Expander;
+        pub type PlatformTreeView = TreeView;
+        pub type PlatformCellValue = CellValue;
     };
 }
 
@@ -77,6 +79,9 @@ macro_rules! common_types_mod {
         /// A labelled disclosure ("advanced options" foldout).
         #[derive(Clone)]
         pub struct Expander { pub inner: PlatformExpander }
+        /// A multi-column list (icon / name / path).
+        #[derive(Clone)]
+        pub struct TreeView { pub inner: PlatformTreeView }
         #[derive(Clone)]
         pub struct SimpleAction { pub inner: PlatformSimpleAction }
         #[derive(Clone)]
@@ -186,6 +191,14 @@ macro_rules! common_types_mod {
         impl AsRef<*mut std::os::raw::c_void> for Expander {
             fn as_ref(&self) -> &*mut std::os::raw::c_void { self.inner.as_ref() }
         }
+        impl TreeView {
+            /// Replace the rows; each row's values line up with the columns.
+            pub fn set_rows(&self, rows: &[Vec<CellValue>]) { self.inner.set_rows(rows); }
+            /// The full path of the selected row, if any.
+            pub fn selected_path(&self, path_column: usize) -> Option<String> {
+                self.inner.selected_path(path_column)
+            }
+        }
         impl SimpleAction {
             pub fn connect_activate<F: FnMut(*mut std::os::raw::c_void) + 'static>(&self, f: F) -> Result<u64, crate::Error> { self.inner.connect_activate(f) }
         }
@@ -249,36 +262,48 @@ mod common_types { common_types_mod!(); }
 mod common_types { common_types_mod!(); }
 
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander, TreeView};
 
 #[cfg(all(windows, not(feature = "zork")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander, TreeView};
 
 #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander, TreeView};
 
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander, TreeView};
 
 #[cfg(all(target_os = "android", not(feature = "zork")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander, TreeView};
 
 #[cfg(feature = "zork")]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander, TreeView};
 
 // Re-export Orientation from the active platform backend
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 pub use self::platform::GtkOrientation as Orientation;
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+pub use self::platform::CellValue;
 #[cfg(all(windows, not(feature = "zork")))]
 pub use self::platform::NwgOrientation as Orientation;
+#[cfg(all(windows, not(feature = "zork")))]
+pub use self::platform::CellValue;
 #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
 pub use self::platform::PancursesOrientation as Orientation;
+#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+pub use self::platform::CellValue;
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
 pub use self::platform::WasmOrientation as Orientation;
+#[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
+pub use self::platform::CellValue;
 #[cfg(all(target_os = "android", not(feature = "zork")))]
 pub use self::platform::AndroidOrientation as Orientation;
+#[cfg(all(target_os = "android", not(feature = "zork")))]
+pub use self::platform::CellValue;
 #[cfg(feature = "zork")]
 pub use self::platform::ZorkOrientation as Orientation;
+#[cfg(feature = "zork")]
+pub use self::platform::CellValue;
 
 // -- Shared menu definition types (no platform deps) --
 

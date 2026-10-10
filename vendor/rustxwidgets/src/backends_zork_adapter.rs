@@ -573,36 +573,10 @@ impl TextView {
         Ok(())
     }
 
-        /// Copy `text` using the terminal clipboard escape (OSC 52), so it works
-    /// over ssh as well as locally. Does nothing (and reports so) when stdout is
-    /// not a terminal.
+    /// Copy `text` using the terminal clipboard escape (OSC 52), so it works
+    /// over ssh as well as locally.
     pub fn clipboard_set_text(&self, text: &str) -> Result<(), Error> {
-        use std::io::{IsTerminal, Write};
-        if !std::io::stdout().is_terminal() {
-            return Err(Error::Backend(
-                "no terminal to receive the clipboard".into(),
-            ));
-        }
-        // OSC 52: ESC ] 52 ; c ; <base64> BEL. `c` selects the clipboard.
-        let mut b64 = String::with_capacity(text.len().div_ceil(3) * 4);
-        const ALPHABET: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        for chunk in text.as_bytes().chunks(3) {
-            let b = [
-                chunk[0],
-                *chunk.get(1).unwrap_or(&0),
-                *chunk.get(2).unwrap_or(&0),
-            ];
-            let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
-            b64.push(ALPHABET[(n >> 18) as usize & 63] as char);
-            b64.push(ALPHABET[(n >> 12) as usize & 63] as char);
-            b64.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
-            b64.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
-        }
-        let mut out = std::io::stdout();
-        write!(out, "\x1b]52;c;{b64}\x07")
-            .and_then(|_| out.flush())
-            .map_err(|e| Error::Backend(format!("clipboard write failed: {e}")))
+        clipboard_set_text(text)
     }
 }
 
@@ -899,6 +873,163 @@ impl Expander {
     pub fn set_hexpand(&self, _expand: bool) {}
     pub fn set_vexpand(&self, _expand: bool) {}
     pub fn set_size_request(&self, _w: i32, _h: i32) {}
+}
+
+    // ---- TreeView (multi-column list) ----
+
+    /// A cell value: text, or an icon by theme name.
+    pub enum CellValue {
+        Text(String),
+        Icon { name: String, fallback: String },
+    }
+
+    /// No multi-column list on this backend; the rows are rendered as text.
+    pub struct TreeView {
+        _id: usize,
+    }
+
+    impl Clone for TreeView {
+        fn clone(&self) -> Self { TreeView { _id: self._id } }
+    }
+
+    impl TreeView {
+        /// Render the rows as aligned text columns, since a terminal has no
+        /// multi-column list. The path column is what selection reports.
+        pub fn set_rows(&self, rows: &[Vec<CellValue>]) {
+            let text = render_rows_text(rows);
+            crate::backends::zork::set_textview_text(self._id, &text);
+            // Remember the path in each row so selection can report it.
+            let paths: Vec<String> = rows
+                .iter()
+                .map(|r| match r.get(2) {
+                    Some(CellValue::Text(t)) => t.clone(),
+                    _ => String::new(),
+                })
+                .collect();
+            crate::backends::zork::treeview_set_rows(self._id, paths);
+        }
+
+        /// The path of the "selected" row. The REPL selects via `select_row`.
+        pub fn selected_path(&self, path_column: usize) -> Option<String> {
+            crate::backends::zork::treeview_selected_path(self._id, path_column)
+        }
+
+        /// The REPL has no pointer; selection is set explicitly.
+        pub fn row_at(&self, _x: f64, _y: f64) -> Option<i32> { None }
+
+        /// Select row `index` (0-based), so context-menu / drag act on it.
+        pub fn select_row(&self, index: i32) {
+            crate::backends::zork::treeview_select_row(self._id, index);
+        }
+
+        pub fn connect_button_press_event(
+            &self,
+            _cb: impl FnMut(u32, f64, f64, *mut std::ffi::c_void) + 'static,
+        ) -> Result<u64, Error> {
+            Ok(0)
+        }
+
+        /// No drag-and-drop in a terminal.
+        pub fn enable_uri_drag_source(
+            &self,
+            _payload: impl FnMut() -> Option<(Vec<String>, String)> + 'static,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// Render `rows` (icon, name, path) as aligned text for a terminal.
+    fn render_rows_text(rows: &[Vec<CellValue>]) -> String {
+        if rows.is_empty() {
+            return "(no matches)".to_string();
+        }
+        const NAME_WIDTH: usize = 24;
+        let mut out = String::new();
+        for row in rows {
+            let icon = match row.first() {
+                Some(CellValue::Icon { name, .. }) => crate::backends_zork_adapter::icon_glyph(name),
+                _ => " ",
+            };
+            let name = match row.get(1) {
+                Some(CellValue::Text(t)) => t.as_str(),
+                _ => "",
+            };
+            let path = match row.get(2) {
+                Some(CellValue::Text(t)) => t.as_str(),
+                _ => "",
+            };
+            let name = if name.chars().count() > NAME_WIDTH {
+                let mut s: String = name.chars().take(NAME_WIDTH - 1).collect();
+                s.push('\u{2026}');
+                s
+            } else {
+                name.to_string()
+            };
+            out.push_str(&format!("{icon}  {name:<NAME_WIDTH$}  {path}\n"));
+        }
+        out.pop();
+        out
+    }
+
+    /// A glyph standing in for an icon name, for terminals.
+    pub fn icon_glyph(icon: &str) -> &'static str {
+        match icon {
+            "folder" => "\u{1F4C1}",
+            "image-x-generic" => "\u{1F5BC}",
+            "application-pdf" => "\u{1F4D5}",
+            "package-x-generic" => "\u{1F4E6}",
+            _ => "\u{1F4C4}",
+        }
+    }
+
+    impl Widget for TreeView {
+        fn raw_handle(&self) -> *mut c_void { &self._id as *const usize as *mut c_void }
+    }
+
+    impl AsRef<*mut c_void> for TreeView {
+        fn as_ref(&self) -> &*mut c_void {
+            unsafe { &*(&self._id as *const usize as *const *mut c_void) }
+        }
+    }
+
+    
+/// Copy `text` using the terminal clipboard escape (OSC 52), so it works over
+/// ssh as well as locally. Reports an error when stdout is not a terminal.
+pub fn clipboard_set_text(text: &str) -> Result<(), Error> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdout().is_terminal() {
+        return Err(Error::Backend(
+            "no terminal to receive the clipboard".into(),
+        ));
+    }
+    // OSC 52: ESC ] 52 ; c ; <base64> BEL. `c` selects the clipboard.
+    let mut b64 = String::with_capacity(text.len().div_ceil(3) * 4);
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for chunk in text.as_bytes().chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+        b64.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        b64.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        b64.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+        b64.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+    }
+    let mut out = std::io::stdout();
+    write!(out, "\x1b]52;c;{b64}\x07")
+        .and_then(|_| out.flush())
+        .map_err(|e| Error::Backend(format!("clipboard write failed: {e}")))
+}
+
+pub fn create_treeview(_columns: &[(&str, bool)]) -> Result<TreeView, Error> {
+    // The multi-column list is backed by a TextView node, which `set_rows`
+    // fills with aligned text columns.
+    let id = crate::backends::zork::create_textview()
+        .map_err(|e| Error::Backend(format!("{}", e)))?;
+    Ok(TreeView { _id: id })
 }
 
 pub fn create_expander(label: &str) -> Result<Expander, Error> {
