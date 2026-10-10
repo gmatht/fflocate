@@ -287,6 +287,7 @@ fx --since c:7:481221            # what changed since
 fx stats --roots                 # entries, backend, queue depth, drops,
                                  # recrawl_count, last_rescan_cause, per-root caps/state
 fx rescan /data
+fx update [--timeout 120] [ROOT...]  # reconcile all roots, then settle
 fx watch                         # tail live events (debugging; preview of subscribe)
 fx service install               # systemd user unit / launchd plist
 ```

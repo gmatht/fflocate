@@ -32,7 +32,9 @@ use findex::journal::Record;
 use findex::roots::Root;
 use findex::server::{Control, ControlSender, ServerCtx};
 use findex::sync::SyncRegistry;
-use findex::watch::{FakeBackend, InotifyBackend, WatchBackend};
+use findex::watch::{FakeBackend, WatchBackend};
+#[cfg(target_os = "linux")]
+use findex::watch::InotifyBackend;
 
 use crate::config::{BackendChoice, Config};
 
@@ -51,10 +53,17 @@ pub struct WatchFailure {
 /// Build the configured backend.
 pub fn make_backend(choice: BackendChoice) -> anyhow::Result<SharedBackend> {
     let b: Box<dyn WatchBackend> = match choice {
+        #[cfg(target_os = "linux")]
         BackendChoice::Inotify => match InotifyBackend::new() {
             Ok(b) => Box::new(b),
             Err(e) => anyhow::bail!("inotify unavailable: {e}"),
         },
+        // No kernel watcher yet on this platform (FSEvents is v1.5, §17);
+        // fail loudly rather than silently running unwatched.
+        #[cfg(not(target_os = "linux"))]
+        BackendChoice::Inotify => {
+            anyhow::bail!("backend `inotify` is Linux-only; use `fake` on this platform")
+        }
         BackendChoice::Fake => Box::new(FakeBackend::new(findex::watch::fake::FakeHandle::new())),
     };
     Ok(Arc::new(Mutex::new(b)))

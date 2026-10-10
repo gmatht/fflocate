@@ -39,4 +39,12 @@ echo "== daemon end-to-end (real crawl, live events, journal restart, socket) ==
 cargo test -p findexd --test daemon_e2e -- --nocapture
 
 echo
+echo "== locate compatibility via symlinked argv[0] (§12) =="
+cargo test -p fx --test locate_e2e -- --test-threads=1 --nocapture
+
+echo
+echo "== manual update heals offline edits (§7/§15) =="
+cargo test -p fx --test update_e2e -- --test-threads=1 --nocapture
+
+echo
 echo "all e2e checks passed"

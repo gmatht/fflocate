@@ -510,6 +510,92 @@ pub struct Results {
     pub total: u64,
 }
 
+/// Run a Watchman-style [`crate::expr::Expr`] over `index`.
+///
+/// `rel_root` scopes the search to a subtree (the `relative_root` parameter) and
+/// is a path relative to the root prefix (empty = the whole root). Candidate
+/// paths are built relative to `root_path` with `rel_root` prepended as the
+/// anchor; a candidate not under `rel_root` is skipped. The `MatchCtx::rel_path`
+/// handed to the expression is relative to `rel_root` (so `name ... wholename`
+/// and `dirname` see the same names Watchman would).
+pub fn execute_expr(
+    index: &Index,
+    root_paths: &[(u32, Vec<u8>)],
+    rel_root: &[u8],
+    expr: &crate::expr::Expr,
+    limit: usize,
+    count_only: bool,
+) -> Results {
+    use crate::expr::MatchCtx;
+
+    let mut results = Results { hits: Vec::new(), total: 0 };
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+
+    // The anchor path we materialize against is `root_path/rel_root`; the
+    // reported name is then everything after it.
+    for (id, entry) in index.iter_live() {
+        if entry.flags().is_root_dir() {
+            continue;
+        }
+        let Some(root_id) = index.root_of(id) else { continue };
+        let Some((_, root_path)) = root_paths.iter().find(|(rid, _)| *rid == root_id) else {
+            continue;
+        };
+
+        // Absolute path of the candidate under its root.
+        buf.clear();
+        let Some(abs) = index.path_of(id, root_path) else { continue };
+
+        // Anchor = root_path + '/' + rel_root.
+        let mut anchor: Vec<u8> = root_path.clone();
+        if !rel_root.is_empty() {
+            if anchor.last() != Some(&b'/') {
+                anchor.push(b'/');
+            }
+            anchor.extend_from_slice(rel_root);
+        }
+        // Must be under the anchor.
+        let rel = if anchor.is_empty() {
+            abs.as_slice()
+        } else if abs.len() > anchor.len()
+            && abs.starts_with(&anchor)
+            && abs[anchor.len()] == b'/'
+        {
+            &abs[anchor.len() + 1..]
+        } else {
+            continue;
+        };
+
+        let ctx = MatchCtx {
+            name: index.name(id),
+            rel_path: rel,
+            is_dir: entry.flags().is_dir(),
+            is_symlink: entry.flags().is_symlink(),
+            // v1 does not carry sizes or timestamps; `size`/`empty`/`since`
+            // terms see `None`.
+            size: None,
+            otime: None,
+            ctime: None,
+            mtime: None,
+            fs_case_insensitive: false,
+        };
+        if !expr.eval(&ctx) {
+            continue;
+        }
+        results.total += 1;
+        if count_only {
+            continue;
+        }
+        if limit != 0 && results.hits.len() >= limit {
+            continue;
+        }
+        // Report the path exactly as `abs` (root-anchored), matching the string
+        // query path's behaviour.
+        results.hits.push(Hit { id, path: abs });
+    }
+    results
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

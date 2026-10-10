@@ -107,7 +107,9 @@ dependencies = [
  "anyhow",
  "findex",
  "libc",
+ "regex",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

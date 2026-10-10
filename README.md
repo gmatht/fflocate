@@ -42,8 +42,10 @@ fx --sync "notes"                # settle, then search — deterministic
 fx --since c:7:481221            # what changed since
 fx stats --roots                 # entries, backend, queue depth, caps, state
 fx rescan /data
+fx update [--timeout 120] [ROOT...]  # reconcile missed changes, then settle
 fx watch                         # tail live events (subscribe preview)
 fx service install               # systemd user unit / launchd plist
+ln -s "$(command -v fx)" ~/bin/locate  # drop-in locate replacement (argv[0])
 ```
 
 By default the daemon indexes `$HOME`. To index something else:

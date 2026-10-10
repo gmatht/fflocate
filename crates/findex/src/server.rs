@@ -47,7 +47,38 @@ pub fn handle_request(ctx: &ServerCtx, req: &Request) -> Vec<Response> {
             version: crate::proto::PROTOCOL_VERSION,
             backend: ctx.backend.clone(),
         }],
-        Request::Query { q, limit, json: _, count } => handle_query(ctx, q, *limit, *count, t0),
+        Request::Query { q, limit, json: _, count, expression, glob, glob_includedotfiles, glob_noescape, suffix, path, relative_root, case_sensitive } => {
+            if expression.is_some() || glob.is_some() || suffix.is_some() || path.is_some() {
+                let mut obj = serde_json::Map::new();
+                if let Some(e) = expression {
+                    obj.insert("expression".into(), e.clone());
+                }
+                if let Some(g) = glob {
+                    obj.insert("glob".into(), g.clone());
+                }
+                if let Some(b) = glob_includedotfiles {
+                    obj.insert("glob_includedotfiles".into(), serde_json::Value::Bool(*b));
+                }
+                if let Some(b) = glob_noescape {
+                    obj.insert("glob_noescape".into(), serde_json::Value::Bool(*b));
+                }
+                if let Some(s) = suffix {
+                    obj.insert("suffix".into(), s.clone());
+                }
+                if let Some(p) = path {
+                    obj.insert("path".into(), p.clone());
+                }
+                if let Some(rr) = relative_root {
+                    obj.insert("relative_root".into(), serde_json::Value::String(rr.clone()));
+                }
+                if let Some(cs) = case_sensitive {
+                    obj.insert("case_sensitive".into(), serde_json::Value::Bool(*cs));
+                }
+                handle_expr_query(ctx, &serde_json::Value::Object(obj), *limit, *count, t0)
+            } else {
+                handle_query(ctx, q, *limit, *count, t0)
+            }
+        }
         Request::Sync { timeout_ms, roots } => handle_sync(ctx, *timeout_ms, roots.as_deref()),
         Request::Since { cursor, q } => handle_since(ctx, cursor, q),
         Request::Stats { roots } => handle_stats(ctx, *roots),
@@ -95,6 +126,54 @@ fn handle_query(ctx: &ServerCtx, raw: &str, limit: usize, count_only: bool, t0: 
     }
     let effective_limit = if count_only { 0 } else { limit };
     let res = query::execute(&ix, &root_paths, &q, effective_limit, count_only);
+    let cursor = ctx.shared.cursor().to_string_repr();
+    let elapsed = t0.elapsed();
+    drop(roots);
+    drop(ix);
+
+    let mut out = Vec::new();
+    out.push(meta_preamble(ctx, false, elapsed));
+    if count_only {
+        out.push(Response::Done { count: res.total, cursor });
+        return out;
+    }
+    for h in &res.hits {
+        out.push(Response::Hit { path: bytes_to_string(&h.path), id: h.id });
+    }
+    out.push(Response::Done { count: res.total, cursor });
+    out
+}
+
+/// The expression-tree query path (§10). Parses the Watchman-style query object
+/// and evaluates it over the index, honouring `relative_root`.
+fn handle_expr_query(
+    ctx: &ServerCtx,
+    query: &serde_json::Value,
+    limit: usize,
+    count_only: bool,
+    t0: Instant,
+) -> Vec<Response> {
+    let expr = match crate::expr::parse_query(query) {
+        Ok(e) => e,
+        Err(e) => return vec![Response::Error { message: e }],
+    };
+    let rel_root = query
+        .get("relative_root")
+        .and_then(|v| v.as_str())
+        .map(|s| s.as_bytes().to_vec())
+        .unwrap_or_default();
+
+    let ix = ctx.shared.index.read().unwrap();
+    let roots = ctx.shared.roots.read().unwrap();
+    let mut root_paths: Vec<(u32, Vec<u8>)> = Vec::new();
+    for r in roots.iter() {
+        let rid = crate::applier::root_dir_id(&ix, r);
+        if rid != crate::index::ROOT_ID {
+            root_paths.push((rid, r.path.as_os_str().to_string_lossy().as_bytes().to_vec()));
+        }
+    }
+    let effective_limit = if count_only { 0 } else { limit };
+    let res = query::execute_expr(&ix, &root_paths, &rel_root, &expr, effective_limit, count_only);
     let cursor = ctx.shared.cursor().to_string_repr();
     let elapsed = t0.elapsed();
     drop(roots);
@@ -384,7 +463,7 @@ mod tests {
     #[test]
     fn query_returns_meta_hits_done() {
         let (ctx, _d, _s) = ctx_with_tree();
-        let out = handle_request(&ctx, &Request::Query { q: "rs".into(), limit: 0, json: true, count: false });
+        let out = handle_request(&ctx, &Request::query("rs", 0, true, false));
         assert!(matches!(out.first(), Some(Response::Meta { .. })));
         assert!(matches!(out.last(), Some(Response::Done { .. })));
         let hits: Vec<_> = out.iter().filter_map(|r| match r { Response::Hit { path, .. } => Some(path.clone()), _ => None }).collect();
@@ -395,10 +474,59 @@ mod tests {
     #[test]
     fn count_fast_path() {
         let (ctx, _d, _s) = ctx_with_tree();
-        let out = handle_request(&ctx, &Request::Query { q: "rs".into(), limit: 0, json: false, count: true });
+        let out = handle_request(&ctx, &Request::query("rs", 0, false, true));
         let done = out.iter().find_map(|r| match r { Response::Done { count, .. } => Some(*count), _ => None }).unwrap();
         assert_eq!(done, 1);
         assert!(!out.iter().any(|r| matches!(r, Response::Hit { .. })));
+    }
+
+    #[test]
+    fn expression_query_reaches_expression_engine() {
+        // `["allof", ["suffix","rs"]]` should find src/main.rs via the
+        // Watchman-style expression path.
+        let (ctx, _d, _s) = ctx_with_tree();
+        let req = Request::Query {
+            q: String::new(),
+            limit: 0,
+            json: true,
+            count: false,
+            expression: Some(serde_json::json!(["suffix", "rs"])),
+            glob: None,
+            glob_includedotfiles: None,
+            glob_noescape: None,
+            suffix: None,
+            path: None,
+            relative_root: None,
+            case_sensitive: None,
+        };
+        let out = handle_request(&ctx, &req);
+        let hits: Vec<_> = out.iter().filter_map(|r| match r { Response::Hit { path, .. } => Some(path.clone()), _ => None }).collect();
+        assert_eq!(hits.len(), 1, "got {hits:?}");
+        assert!(hits[0].ends_with("/src/main.rs"));
+    }
+
+    #[test]
+    fn expression_query_errors_are_reported() {
+        let (ctx, _d, _s) = ctx_with_tree();
+        let req = Request::Query {
+            q: String::new(),
+            limit: 0,
+            json: false,
+            count: false,
+            expression: Some(serde_json::json!(["type", "x"])),
+            glob: None,
+            glob_includedotfiles: None,
+            glob_noescape: None,
+            suffix: None,
+            path: None,
+            relative_root: None,
+            case_sensitive: None,
+        };
+        let out = handle_request(&ctx, &req);
+        match &out[0] {
+            Response::Error { message } => assert!(message.contains("invalid type string 'x'"), "{message}"),
+            other => panic!("expected error, got {other:?}"),
+        }
     }
 
     #[test]

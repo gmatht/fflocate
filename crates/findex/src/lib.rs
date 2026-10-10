@@ -24,6 +24,7 @@ pub mod config_paths;
 pub mod crawl;
 pub mod cursor;
 pub mod event;
+pub mod expr;
 pub mod health;
 pub mod index;
 pub mod journal;

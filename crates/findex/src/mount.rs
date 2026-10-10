@@ -157,30 +157,40 @@ pub fn probe_dev(path: &Path) -> Option<u64> {
 
 /// Does `name_to_handle_at` work on `path`? (fanotify-FID viability, §4.)
 pub fn has_file_handle(path: &Path) -> bool {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c) = CString::new(path.as_os_str().as_bytes()) else { return false };
-    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return false;
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c) = CString::new(path.as_os_str().as_bytes()) else { return false };
+        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return false;
+        }
+        // A 128-byte handle buffer is enough for every in-tree fs.
+        let mut handle = [0u8; 128];
+        let mut mount_id: libc::c_int = 0;
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_name_to_handle_at,
+                fd,
+                c.as_ptr(),
+                handle.as_mut_ptr() as *mut libc::c_void,
+                &mut mount_id as *mut libc::c_int,
+                0,
+            )
+        };
+        unsafe {
+            libc::close(fd);
+        }
+        rc == 0
     }
-    // A 128-byte handle buffer is enough for every in-tree fs.
-    let mut handle = [0u8; 128];
-    let mut mount_id: libc::c_int = 0;
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_name_to_handle_at,
-            fd,
-            c.as_ptr(),
-            handle.as_mut_ptr() as *mut libc::c_void,
-            &mut mount_id as *mut libc::c_int,
-            0,
-        )
-    };
-    unsafe {
-        libc::close(fd);
+    // `name_to_handle_at(2)` is Linux-only; without it there are no file
+    // handles to have (fanotify-FID is v1.5 anyway, §17).
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        false
     }
-    rc == 0
 }
 
 /// Do we need `fstatat` fallback during crawls? We cannot observe `DT_UNKNOWN`
@@ -257,8 +267,15 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let caps = probe_root(d.path());
         assert!(caps.writable, "a tempdir must be writable");
-        // case probe on a normal ext4/tmpfs dir should say case-sensitive
-        assert!(!caps.case_insensitive, "tempdirs are case-sensitive here");
+        // Ground truth from a direct variant-spelling check: Linux
+        // tmpfs/ext4 tempdirs are case-sensitive, macOS APFS ones usually
+        // are not. Assert the classifier agrees with reality either way.
+        let upper = d.path().join(".findex-ground-ABC");
+        let lower = d.path().join(".findex-ground-abc");
+        std::fs::write(&upper, b"").unwrap();
+        let insensitive = lower.exists();
+        let _ = std::fs::remove_file(&upper);
+        assert_eq!(caps.case_insensitive, insensitive, "classifier must match the direct probe");
     }
 
     #[test]

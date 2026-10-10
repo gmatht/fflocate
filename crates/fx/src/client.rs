@@ -93,6 +93,10 @@ impl Client {
     }
 
     /// Run a query and print results. Returns the process exit code.
+    ///
+    /// When `expr` is `Some`, it is a Watchman-style expression tree or a full
+    /// query object; the JSON is sent as the query and the string `q` is
+    /// ignored (§10, expr).
     pub fn query(
         &mut self,
         q: &str,
@@ -100,13 +104,39 @@ impl Client {
         json: bool,
         count: bool,
         zero: bool,
+        expr: Option<serde_json::Value>,
     ) -> Result<ExitCode, CliError> {
-        let resp = self.send(&Request::Query {
-            q: q.to_string(),
-            limit,
-            json,
-            count,
-        })?;
+        let req = match expr {
+            Some(v) => {
+                // Accept either a bare expression tree (array/string) or a full
+                // query object; the protocol takes the object's keys.
+                let obj = match v {
+                    serde_json::Value::Object(o) => serde_json::Value::Object(o),
+                    other => {
+                        let mut m = serde_json::Map::new();
+                        m.insert("expression".into(), other);
+                        serde_json::Value::Object(m)
+                    }
+                };
+                let get = |k: &str| obj.get(k).cloned();
+                Request::Query {
+                    q: String::new(),
+                    limit,
+                    json,
+                    count,
+                    expression: get("expression"),
+                    glob: get("glob"),
+                    glob_includedotfiles: get("glob_includedotfiles").and_then(|v| v.as_bool()),
+                    glob_noescape: get("glob_noescape").and_then(|v| v.as_bool()),
+                    suffix: get("suffix"),
+                    path: get("path"),
+                    relative_root: get("relative_root").and_then(|v| v.as_str().map(|s| s.to_string())),
+                    case_sensitive: get("case_sensitive").and_then(|v| v.as_bool()),
+                }
+            }
+            None => Request::query(q, limit, json, count),
+        };
+        let resp = self.send(&req)?;
         let mut printed = 0u64;
         let mut total = 0u64;
         let mut stdout = std::io::stdout().lock();
@@ -150,18 +180,264 @@ impl Client {
         Ok(ExitCode::SUCCESS)
     }
 
-    /// Settle the index (§8). Returns per-root status.
-    pub fn sync(
+    /// Run a prebuilt expression query in `locate` mode: plain absolute paths
+    /// on stdout, `locate` exit statuses (0 = matches, 1 = none).
+    ///
+    /// With `existing`, hits are filtered by the filesystem at print time and
+    /// the limit is applied client-side (the server cannot know which hits
+    /// survive the existence check).
+    pub fn locate(
         &mut self,
-        _socket: Option<String>,
+        o: &crate::locate::LocateArgs,
+        expr: serde_json::Value,
+    ) -> Result<ExitCode, CliError> {
+        let req = Request::Query {
+            q: String::new(),
+            // Over-fetch when filtering: the limit applies to printed hits.
+            limit: if o.existing { 0 } else { o.limit },
+            json: false,
+            // Server-side count skips hits; with -e we must count survivors.
+            count: o.count && !o.existing,
+            expression: Some(expr),
+            glob: None,
+            glob_includedotfiles: None,
+            glob_noescape: None,
+            suffix: None,
+            path: None,
+            relative_root: None,
+            case_sensitive: None,
+        };
+        let resp = self.send(&req)?;
+        let mut paths: Vec<String> = Vec::new();
+        let mut total = 0u64;
+        for r in &resp {
+            match r {
+                Response::Meta { stale_roots, catching_up, .. } => {
+                    if o.quiet {
+                        continue;
+                    }
+                    if !stale_roots.is_empty() {
+                        eprintln!("locate: warning: stale roots: {}", stale_roots.join(", "));
+                    }
+                    if catching_up == &Some(true) {
+                        eprintln!("locate: warning: daemon is still catching up; results may be incomplete");
+                    }
+                }
+                Response::Hit { path, .. } => {
+                    if o.existing && !path_exists(path, o.follow) {
+                        continue;
+                    }
+                    if o.limit != 0 && paths.len() >= o.limit {
+                        continue;
+                    }
+                    paths.push(path.clone());
+                }
+                Response::Done { count: c, .. } => total = *c,
+                Response::Error { message } => {
+                    return Err(CliError::Protocol(message.clone()));
+                }
+                _ => {}
+            }
+        }
+        if o.count {
+            // Server-side count (no -e) arrives in `done`; with -e we count
+            // the survivors.
+            println!("{}", total.max(paths.len() as u64));
+        } else {
+            let mut stdout = std::io::stdout().lock();
+            for p in &paths {
+                if o.zero {
+                    let _ = stdout.write_all(p.as_bytes());
+                    let _ = stdout.write_all(b"\0");
+                } else {
+                    let _ = writeln!(stdout, "{p}");
+                }
+            }
+            let _ = stdout.flush();
+        }
+        // Server-side count arrives in `done`; otherwise the fetched (and
+        // possibly existence-filtered) hits tell the story.
+        let matched = if o.count && !o.existing { total } else { paths.len() as u64 };
+        if matched == 0 {
+            return Ok(ExitCode::from(1));
+        }
+        Ok(ExitCode::SUCCESS)
+    }
+
+    /// Run a `find`-mode plan: the index answers the name/type/path/depth
+    /// predicates, then the surviving candidates are `lstat`ed for the metadata
+    /// tests (§10, two-phase plan).
+    ///
+    /// `find` exits 0 even when nothing matches, so this never returns the
+    /// "no matches" status.
+    pub fn find(
+        &mut self,
+        query: &serde_json::Value,
+        plan: &crate::find::Plan,
+    ) -> Result<ExitCode, CliError> {
+        // `-newer` needs the index to be settled, or the reference file's own
+        // creation may not be visible yet.
+        if plan.sync {
+            let _ = self.sync_timeout(60_000)?;
+        }
+
+        let obj = query.as_object().cloned().unwrap_or_default();
+        let get = |k: &str| obj.get(k).cloned();
+        let req = Request::Query {
+            q: String::new(),
+            // Phase 2 filters, so the limit cannot apply server-side.
+            limit: 0,
+            json: false,
+            count: false,
+            expression: get("expression"),
+            glob: get("glob"),
+            glob_includedotfiles: get("glob_includedotfiles").and_then(|v| v.as_bool()),
+            glob_noescape: get("glob_noescape").and_then(|v| v.as_bool()),
+            suffix: get("suffix"),
+            path: get("path"),
+            relative_root: get("relative_root").and_then(|v| v.as_str().map(|s| s.to_string())),
+            case_sensitive: get("case_sensitive").and_then(|v| v.as_bool()),
+        };
+        let resp = self.send(&req)?;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        // Collect phase-1 survivors (the server has already applied the
+        // index-level predicates), then apply path/depth filters and phase 2.
+        let mut survivors: Vec<String> = Vec::new();
+        for r in &resp {
+            match r {
+                Response::Meta { stale_roots, catching_up, .. } => {
+                    if !stale_roots.is_empty() {
+                        eprintln!("find: warning: stale roots: {}", stale_roots.join(", "));
+                    }
+                    if catching_up == &Some(true) {
+                        eprintln!("find: warning: daemon is still catching up");
+                    }
+                }
+                Response::Hit { path, .. } => survivors.push(path.clone()),
+                Response::Error { message } => {
+                    return Err(CliError::Protocol(message.clone()));
+                }
+                _ => {}
+            }
+        }
+
+        let mut shown = 0u64;
+        let mut stdout = std::io::stdout().lock();
+        for path in &survivors {
+            if !plan.paths.is_empty() {
+                let under = plan.paths.iter().any(|base| path_under(path, base));
+                if !under {
+                    continue;
+                }
+            }
+            let depth = depth_of(path, &plan.paths, &survivors);
+            if let Some(d) = plan.max_depth {
+                if depth > d {
+                    continue;
+                }
+            }
+            if let Some(d) = plan.min_depth {
+                if depth < d {
+                    continue;
+                }
+            }
+            if !plan.meta.is_empty() {
+                let p = std::path::Path::new(path);
+                let Some(m) = crate::find::lstat(p, now) else { continue };
+                let is_empty_dir = std::fs::read_dir(p).map(|mut d| d.next().is_none()).unwrap_or(false);
+                if !crate::find::meta_matches(&plan.meta, &m, is_empty_dir, now) {
+                    continue;
+                }
+            }
+            shown += 1;
+            if let Some(fmt) = &plan.printf {
+                // `-printf` supplies its own newlines; do not add one.
+                let _ = stdout.write_all(expand_printf(fmt, path).as_bytes());
+            } else if plan.print0 {
+                let _ = stdout.write_all(path.as_bytes());
+                let _ = stdout.write_all(b"\0");
+            } else {
+                let _ = writeln!(stdout, "{path}");
+            }
+        }
+        let _ = stdout.flush();
+        let _ = shown;
+        // `find` exits 0 even with no matches.
+        Ok(ExitCode::SUCCESS)
+    }
+
+    /// Settle the index (§8), with an explicit timeout. `fx update` needs
+    /// longer than the interactive `--sync` default: a full-tree rescan is
+    /// behind the barrier.
+    pub fn sync_timeout(
+        &mut self,
+        timeout_ms: u64,
     ) -> Result<std::collections::BTreeMap<String, String>, CliError> {
-        let resp = self.send(&Request::Sync { timeout_ms: 2000, roots: None })?;
+        let resp = self.send(&Request::Sync { timeout_ms, roots: None })?;
         for r in resp {
             if let Response::Synced { roots } = r {
                 return Ok(roots);
             }
         }
         Ok(Default::default())
+    }
+
+    /// Root keys (absolute paths) currently configured on the daemon.
+    pub fn root_paths(&mut self) -> Result<Vec<String>, CliError> {
+        let resp = self.send(&Request::Stats { roots: true })?;
+        for r in resp {
+            if let Response::Stats { stats } = r {
+                let mut out = Vec::new();
+                if let Some(roots) = stats.get("roots").and_then(|v| v.as_array()) {
+                    for x in roots {
+                        if let Some(p) = x.get("path").and_then(|v| v.as_str()) {
+                            out.push(p.to_string());
+                        }
+                    }
+                }
+                return Ok(out);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Ask for a rescan of one root. Fire-and-forget: pair with a sync, which
+    /// cannot complete until the rescan drains (pending ordering, §7–§8).
+    pub fn rescan_root(&mut self, root: &str) -> Result<(), CliError> {
+        let resp = self.send(&Request::Rescan { root: root.to_string() })?;
+        for r in resp {
+            if let Response::Rescanning { .. } = r {
+                return Ok(());
+            }
+            if let Response::Error { message } = r {
+                return Err(CliError::Protocol(message));
+            }
+        }
+        Ok(())
+    }
+
+    /// Full manual update (the updatedb equivalent): rescan every root — or
+    /// just `only` when non-empty — then settle. A rescan enqueued before the
+    /// sync cookie is necessarily applied before the cookie completes, so a
+    /// root reporting `ok` is reconciled with the filesystem: this heals
+    /// missed changes from daemon downtime or offline edits. Returns the
+    /// per-root status map (`ok` / `weak` / `timeout`).
+    pub fn update(
+        &mut self,
+        only: &[String],
+        timeout_ms: u64,
+    ) -> Result<std::collections::BTreeMap<String, String>, CliError> {
+        let targets: Vec<String> =
+            if only.is_empty() { self.root_paths()? } else { only.to_vec() };
+        for r in &targets {
+            self.rescan_root(r)?;
+        }
+        self.sync_timeout(timeout_ms)
     }
 
     pub fn since(&mut self, cursor: &str, q: &str) -> Result<ExitCode, CliError> {
@@ -233,6 +509,98 @@ impl Client {
         Ok(ExitCode::SUCCESS)
     }
 
+}
+
+/// Existence check for `locate -e`: follow symlinks only with `-L`
+/// (default `-P`, like GNU locate).
+fn path_exists(path: &str, follow: bool) -> bool {
+    let p = std::path::Path::new(path);
+    if follow {
+        p.exists()
+    } else {
+        std::fs::symlink_metadata(p).is_ok()
+    }
+}
+
+/// Is `path` the same as, or under, `base`?
+fn path_under(path: &str, base: &str) -> bool {
+    let base = base.trim_end_matches('/');
+    if base.is_empty() {
+        return true;
+    }
+    path == base || path.starts_with(&format!("{base}/"))
+}
+
+/// Depth of a result relative to the given start paths. With no start paths the
+/// depth is measured from the root the path belongs to (i.e. path components
+/// after the matched base); this is the closest analogue of `find`'s depth.
+fn depth_of(path: &str, bases: &[String], _all: &[String]) -> u32 {
+    let base = if bases.is_empty() {
+        // Nothing to strip against; use the number of components as a stand-in.
+        return path.split('/').filter(|c| !c.is_empty()).count() as u32;
+    } else {
+        bases
+            .iter()
+            .map(|b| b.trim_end_matches('/'))
+            .filter(|b| path_under(path, b))
+            .max_by_key(|b| b.len())
+            .unwrap_or("")
+    };
+    let rest = path.strip_prefix(base).unwrap_or(path).trim_start_matches('/');
+    rest.split('/').filter(|c| !c.is_empty()).count() as u32
+}
+
+/// Expand the small, high-value subset of `-printf` directives: `%p` (path),
+/// `%f` (basename), `%h` (dirname), `%s` (size), `%P` (path minus the start
+/// point), `%%` (a literal percent) and `\n`/`\t`/`\0` escapes.
+fn expand_printf(fmt: &str, path: &str) -> String {
+    let mut outout = String::with_capacity(fmt.len() + path.len());
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('n') => outout.push('\n'),
+                Some('t') => outout.push('\t'),
+                Some('0') => outout.push('\0'),
+                Some('\\') => outout.push('\\'),
+                Some(other) => {
+                    outout.push('\\');
+                    outout.push(other);
+                }
+                None => outout.push('\\'),
+            },
+            '%' => match chars.next() {
+                Some('p') => outout.push_str(path),
+                Some('f') => outout.push_str(
+                    std::path::Path::new(path)
+                        .file_name()
+                        .map(|s| s.to_string_lossy())
+                        .as_deref()
+                        .unwrap_or(""),
+                ),
+                Some('h') => outout.push_str(
+                    std::path::Path::new(path)
+                        .parent()
+                        .map(|s| s.to_string_lossy())
+                        .as_deref()
+                        .unwrap_or(""),
+                ),
+                Some('P') => outout.push_str(path.trim_start_matches('/')),
+                Some('s') => {
+                    let sz = std::fs::symlink_metadata(path).map(|m| m.len()).unwrap_or(0);
+                    outout.push_str(&sz.to_string());
+                }
+                Some('%') => outout.push('%'),
+                Some(other) => {
+                    outout.push('%');
+                    outout.push(other);
+                }
+                None => outout.push('%'),
+            },
+            other => outout.push(other),
+        }
+    }
+    outout
 }
 
 fn print_stats(stats: &serde_json::Value) {

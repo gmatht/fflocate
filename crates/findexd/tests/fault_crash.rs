@@ -27,6 +27,22 @@ fn binaries() -> Option<(PathBuf, PathBuf)> {
     }
 }
 
+/// Watch backend for the spawned daemon: the real watcher on Linux, the fake
+/// backend elsewhere (no kernel watcher is ported yet; FSEvents is v1.5).
+/// Crash/restart/rescan recovery is backend-independent; live-event delivery
+/// during the churn window is weaker with `fake`, which the assertions
+/// tolerate by converging via explicit rescans.
+fn backend_arg() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        "inotify"
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "fake"
+    }
+}
+
 struct DaemonProc {
     child: Child,
     socket: PathBuf,
@@ -42,7 +58,7 @@ impl DaemonProc {
             .arg("--root")
             .arg(root)
             .arg("--backend")
-            .arg("inotify")
+            .arg(backend_arg())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

@@ -1,3 +1,8 @@
 /target
 **/*.rs.bk
 .pir/
+
+# Upstream facebook/watchman checkout, kept only as a reference for the ported
+# tests and expression-language semantics. 51 MB, its own git repo: reference
+# material, not part of this project, never committed.
+/watchman/

@@ -27,6 +27,27 @@ pub enum Request {
         /// Return only a count (skips path materialization, §10).
         #[serde(default)]
         count: bool,
+        /// Watchman-style expression tree (`["allof", ["type","f"], ...]`).
+        /// When present, it takes precedence over the string `q` (§10, expr).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expression: Option<serde_json::Value>,
+        /// Watchman-style generators; only meaningful with `expression`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        glob: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        glob_includedotfiles: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        glob_noescape: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suffix: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<serde_json::Value>,
+        /// Subtree to scope the query to; names are reported relative to it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relative_root: Option<String>,
+        /// Override the filesystem's case sensitivity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        case_sensitive: Option<bool>,
     },
     /// Settle barrier: complete when everything before the call is indexed (§8).
     Sync {
@@ -113,6 +134,25 @@ impl Response {
 }
 
 impl Request {
+    /// Convenience constructor for a plain string query (all expression fields
+    /// unset). Keeps existing call sites terse.
+    pub fn query(q: impl Into<String>, limit: usize, json: bool, count: bool) -> Request {
+        Request::Query {
+            q: q.into(),
+            limit,
+            json,
+            count,
+            expression: None,
+            glob: None,
+            glob_includedotfiles: None,
+            glob_noescape: None,
+            suffix: None,
+            path: None,
+            relative_root: None,
+            case_sensitive: None,
+        }
+    }
+
     pub fn from_line(line: &str) -> Result<Request, serde_json::Error> {
         let v: serde_json::Value = serde_json::from_str(line)?;
         // Accept requests with or without the `v` field; validate version when
@@ -137,7 +177,7 @@ mod tests {
     fn parse_query() {
         let r = Request::from_line(r#"{"v":2,"op":"query","q":"src ext:rs","limit":50,"json":true}"#).unwrap();
         match r {
-            Request::Query { q, limit, json, count } => {
+            Request::Query { q, limit, json, count, .. } => {
                 assert_eq!(q, "src ext:rs");
                 assert_eq!(limit, 50);
                 assert!(json);

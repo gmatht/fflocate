@@ -14,6 +14,20 @@ fn bin_dir() -> Option<PathBuf> {
     (d.join("findexd").exists() && d.join("fx").exists()).then_some(d)
 }
 
+/// Watch backend for the spawned daemon (see fault_crash.rs). These tests
+/// skip without bind-mount/sysctl capabilities anyway; on non-Linux that is
+/// always the case.
+fn backend_arg() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        "inotify"
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "fake"
+    }
+}
+
 struct DaemonProc {
     child: Child,
     socket: PathBuf,
@@ -25,7 +39,7 @@ impl DaemonProc {
             .args(["--socket", &socket.to_string_lossy()])
             .args(["--state-dir", &state.to_string_lossy()])
             .args(["--root", &root.to_string_lossy()])
-            .args(["--backend", "inotify"])
+            .args(["--backend", backend_arg()])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

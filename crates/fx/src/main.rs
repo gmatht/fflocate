@@ -9,6 +9,7 @@
 //! fx --since c:7:481221            # what changed since
 //! fx stats --roots
 //! fx rescan /data
+//! fx update [--timeout 120] [ROOT...]  # reconcile all roots, then settle
 //! fx watch                         # tail live events
 //! fx service install               # systemd user unit / launchd plist
 //! ```
@@ -16,6 +17,8 @@
 //! `fx` auto-spawns the daemon if not running.
 
 mod client;
+mod find;
+mod locate;
 mod service;
 
 use std::process::ExitCode;
@@ -29,8 +32,10 @@ USAGE:
     fx [OPTIONS] [QUERY...]
     fx stats [--roots] [--json]
     fx rescan <ROOT>
+    fx update [--timeout SECS] [ROOT...]
     fx watch [QUERY...]
     fx service install [--socket PATH]
+    find ...                         # via a `find` or `fxfind` symlink
 
 OPTIONS:
     -c, --count         print only the number of matches
@@ -39,6 +44,8 @@ OPTIONS:
     -l, --limit N       stop after N results (0 = unlimited)
     -s, --sync          settle the index before searching (cookie sync)
         --since CURSOR  report what changed since a cursor
+        --expr JSON     Watchman-style expression/query (JSON object or tree)
+        --timeout SECS  settle timeout for --sync/--update (default 2/120)
     -h, --help          show this help
     -V, --version       print version
 
@@ -46,9 +53,21 @@ QUERY:
     space-separated terms are ANDed; \"...\" is a phrase; * and ? are
     wildcards; modifiers: ext:rs  path:src  case:Foo  regex:^a.*z$
 
+    --expr runs Watchman's expression-tree language instead, e.g.
+      fx --expr '{\"expression\": [\"allof\", [\"type\",\"f\"], [\"suffix\",\"rs\"]]}'
+      fx --expr '[\"match\", \"**/*.rs\", \"wholename\"]'
+      fx --expr '{\"glob\": [\"**/*.rs\"], \"relative_root\": \"src\"}'
+
+UPDATE:
+    fx update reconciles every root with the filesystem (rescan, then
+    settle) — the manual fix for changes the watcher missed: daemon
+    downtime, offline edits, overflow gaps. With no ROOTs all roots are
+    updated; otherwise only the named ones. One `status<TAB>root` line per
+    root; exit 1 if any root is not `ok`.
+
 EXIT STATUS:
     0  matches found (or a non-search command succeeded)
-    1  no matches
+    1  no matches (or update left a root unreconciled)
     2  error
 ";
 
@@ -64,6 +83,9 @@ struct Args {
     command: Option<String>,
     query: Vec<String>,
     socket: Option<String>,
+    expr: Option<serde_json::Value>,
+    /// Settle timeout in ms (--timeout SECS; per-command defaults).
+    timeout_ms: Option<u64>,
 }
 
 fn main() -> ExitCode {
@@ -77,6 +99,18 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<ExitCode, CliError> {
+    // Drop-in `locate` replacement when invoked under that name (§12, locate).
+    if locate::invoked_as_locate() {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        return locate::run(&argv);
+    }
+
+    // Drop-in `find` / `fxfind` replacement when invoked under either name.
+    if find::invoked_as_find() {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        return find::run(&argv);
+    }
+
     let args = parse_args(std::env::args().skip(1))?;
 
     match args.command.as_deref() {
@@ -89,6 +123,26 @@ fn run() -> Result<ExitCode, CliError> {
             let root = args.query.first().ok_or_else(|| CliError::Usage("rescan needs a ROOT".into()))?;
             let mut c = Client::connect(args.socket.as_deref())?;
             return c.rescan(root);
+        }
+        Some("update") => {
+            let timeout = args.timeout_ms.unwrap_or(120_000);
+            let mut c = Client::connect(args.socket.as_deref())?;
+            let status = c.update(&args.query, timeout)?;
+            let mut all_ok = true;
+            let mut roots: Vec<&String> = status.keys().collect();
+            roots.sort();
+            for root in roots {
+                let st = &status[root];
+                if st != "ok" {
+                    all_ok = false;
+                }
+                println!("{st}\t{root}");
+            }
+            if !all_ok {
+                eprintln!("fx: update left a root unreconciled (see statuses above)");
+                return Ok(ExitCode::from(1));
+            }
+            return Ok(ExitCode::SUCCESS);
         }
         Some("watch") => {
             let q = args.query.join(" ");
@@ -107,7 +161,7 @@ fn run() -> Result<ExitCode, CliError> {
     }
     let q = args.query.join(" ");
     if args.sync {
-        let status = c.sync(args.socket.clone())?;
+        let status = c.sync_timeout(args.timeout_ms.unwrap_or(2000))?;
         // Report non-ok roots to stderr but keep going: loudly stale beats
         // silently wrong (§7), yet the search still answers.
         for (root, st) in &status {
@@ -122,6 +176,7 @@ fn run() -> Result<ExitCode, CliError> {
         args.json,
         args.count,
         args.zero,
+        args.expr,
     )
 }
 
@@ -149,7 +204,21 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<Args, CliError> {
             "--since" => {
                 a.since = Some(it.next().ok_or_else(|| CliError::Usage("--since needs a cursor".into()))?);
             }
+            "--timeout" => {
+                let v = it.next().ok_or_else(|| CliError::Usage("--timeout needs seconds".into()))?;
+                let secs: u64 = v
+                    .parse()
+                    .map_err(|_| CliError::Usage(format!("bad timeout: {v}")))?;
+                a.timeout_ms = Some(secs.saturating_mul(1000));
+            }
             "--roots" => a.roots = true,
+            "--expr" => {
+                let v = it.next().ok_or_else(|| CliError::Usage("--expr needs JSON".into()))?;
+                a.expr = Some(
+                    serde_json::from_str(&v)
+                        .map_err(|e| CliError::Usage(format!("bad --expr JSON: {e}")))?,
+                );
+            }
             "--socket" => {
                 a.socket = Some(it.next().ok_or_else(|| CliError::Usage("--socket needs a path".into()))?);
             }
@@ -177,7 +246,7 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<Args, CliError> {
 }
 
 fn is_command(s: &str) -> bool {
-    matches!(s, "stats" | "rescan" | "watch" | "service")
+    matches!(s, "stats" | "rescan" | "update" | "watch" | "service")
 }
 
 #[cfg(test)]
@@ -226,10 +295,37 @@ mod tests {
     }
 
     #[test]
+    fn update_command_and_timeout() {
+        let a = parse(&["update"]);
+        assert_eq!(a.command.as_deref(), Some("update"));
+        assert!(a.query.is_empty());
+        assert_eq!(a.timeout_ms, None);
+        let a = parse(&["update", "--timeout", "30", "/data", "/srv"]);
+        assert_eq!(a.command.as_deref(), Some("update"));
+        assert_eq!(a.timeout_ms, Some(30_000));
+        assert_eq!(a.query, vec!["/data", "/srv"]);
+        // --timeout also applies to --sync.
+        let a = parse(&["--timeout", "5", "--sync", "x"]);
+        assert_eq!(a.timeout_ms, Some(5_000));
+        assert!(a.sync);
+        assert!(parse_args(["--timeout", "xx"].iter().map(|s| s.to_string())).is_err());
+    }
+
+    #[test]
     fn query_starting_with_dash_after_command() {
         // `-foo` as a query term must not be parsed as an option when it looks
         // like a flag but the user meant a negation term.
         let a = parse(&["rs", "-main"]);
         assert_eq!(a.query, vec!["rs", "-main"]);
+    }
+
+    #[test]
+    fn expr_flag_parses_json() {
+        let a = parse(&["--expr", r#"["suffix","rs"]"#]);
+        assert_eq!(a.expr, Some(serde_json::json!(["suffix", "rs"])));
+        let a = parse(&["--expr", r#"{"glob":["**/*.rs"]}"#]);
+        assert_eq!(a.expr, Some(serde_json::json!({"glob": ["**/*.rs"]})));
+        // Bad JSON is a usage error.
+        assert!(parse_args(["--expr", "not json"].iter().map(|s| s.to_string())).is_err());
     }
 }

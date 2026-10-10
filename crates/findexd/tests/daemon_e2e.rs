@@ -57,7 +57,7 @@ fn crawl_indexes_a_real_tree() {
     let ctx = daemon.server_ctx();
     let out = findex::server::handle_request(
         &ctx,
-        &Request::Query { q: "".into(), limit: 0, json: true, count: false },
+        &Request::query("", 0, true, false),
     );
     let paths: Vec<String> = out
         .iter()
@@ -163,7 +163,7 @@ fn socket_roundtrip_serves_a_query() {
         });
     }
 
-    let resp = net::roundtrip(&sock, &Request::Query { q: "hello".into(), limit: 0, json: true, count: false }).unwrap();
+    let resp = net::roundtrip(&sock, &Request::query("hello", 0, true, false)).unwrap();
     assert!(matches!(resp.first(), Some(Response::Meta { .. })));
     assert!(resp.iter().any(|r| matches!(r, Response::Hit { path, .. } if path.ends_with("hello.rs"))));
     daemon.stop();

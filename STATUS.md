@@ -39,8 +39,34 @@ All of the following were exercised against real binaries and a real temp tree:
   the queue drained).
 * Cookie files are cleaned up on completion and on timeout (no leaks).
 
-`cargo test` runs 158 tests, all green, including a 120-step random
+`cargo test` runs 185 tests, all green, including a 120-step random
 differential test against a from-scratch filesystem walk.
+
+### `locate` drop-in (`crates/fx/src/locate.rs`)
+
+Invoking the `fx` binary as `locate` (argv\[0\], e.g. a symlink) speaks GNU
+locate: substring/`*PATTERN*` semantics, full-path shell globs (`*` crosses
+`/`, translated to anchored `pcre`), `-r/--regex`, `-b`, `-i`, `-A`
+(anyof/allof), `-c`, `-l`, `-0`, `-e` (with `-L`/`-P` symlink handling),
+`-q`, `-S` (maps to `fx stats`), `-d` accepted and ignored — the live index
+replaces the updatedb snapshot. Same exit statuses (0/1/2). Covered by unit
+tests (parsing, glob→regex) and `crates/fx/tests/locate_e2e.rs` (symlinked
+binary against a real daemon, incl. the dangling-symlink `-e`/`-L` case),
+wired into `scripts/e2e.sh`.
+
+### Watchman query-language ports (`crates/findex/src/expr.rs`)
+
+The expression-tree language (`since.cpp` term added: `ClockSpec` with
+timestamp/`c:pid:ticks`/`c:start:pid:root:ticks` clockspecs, `oclock`/
+`cclock`/`mtime`/`ctime` fields, Watchman's `>=`/`>` boundary semantics and
+error strings) plus the ported suites: the full 208-row
+`WildmatchTest.json` table, `test_empty.py`, `test_pcre.py`,
+`test_since_term.py`, `SuffixQueryTest.cpp` (`simple_suffix_type()` /
+`suffix_glob_patterns()`), and the `relative_root` / case-sensitivity /
+path-depth cases from `test_name/match/glob/suffix_generator/
+path_generator.py`. Porting the wildmatch table fixed three divergences from
+`wildmatch.c`: `**` outside a segment boundary is malformed (fails the
+match), POSIX `[:class:]` support, and the `/.` period rule for `**`.
 
 ### Fault injection and soak (§14.3, §14.5)
 
@@ -145,3 +171,12 @@ cargo test
 `fx stats` is the operational surface. If a root is degraded, a rescan was
 deferred, the journal was corrupt, or the daemon is still catching up, it is
 visible there — the design's "loudly stale beats silently wrong" rule.
+
+`fx update [--timeout 120] [ROOT...]` is the manual update (the updatedb
+equivalent): rescan every root, then settle. A rescan enqueued before the
+sync cookie cannot complete after it (pending ordering), so a root reporting
+`ok` is reconciled with the filesystem — this heals downtime/offline edits
+a restart crawl alone cannot (crawls only add). Exit 1 if any root is not
+`ok`; unknown roots are an error. Covered by `crates/fx/tests/update_e2e.rs`
+(kill -9 → offline delete+add → restart → update converges, with
+`last_rescan_cause=manual` proving the update's rescan did it).

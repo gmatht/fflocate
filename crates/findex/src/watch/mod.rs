@@ -20,9 +20,14 @@ use crate::event::FsEvent;
 use crate::roots::Root;
 
 pub mod fake;
+/// The real Linux backend. Gated: inotify is a Linux-only API (FSEvents is
+/// v1.5, §17), so on other platforms the crate builds with the fake backend
+/// only and the daemon reports `inotify` as unavailable.
+#[cfg(target_os = "linux")]
 pub mod inotify;
 
 pub use fake::FakeBackend;
+#[cfg(target_os = "linux")]
 pub use inotify::InotifyBackend;
 
 /// Capabilities a backend advertises, so the applier can adapt rather than
