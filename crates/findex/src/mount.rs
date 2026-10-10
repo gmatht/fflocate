@@ -155,6 +155,80 @@ pub fn probe_dev(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|m| m.dev())
 }
 
+/// The raw kernel file handle for `path`, as the kernel reports it.
+///
+/// This is the piece the fanotify-FID resolver needs (§6): during the crawl we
+/// ask the kernel for each directory's handle and remember `handle → dir id`;
+/// every fanotify event then names its parent by that same handle, so the two
+/// line up without any path guessing.
+///
+/// Returns `None` when the syscall is unavailable or fails (unsupported
+/// filesystem, no permission). Callers treat that as "this dir cannot be
+/// resolved" and fall back rather than silently mis-attribute.
+#[cfg(target_os = "linux")]
+pub fn handle_of_path(path: &Path) -> Option<HandleId> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    // `struct file_handle { u32 handle_bytes; s32 handle_type; u8 f_handle[]; }`.
+    // Over-allocate and let the kernel tell us the real size.
+    let mut buf = vec![0u8; 8 + 128];
+    let mut mount_id: libc::c_int = 0;
+    // handle_bytes must be set to the buffer capacity before the call.
+    let cap = (buf.len() - 8) as u32;
+    buf[0..4].copy_from_slice(&cap.to_ne_bytes());
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_name_to_handle_at,
+            fd,
+            c.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut mount_id as *mut libc::c_int,
+            0,
+        )
+    };
+    unsafe {
+        libc::close(fd);
+    }
+    if rc != 0 {
+        return None;
+    }
+    let handle_bytes = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let handle_type = i32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let n = handle_bytes as usize;
+    if 8 + n > buf.len() {
+        return None;
+    }
+    Some(HandleId { mount_id, handle_type, handle: buf[8..8 + n].to_vec() })
+}
+
+/// The identity of a file handle as the kernel reports it, independent of any
+/// path. `mount_id` comes from `name_to_handle_at`.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HandleId {
+    pub mount_id: i32,
+    pub handle_type: i32,
+    pub handle: Vec<u8>,
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HandleId {
+    pub mount_id: i32,
+    pub handle_type: i32,
+    pub handle: Vec<u8>,
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn handle_of_path(_path: &Path) -> Option<HandleId> {
+    None
+}
+
 /// Does `name_to_handle_at` work on `path`? (fanotify-FID viability, §4.)
 pub fn has_file_handle(path: &Path) -> bool {
     #[cfg(target_os = "linux")]
