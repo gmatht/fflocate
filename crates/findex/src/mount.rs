@@ -155,6 +155,132 @@ pub fn probe_dev(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|m| m.dev())
 }
 
+/// The raw kernel file handle for `path`, as the kernel reports it.
+///
+/// This is the piece the fanotify-FID resolver needs (§6): during the crawl we
+/// ask the kernel for each directory's handle and remember `handle → dir id`;
+/// every fanotify event then names its parent by that same handle, so the two
+/// line up without any path guessing.
+///
+/// Returns `None` when the syscall is unavailable or fails (unsupported
+/// filesystem, no permission). Callers treat that as "this dir cannot be
+/// resolved" and fall back rather than silently mis-attribute.
+#[cfg(target_os = "linux")]
+pub fn handle_of_path(path: &Path) -> Option<HandleId> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    // `struct file_handle { u32 handle_bytes; s32 handle_type; u8 f_handle[]; }`.
+    // Over-allocate and let the kernel tell us the real size.
+    let mut buf = vec![0u8; 8 + 128];
+    let mut mount_id: libc::c_int = 0;
+    // handle_bytes must be set to the buffer capacity before the call.
+    let cap = (buf.len() - 8) as u32;
+    buf[0..4].copy_from_slice(&cap.to_ne_bytes());
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_name_to_handle_at,
+            fd,
+            c.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut mount_id as *mut libc::c_int,
+            0,
+        )
+    };
+    unsafe {
+        libc::close(fd);
+    }
+    if rc != 0 {
+        return None;
+    }
+    let handle_bytes = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let handle_type = i32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let n = handle_bytes as usize;
+    if 8 + n > buf.len() {
+        return None;
+    }
+    Some(HandleId { mount_id, handle_type, handle: buf[8..8 + n].to_vec() })
+}
+
+/// The identity of a file handle as the kernel reports it, independent of any
+/// path. `mount_id` comes from `name_to_handle_at`.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HandleId {
+    pub mount_id: i32,
+    pub handle_type: i32,
+    pub handle: Vec<u8>,
+}
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct HandleId {
+    pub mount_id: i32,
+    pub handle_type: i32,
+    pub handle: Vec<u8>,
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn handle_of_path(_path: &Path) -> Option<HandleId> {
+    None
+}
+
+/// Can this system run the fanotify-FID backend at all?
+///
+/// Probes by *doing*: open a fanotify fd with the flags the backend needs, and
+/// close it. This is the honest test — a kernel may support `fanotify_init` but
+/// not `FAN_REPORT_DFID_NAME` (pre-5.13), and a container may deny the syscall
+/// outright (seccomp). Either way the answer is `false` and the caller falls back
+/// to inotify, rather than discovering it when the first event never arrives.
+#[cfg(target_os = "linux")]
+pub fn fanotify_available() -> bool {
+    // The same flag word the backend uses; keep them in sync.
+    const FAN_CLASS_NOTIF: u32 = 0x0000_0000;
+    const FAN_CLOEXEC: u32 = 0x0000_0001;
+    const FAN_NONBLOCK: u32 = 0x0000_0002;
+    const FAN_REPORT_DFID_NAME: u32 = 0x0000_0c00; // DIR_FID | NAME
+    let flags = FAN_CLASS_NOTIF | FAN_REPORT_DFID_NAME | FAN_CLOEXEC | FAN_NONBLOCK;
+    let fd = unsafe {
+        libc::fanotify_init(
+            flags as libc::c_uint,
+            (libc::O_RDONLY | libc::O_LARGEFILE) as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return false;
+    }
+    unsafe {
+        libc::close(fd);
+    }
+    true
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn fanotify_available() -> bool {
+    false
+}
+
+/// A one-line explanation for `ff stats` / startup logs of *why* fanotify is or
+/// is not usable, so a fallback is visible rather than mysterious (§4).
+pub fn fanotify_availability_note() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        if fanotify_available() {
+            "fanotify-FID available (FAN_REPORT_DFID_NAME)"
+        } else {
+            "fanotify-FID unavailable: fanotify_init(FAN_REPORT_DFID_NAME) failed (kernel < 5.13 or restricted)"
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        "fanotify-FID unavailable: Linux-only"
+    }
+}
+
 /// Does `name_to_handle_at` work on `path`? (fanotify-FID viability, §4.)
 pub fn has_file_handle(path: &Path) -> bool {
     #[cfg(target_os = "linux")]

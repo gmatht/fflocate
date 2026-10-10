@@ -26,7 +26,21 @@ pub mod fake;
 #[cfg(target_os = "linux")]
 pub mod inotify;
 
+/// The fanotify-FID backend (§6, v1.5). Linux-only, same gating as inotify.
+/// Watches whole filesystems and reports file handles instead of watch
+/// descriptors; the applier filters exclusions because a whole-mount watch
+/// cannot decline a subtree.
+#[cfg(target_os = "linux")]
+pub mod fanotify;
+
+/// FID → directory-id resolution for the fanotify backend (§6). Linux-only on
+/// the syscall side, but the module itself is pure and compiles everywhere so
+/// the mapping logic is testable without a kernel.
+pub mod fidmap;
+
 pub use fake::FakeBackend;
+#[cfg(target_os = "linux")]
+pub use fanotify::FanotifyBackend;
 #[cfg(target_os = "linux")]
 pub use inotify::InotifyBackend;
 

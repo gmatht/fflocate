@@ -288,6 +288,7 @@ fn cursor_advances_and_since_reports_changes() {
         sync: SyncRegistry::new(),
         backend: "fake".into(),
         control: None,
+        caller: None,
     };
 
     // Establish a cursor *after* settling (settle() rescans, which bumps the
@@ -338,6 +339,7 @@ fn since_reports_fresh_on_generation_bump() {
         sync: SyncRegistry::new(),
         backend: "fake".into(),
         control: None,
+        caller: None,
     };
     let c = f.shared.cursor();
 

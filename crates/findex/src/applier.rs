@@ -35,6 +35,17 @@ pub trait FsView: Send + Sync {
     /// Canonical identity of a path, if it exists (used to detect renames and
     /// to distinguish files from dirs).
     fn stat(&self, abs_path: &Path) -> io::Result<Option<StatInfo>>;
+
+    /// Ownership of a path, or `None` when the implementation cannot say.
+    ///
+    /// Only the **system** daemon asks for this (see [`crate::ownership`]): it
+    /// costs an `lstat` per entry, which the default crawl otherwise avoids
+    /// entirely. The default implementation returns `None`, so a model or fake
+    /// filesystem is unaffected — which is what keeps the extra cost opt-in
+    /// rather than a tax on every user of every mode.
+    fn attr(&self, _abs_path: &Path) -> io::Result<Option<crate::ownership::Attr>> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,6 +103,21 @@ impl FsView for RealFs {
             Err(e) => Err(e),
         }
     }
+
+    fn attr(&self, abs_path: &Path) -> io::Result<Option<crate::ownership::Attr>> {
+        match std::fs::symlink_metadata(abs_path) {
+            Ok(md) => {
+                use std::os::unix::fs::MetadataExt;
+                Ok(Some(crate::ownership::Attr {
+                    uid: md.uid(),
+                    gid: md.gid(),
+                    mode: md.mode(),
+                }))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 pub fn os_str_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
@@ -131,6 +157,12 @@ pub struct Shared {
     /// only ever add a candidate, never remove a real hit.
     #[cfg(feature = "trigram")]
     pub trigram: RwLock<Option<(u64, usize, Arc<crate::trigram::TrigramIndex>)>>,
+    /// Per-entry ownership, for the privileged system instance (§3, §15).
+    ///
+    /// Read by the query path to answer "may *this* caller see this file?".
+    /// Empty unless the daemon runs in system mode, in which case a missing
+    /// record means "not shown" — the filter fails closed.
+    pub ownership: RwLock<crate::ownership::Ownership>,
 }
 
 impl Shared {
@@ -146,6 +178,7 @@ impl Shared {
             changes: RwLock::new(crate::health::ChangeLog::new(4096)),
             #[cfg(feature = "trigram")]
             trigram: RwLock::new(None),
+            ownership: RwLock::new(crate::ownership::Ownership::new()),
         })
     }
 
@@ -234,6 +267,17 @@ pub struct Applier {
     /// Directories the daemon should watch, discovered during crawl/diff.
     watch_requests: Vec<(u32, PathBuf)>,
     watch_requested: std::collections::HashSet<u32>,
+    /// Exclusion rules (§4/§6). An excluded directory is never inserted, which
+    /// is what prunes its whole subtree for a whole-mount backend that cannot
+    /// decline the watch.
+    excludes: crate::excludes::Excludes,
+    /// How many names were dropped by [`Self::excludes`]. For `ff stats`.
+    pub excluded_names: u64,
+    /// Whether to capture ownership as entries are created. Populated only in
+    /// system mode, because it costs an `lstat` per entry — a price the personal
+    /// mode should not pay. The records themselves live in
+    /// [`Shared::ownership`] so the query path can read them.
+    track_ownership: bool,
 }
 
 impl Applier {
@@ -262,12 +306,66 @@ impl Applier {
             next_cookie_token: 1,
             watch_requests: Vec::new(),
             watch_requested: std::collections::HashSet::new(),
+            excludes: crate::excludes::Excludes::new(),
+            excluded_names: 0,
+            track_ownership: false,
         }
     }
 
     pub fn pending(&self) -> &Pending {
         &self.pending
     }
+
+    /// Install the exclusion rules (§4/§6). Called before the initial crawl so
+    /// an excluded subtree is never enumerated in the first place.
+    pub fn set_excludes(&mut self, e: crate::excludes::Excludes) {
+        self.excludes = e;
+    }
+
+    pub fn excludes(&self) -> &crate::excludes::Excludes {
+        &self.excludes
+    }
+
+    /// Turn on per-entry ownership capture (system mode). Once on, every entry
+    /// the crawler creates records its `uid`/`gid`/`mode`.
+    ///
+    /// This is deliberately a switch, not a default: it is the difference
+    /// between a crawl that stats nothing and one that stats every file, and
+    /// only the privileged system index has a reason to pay for it.
+    ///
+    /// It also records the **root directories themselves**. That is easy to
+    /// forget and fatal to miss: every entry's visibility is checked up the
+    /// parent chain, so a root with no ownership record hides its entire subtree
+    /// — the filter would look like it worked while showing nobody anything.
+    pub fn track_ownership(&mut self, on: bool) {
+        self.track_ownership = on;
+        if !on {
+            return;
+        }
+        let roots = self.shared.roots.read().unwrap().clone();
+        for r in &roots {
+            let rid = root_dir_id(&self.shared.index.read().unwrap(), r);
+            if rid != ROOT_ID {
+                self.note_ownership(rid, &r.path);
+            }
+        }
+    }
+
+    pub fn tracks_ownership(&self) -> bool {
+        self.track_ownership
+    }
+
+    /// Record ownership for one entry. A no-op unless tracking is on.
+    fn note_ownership(&mut self, id: u32, abs: &Path) {
+        if !self.track_ownership {
+            return;
+        }
+        if let Ok(Some(a)) = self.fs.attr(abs) {
+            // The query path reads this table; the applier is its only writer.
+            self.shared.ownership.write().unwrap().set(id, a);
+        }
+    }
+
     pub fn pending_mut(&mut self) -> &mut Pending {
         &mut self.pending
     }
@@ -305,6 +403,12 @@ impl Applier {
     /// Absolute path of directory `id`, descending from the nearest cached
     /// ancestor. Non-UTF-8 names lose fidelity through this path (only used to
     /// reach real directories); the byte-exact crawler path does not.
+    ///
+    /// Terminates on a broken or cyclic parent chain by returning `None`. A
+    /// naive recursive walk would loop forever if an entry's parent chain never
+    /// reached a cached ancestor (an un-cached root, a self-parented entry) —
+    /// which turns a misconfigured root into a stack overflow instead of an
+    /// error. The depth bound is the index size: no real chain is longer.
     fn abs_path_for(&mut self, id: u32) -> Option<PathBuf> {
         if let Some(p) = self.dir_paths.get(&id) {
             return Some(p.clone());
@@ -314,6 +418,11 @@ impl Applier {
             let e = ix.entry(id)?;
             (ix.name(id).to_vec(), e.parent)
         };
+        // A single-entry cycle (an entry parented to itself) is the degenerate
+        // case that bites first; refuse it before recursing.
+        if parent == id {
+            return None;
+        }
         let parent_path = self.abs_path_for(parent)?;
         let mut p = parent_path;
         p.push(std::ffi::OsString::from(String::from_utf8_lossy(&name).into_owned()));
@@ -380,9 +489,18 @@ impl Applier {
         if parent as usize >= ix.entry_count() || !ix.is_alive(parent) || !ix.is_dir(parent) {
             return; // event for a dir we do not (yet) know
         }
+        // The same exclusion rule as the crawl (§4/§6): a whole-mount backend
+        // cannot decline the watch, so an excluded directory must be refused
+        // here too. Because it is never inserted, its children never resolve,
+        // and the subtree stays pruned without an ancestor walk.
+        if is_dir_hint && self.excludes.excludes_dir_name(&name) {
+            self.excluded_names += 1;
+            return;
+        }
         // Use the hint to pick flags; the crawler will correct type later.
         let flags = EntryFlags::EMPTY.with_dir(is_dir_hint);
-        match ix.lookup(parent, &name) {
+        let lookup = ix.lookup(parent, &name);
+        let _new_id = match lookup {
             Some(id) => {
                 // Refresh the type if it changed (e.g. file → dir via rename).
                 let cur = ix.entry(id).unwrap().flags();
@@ -390,23 +508,29 @@ impl Applier {
                     let nf = EntryFlags(cur.0).with_dir(is_dir_hint);
                     ix.entry_mut(id).flags = nf.0;
                 }
-                let _ = id;
+                None
             }
             None => {
                 let id = ix.insert(parent, &name, flags);
-                drop(ix);
-                let rec = Record::Add {
-                    id,
-                    parent,
-                    name,
-                    flags: flags.0,
-                };
-                self.emit(rec);
-                return;
+                Some(id)
             }
-        }
+        };
         drop(ix);
-        // New directory: watch it, then crawl it to learn its children.
+        if let Some(id) = _new_id {
+            let rec = Record::Add { id, parent, name: name.clone(), flags: flags.0 };
+            self.emit(rec);
+        }
+
+        // A directory, new or re-typed: record its path so a later crawl/diff can
+        // reach it, ask the backend to watch it, and **crawl it** to learn its
+        // children.
+        //
+        // The crawl is not an optimization, it is load-bearing for a FID backend:
+        // a fanotify event names its parent by *file handle*, and the handle for a
+        // directory created after we started watching is only learned by asking
+        // for it — which the crawl does. Without this, every event for the new
+        // directory's children is unresolvable, and the subtree goes silently
+        // unseen. (A per-dir-watch backend gets the equivalent from its watch.)
         if is_dir_hint {
             let existing = {
                 let ix = self.shared.index.read().unwrap();
@@ -422,6 +546,7 @@ impl Applier {
                 self.pending.enqueue_crawl(id);
             }
         }
+        // (the id is not needed past this point; the crawl is what matters)
     }
 
     fn drop_subtree(&mut self, dir: u32) {
@@ -480,22 +605,41 @@ impl Applier {
             if crate::util::is_cookie(&it.name) {
                 continue;
             }
+            // Exclusions (§4/§6): an excluded *directory* is never inserted, and
+            // because events name their parent by id, that one omission prunes
+            // its entire subtree — including for a whole-mount backend that
+            // could not have declined the watch.
+            if it.is_dir && !it.is_symlink && self.excludes.excludes_dir_name(&it.name) {
+                self.excluded_names += 1;
+                continue;
+            }
+            if self.excludes.excludes_path(
+                abs.join(std::ffi::OsString::from(String::from_utf8_lossy(&it.name).into_owned()))
+                    .to_string_lossy()
+                    .as_bytes(),
+            ) {
+                self.excluded_names += 1;
+                continue;
+            }
             let exists = {
                 let ix = self.shared.index.read().unwrap();
                 ix.lookup(dir, &it.name)
             };
             if exists.is_none() {
                 let flags = EntryFlags::EMPTY.with_dir(it.is_dir).with_symlink(it.is_symlink);
+                let child_abs = abs.join(std::ffi::OsString::from(
+                    String::from_utf8_lossy(&it.name).into_owned(),
+                ));
                 let mut ix = self.shared.index.write().unwrap();
                 let id = ix.insert(dir, &it.name, flags);
                 drop(ix);
+                // System mode: remember who owns this entry, so a query can be
+                // answered as the caller (§3).
+                self.note_ownership(id, &child_abs);
                 self.emit(Record::Add { id, parent: dir, name: it.name.clone(), flags: flags.0 });
                 if it.is_dir && !it.is_symlink {
                     // Watch before enumerating: install a watch, then queue the
                     // crawl of the new directory (§5 race rule).
-                    let child_abs = abs.join(std::ffi::OsString::from(
-                        String::from_utf8_lossy(&it.name).into_owned(),
-                    ));
                     self.dir_paths.insert(id, child_abs.clone());
                     self.record_watch_request(id, child_abs);
                     new_dirs.push(id);

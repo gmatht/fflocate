@@ -122,7 +122,7 @@ like ripgrep/fzf).
 ## Testing
 
 ```sh
-cargo test          # 204 tests
+cargo test          # 283 tests
 ```
 
 The suite is the design's §14, and it is the point of the project:
@@ -169,8 +169,23 @@ crates/fx/       CLI client + service install
   order differs from a plain query even at `k = 0` (same set, ranked sequence).
   The trigram index generates candidates but never decides correctness. See
   `crates/findex/src/fuzzy.rs`, `crates/findex/src/query.rs` (`execute_fuzzy`).
+* **fanotify-FID backend** (§6, v1.5). Whole-mount watch, file-handle events,
+  atomic rename pairs; selected by a capability probe (`--backend auto`) with a
+  clean fallback to inotify. Verified against real kernel events on a private
+  tmpfs. See `crates/findex/src/watch/fanotify.rs`, `watch/fidmap.rs`,
+  `tests/fanotify_live.rs`.
+* **exclusions** (§4/§6) — `FINDEX_EXCLUDE=build,node_modules`. A whole-mount
+  backend cannot decline a subtree, so the applier filters: an excluded directory
+  is never inserted, which prunes its whole subtree.
+* **system daemon** (`findexd --system`, §3). A root-run instance that indexes
+  privileged paths and answers each caller as themselves. Per-entry ownership
+  (`uid`/`gid`/`mode`) in a sidecar keyed by stable id; queries filtered to what
+  the caller may read *including every ancestor*; socket at `/run/findexd.sock`,
+  mode 0660 owned by the `findex` group; caller identity from `SO_PEERCRED`.
+  Verified live as root with a real unprivileged user. See
+  `crates/findex/src/ownership.rs`, `crates/findex/src/server.rs`,
+  `crates/findexd/src/net.rs`, `tests/system_access.rs`, `tests/system_live.rs`.
 
-**Not implemented:** fanotify-FID and macOS FSEvents backends, the lazy
-attribute sidecar keyed by stable ids, and a live GUI subscriber feed.
-`subscribe` currently emits the protocol shape (meta + current cursor) as a
-preview.
+**Not implemented:** macOS FSEvents, live `since`/`subscribe` change feeds, and a
+GUI client. `subscribe` currently emits the protocol shape (meta + current
+cursor) as a preview.

@@ -20,19 +20,73 @@ pub struct Config {
     pub sync_timeout_ms: u64,
     /// Directory for the pidfile + lock (§15 stale-lock recovery).
     pub pidfile: PathBuf,
+    /// Exclusion rules (§4/§6): directory names whose subtrees are never
+    /// indexed. Empty by default so nothing is filtered unless asked for.
+    pub excludes: findex::excludes::Excludes,
+    /// Run as a **system** instance (§3): index owned/privileged paths and answer
+    /// each query as the connecting user, filtering by per-entry ownership.
+    ///
+    /// Never the default: this mode runs as whatever user started it (in practice
+    /// root) and must be asked for explicitly.
+    pub system: bool,
+    /// The group that owns the system socket (§15). Numeric gid; the daemon
+    /// resolves `findex` from `/etc/group` when the flag is bare.
+    pub system_group: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendChoice {
     Inotify,
+    /// fanotify-FID: whole-mount watch, file-handle events (§6, v1.5).
+    Fanotify,
     Fake,
+    /// Pick the best available backend for this system (§4): fanotify when the
+    /// kernel supports it, else inotify on Linux, else nothing (caller errors).
+    Auto,
 }
 
 impl BackendChoice {
     pub fn as_str(&self) -> &'static str {
         match self {
             BackendChoice::Inotify => "inotify",
+            BackendChoice::Fanotify => "fanotify",
             BackendChoice::Fake => "fake",
+            BackendChoice::Auto => "auto",
+        }
+    }
+
+    /// Parse a `--backend` / `$FINDEX_BACKEND` value.
+    pub fn parse(s: &str) -> Option<BackendChoice> {
+        Some(match s {
+            "inotify" => BackendChoice::Inotify,
+            "fanotify" => BackendChoice::Fanotify,
+            "fake" => BackendChoice::Fake,
+            "auto" => BackendChoice::Auto,
+            _ => return None,
+        })
+    }
+
+    /// Resolve `Auto` against what this system actually supports. Returns the
+    /// concrete choice, or `None` when nothing usable exists.
+    pub fn resolve(self) -> Option<BackendChoice> {
+        match self {
+            BackendChoice::Auto => {
+                #[cfg(target_os = "linux")]
+                {
+                    if findex::mount::fanotify_available() {
+                        Some(BackendChoice::Fanotify)
+                    } else {
+                        Some(BackendChoice::Inotify)
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // No kernel watcher is ported off Linux yet (FSEvents is
+                    // v1.5); `fake` is the only honest option.
+                    Some(BackendChoice::Fake)
+                }
+            }
+            other => Some(other),
         }
     }
 }
@@ -64,6 +118,13 @@ impl Config {
             Some(v) if !v.is_empty() => std::env::split_paths(&v).collect(),
             _ => vec![home],
         };
+        // §4/§6: exclusions are opt-in. `FINDEX_EXCLUDE` takes comma/colon
+        // separated names (`build,node_modules`), absolute prefixes (`/proc`)
+        // or suffixes (`*.pyc`).
+        let excludes = match std::env::var("FINDEX_EXCLUDE") {
+            Ok(v) if !v.trim().is_empty() => findex::excludes::Excludes::parse_list(&v),
+            _ => findex::excludes::Excludes::new(),
+        };
         Config {
             socket_path: rd.join("findex.sock"),
             pidfile: rd.join("findex.pid"),
@@ -72,7 +133,37 @@ impl Config {
             backend: BackendChoice::Inotify,
             compaction_threshold: 100_000,
             sync_timeout_ms: 2_000,
+            excludes,
+            system: false,
+            system_group: 0,
         }
+    }
+
+    /// Switch to system mode: a socket under `/run`, state under `/var/lib`, and
+    /// per-entry ownership tracking. The caller is responsible for actually
+    /// having the privilege this implies.
+    pub fn with_system(mut self, on: bool) -> Self {
+        self.system = on;
+        if on {
+            self.socket_path = PathBuf::from("/run/findexd.sock");
+            self.pidfile = PathBuf::from("/run/findexd.pid");
+            self.state_dir = PathBuf::from(format!("/var/lib/findex/{FORMAT_VERSION}"));
+        }
+        self
+    }
+
+    /// The `findex` group's gid from `/etc/group`, or `None` when it does not
+    /// exist. A system instance refuses to start without it rather than silently
+    /// widening the socket's mode.
+    pub fn findex_group_gid() -> Option<u32> {
+        let txt = std::fs::read_to_string("/etc/group").ok()?;
+        for line in txt.lines() {
+            let f: Vec<&str> = line.split(':').collect();
+            if f.len() > 2 && f[0] == "findex" {
+                return f[2].parse().ok();
+            }
+        }
+        None
     }
 
     pub fn with_roots(mut self, roots: Vec<PathBuf>) -> Self {
@@ -135,5 +226,34 @@ mod tests {
         std::env::set_var("FINDEX_SOCKET", "/run/user/1/x.sock");
         assert_eq!(socket_path_from_env(), PathBuf::from("/run/user/1/x.sock"));
         std::env::remove_var("FINDEX_SOCKET");
+    }
+
+    #[test]
+    fn backend_choice_parses_and_round_trips() {
+        for name in ["inotify", "fanotify", "fake", "auto"] {
+            let c = BackendChoice::parse(name).unwrap_or_else(|| panic!("{name} must parse"));
+            assert_eq!(c.as_str(), name);
+        }
+        assert!(BackendChoice::parse("nope").is_none());
+        assert!(BackendChoice::parse("Inotify").is_none(), "case-sensitive, like the CLI flag");
+    }
+
+    #[test]
+    fn auto_resolves_to_a_concrete_backend() {
+        // Auto must never stay Auto past resolution: the daemon needs a
+        // concrete choice, and on a supported Linux box that is fanotify or
+        // inotify, never neither.
+        let r = BackendChoice::Auto.resolve();
+        assert!(r.is_some(), "this platform must resolve Auto to something");
+        assert_ne!(r, Some(BackendChoice::Auto));
+    }
+
+    #[test]
+    fn explicit_choices_resolve_to_themselves() {
+        // Asking for a backend must not silently become a different one; if it
+        // is unavailable, `make_backend` errors instead.
+        for c in [BackendChoice::Inotify, BackendChoice::Fanotify, BackendChoice::Fake] {
+            assert_eq!(c.resolve(), Some(c));
+        }
     }
 }
