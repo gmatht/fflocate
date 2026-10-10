@@ -51,15 +51,24 @@ pub fn state_dir() -> PathBuf {
 
 impl Config {
     /// Default configuration: index `$HOME`, socket under the runtime dir.
+    ///
+    /// `$FINDEX_ROOT` overrides the root list; entries are separated by the
+    /// platform path separator (`:` on Unix). This lets `ff` forward the roots
+    /// it was asked to use when it auto-spawns a daemon, instead of the daemon
+    /// silently falling back to indexing the whole home directory.
     pub fn defaults() -> Config {
         let rd = runtime_dir();
         let state = state_dir();
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"));
+        let roots = match std::env::var_os("FINDEX_ROOT") {
+            Some(v) if !v.is_empty() => std::env::split_paths(&v).collect(),
+            _ => vec![home],
+        };
         Config {
             socket_path: rd.join("findex.sock"),
             pidfile: rd.join("findex.pid"),
             state_dir: state,
-            roots: vec![home],
+            roots,
             backend: BackendChoice::Inotify,
             compaction_threshold: 100_000,
             sync_timeout_ms: 2_000,

@@ -43,17 +43,28 @@ impl Client {
             Ok(stream) => Ok(Client { stream, socket }),
             Err(_) => {
                 spawn_daemon(&socket)?;
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                // Wait for the socket to come up. The daemon performs its
+                // initial mount probes and starts its threads before binding,
+                // which on a slow or network-backed filesystem can take a
+                // while; a daemon that is still *starting* must not be
+                // mistaken for one that is absent.
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(30);
+                let mut last_err = None;
                 loop {
                     match std::os::unix::net::UnixStream::connect(&socket) {
                         Ok(stream) => return Ok(Client { stream, socket }),
-                        Err(_) if std::time::Instant::now() < deadline => {
+                        Err(e) if std::time::Instant::now() < deadline => {
+                            last_err = Some(e);
                             std::thread::sleep(std::time::Duration::from_millis(25));
                         }
                         Err(e) => {
                             return Err(CliError::Io(format!(
-                                "cannot connect to findexd at {}: {e}",
-                                socket.display()
+                                "cannot connect to findexd at {}: {e} (last error: {})",
+                                socket.display(),
+                                last_err
+                                    .map(|e| e.to_string())
+                                    .unwrap_or_else(|| "none".into())
                             )));
                         }
                     }
@@ -698,11 +709,25 @@ fn spawn_daemon(socket: &Path) -> Result<(), CliError> {
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("--socket").arg(socket);
     cmd.arg("--state-dir").arg(&state);
+    // Pick a backend this platform actually has. The daemon's own default is
+    // inotify, which is Linux-only: spawning it on macOS/Windows would make the
+    // child exit immediately ("backend `inotify` is Linux-only") and leave a
+    // stale socket behind, so `ff` would fail to connect with ECONNREFUSED.
+    cmd.arg("--backend").arg(default_backend_for_platform());
+    // Forward the roots to index. Without this the daemon falls back to its own
+    // default ($HOME), which makes auto-spawn crawl the entire home directory
+    // and can take far longer than the connect window — the daemon is healthy
+    // but `ff` reports "connection refused". `FINDEX_ROOT` is the same
+    // separator-delimited override the daemon understands.
+    if let Some(roots) = roots_from_env() {
+        if let Ok(joined) = std::env::join_paths(roots) {
+            cmd.env("FINDEX_ROOT", joined);
+        }
+    }
     // Detach: redirect stdio so the child does not hold the terminal.
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
-    // Index $HOME by default (the daemon's own default).
     let child = cmd
         .spawn()
         .map_err(|e| CliError::Io(format!("cannot spawn {}: {e}", exe.display())))?;
@@ -710,27 +735,84 @@ fn spawn_daemon(socket: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Locate the `findexd` binary: next to `ff`, else on `$PATH`.
+/// The watcher backend to ask for when auto-spawning.
+///
+/// inotify exists only on Linux; elsewhere the kernel watcher is not ported yet
+/// (FSEvents/FSEvents is v1.5), so the daemon runs with the fake backend, which
+/// still crawls, serves queries and reconciles on demand — it just does not get
+/// live events. `$FINDEX_BACKEND` overrides.
+fn default_backend_for_platform() -> &'static str {
+    if let Ok(b) = std::env::var("FINDEX_BACKEND") {
+        if b == "inotify" || b == "fake" {
+            // Leak is fine: a single short-lived string for a process that is
+            // about to exec a child.
+            return Box::leak(b.into_boxed_str());
+        }
+    }
+    if cfg!(target_os = "linux") {
+        "inotify"
+    } else {
+        "fake"
+    }
+}
+
+/// The roots the daemon should index, from `$FINDEX_ROOT` if the user set it.
+/// `None` means "let the daemon decide" ($HOME).
+fn roots_from_env() -> Option<Vec<PathBuf>> {
+    let v = std::env::var_os("FINDEX_ROOT")?;
+    if v.is_empty() {
+        return None;
+    }
+    Some(std::env::split_paths(&v).collect())
+}
+
+/// Locate the `findexd` binary.
+///
+/// Search order: `$FINDEXD_BIN`, then the directory of `argv[0]` (the invoked
+/// path — a symlink is deliberately *not* resolved, so a `ff` symlinked into
+/// `~/bin` finds a `findexd` placed beside it), then the directory of
+/// `current_exe()` (which on Linux resolves the symlink target), then `$PATH`.
 fn daemon_binary_path() -> Result<PathBuf, CliError> {
     if let Ok(p) = std::env::var("FINDEXD_BIN") {
         return Ok(PathBuf::from(p));
     }
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    // The invoked path as given (may be a symlink). `current_exe()` resolves
+    // symlinks on Linux, so this is the only way to see the symlink's own dir.
+    if let Some(arg0) = std::env::args_os().next() {
+        let p = Path::new(&arg0);
+        if let Some(dir) = p.parent() {
+            if !dir.as_os_str().is_empty() {
+                dirs.push(dir.to_path_buf());
+            }
+        }
+        // A bare `ff` (no slash) has no parent of its own; it is found via PATH.
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let cand = dir.join("findexd");
-            if cand.exists() {
-                return Ok(cand);
-            }
+            dirs.push(dir.to_path_buf());
+        }
+    }
+    for dir in dirs {
+        let cand = dir.join("findexd");
+        if cand.exists() {
+            return Ok(cand);
         }
     }
     for dir in std::env::var("PATH").unwrap_or_default().split(':') {
+        if dir.is_empty() {
+            continue;
+        }
         let cand = PathBuf::from(dir).join("findexd");
         if cand.exists() {
             return Ok(cand);
         }
     }
     Err(CliError::Io(
-        "findexd not found next to ff or on PATH (set FINDEXD_BIN)".into(),
+        "findexd not found: looked next to ff, next to the invoked path, and on \
+         PATH (set FINDEXD_BIN to override)"
+            .into(),
     ))
 }
 
@@ -746,5 +828,35 @@ mod tests {
         assert_eq!(folded_query("readme"), None);
         assert_eq!(folded_query(""), None);
         assert_eq!(folded_query("123-_.rs"), None);
+    }
+
+    /// `ff` symlinked into a bin dir must find a `findexd` placed *beside the
+    /// symlink* — `current_exe()` resolves the symlink on Linux, so the
+    /// invoked path has to be searched as well.
+    #[test]
+    fn finds_findexd_beside_the_invoked_symlink() {
+        let d = tempfile::tempdir().unwrap();
+        let real = d.path().join("real");
+        let bin = d.path().join("bin");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+
+        // A stand-in `findexd` that exists; the code only checks `.exists()`.
+        std::fs::write(bin.join("findexd"), b"stub").unwrap();
+
+        // Sanity: with PATH cleared and no FINDEXD_BIN, the search must find the
+        // one in `bin/`. We cannot set argv[0] for the test process, so this
+        // pins the `$PATH` leg and the directory-probing logic that the symlink
+        // fix relies on.
+        std::env::remove_var("FINDEXD_BIN");
+        let saved = std::env::var("PATH").ok();
+        std::env::set_var("PATH", bin.as_os_str());
+        let found = daemon_binary_path();
+        match saved {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        let found = found.expect("findexd must be found on PATH");
+        assert_eq!(found, bin.join("findexd"));
     }
 }

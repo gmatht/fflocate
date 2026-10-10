@@ -55,6 +55,8 @@ fn home() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
 }
 
+/// XDG config home, used only by the Linux systemd-unit path.
+#[cfg(target_os = "linux")]
 fn config_home() -> PathBuf {
     if let Ok(d) = std::env::var("XDG_CONFIG_HOME") {
         if !d.is_empty() {
