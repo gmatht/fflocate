@@ -35,6 +35,17 @@ pub trait FsView: Send + Sync {
     /// Canonical identity of a path, if it exists (used to detect renames and
     /// to distinguish files from dirs).
     fn stat(&self, abs_path: &Path) -> io::Result<Option<StatInfo>>;
+
+    /// Ownership of a path, or `None` when the implementation cannot say.
+    ///
+    /// Only the **system** daemon asks for this (see [`crate::ownership`]): it
+    /// costs an `lstat` per entry, which the default crawl otherwise avoids
+    /// entirely. The default implementation returns `None`, so a model or fake
+    /// filesystem is unaffected — which is what keeps the extra cost opt-in
+    /// rather than a tax on every user of every mode.
+    fn attr(&self, _abs_path: &Path) -> io::Result<Option<crate::ownership::Attr>> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,6 +103,21 @@ impl FsView for RealFs {
             Err(e) => Err(e),
         }
     }
+
+    fn attr(&self, abs_path: &Path) -> io::Result<Option<crate::ownership::Attr>> {
+        match std::fs::symlink_metadata(abs_path) {
+            Ok(md) => {
+                use std::os::unix::fs::MetadataExt;
+                Ok(Some(crate::ownership::Attr {
+                    uid: md.uid(),
+                    gid: md.gid(),
+                    mode: md.mode(),
+                }))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 pub fn os_str_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
@@ -131,6 +157,12 @@ pub struct Shared {
     /// only ever add a candidate, never remove a real hit.
     #[cfg(feature = "trigram")]
     pub trigram: RwLock<Option<(u64, usize, Arc<crate::trigram::TrigramIndex>)>>,
+    /// Per-entry ownership, for the privileged system instance (§3, §15).
+    ///
+    /// Read by the query path to answer "may *this* caller see this file?".
+    /// Empty unless the daemon runs in system mode, in which case a missing
+    /// record means "not shown" — the filter fails closed.
+    pub ownership: RwLock<crate::ownership::Ownership>,
 }
 
 impl Shared {
@@ -146,6 +178,7 @@ impl Shared {
             changes: RwLock::new(crate::health::ChangeLog::new(4096)),
             #[cfg(feature = "trigram")]
             trigram: RwLock::new(None),
+            ownership: RwLock::new(crate::ownership::Ownership::new()),
         })
     }
 
@@ -240,6 +273,11 @@ pub struct Applier {
     excludes: crate::excludes::Excludes,
     /// How many names were dropped by [`Self::excludes`]. For `ff stats`.
     pub excluded_names: u64,
+    /// Whether to capture ownership as entries are created. Populated only in
+    /// system mode, because it costs an `lstat` per entry — a price the personal
+    /// mode should not pay. The records themselves live in
+    /// [`Shared::ownership`] so the query path can read them.
+    track_ownership: bool,
 }
 
 impl Applier {
@@ -270,6 +308,7 @@ impl Applier {
             watch_requested: std::collections::HashSet::new(),
             excludes: crate::excludes::Excludes::new(),
             excluded_names: 0,
+            track_ownership: false,
         }
     }
 
@@ -285,6 +324,46 @@ impl Applier {
 
     pub fn excludes(&self) -> &crate::excludes::Excludes {
         &self.excludes
+    }
+
+    /// Turn on per-entry ownership capture (system mode). Once on, every entry
+    /// the crawler creates records its `uid`/`gid`/`mode`.
+    ///
+    /// This is deliberately a switch, not a default: it is the difference
+    /// between a crawl that stats nothing and one that stats every file, and
+    /// only the privileged system index has a reason to pay for it.
+    ///
+    /// It also records the **root directories themselves**. That is easy to
+    /// forget and fatal to miss: every entry's visibility is checked up the
+    /// parent chain, so a root with no ownership record hides its entire subtree
+    /// — the filter would look like it worked while showing nobody anything.
+    pub fn track_ownership(&mut self, on: bool) {
+        self.track_ownership = on;
+        if !on {
+            return;
+        }
+        let roots = self.shared.roots.read().unwrap().clone();
+        for r in &roots {
+            let rid = root_dir_id(&self.shared.index.read().unwrap(), r);
+            if rid != ROOT_ID {
+                self.note_ownership(rid, &r.path);
+            }
+        }
+    }
+
+    pub fn tracks_ownership(&self) -> bool {
+        self.track_ownership
+    }
+
+    /// Record ownership for one entry. A no-op unless tracking is on.
+    fn note_ownership(&mut self, id: u32, abs: &Path) {
+        if !self.track_ownership {
+            return;
+        }
+        if let Ok(Some(a)) = self.fs.attr(abs) {
+            // The query path reads this table; the applier is its only writer.
+            self.shared.ownership.write().unwrap().set(id, a);
+        }
     }
 
     pub fn pending_mut(&mut self) -> &mut Pending {
@@ -548,16 +627,19 @@ impl Applier {
             };
             if exists.is_none() {
                 let flags = EntryFlags::EMPTY.with_dir(it.is_dir).with_symlink(it.is_symlink);
+                let child_abs = abs.join(std::ffi::OsString::from(
+                    String::from_utf8_lossy(&it.name).into_owned(),
+                ));
                 let mut ix = self.shared.index.write().unwrap();
                 let id = ix.insert(dir, &it.name, flags);
                 drop(ix);
+                // System mode: remember who owns this entry, so a query can be
+                // answered as the caller (§3).
+                self.note_ownership(id, &child_abs);
                 self.emit(Record::Add { id, parent: dir, name: it.name.clone(), flags: flags.0 });
                 if it.is_dir && !it.is_symlink {
                     // Watch before enumerating: install a watch, then queue the
                     // crawl of the new directory (§5 race rule).
-                    let child_abs = abs.join(std::ffi::OsString::from(
-                        String::from_utf8_lossy(&it.name).into_owned(),
-                    ));
                     self.dir_paths.insert(id, child_abs.clone());
                     self.record_watch_request(id, child_abs);
                     new_dirs.push(id);

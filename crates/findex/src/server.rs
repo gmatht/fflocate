@@ -24,6 +24,13 @@ pub struct ServerCtx {
     /// A sender the daemon's applier thread listens on to create+register a
     /// cookie and to request a rescan. `None` in pure-read deployments.
     pub control: Option<ControlSender>,
+    /// Who is asking, as established from `SO_PEERCRED` on the connection — never
+    /// from anything the client says. `None` means "unknown caller", which in
+    /// system mode means "show nothing" (see [`crate::ownership`]).
+    ///
+    /// In a per-user daemon this is `None` and no ownership filtering happens:
+    /// the daemon already runs as the user.
+    pub caller: Option<crate::ownership::Caller>,
 }
 
 /// A request from a client thread to the applier thread.
@@ -131,6 +138,12 @@ fn handle_query(ctx: &ServerCtx, raw: &str, limit: usize, count_only: bool, t0: 
             root_paths.push((rid, std::mem::take(&mut p)));
         }
     }
+    // When we must filter by ownership we cannot use the engine's count-only
+    // fast path: it returns no hits, and a count we cannot inspect is a count we
+    // cannot filter — it would report how many files *exist*, not how many the
+    // caller may see. So in system mode we materialize and count ourselves.
+    let filtering = ctx.caller.is_some();
+    let engine_count_only = count_only && !filtering;
     let effective_limit = if count_only { 0 } else { limit };
     #[cfg(feature = "trigram")]
     let res = query::execute_with_trigram(
@@ -138,27 +151,93 @@ fn handle_query(ctx: &ServerCtx, raw: &str, limit: usize, count_only: bool, t0: 
         &root_paths,
         &q,
         effective_limit,
-        count_only,
+        engine_count_only,
         trigram.as_deref(),
     );
     #[cfg(not(feature = "trigram"))]
-    let res = query::execute(&ix, &root_paths, &q, effective_limit, count_only);
+    let res = query::execute(&ix, &root_paths, &q, effective_limit, engine_count_only);
     let cursor = ctx.shared.cursor().to_string_repr();
     let elapsed = t0.elapsed();
     drop(roots);
     drop(ix);
 
+    finish_query(ctx, res, cursor, elapsed, count_only)
+}
+
+/// Turn a [`query::Results`] into the wire responses, applying the caller's
+/// visibility filter when there is a caller to apply it for.
+fn finish_query(
+    ctx: &ServerCtx,
+    res: query::Results,
+    cursor: String,
+    elapsed: std::time::Duration,
+    count_only: bool,
+) -> Vec<Response> {
     let mut out = Vec::new();
     out.push(meta_preamble(ctx, false, elapsed));
     if count_only {
-        out.push(Response::Done { count: res.total, cursor });
+        // In system mode the count must reflect what the *caller* may see, not
+        // what root can — otherwise it leaks the existence of files they cannot
+        // open. Counting therefore respects the same filter as listing.
+        let total = match &ctx.caller {
+            Some(caller) => res.hits.iter().filter(|h| visible_chain(ctx, h.id, caller)).count() as u64,
+            None => res.total,
+        };
+        out.push(Response::Done { count: total, cursor });
         return out;
     }
+    let mut shown = 0u64;
     for h in &res.hits {
+        if let Some(caller) = &ctx.caller {
+            if !visible_chain(ctx, h.id, caller) {
+                continue;
+            }
+        }
+        shown += 1;
         out.push(Response::Hit { path: bytes_to_string(&h.path), id: h.id });
     }
-    out.push(Response::Done { count: res.total, cursor });
+    let total = if ctx.caller.is_some() { shown } else { res.total };
+    out.push(Response::Done { count: total, cursor });
     out
+}
+
+/// May the caller see this entry, *and* traverse every directory on the way to
+/// it?
+///
+/// The second half is the part that is easy to get wrong: a world-readable file
+/// inside a `0700` directory is not readable by anyone but the directory's owner,
+/// yet the file's own mode says otherwise. So visibility is checked up the parent
+/// chain, requiring traverse (`x`) on each directory and read (`r`) on the entry
+/// itself.
+///
+/// Returns `true` when there is no caller set (a per-user daemon, which already
+/// runs as that user) — this function is only reached in system mode.
+fn visible_chain(ctx: &ServerCtx, id: u32, caller: &crate::ownership::Caller) -> bool {
+    if caller.is_root() {
+        return true;
+    }
+    let ix = ctx.shared.index.read().unwrap();
+    let mut cur = id;
+    loop {
+        if cur == crate::index::ROOT_ID || cur as usize >= ix.entry_count() {
+            // Ran off the top without reaching a root dir: unreachable.
+            return false;
+        }
+        {
+            let attrs = ctx.shared.ownership.read().unwrap();
+            if !attrs.visible_to(cur, caller) {
+                return false;
+            }
+        }
+        let entry = match ix.entry(cur) {
+            Some(e) => e,
+            None => return false,
+        };
+        if entry.flags().is_root_dir() {
+            return true;
+        }
+        cur = entry.parent;
+    }
 }
 
 /// Default edit budget for `--fuzzy` when the client does not choose one.
@@ -208,6 +287,11 @@ fn handle_fuzzy_query(
                 root_paths.push((rid, r.path.as_os_str().to_string_lossy().as_bytes().to_vec()));
             }
         }
+        // As in `handle_query`: never take the engine's count-only fast path when
+        // we must filter, or the count would describe root's view, not the
+        // caller's.
+        let filtering = ctx.caller.is_some();
+        let engine_count_only = count_only && !filtering;
         let effective_limit = if count_only { 0 } else { limit };
         let res = query::execute_fuzzy(
             &ix,
@@ -215,7 +299,7 @@ fn handle_fuzzy_query(
             &q,
             k,
             effective_limit,
-            count_only,
+            engine_count_only,
             Some(trigram.as_ref()),
         );
         let cursor = ctx.shared.cursor().to_string_repr();
@@ -223,17 +307,10 @@ fn handle_fuzzy_query(
         drop(roots);
         drop(ix);
 
-        let mut out = Vec::new();
-        out.push(meta_preamble(ctx, false, elapsed));
-        if count_only {
-            out.push(Response::Done { count: res.total, cursor });
-            return out;
-        }
-        for h in &res.hits {
-            out.push(Response::Hit { path: bytes_to_string(&h.path), id: h.id });
-        }
-        out.push(Response::Done { count: res.total, cursor });
-        out
+        // The same ownership filter as the exact path. Fuzzy results are still
+        // results: skipping this here would leak every file the caller cannot read
+        // (and it did, before this line existed).
+        finish_query(ctx, res, cursor, elapsed, count_only)
     }
 }
 
@@ -266,23 +343,17 @@ fn handle_expr_query(
         }
     }
     let effective_limit = if count_only { 0 } else { limit };
-    let res = query::execute_expr(&ix, &root_paths, &rel_root, &expr, effective_limit, count_only);
+    let filtering = ctx.caller.is_some();
+    let engine_count_only = count_only && !filtering;
+    let res = query::execute_expr(&ix, &root_paths, &rel_root, &expr, effective_limit, engine_count_only);
     let cursor = ctx.shared.cursor().to_string_repr();
     let elapsed = t0.elapsed();
     drop(roots);
     drop(ix);
 
-    let mut out = Vec::new();
-    out.push(meta_preamble(ctx, false, elapsed));
-    if count_only {
-        out.push(Response::Done { count: res.total, cursor });
-        return out;
-    }
-    for h in &res.hits {
-        out.push(Response::Hit { path: bytes_to_string(&h.path), id: h.id });
-    }
-    out.push(Response::Done { count: res.total, cursor });
-    out
+    // The one place results become responses, so the ownership filter cannot be
+    // forgotten by one query path and remembered by another.
+    finish_query(ctx, res, cursor, elapsed, count_only)
 }
 
 /// The sync engine (§8). For each writable root we create a cookie, ask the
@@ -556,6 +627,7 @@ mod tests {
             sync: SyncRegistry::new(),
             backend: "fake".into(),
             control: None,
+            caller: None,
         };
         let store_dir = d.path().join("state");
         let _ = Store::open(&store_dir);
@@ -747,6 +819,7 @@ mod tests {
             sync,
             backend: "fake".into(),
             control: Some(tx),
+            caller: None,
         };
         let out = handle_request(&ctx, &Request::Sync { timeout_ms: 1000, roots: None });
         match &out[0] {

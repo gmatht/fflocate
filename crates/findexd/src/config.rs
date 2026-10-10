@@ -23,6 +23,15 @@ pub struct Config {
     /// Exclusion rules (§4/§6): directory names whose subtrees are never
     /// indexed. Empty by default so nothing is filtered unless asked for.
     pub excludes: findex::excludes::Excludes,
+    /// Run as a **system** instance (§3): index owned/privileged paths and answer
+    /// each query as the connecting user, filtering by per-entry ownership.
+    ///
+    /// Never the default: this mode runs as whatever user started it (in practice
+    /// root) and must be asked for explicitly.
+    pub system: bool,
+    /// The group that owns the system socket (§15). Numeric gid; the daemon
+    /// resolves `findex` from `/etc/group` when the flag is bare.
+    pub system_group: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,7 +134,36 @@ impl Config {
             compaction_threshold: 100_000,
             sync_timeout_ms: 2_000,
             excludes,
+            system: false,
+            system_group: 0,
         }
+    }
+
+    /// Switch to system mode: a socket under `/run`, state under `/var/lib`, and
+    /// per-entry ownership tracking. The caller is responsible for actually
+    /// having the privilege this implies.
+    pub fn with_system(mut self, on: bool) -> Self {
+        self.system = on;
+        if on {
+            self.socket_path = PathBuf::from("/run/findexd.sock");
+            self.pidfile = PathBuf::from("/run/findexd.pid");
+            self.state_dir = PathBuf::from(format!("/var/lib/findex/{FORMAT_VERSION}"));
+        }
+        self
+    }
+
+    /// The `findex` group's gid from `/etc/group`, or `None` when it does not
+    /// exist. A system instance refuses to start without it rather than silently
+    /// widening the socket's mode.
+    pub fn findex_group_gid() -> Option<u32> {
+        let txt = std::fs::read_to_string("/etc/group").ok()?;
+        for line in txt.lines() {
+            let f: Vec<&str> = line.split(':').collect();
+            if f.len() > 2 && f[0] == "findex" {
+                return f[2].parse().ok();
+            }
+        }
+        None
     }
 
     pub fn with_roots(mut self, roots: Vec<PathBuf>) -> Self {

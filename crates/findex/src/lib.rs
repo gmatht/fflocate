@@ -35,6 +35,7 @@ pub mod journal;
 pub mod pending;
 pub mod modelfs;
 pub mod mount;
+pub mod ownership;
 pub mod persist;
 pub mod proto;
 pub mod query;

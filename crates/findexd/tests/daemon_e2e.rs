@@ -19,6 +19,8 @@ fn test_config(dir: &std::path::Path, root: PathBuf) -> Config {
         compaction_threshold: 1_000_000,
         sync_timeout_ms: 500,
         excludes: findex::excludes::Excludes::new(),
+        system: false,
+        system_group: 0,
     }
 }
 

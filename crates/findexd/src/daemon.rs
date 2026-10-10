@@ -434,7 +434,34 @@ impl Daemon {
             sync: self.sync.clone(),
             backend: self.resolved_backend.as_str().to_string(),
             control: Some(self.control_tx.clone()),
+            // Per-user daemon: no ownership filter. The system daemon builds a
+            // context per connection instead, with the caller from SO_PEERCRED.
+            caller: None,
         }
+    }
+
+    /// A context for a **system** instance, where every query is answered as the
+    /// connecting user (§3).
+    pub fn server_ctx_for(&self, caller: Option<findex::ownership::Caller>) -> ServerCtx {
+        let mut ctx = self.server_ctx();
+        ctx.caller = caller;
+        ctx
+    }
+
+    /// Is this the privileged system instance?
+    pub fn is_system(&self) -> bool {
+        self.config.system
+    }
+
+    /// The backend name in use (after `auto` resolution).
+    pub fn backend_name(&self) -> String {
+        self.resolved_backend.as_str().to_string()
+    }
+
+    /// Turn on per-entry ownership capture. Separate from `build` so the cost is
+    /// visible at the call site rather than buried: this is the `lstat` per file.
+    pub fn enable_ownership_tracking(&mut self) {
+        self.applier.track_ownership(true);
     }
 
     pub fn applier_mut(&mut self) -> &mut Applier {
