@@ -18,6 +18,9 @@
 //! -perm -user -group -inum -links -a -o -not ! ( ) -true -false` plus the
 //! implicit `-print`. Default roots are the indexed roots (there is no `.` to
 //! walk in an index); passing an explicit path filters to paths under it.
+//! Starting points are resolved to absolute form against the cwd before use, so
+//! a relative base (`.`, `src`) matches the absolute paths the index stores; a
+//! relative base that does not exist is a loud error, never an empty result.
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -49,7 +52,8 @@ OPERATORS:
 
 EXIT STATUS:
     0  success (even with no matches, like GNU find)
-    1  a file could not be processed
+    1  a start point could not be resolved (e.g. a relative path that does not
+       exist in the cwd)
     2  usage error
 ";
 
@@ -178,6 +182,22 @@ pub fn run(argv: &[String]) -> Result<ExitCode, CliError> {
     }
 
     let (paths, expr) = split_paths(argv);
+
+    // Resolve the starting points *before* building the plan. The index stores
+    // absolute paths, so a relative base (`.` or `src`, which agents and humans
+    // type constantly) must be anchored to the cwd or it can never match
+    // anything. Silently filtering every hit away and exiting 0 is the worst
+    // possible failure mode for a find wrapper: it looks like "no matches".
+    let paths = match resolve_bases(&paths) {
+        Ok(p) => p,
+        Err(p) => {
+            // GNU find reports an unreadable start point as
+            // `<path>: No such file or directory` and exits 1 (distinct from a
+            // usage error). Mirror that exactly.
+            eprintln!("{}: No such file or directory", p.display());
+            return Ok(ExitCode::from(1));
+        }
+    };
     let plan = Plan::build(&paths, &expr)?;
 
     // The index-level expression, plus the metadata tests to run on survivors.
@@ -187,10 +207,48 @@ pub fn run(argv: &[String]) -> Result<ExitCode, CliError> {
     c.find(&query, &plan)
 }
 
+/// Anchor the command-line start paths to the filesystem the same way the index
+/// does, so a relative base compares equal to the absolute indexed paths.
+///
+/// * An already-absolute path is canonicalized when that succeeds; if it does
+///   not, the literal string is kept (GNU find would fail later, per test; we
+///   deliberately do not turn that into a hard error here).
+/// * A relative path is joined to the cwd and canonicalized. If it does not
+///   resolve, it can never match anything, so we return it as `Err` for the
+///   caller to report — an empty result would be a lie.
+fn resolve_bases(paths: &[String]) -> Result<Vec<String>, std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok();
+    let mut out = Vec::with_capacity(paths.len());
+    for p in paths {
+        let raw = Path::new(p);
+        let resolved = if raw.is_absolute() {
+            raw.canonicalize().ok()
+        } else {
+            cwd.as_ref().and_then(|c| c.join(raw).canonicalize().ok())
+        };
+        match resolved {
+            // `.` at the filesystem root canonicalizes to `/`; keep the string
+            // form the index uses (no trailing slash), which `path_under`
+            // already normalizes.
+            Some(rp) => match rp.to_str() {
+                Some(s) => out.push(s.to_string()),
+                None => out.push(p.clone()),
+            },
+            // Absolute but unresolvable: leave it be (it simply won't match).
+            None if raw.is_absolute() => out.push(p.clone()),
+            // Relative and unresolvable: loud failure, not silent empty.
+            None => return Err(raw.to_path_buf()),
+        }
+    }
+    Ok(out)
+}
+
 /// A compiled `find` command: index-level expression + phase-2 tests.
 #[derive(Debug, Clone)]
 pub struct Plan {
-    /// Paths given on the command line (empty = all indexed roots).
+    /// Paths given on the command line (empty = all indexed roots), already
+    /// resolved to absolute form by [`resolve_bases`] so they compare equal to
+    /// the absolute paths the index stores.
     pub paths: Vec<String>,
     /// The index-level expression as a findex expression tree (JSON).
     pub index_expr: serde_json::Value,
@@ -555,6 +613,34 @@ mod tests {
         let (paths, expr) = split_paths(&a);
         assert!(paths.is_empty());
         assert_eq!(expr.len(), 2);
+    }
+
+    #[test]
+    fn relative_bases_are_anchored_to_cwd() {
+        // `.` must resolve to the (canonical) cwd, not stay a literal ".": the
+        // index stores absolute paths, so an unresolved base would filter every
+        // hit away and exit 0 — the silent-empty bug.
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let got = resolve_bases(&[".".to_string()]).unwrap();
+        assert_eq!(got, vec![cwd.to_string_lossy().to_string()]);
+
+        // An absolute path that exists round-trips through canonicalization.
+        let abs = cwd.join("Cargo.toml");
+        let got = resolve_bases(&[abs.to_string_lossy().to_string()]).unwrap();
+        assert_eq!(got, vec![cwd.join("Cargo.toml").to_string_lossy().to_string()]);
+    }
+
+    #[test]
+    fn unresolvable_relative_base_is_an_error() {
+        // A relative base that does not exist cannot match anything; returning
+        // an empty set and exit 0 would be a lie. This must be reported.
+        let e = resolve_bases(&["definitely-not-a-real-dir-xyzzy".to_string()]);
+        assert!(e.is_err(), "unresolvable relative base must be an error");
+
+        // An absolute, unresolvable path is deliberately left untouched: it
+        // simply will not match, matching the existing absolute-path behavior.
+        let got = resolve_bases(&["/no/such/dir/xyzzy".to_string()]).unwrap();
+        assert_eq!(got, vec!["/no/such/dir/xyzzy".to_string()]);
     }
 
     #[test]
