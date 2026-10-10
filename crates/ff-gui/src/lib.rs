@@ -76,7 +76,19 @@ impl DaemonClient {
             GuiError::Connect(format!("{}: {e}", self.socket.display()))
         })?;
         let mut writer = stream.try_clone().map_err(|e| GuiError::Io(e.to_string()))?;
-        let line = serde_json::to_string(req).map_err(|e| GuiError::Protocol(e.to_string()))?;
+        // Stamp the protocol version. A daemon built before a behaviour change
+        // rejects the request rather than silently ignoring a field it does not
+        // understand (that is how a stale daemon made the Case-sensitive
+        // checkbox look broken).
+        let mut v: serde_json::Value =
+            serde_json::to_value(req).map_err(|e| GuiError::Protocol(e.to_string()))?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert(
+                "v".into(),
+                serde_json::Value::from(findex::proto::PROTOCOL_VERSION),
+            );
+        }
+        let line = serde_json::to_string(&v).map_err(|e| GuiError::Protocol(e.to_string()))?;
         writeln!(writer, "{line}").map_err(|e| GuiError::Io(e.to_string()))?;
         writer.flush().map_err(|e| GuiError::Io(e.to_string()))?;
 
@@ -153,7 +165,20 @@ impl DaemonClient {
                 }
                 Response::Hit { path, .. } => paths.push(path.clone()),
                 Response::Done { count, .. } => total = *count,
-                Response::Error { message } => return Err(GuiError::Protocol(message.clone())),
+                Response::Error { message } => {
+                    // A version rejection means a *stale daemon* is running:
+                    // say so and how to fix it, rather than surfacing a bare
+                    // protocol string that looks like a bug in the GUI.
+                    if message.contains("unsupported protocol version") {
+                        return Err(GuiError::Protocol(format!(
+                            "{message} — the running findexd predates this build; \
+                             restart it (findexd reads --socket/--state-dir, or \
+                             kill {} and let `ff` respawn one)",
+                            self.socket.display()
+                        )));
+                    }
+                    return Err(GuiError::Protocol(message.clone()));
+                }
                 _ => {}
             }
         }
