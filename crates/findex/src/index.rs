@@ -453,9 +453,12 @@ impl Index {
     /// renumbered densely, names arena rebuilt. Live ids are remapped in a
     /// stable (ascending) order so relationships survive.
     ///
-    /// Returns the new index; the caller swaps it in under the writer lock and
-    /// bumps the generation (§9).
-    pub fn compacted(&self) -> Index {
+    /// Returns the new index **and the old→new id map**, because compaction
+    /// renumbers ids and anything keyed by id outside the index — the ownership
+    /// sidecar, for one — must be remapped with it. Returning the map here
+    /// rather than recomputing it keeps the two in step: a caller cannot forget
+    /// it, because it is handed over with the new index.
+    pub fn compacted(&self) -> (Index, Vec<u32>) {
         let mut out = Index::new();
         out.generation = self.generation;
         out.last_lsn = self.last_lsn;
@@ -475,7 +478,7 @@ impl Index {
             map[old] = id;
         }
         out.set_next_id(self.next_id);
-        out
+        (out, map)
     }
 
     // ------------------------------------------------------------- iteration
@@ -639,7 +642,7 @@ mod tests {
         ix.remove(ids[0]);
         ix.remove(ids[2]);
         let before_live = ix.live_count();
-        let c = ix.compacted();
+        let (c, map) = ix.compacted();
         assert_eq!(c.live_count(), before_live);
         assert_eq!(c.entry_count(), before_live as usize + 1);
         assert_eq!(c.entries.len(), 5); // slot0 + root + 3 live files
@@ -650,6 +653,19 @@ mod tests {
         // ids are remapped but reachability and names survive
         let f1 = c.lookup(1, b"f1").expect("f1 survived");
         assert_eq!(c.path_of(f1, b"/p").unwrap(), b"/p/f1".to_vec());
+
+        // The map must describe that renumbering exactly, because anything keyed
+        // by id outside the index (the ownership sidecar) is remapped through it.
+        // Tombstoned ids map to 0 — "no slot" — and live ones to a real slot whose
+        // name still matches. A map that silently dropped this would make the
+        // access filter answer about the wrong files after every compaction.
+        assert_eq!(map[ids[0] as usize], 0, "a removed id must map to no slot");
+        assert_eq!(map[ids[2] as usize], 0);
+        for live in [ids[1], ids[3], ids[4]] {
+            let new = map[live as usize];
+            assert_ne!(new, 0, "a surviving id must map to a slot");
+            assert_eq!(c.name(new), ix.name(live), "the map must preserve identity");
+        }
     }
 
     #[test]

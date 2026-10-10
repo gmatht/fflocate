@@ -353,3 +353,120 @@ fn re_upsert_refreshes_ownership() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Compaction renumbers entry ids. The ownership sidecar is keyed by id, so it
+/// must be remapped in the same breath — otherwise every record afterwards
+/// describes whichever file moved into that slot, and the filter answers about
+/// one file using another's permissions.
+///
+/// This is the bug that would be hardest to notice in production: it only goes
+/// wrong after 100 000 records, and then only for whichever files happen to
+/// shift, in whichever direction their neighbours' modes imply.
+#[test]
+fn ownership_survives_compaction() {
+    use std::sync::Arc;
+    use findex::applier::{Applier, RealFs};
+
+    let root = std::path::PathBuf::from("/tmp/findex-compact-ownership");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    // `early.txt` is created *first* so it takes the lowest id; deleting it later
+    // forces compaction to renumber everything after it.
+    std::fs::write(root.join("early.txt"), b"e").unwrap();
+    // One world-readable and one owner-only file, at different ids.
+    std::fs::write(root.join("open.txt"), b"x").unwrap();
+    std::fs::write(root.join("shut.txt"), b"y").unwrap();
+    std::fs::set_permissions(root.join("open.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(root.join("shut.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(root.join("early.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    let early = root.join("early.txt");
+
+    let d = tempfile::tempdir().unwrap();
+    let store = findex::persist::Store::open(&d.path().join("state")).unwrap();
+    let mut ix = Index::new();
+    let rid = ix.insert(
+        ROOT_ID,
+        b"findex-compact-ownership",
+        EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+    );
+    let mut r = Root::new(0, root.clone());
+    r.caps.writable = true;
+    let shared = Shared::new(ix, vec![r]);
+    let mut applier = Applier::new(shared.clone(), store, Arc::new(RealFs), SyncRegistry::new());
+    applier.rebuild_dir_cache();
+    applier.track_ownership(true);
+    applier.pending_mut().enqueue_crawl(rid);
+    applier.drain();
+
+    let caller = Caller::new(1000, 1000);
+    let visible = |shared: &Arc<Shared>| -> Vec<String> {
+        let own = shared.ownership.read().unwrap();
+        let ix = shared.index.read().unwrap();
+        let mut v: Vec<String> = ix
+            .iter_live()
+            .filter(|(_, e)| !e.flags().is_root_dir())
+            .filter(|(id, _)| own.visible_to(*id, &caller))
+            .map(|(id, _)| String::from_utf8_lossy(ix.name(id)).into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    let before = visible(&shared);
+    assert_eq!(
+        before,
+        vec!["early.txt".to_string(), "open.txt".to_string()],
+        "the two 0644 files are visible; shut.txt is not"
+    );
+    // Note the ids, so we can prove the renumbering really happened — a
+    // compaction that happens to keep every id where it was would make this test
+    // vacuous, which is exactly how the first version of it passed while the bug
+    // was live.
+    let ids_before: Vec<(u32, String)> = {
+        let ix = shared.index.read().unwrap();
+        let mut v: Vec<(u32, String)> = ix
+            .iter_live()
+            .map(|(i, _)| (i, String::from_utf8_lossy(ix.name(i)).into_owned()))
+            .collect();
+        v.sort();
+        v
+    };
+
+    // Delete a file *earlier* in id order than the survivors, so compaction must
+    // actually shift their ids. Without a tombstone ahead of them, renaming is a
+    // no-op and the test proves nothing.
+    std::fs::remove_file(&early).unwrap();
+    applier.push(findex::event::FsEvent::remove(findex::event::DirKey::new(rid), b"early.txt".to_vec()));
+    applier.drain();
+
+    let compacted = applier.compact_now();
+    assert!(compacted, "compaction should have run");
+    let ids_after: Vec<(u32, String)> = {
+        let ix = shared.index.read().unwrap();
+        let mut v: Vec<(u32, String)> = ix
+            .iter_live()
+            .map(|(i, _)| (i, String::from_utf8_lossy(ix.name(i)).into_owned()))
+            .collect();
+        v.sort();
+        v
+    };
+    assert!(
+        ids_before.iter().any(|(id, name)| name != "early.txt" && !ids_after.contains(&(*id, name.clone()))),
+        "ids must actually have been renumbered, or this test is vacuous: {ids_before:?} -> {ids_after:?}"
+    );
+
+    let after = visible(&shared);
+    // `early.txt` was deleted, so it is gone from both; the survivors must be
+    // exactly the ones that were visible before.
+    let mut expected: Vec<String> = before.into_iter().filter(|n| n != "early.txt").collect();
+    expected.sort();
+    assert_eq!(
+        after, expected,
+        "compaction must not change *which* surviving files a caller can see; got {after:?}"
+    );
+    // The decisive check: `shut.txt` is 0600 and must still be hidden, and
+    // `open.txt` must still be shown — after their ids moved.
+    assert!(after.contains(&"open.txt".to_string()), "got {after:?}");
+    assert!(!after.contains(&"shut.txt".to_string()), "got {after:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}

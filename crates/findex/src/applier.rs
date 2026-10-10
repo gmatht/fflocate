@@ -1011,7 +1011,7 @@ impl Applier {
             (ix.clone(), roots.clone())
         };
         // Build the compacted index off the lock, then swap it in.
-        let compacted = ix_snapshot.compacted();
+        let (compacted, id_map) = ix_snapshot.compacted();
         let new_gen = self.shared.generation() + 1;
         let mut compacted = compacted;
         compacted.set_generation(new_gen);
@@ -1019,6 +1019,14 @@ impl Applier {
         {
             let mut ix = self.shared.index.write().unwrap();
             *ix = compacted;
+        }
+        // Compaction renumbers ids, so anything keyed by id outside the index must
+        // be remapped in the same breath. Forgetting this does not fail loudly:
+        // the ownership sidecar would keep answering about the *old* numbering,
+        // i.e. about whichever files now sit at those ids.
+        {
+            let mut own = self.shared.ownership.write().unwrap();
+            own.remap(&id_map);
         }
         self.shared.generation.store(new_gen, Ordering::Release);
         let (snap_index, snap_roots) = {

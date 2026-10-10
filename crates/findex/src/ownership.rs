@@ -112,6 +112,29 @@ impl Ownership {
         self.attrs.remove(&id);
     }
 
+    /// Remap every id through `old_to_new`, dropping records whose entry did not
+    /// survive compaction.
+    ///
+    /// Compaction renumbers ids densely (tombstones purged), so a table keyed by
+    /// id goes stale the moment it runs. Stale in the *wrong* direction matters:
+    /// a record left at an old id now describes whichever file moved into that
+    /// slot, so the filter would answer about one file using another's
+    /// permissions. `index.compacted()` hands over the map so this cannot be
+    /// skipped by accident.
+    pub fn remap(&mut self, old_to_new: &[u32]) {
+        let mut out = HashMap::with_capacity(self.attrs.len());
+        for (old, attr) in self.attrs.drain() {
+            // Slot 0 is the virtual root and is never a real entry; ids past the
+            // end did not survive.
+            let Some(&new) = old_to_new.get(old as usize) else { continue };
+            if new == 0 {
+                continue; // tombstoned: no slot in the compacted index
+            }
+            out.insert(new, attr);
+        }
+        self.attrs = out;
+    }
+
     /// Drop everything about ids the caller no longer considers live. Called
     /// after compaction renumbers entries.
     pub fn retain_ids(&mut self, keep: impl Fn(u32) -> bool) {
