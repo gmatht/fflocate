@@ -442,9 +442,39 @@ impl Applier {
                 }
             }
         }
+        // Ownership is recorded here, at the single funnel every creation passes
+        // through, rather than at each of the three call sites (crawl, rescan
+        // diff, and the event path). Having it in only some of them was a real
+        // bug: a file discovered by a *rescan* had no record, and the filter —
+        // which fails closed — then hid a world-readable file from everyone but
+        // root. One funnel means a fourth creation path cannot forget.
+        if let Record::Add { id, parent, name, .. } = &rec {
+            self.note_ownership_for(*id, *parent, name);
+        }
         // Apply to the live index regardless of journaling.
         let mut ix = self.shared.index.write().unwrap();
         apply_record(&mut ix, &rec);
+    }
+
+    /// Record ownership for a newly inserted entry, resolving its absolute path
+    /// from the parent's cached path.
+    ///
+    /// Best-effort by design: if the parent path is unknown or the stat fails, no
+    /// record is written and the entry is simply not shown to unprivileged
+    /// callers. That is the safe direction, and it is *visible* — the ownership
+    /// table's size is reported by `ff stats`.
+    fn note_ownership_for(&mut self, id: u32, parent: u32, name: &[u8]) {
+        if !self.track_ownership {
+            return;
+        }
+        let Some(parent_path) = self.dir_paths.get(&parent).cloned() else {
+            return;
+        };
+        let abs = parent_path.join(std::ffi::OsString::from(String::from_utf8_lossy(name).into_owned()));
+        if let Ok(Some(a)) = self.fs.attr(&abs) {
+            // The query path reads this table; the applier is its only writer.
+            self.shared.ownership.write().unwrap().set(id, a);
+        }
     }
 
     /// Apply one event.
@@ -485,7 +515,7 @@ impl Applier {
             }
             return;
         }
-        let mut ix = self.shared.index.write().unwrap();
+        let ix = self.shared.index.write().unwrap();
         if parent as usize >= ix.entry_count() || !ix.is_alive(parent) || !ix.is_dir(parent) {
             return; // event for a dir we do not (yet) know
         }
@@ -499,6 +529,16 @@ impl Applier {
         }
         // Use the hint to pick flags; the crawler will correct type later.
         let flags = EntryFlags::EMPTY.with_dir(is_dir_hint);
+        // Make sure the parent's path is cached before the entry is emitted, so
+        // `note_ownership_for` can resolve this file's absolute path. This takes
+        // the index read lock, so it must happen before we take the write lock.
+        let parent_known = ix.is_alive(parent) && ix.is_dir(parent);
+        drop(ix);
+        if !parent_known {
+            return;
+        }
+        let _ = self.abs_path_for(parent);
+        let mut ix = self.shared.index.write().unwrap();
         let lookup = ix.lookup(parent, &name);
         let _new_id = match lookup {
             Some(id) => {
@@ -595,6 +635,9 @@ impl Applier {
                 return;
             }
         };
+        // Record this dir's own path first, so `note_ownership_for` can resolve a
+        // child's absolute path the moment it is emitted.
+        self.dir_paths.insert(dir, abs.clone());
         let mut new_dirs = Vec::new();
         for it in items {
             if it.name == b"." || it.name == b".." {
@@ -633,9 +676,6 @@ impl Applier {
                 let mut ix = self.shared.index.write().unwrap();
                 let id = ix.insert(dir, &it.name, flags);
                 drop(ix);
-                // System mode: remember who owns this entry, so a query can be
-                // answered as the caller (§3).
-                self.note_ownership(id, &child_abs);
                 self.emit(Record::Add { id, parent: dir, name: it.name.clone(), flags: flags.0 });
                 if it.is_dir && !it.is_symlink {
                     // Watch before enumerating: install a watch, then queue the
@@ -705,6 +745,9 @@ impl Applier {
     }
 
     fn diff_subtree(&mut self, dir: u32, abs: &Path) {
+        // As in `crawl_dir`: the parent's path must be cached before any child is
+        // emitted, so ownership can be resolved for it.
+        self.dir_paths.insert(dir, abs.to_path_buf());
         // 1. Snapshot the index's children of `dir`.
         let indexed: HashMap<Vec<u8>, u32> = {
             let ix = self.shared.index.read().unwrap();

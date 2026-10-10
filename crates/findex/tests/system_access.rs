@@ -231,3 +231,62 @@ fn group_membership_is_honoured_in_the_filter() {
     assert!(own.visible_to(1, &c), "supplementary group");
     assert!(!own.visible_to(1, &Caller::new(5001, 9999)), "no group ⇒ no read");
 }
+
+// ---------------------------------------------------------------------------
+// Ownership must be recorded by *every* path that creates an entry, not just
+// the first one. Getting this wrong does not fail loudly: the filter fails
+// closed, so a world-readable file simply vanishes from everyone but root.
+// ---------------------------------------------------------------------------
+
+/// A world-readable file discovered by a **rescan** (not by a watcher event) must
+/// still be visible to an unprivileged caller. This was a real bug: ownership was
+/// recorded in the crawl and the event path but not in the rescan diff, so after
+/// a restart or any rescan, correct files were hidden.
+#[test]
+fn a_file_found_by_rescan_is_still_visible() {
+    use std::sync::Arc;
+    use findex::applier::{Applier, RealFs};
+    use findex::event::RescanCause;
+
+    let root = std::path::PathBuf::from("/tmp/findex-rescan-ownership");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("crawled.txt"), b"x").unwrap();
+
+    let d = tempfile::tempdir().unwrap();
+    let store = findex::persist::Store::open(&d.path().join("state")).unwrap();
+    let mut ix = Index::new();
+    let rid = ix.insert(
+        ROOT_ID,
+        b"findex-rescan-ownership",
+        EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+    );
+    let mut r = Root::new(0, root.clone());
+    r.caps.writable = true;
+    let shared = Shared::new(ix, vec![r]);
+    let mut applier = Applier::new(shared.clone(), store, Arc::new(RealFs), SyncRegistry::new());
+    applier.rebuild_dir_cache();
+    applier.track_ownership(true);
+    applier.pending_mut().enqueue_crawl(rid);
+    applier.drain();
+
+    // A file that appears on disk and is found by a rescan, never by an event.
+    std::fs::write(root.join("rescanned.txt"), b"y").unwrap();
+    applier.pending_mut().enqueue_rescan(rid, RescanCause::Manual);
+    applier.drain();
+
+    let ctx = ServerCtx {
+        shared: shared.clone(),
+        sync: SyncRegistry::new(),
+        backend: "fake".into(),
+        control: None,
+        caller: Some(Caller::new(1000, 1000)),
+    };
+    let got = hits(&ctx, &Request::query("", 0, false, false));
+    assert!(
+        got.iter().any(|p| p.ends_with("/rescanned.txt")),
+        "a rescan-discovered world-readable file must be visible; got {got:?}"
+    );
+    assert!(got.iter().any(|p| p.ends_with("/crawled.txt")), "got {got:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
