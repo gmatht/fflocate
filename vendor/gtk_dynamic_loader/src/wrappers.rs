@@ -143,6 +143,101 @@ impl Drop for BoxWidget {
     }
 }
 
+/// A labelled disclosure: clicking the label shows or hides a single child.
+/// This is the native "advanced options" foldout.
+pub struct Expander {
+    inner: *mut c_void,
+    loader: Arc<Loader>,
+    _not_send: PhantomData<Rc<()>>,
+}
+
+impl Clone for Expander {
+    fn clone(&self) -> Self {
+        if let Some(gref) = self.loader.symbols.g_object_ref {
+            unsafe { gref(self.inner); }
+        }
+        Expander { inner: self.inner, loader: self.loader.clone(), _not_send: PhantomData }
+    }
+}
+
+impl Expander {
+    pub fn new(loader: Arc<Loader>, label: &str) -> Result<Self, Error> {
+        let ctor = loader
+            .symbols
+            .gtk_expander_new
+            .ok_or(Error::MissingSymbol("gtk_expander_new".into()))?;
+        let c = CString::new(label).unwrap_or_default();
+        let inner = unsafe { ctor(c.as_ptr()) };
+        if inner.is_null() {
+            return Err(Error::Other("gtk_expander_new returned null".into()));
+        }
+        unsafe { take_ownership(&loader.symbols, &loader.version, inner); }
+        Ok(Expander { inner, loader, _not_send: PhantomData })
+    }
+
+    pub fn set_label(&self, label: &str) {
+        if let Some(f) = self.loader.symbols.gtk_expander_set_label {
+            let c = CString::new(label).unwrap_or_default();
+            unsafe { f(self.inner, c.as_ptr()); }
+        }
+    }
+
+    /// Set the single child the expander shows or hides.
+    pub fn set_child(&self, child: &impl GtkWidget) {
+        let symbols = &self.loader.symbols;
+        let child_ptr = child.widget_ptr();
+        if !guard_widget_ptr(child_ptr, "Expander", "set_child.child") {
+            return;
+        }
+        // GTK4 has gtk_expander_set_child; GTK3 goes through gtk_container_add.
+        if let Some(set_child) = symbols.gtk_expander_set_child {
+            unsafe { set_child(self.inner, child_ptr); }
+        } else if let Some(container_add) = symbols.gtk_container_add {
+            unsafe { container_add(self.inner, child_ptr); }
+        }
+    }
+
+    pub fn set_expanded(&self, expanded: bool) {
+        if let Some(f) = self.loader.symbols.gtk_expander_set_expanded {
+            unsafe { f(self.inner, if expanded { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn is_expanded(&self) -> bool {
+        self.loader
+            .symbols
+            .gtk_expander_get_expanded
+            .map(|f| unsafe { f(self.inner) } != 0)
+            .unwrap_or(false)
+    }
+
+    pub fn set_visible(&self, visible: bool) {
+        if let Some(f) = self.loader.symbols.gtk_widget_set_visible {
+            unsafe { f(self.inner, if visible { 1 } else { 0 }); }
+        }
+    }
+
+    pub fn set_hexpand(&self, expand: bool) {
+        unsafe { widget_set_hexpand(&self.loader, self.inner, expand); }
+    }
+    pub fn set_vexpand(&self, expand: bool) {
+        unsafe { widget_set_vexpand(&self.loader, self.inner, expand); }
+    }
+
+    pub fn set_size_request(&self, w: i32, h: i32) {
+        unsafe { widget_set_size_request(&self.loader, self.inner, w, h); }
+    }
+}
+
+impl AsRef<*mut c_void> for Expander { fn as_ref(&self) -> &*mut c_void { &self.inner } }
+
+impl Drop for Expander {
+    fn drop(&mut self) {
+        unsafe { crate::wrappers::unref_widget(&self.loader, self.inner); }
+        self.inner = std::ptr::null_mut();
+    }
+}
+
 pub struct Window {
     inner: *mut c_void,
     loader: Arc<Loader>,

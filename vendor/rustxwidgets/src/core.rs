@@ -286,6 +286,11 @@ impl App {
         crate::backends_gtk_adapter::create_scrolled_window()
     }
 
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    pub fn create_expander(&self, label: &str) -> Result<crate::backends_gtk_adapter::Expander, Error> {
+        crate::backends_gtk_adapter::create_expander(label)
+    }
+
     #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     pub fn create_overlay(&self) -> Result<crate::backends_gtk_adapter::Overlay, Error> {
         crate::backends_gtk_adapter::create_overlay()
@@ -412,6 +417,12 @@ impl App {
         crate::backends_nwg_adapter::create_scrolled_window(parent)
     }
 
+#[cfg(all(windows, not(feature = "zork")))]
+    pub fn create_expander(&self, label: &str) -> Result<crate::backends_nwg_adapter::Expander, Error> {
+        let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
+        crate::backends_nwg_adapter::create_expander(parent, label)
+    }
+
     #[cfg(all(windows, not(feature = "zork")))]
     pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
         let parent = self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut());
@@ -516,6 +527,11 @@ impl App {
         crate::backends_pancurses_adapter::create_scrolled_window()
     }
 
+#[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+    pub fn create_expander(&self, label: &str) -> Result<crate::backends_pancurses_adapter::Expander, Error> {
+        crate::backends_pancurses_adapter::create_expander(label)
+    }
+
     #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
     pub fn open_file(&self, title: &str) -> Result<Option<String>, Error> {
         crate::backends_pancurses_adapter::open_file(title)
@@ -541,6 +557,11 @@ impl App {
     #[cfg(feature = "zork")]
     pub fn create_scrolled_window(&self) -> Result<crate::backends_zork_adapter::ScrolledWindow, Error> {
         crate::backends_zork_adapter::create_scrolled_window()
+    }
+
+#[cfg(feature = "zork")]
+    pub fn create_expander(&self, label: &str) -> Result<crate::backends_zork_adapter::Expander, Error> {
+        crate::backends_zork_adapter::create_expander(label)
     }
 
     #[cfg(feature = "zork")]
@@ -708,6 +729,11 @@ impl App {
     #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn create_scrolled_window(&self) -> Result<crate::backends_wasm_adapter::ScrolledWindow, Error> {
         crate::backends_wasm_adapter::create_scrolled_window()
+    }
+
+#[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
+    pub fn create_expander(&self, label: &str) -> Result<crate::backends_wasm_adapter::Expander, Error> {
+        crate::backends_wasm_adapter::create_expander(label)
     }
     #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     pub fn open_file(&self, _title: &str) -> Result<Option<String>, Error> {
@@ -967,6 +993,46 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         {
             let inner = crate::backends_android_adapter::create_context_menu()?;
             Ok(crate::common::ContextMenu { inner })
+        }
+    }
+
+    /// Create a labelled disclosure ("advanced options" foldout).
+    ///
+    /// The returned expander starts collapsed; `set_child` gives it the content
+    /// it shows or hides.
+    pub fn new_expander(&self, label: &str) -> Result<crate::common::Expander, Error> {
+        #[cfg(feature = "zork")]
+        {
+            let inner = crate::backends_zork_adapter::create_expander(label)?;
+            return Ok(crate::common::Expander { inner });
+        }
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        {
+            let inner = crate::backends_gtk_adapter::create_expander(label)?;
+            return Ok(crate::common::Expander { inner });
+        }
+        #[cfg(all(windows, not(feature = "zork")))]
+        {
+            let inner = crate::backends_nwg_adapter::create_expander(
+                self.parent_cell.borrow().as_ref().copied().unwrap_or(std::ptr::null_mut()),
+                label,
+            )?;
+            Ok(crate::common::Expander { inner })
+        }
+        #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+        {
+            let inner = crate::backends_pancurses_adapter::create_expander(label)?;
+            Ok(crate::common::Expander { inner })
+        }
+        #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
+        {
+            let inner = crate::backends_wasm_adapter::create_expander(label)?;
+            Ok(crate::common::Expander { inner })
+        }
+        #[cfg(all(target_os = "android", not(feature = "zork")))]
+        {
+            let inner = crate::backends_android_adapter::create_expander(label)?;
+            Ok(crate::common::Expander { inner })
         }
     }
 

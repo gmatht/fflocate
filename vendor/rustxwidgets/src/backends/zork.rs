@@ -28,6 +28,8 @@ pub enum ZorkKind {
     SimpleAction,
     DropDown { items: Vec<String>, selected: Option<usize> },
     TextView { text: String },
+    /// A labelled disclosure: `expanded` toggles whether its child is shown.
+    Expander { label: String, expanded: bool },
 }
 
 pub struct ZorkNode {
@@ -241,6 +243,13 @@ fn describe_room(state: &ZorkState, node: &ZorkNode) {
         ZorkKind::BoxWidget { horizontal, .. } => {
             println!("You are in a {} Box.", if *horizontal { "horizontal" } else { "vertical" });
         }
+        ZorkKind::Expander { label, expanded } => {
+            println!(
+                "You are at an Expander labeled \"{}\" ({}).",
+                label,
+                if *expanded { "expanded" } else { "collapsed" }
+            );
+        }
         ZorkKind::Grid { .. } => {
             println!("You are in a Grid layout.");
         }
@@ -361,6 +370,9 @@ fn short_desc(node: &ZorkNode) -> String {
             format!("DropDown [{}]", current)
         }
         ZorkKind::TextView { .. } => "TextView".into(),
+        ZorkKind::Expander { label, expanded } => {
+            format!("Expander \"{}\" ({})", label, if *expanded { "expanded" } else { "collapsed" })
+        }
         ZorkKind::Menu => "Menu".into(),
         ZorkKind::MenuBar => "MenuBar".into(),
         ZorkKind::SimpleAction => "SimpleAction".into(),
@@ -1207,4 +1219,31 @@ pub fn create_overlay() -> usize {
 
 pub fn create_scrolled_window() -> usize {
     with_state(|s| s.add_node(ZorkKind::Label { text: "ScrolledWindow".into() }, Some(s.current_id)))
+}
+
+pub fn create_expander(label: &str) -> usize {
+    with_state(|s| {
+        s.add_node(
+            ZorkKind::Expander { label: label.to_string(), expanded: false },
+            Some(s.current_id),
+        )
+    })
+}
+
+pub fn set_expander_expanded(id: usize, expanded: bool) {
+    with_state(|s| {
+        if let Some(n) = s.node_mut(id) {
+            if let ZorkKind::Expander { expanded: ref mut e, .. } = n.kind {
+                *e = expanded;
+            }
+        }
+    });
+}
+
+pub fn expander_is_expanded(id: usize) -> bool {
+    with_state(|s| {
+        s.node(id)
+            .map(|n| matches!(&n.kind, ZorkKind::Expander { expanded, .. } if *expanded))
+            .unwrap_or(false)
+    })
 }

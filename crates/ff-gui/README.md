@@ -35,10 +35,10 @@ with the fixes needed for the `zork` backend to run `ff-gui` (`core.rs` had no
 `Clone` impls and delegate methods; and `backends/zork.rs` invoked widget
 callbacks while it still held the state `RefCell`'s `borrow_mut`, so a button
 like Search — whose callback calls back into the widget API — panicked with
-"RefCell already borrowed"). The 3.x widget API also had no context-menu,
-clipboard, or drag-and-drop support at all, so `gtk_dynamic_loader` gained the
-missing GTK3/GTK4 bindings, a closure-backed `ContextMenu`, and URI/text drag
-sources. They are vendored rather than referenced by path so the build does not
+"RefCell already borrowed"). The 3.x widget API also had no
+context-menu, clipboard, drag-and-drop, or disclosure support at all, so
+`gtk_dynamic_loader` gained the missing GTK3/GTK4 bindings, a closure-backed
+`ContextMenu`, URI/text drag sources, and an `Expander` foldout. They are vendored rather than referenced by path so the build does not
 depend on a checkout outside this repository.
 
 ## Status
@@ -48,6 +48,12 @@ depend on a checkout outside this repository.
 * Results render into a `TextView`, one path per row — a real scrollable list
   rather than one wrapping paragraph. `(no matches)` is shown as an explicit
   single line so it is never confused with an empty/absent daemon.
+* An **Advanced search** foldout (a native disclosure) holds a free-form query
+  field for the full syntax (`ext:`, `path:`, `case:`, `regex:`, globs, phrases)
+  together with a reminder of that syntax. Its contents are merged into the
+  effective query — one readable string — and when both boxes hold text the
+  advanced one runs and the status line says so (live, as you type, and again
+  after Search).
 * **Right-click a result** for a context menu: *Copy path*, *Open*, and *Open
   containing folder*. The row under the cursor is found with GTK's own text
   hit-test, so it stays correct under scrolling. Copy uses the system clipboard

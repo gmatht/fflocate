@@ -1073,6 +1073,37 @@ mod gtk_adapter {
         Ok(ScrolledWindow(sw))
     }
 
+    // ---- Expander (labelled disclosure / "advanced options" foldout) ----
+
+    #[repr(transparent)]
+    pub struct Expander(pub gtk_dynamic_loader::Expander);
+
+    impl Clone for Expander { fn clone(&self) -> Self { Expander(self.0.clone()) } }
+
+    impl Expander {
+        /// Show or hide the expander's child.
+        pub fn set_expanded(&self, expanded: bool) { self.0.set_expanded(expanded); }
+        pub fn is_expanded(&self) -> bool { self.0.is_expanded() }
+        pub fn set_label(&self, label: &str) { self.0.set_label(label); }
+        /// Set the single child the expander reveals.
+        pub fn set_child(&self, child: &impl AsRef<*mut c_void>) { self.0.set_child(child); }
+        pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+        pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
+        pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
+    }
+
+    impl AsRef<*mut c_void> for Expander { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+    impl Widget for Expander { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+
+    pub fn create_expander(label: &str) -> Result<Expander, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+        let e = gtk_dynamic_loader::Expander::new(loader, label)
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(Expander(e))
+    }
+
     // ---- Overlay (cross-platform stacking container) ----
 
     #[repr(transparent)]

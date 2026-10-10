@@ -854,6 +854,50 @@ pub fn create_scrolled_window() -> Result<ScrolledWindow, Error> {
     Ok(ScrolledWindow { id: crate::backends::zork::create_scrolled_window() })
 }
 
+// -- Expander --
+
+pub struct Expander {
+    id: usize,
+}
+
+impl Widget for Expander {
+    fn raw_handle(&self) -> *mut c_void {
+        &self.id as *const usize as *mut c_void
+    }
+}
+
+impl AsRef<*mut c_void> for Expander {
+    fn as_ref(&self) -> &*mut c_void {
+        unsafe { &*(&self.id as *const usize as *const *mut c_void) }
+    }
+}
+
+impl Clone for Expander {
+    fn clone(&self) -> Self { Expander { id: self.id } }
+}
+
+impl Expander {
+    pub fn set_expanded(&self, expanded: bool) {
+        crate::backends::zork::set_expander_expanded(self.id, expanded);
+    }
+    pub fn is_expanded(&self) -> bool {
+        crate::backends::zork::expander_is_expanded(self.id)
+    }
+    pub fn set_label(&self, _label: &str) {}
+    pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
+        let child_id = *child.as_ref() as usize;
+        crate::backends::zork::set_child(self.id, child_id);
+    }
+    pub fn set_visible(&self, _visible: bool) {}
+    pub fn set_hexpand(&self, _expand: bool) {}
+    pub fn set_vexpand(&self, _expand: bool) {}
+    pub fn set_size_request(&self, _w: i32, _h: i32) {}
+}
+
+pub fn create_expander(label: &str) -> Result<Expander, Error> {
+    Ok(Expander { id: crate::backends::zork::create_expander(label) })
+}
+
 pub fn open_file(_title: &str) -> Result<Option<String>, Error> {
     Ok(None)
 }

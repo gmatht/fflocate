@@ -197,6 +197,28 @@ impl SearchOutcome {
     }
 }
 
+/// The query the daemon should actually run, built from the quick box and the
+/// advanced foldout.
+///
+/// The foldout's contents are *merged* into the query string rather than sent
+/// as separate protocol fields, so the effective query is one thing the user can
+/// read, copy, and paste into `ff`. When both boxes are filled the advanced one
+/// wins (it is the more specific expression) and the simple one is ignored; the
+/// status line says so.
+pub fn effective_query(quick: &str, advanced: &str) -> (String, bool) {
+    let quick = quick.trim();
+    let advanced = advanced.trim();
+    match (quick.is_empty(), advanced.is_empty()) {
+        // Advanced wins when both are set.
+        (_, false) => (advanced.to_string(), !quick.is_empty()),
+        (false, true) => (quick.to_string(), false),
+        (true, true) => (String::new(), false),
+    }
+}
+
+/// A one-line reminder of the advanced syntax, shown inside the foldout.
+pub const ADVANCED_SYNTAX_HELP: &str = "ext:rs  path:src  case:Foo  regex:^m.*\\.rs  \"exact phrase\"  *.rs  term1 term2 (all must match)";
+
 /// Build a `file://` URI from an absolute path, percent-encoding the bytes that
 /// are not allowed raw in a URI path.
 ///
@@ -287,6 +309,25 @@ pub fn row_at_line(paths: &[String], line: i32) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_query_prefers_whichever_is_filled() {
+        // Only the quick box.
+        assert_eq!(effective_query("main", ""), ("main".to_string(), false));
+        // Only the advanced box.
+        assert_eq!(effective_query("", "ext:rs"), ("ext:rs".to_string(), false));
+        // Whitespace is not content.
+        assert_eq!(effective_query("  ", "\t"), (String::new(), false));
+    }
+
+    #[test]
+    fn effective_query_advanced_wins_and_is_flagged() {
+        // Both set: the advanced one runs, and the caller is told the quick box
+        // was shadowed so the status line can say so.
+        let (q, shadowed) = effective_query("main", "ext:rs path:src");
+        assert_eq!(q, "ext:rs path:src");
+        assert!(shadowed);
+    }
 
     #[test]
     fn file_uri_encodes_special_characters() {

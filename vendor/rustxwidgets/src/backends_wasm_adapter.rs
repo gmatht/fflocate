@@ -1777,6 +1777,89 @@ impl SimpleAction {
     }
 
     // -----------------------------------------------------------------------
+    // Expander
+    // -----------------------------------------------------------------------
+
+    /// A foldout on the web: a native `<details>`/`<summary>` disclosure. The
+    /// `<summary>` is the clickable label; the child goes in the body.
+    pub struct Expander {
+        elem: HtmlElement,
+        body: HtmlDivElement,
+    }
+
+    impl AsElement for Expander {
+        fn as_element(&self) -> &Element { self.elem.as_ref() }
+    }
+
+    impl Widget for Expander {
+        fn raw_handle(&self) -> *mut c_void {
+            &self.elem as *const HtmlElement as *mut c_void
+        }
+    }
+
+    impl Clone for Expander {
+        fn clone(&self) -> Self {
+            Expander { elem: self.elem.clone(), body: self.body.clone() }
+        }
+    }
+
+    impl Expander {
+        pub fn set_expanded(&self, expanded: bool) {
+            self.elem.set_attribute("open", if expanded { "open" } else { "" }).ok();
+            if !expanded {
+                self.elem.remove_attribute("open").ok();
+            }
+        }
+        pub fn is_expanded(&self) -> bool {
+            self.elem.has_attribute("open")
+        }
+        pub fn set_label(&self, label: &str) {
+            if let Some(summary) = self.elem.query_selector("summary").ok().flatten() {
+                summary.set_text_content(Some(label));
+            }
+        }
+        pub fn set_child(&self, child: &impl AsElement) {
+            while let Some(c) = self.body.first_child() {
+                self.body.remove_child(&c).ok();
+            }
+            self.body.append_child(child.as_element()).ok();
+        }
+        pub fn set_visible(&self, visible: bool) {
+            if visible {
+                self.elem.style().set_property("display", "").ok();
+            } else {
+                self.elem.style().set_property("display", "none").ok();
+            }
+        }
+        pub fn set_hexpand(&self, expand: bool) {
+            set_css(self.elem.as_ref(), "width", if expand { "100%" } else { "auto" });
+        }
+        pub fn set_vexpand(&self, expand: bool) {
+            set_css(self.elem.as_ref(), "flex-grow", if expand { "1" } else { "0" });
+        }
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if w > 0 { set_css(self.elem.as_ref(), "width", &format!("{}px", w)); }
+            if h > 0 { set_css(self.elem.as_ref(), "height", &format!("{}px", h)); }
+        }
+    }
+
+    pub fn create_expander(label: &str) -> Result<Expander, Error> {
+        let details: HtmlElement = create_element("details").dyn_into().map_err(|e| {
+            Error::Backend(format!("create_expander: {:?}", e))
+        })?;
+        let summary: HtmlElement = create_element("summary").dyn_into().map_err(|e| {
+            Error::Backend(format!("create_expander: {:?}", e))
+        })?;
+        summary.set_text_content(Some(label));
+        details.append_child(summary.as_ref()).ok();
+        let body: HtmlDivElement = create_element("div").dyn_into().map_err(|e| {
+            Error::Backend(format!("create_expander: {:?}", e))
+        })?;
+        details.append_child(body.as_ref()).ok();
+        Ok(Expander { elem: details, body })
+    }
+
+    // -----------------------------------------------------------------------
     // ScrolledWindow
     // -----------------------------------------------------------------------
     pub struct ScrolledWindow {

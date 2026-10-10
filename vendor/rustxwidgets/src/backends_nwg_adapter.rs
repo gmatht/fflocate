@@ -1603,6 +1603,90 @@ mod nwg_adapter {
         Ok(Overlay { frame: Some(Rc::new(frame)), hwnd })
     }
 
+    // ========== Expander ==========
+
+    /// A foldout on Windows: an owned frame whose child is shown or hidden by
+    /// toggling the frame's visibility. (Windows has no native disclosure, so
+    /// this is the closest equivalent rather than a real GtkExpander.)
+    pub struct Expander {
+        frame: Option<Rc<nwg::Frame>>,
+        hwnd: *mut c_void,
+        expanded: Rc<RefCell<bool>>,
+    }
+
+    impl Expander {
+        pub fn set_expanded(&self, expanded: bool) {
+            *self.expanded.borrow_mut() = expanded;
+            if !self.hwnd.is_null() {
+                unsafe {
+                    winapi::um::winuser::ShowWindow(
+                        self.hwnd as _,
+                        if expanded { winapi::um::winuser::SW_SHOW } else { winapi::um::winuser::SW_HIDE },
+                    );
+                }
+            }
+        }
+        pub fn is_expanded(&self) -> bool { *self.expanded.borrow() }
+        pub fn set_label(&self, _label: &str) {}
+        pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
+            let ptr = *child.as_ref();
+            if !ptr.is_null() && !self.hwnd.is_null() {
+                unsafe { winapi::um::winuser::SetParent(ptr as _, self.hwnd as _); }
+            }
+        }
+        pub fn set_visible(&self, visible: bool) {
+            if !self.hwnd.is_null() {
+                unsafe {
+                    winapi::um::winuser::ShowWindow(
+                        self.hwnd as _,
+                        if visible { winapi::um::winuser::SW_SHOW } else { winapi::um::winuser::SW_HIDE },
+                    );
+                }
+            }
+        }
+        pub fn set_hexpand(&self, _expand: bool) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            if !self.hwnd.is_null() {
+                unsafe {
+                    winapi::um::winuser::SetWindowPos(
+                        self.hwnd as _, std::ptr::null_mut(), 0, 0, w, h,
+                        winapi::um::winuser::SWP_NOZORDER | winapi::um::winuser::SWP_NOMOVE,
+                    );
+                }
+            }
+        }
+    }
+
+    impl Clone for Expander {
+        fn clone(&self) -> Self {
+            Expander { frame: self.frame.clone(), hwnd: self.hwnd, expanded: self.expanded.clone() }
+        }
+    }
+
+    impl AsRef<*mut c_void> for Expander {
+        fn as_ref(&self) -> &*mut c_void { &self.hwnd }
+    }
+
+    impl Widget for Expander {
+        fn raw_handle(&self) -> *mut c_void { self.hwnd }
+    }
+
+    pub fn create_expander(parent: *mut c_void, _label: &str) -> Result<Expander, Error> {
+        let mut frame = nwg::Frame::default();
+        if !parent.is_null() {
+            nwg::Frame::builder()
+                .flags(nwg::FrameFlags::NONE)
+                .size((0, 0))
+                .position((0, 0))
+                .parent(&nwg::ControlHandle::Hwnd(parent as _))
+                .build(&mut frame)
+                .map_err(|e| Error::Backend(format!("{}", e)))?;
+        }
+        let hwnd = frame.handle.hwnd().unwrap_or(std::ptr::null_mut()) as *mut c_void;
+        Ok(Expander { frame: Some(Rc::new(frame)), hwnd, expanded: Rc::new(RefCell::new(false)) })
+    }
+
     // ========== ScrolledWindow ==========
 
     pub struct ScrolledWindow {

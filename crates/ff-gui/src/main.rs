@@ -24,7 +24,10 @@ use rustxwidgets::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use ff_gui::{row_at_line, DaemonClient, GuiError, RowAction, SearchOutcome};
+use ff_gui::{
+    effective_query, row_at_line, DaemonClient, GuiError, RowAction, SearchOutcome,
+    ADVANCED_SYNTAX_HELP,
+};
 
 /// Which backend this binary was compiled with.
 ///
@@ -81,6 +84,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         results.set_wrap_mode(0); // no wrapping: one hit per line
     }
 
+    // The advanced-search foldout: a native disclosure holding a free-form
+    // query field (with the full syntax) and a reminder of that syntax. Its
+    // contents are merged into the effective query, so what runs is always one
+    // readable string.
+    let advanced = app.create_expander("Advanced search")?;
+    let advanced_query = app.create_entry()?;
+    advanced_query.set_text("");
+    let advanced_help = app.create_label(ADVANCED_SYNTAX_HELP)?;
+    let advanced_box = app.create_box(Orientation::Vertical, 2)?;
+    advanced_box.append(&advanced_query);
+    advanced_box.append(&advanced_help);
+    advanced.set_child(&advanced_box);
+    advanced.set_expanded(false);
+
     // The rows currently on screen, shared between the Search handler (which
     // fills them) and the right-click handler (which picks one). Also holds the
     // live context menu: GTK does not own a menu popped up this way, so we must
@@ -113,14 +130,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // `subscribe` op, which is still a v1.5 preview in the daemon.)
     {
         let query = query.clone();
+        let advanced_query = advanced_query.clone();
         let status = status.clone();
         let results = results.clone();
         let current = current.clone();
         search.on_click(move || {
-            let q = query.get_text().unwrap_or_default();
+            let quick = query.get_text().unwrap_or_default();
+            let adv = advanced_query.get_text().unwrap_or_default();
+            let (q, shadowed) = effective_query(&quick, &adv);
             match run_query(&q) {
                 Ok(outcome) => {
-                    status.set_text(&outcome.status_line(outcome.paths.len().min(MAX_ROWS)));
+                    let mut line = outcome.status_line(outcome.paths.len().min(MAX_ROWS));
+                    if shadowed {
+                        // Say which query ran: the two boxes disagreeing must
+                        // not be silent.
+                        line.push_str("  [advanced query]");
+                    }
+                    status.set_text(&line);
                     results.set_text(&render_rows(&outcome));
                     // Record only the rows actually shown (a "no matches" view
                     // shows a placeholder line, which is not a path).
@@ -133,6 +159,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         })?;
+    }
+
+    // Warn live when both boxes hold text: the advanced one will run and the
+    // quick one will be ignored. Better to say so as the user types than to
+    // surprise them after pressing Search.
+    {
+        let q1 = query.clone();
+        let a1 = advanced_query.clone();
+        let s1 = status.clone();
+        advanced_query
+            .connect_changed(move || {
+                let quick = q1.get_text().unwrap_or_default();
+                let adv = a1.get_text().unwrap_or_default();
+                if !quick.trim().is_empty() && !adv.trim().is_empty() {
+                    s1.set_text("both boxes have text — Search will run the advanced query");
+                }
+            })
+            .ok();
+        let q2 = query.clone();
+        let a2 = advanced_query.clone();
+        let s2 = status.clone();
+        query
+            .connect_changed(move || {
+                let quick = q2.get_text().unwrap_or_default();
+                let adv = a2.get_text().unwrap_or_default();
+                if !quick.trim().is_empty() && !adv.trim().is_empty() {
+                    s2.set_text("both boxes have text — Search will run the advanced query");
+                }
+            })
+            .ok();
     }
 
     // Right-click on the results opens a context menu for the row under the
@@ -232,6 +288,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let layout = app.create_box(Orientation::Vertical, 1)?;
     layout.append(&query_row);
+    layout.append(&advanced);
     layout.append(&status);
     layout.append(&results);
 

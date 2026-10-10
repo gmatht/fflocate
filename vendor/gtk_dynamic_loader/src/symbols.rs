@@ -58,6 +58,14 @@ pub type GtkPopoverMenuBarNewFromModel = unsafe extern "C" fn(model: *mut c_void
 // GTK3 menu bar
 pub type GtkMenuBarNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkMenuNew = unsafe extern "C" fn() -> *mut c_void;
+// GtkExpander: a labelled disclosure that shows/hides its single child. GTK3
+// sets the child through gtk_container_add (already bound); GTK4 would use
+// gtk_expander_set_child, bound below when present.
+pub type GtkExpanderNew = unsafe extern "C" fn(label: *const i8) -> *mut c_void;
+pub type GtkExpanderSetExpanded = unsafe extern "C" fn(expander: *mut c_void, expanded: i32);
+pub type GtkExpanderGetExpanded = unsafe extern "C" fn(expander: *mut c_void) -> i32;
+pub type GtkExpanderSetLabel = unsafe extern "C" fn(expander: *mut c_void, label: *const i8);
+pub type GtkExpanderSetChild = unsafe extern "C" fn(expander: *mut c_void, child: *mut c_void);
 pub type GtkMenuItemNewWithLabel = unsafe extern "C" fn(label: *const i8) -> *mut c_void;
 pub type GtkMenuShellAppend = unsafe extern "C" fn(shell: *mut c_void, child: *mut c_void);
 pub type GtkMenuItemSetSubmenu = unsafe extern "C" fn(item: *mut c_void, submenu: *mut c_void);
@@ -357,6 +365,11 @@ pub struct Symbols {
     pub gtk_popover_menu_bar_new_from_model: Option<GtkPopoverMenuBarNewFromModel>,
     pub gtk_menu_bar_new: Option<GtkMenuBarNew>,
     pub gtk_menu_new: Option<GtkMenuNew>,
+    pub gtk_expander_new: Option<GtkExpanderNew>,
+    pub gtk_expander_set_expanded: Option<GtkExpanderSetExpanded>,
+    pub gtk_expander_get_expanded: Option<GtkExpanderGetExpanded>,
+    pub gtk_expander_set_label: Option<GtkExpanderSetLabel>,
+    pub gtk_expander_set_child: Option<GtkExpanderSetChild>,
     pub gtk_menu_item_new_with_label: Option<GtkMenuItemNewWithLabel>,
     pub gtk_menu_shell_append: Option<GtkMenuShellAppend>,
     pub gtk_menu_item_set_submenu: Option<GtkMenuItemSetSubmenu>,
@@ -705,6 +718,11 @@ impl Symbols {
         let gtk_popover_menu_bar_new_from_model = unsafe { sym::<GtkPopoverMenuBarNewFromModel>(gtk, "gtk_popover_menu_bar_new_from_model") };
         let gtk_menu_bar_new = unsafe { sym::<GtkMenuBarNew>(gtk, "gtk_menu_bar_new") };
         let gtk_menu_new = unsafe { sym::<GtkMenuNew>(gtk, "gtk_menu_new") };
+        let gtk_expander_new = unsafe { sym::<GtkExpanderNew>(gtk, "gtk_expander_new") };
+        let gtk_expander_set_expanded = unsafe { sym::<GtkExpanderSetExpanded>(gtk, "gtk_expander_set_expanded") };
+        let gtk_expander_get_expanded = unsafe { sym::<GtkExpanderGetExpanded>(gtk, "gtk_expander_get_expanded") };
+        let gtk_expander_set_label = unsafe { sym::<GtkExpanderSetLabel>(gtk, "gtk_expander_set_label") };
+        let gtk_expander_set_child = unsafe { sym::<GtkExpanderSetChild>(gtk, "gtk_expander_set_child") };
         let gtk_menu_item_new_with_label = unsafe { sym::<GtkMenuItemNewWithLabel>(gtk, "gtk_menu_item_new_with_label") };
         let gtk_menu_shell_append = unsafe { sym::<GtkMenuShellAppend>(gtk, "gtk_menu_shell_append") };
         let gtk_menu_item_set_submenu = unsafe { sym::<GtkMenuItemSetSubmenu>(gtk, "gtk_menu_item_set_submenu") };
@@ -805,7 +823,7 @@ impl Symbols {
             gtk_widget_set_can_focus,
             gtk_file_chooser_native_new, gtk_native_dialog_run, gtk_file_chooser_get_filename, gtk_widget_destroy, gtk_window_close, g_free, gdk_display_get_default, gdk_screen_get_default, gtk_style_context_add_provider_for_display, gtk_style_context_add_provider_for_screen, gdk_event_get_keyval, gdk_event_get_state, gdk_keyval_from_name,
             gtk_application_new, g_application_run, g_application_register, g_simple_action_new, g_action_map_add_action, g_action_group_activate_action, g_action_map_lookup_action, g_action_activate,
-            g_menu_new, g_menu_append, g_application_set_app_menu, g_application_set_menubar, g_menu_append_submenu, gtk_popover_menu_bar_new_from_model, gtk_menu_bar_new, gtk_menu_new, gtk_menu_item_new_with_label, gtk_menu_shell_append, gtk_menu_item_set_submenu, gtk_window_set_application, gtk_widget_insert_action_group, gtk_actionable_set_detailed_action_name, g_menu_model_get_n_items, g_menu_model_get_item_attribute_value, g_menu_model_get_item_link, g_variant_get_string, g_variant_unref,
+            g_menu_new, g_menu_append, g_application_set_app_menu, g_application_set_menubar, g_menu_append_submenu, gtk_popover_menu_bar_new_from_model, gtk_menu_bar_new, gtk_menu_new, gtk_expander_new, gtk_expander_set_expanded, gtk_expander_get_expanded, gtk_expander_set_label, gtk_expander_set_child, gtk_menu_item_new_with_label, gtk_menu_shell_append, gtk_menu_item_set_submenu, gtk_window_set_application, gtk_widget_insert_action_group, gtk_actionable_set_detailed_action_name, g_menu_model_get_n_items, g_menu_model_get_item_attribute_value, g_menu_model_get_item_link, g_variant_get_string, g_variant_unref,
             gtk_label_set_xalign,
             gtk_event_controller_key_new,
             gtk_event_controller_focus_new,

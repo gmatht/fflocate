@@ -638,6 +638,57 @@ mod android_adapter {
         Ok(TextView(ptr as *mut c_void))
     }
 
+    // -- Expander (foldout) --
+
+    /// A foldout on Android: a plain container whose child is shown or hidden.
+    /// Android has no one-widget disclosure, so this mirrors `BoxWidget`.
+    pub struct Expander(pub *mut c_void);
+
+    impl Widget for Expander {
+        fn raw_handle(&self) -> *mut c_void { self.0 }
+    }
+
+    impl AsRef<*mut c_void> for Expander {
+        fn as_ref(&self) -> &*mut c_void { &self.0 }
+    }
+
+    impl Clone for Expander {
+        fn clone(&self) -> Self { Expander(self.0) }
+    }
+
+    impl Expander {
+        pub fn set_expanded(&self, _expanded: bool) {}
+        pub fn is_expanded(&self) -> bool { false }
+        pub fn set_label(&self, _label: &str) {}
+        pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
+            let child_ptr = *child.as_ref();
+            if child_ptr.is_null() || self.0.is_null() {
+                return;
+            }
+            let _ = crate::backends::android::with_env_and_activity(|env, _activity| {
+                let parent = unsafe { jni::objects::JObject::from_raw(self.0 as jni::sys::jobject) };
+                let child_obj = unsafe { jni::objects::JObject::from_raw(child_ptr as jni::sys::jobject) };
+                env.call_method(
+                    &parent,
+                    "addView",
+                    "(Landroid/view/View;)V",
+                    &[(&child_obj).into()],
+                )?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+            });
+        }
+        pub fn set_visible(&self, _visible: bool) {}
+        pub fn set_hexpand(&self, _expand: bool) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
+        pub fn set_size_request(&self, _w: i32, _h: i32) {}
+    }
+
+    pub fn create_expander(_label: &str) -> Result<Expander, Error> {
+        let ptr = crate::backends::android::create_box(1, 0)
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(Expander(ptr as *mut c_void))
+    }
+
     // -- Context menu (right-click) --
 
     /// Context-menu placeholder for backends without a pointer: items can be

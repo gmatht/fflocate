@@ -1,14 +1,14 @@
 pub use crate::core::{App, DrawContext, Error, HandlerId, Widget};
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
-pub use crate::common::{Window, WidgetBox, Label, Entry, Canvas, Menu, MenuBar, SimpleAction, Dialog, ContextMenu, Orientation};
+pub use crate::common::{Window, WidgetBox, Label, Entry, Canvas, Menu, MenuBar, SimpleAction, Dialog, ContextMenu, Expander, Orientation};
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 pub use crate::backends_gtk_adapter::{Button, Grid, DropDown, CheckButton, RadioButton, TextView, Overlay, Spreadsheet, ScrolledWindow};
 #[cfg(all(windows, not(feature = "zork")))]
-pub use crate::common::{Window, WidgetBox, Label, Entry, Canvas, Menu, MenuBar, SimpleAction, Dialog, ContextMenu, Orientation};
+pub use crate::common::{Window, WidgetBox, Label, Entry, Canvas, Menu, MenuBar, SimpleAction, Dialog, ContextMenu, Expander, Orientation};
 #[cfg(all(windows, not(feature = "zork")))]
 pub use crate::backends_nwg_adapter::{Button, Grid, DropDown, CheckButton, RadioButton, TextView, Appendable};
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
-pub use crate::common::{Window, WidgetBox, Label, Entry, Canvas, Menu, MenuBar, SimpleAction, Dialog, ContextMenu, Orientation};
+pub use crate::common::{Window, WidgetBox, Label, Entry, Canvas, Menu, MenuBar, SimpleAction, Dialog, ContextMenu, Expander, Orientation};
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
 pub use crate::backends_wasm_adapter::{Button, Grid, DropDown, CheckButton, RadioButton, TextView, Overlay, ScrolledWindow};
 #[cfg(all(target_os = "android", not(feature = "zork")))]
@@ -24,3 +24,5 @@ pub use crate::backends_zork_adapter::{Window, Button, Label, BoxWidget, Grid, E
 // `new_menu` does). Re-export that type here too.
 #[cfg(feature = "zork")]
 pub use crate::common::ContextMenu;
+#[cfg(feature = "zork")]
+pub use crate::common::Expander;

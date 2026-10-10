@@ -3,7 +3,7 @@
 // Platform-specific type re-exports using cfg
 macro_rules! platform_module {
     ($backend:path, $Orientation:ident) => {
-        pub use $backend::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, ContextMenu, Orientation as $Orientation};
+        pub use $backend::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, ContextMenu, Expander, Orientation as $Orientation};
         pub type PlatformWindow = Window;
         pub type PlatformWidgetBox = BoxWidget;
         pub type PlatformLabel = Label;
@@ -18,6 +18,7 @@ macro_rules! platform_module {
         pub type PlatformRadioButton = RadioButton;
         pub type PlatformTextView = TextView;
         pub type PlatformContextMenu = ContextMenu;
+        pub type PlatformExpander = Expander;
     };
 }
 
@@ -73,6 +74,9 @@ macro_rules! common_types_mod {
         /// A right-click context menu: items are backed directly by closures.
         /// Not `Clone` — the closures are owned by the menu.
         pub struct ContextMenu { pub inner: PlatformContextMenu }
+        /// A labelled disclosure ("advanced options" foldout).
+        #[derive(Clone)]
+        pub struct Expander { pub inner: PlatformExpander }
         #[derive(Clone)]
         pub struct SimpleAction { pub inner: PlatformSimpleAction }
         #[derive(Clone)]
@@ -168,6 +172,20 @@ macro_rules! common_types_mod {
                 self.inner.popup_at_pointer(widget, event)
             }
         }
+        impl Expander {
+            /// Show or hide the expander's child.
+            pub fn set_expanded(&self, expanded: bool) { self.inner.set_expanded(expanded); }
+            pub fn is_expanded(&self) -> bool { self.inner.is_expanded() }
+            pub fn set_label(&self, label: &str) { self.inner.set_label(label); }
+            /// Set the single child the expander reveals.
+            pub fn set_child(&self, child: &impl AsRef<*mut std::os::raw::c_void>) { self.inner.set_child(child); }
+            pub fn set_visible(&self, visible: bool) { self.inner.set_visible(visible); }
+            pub fn set_hexpand(&self, expand: bool) { self.inner.set_hexpand(expand); }
+            pub fn set_vexpand(&self, expand: bool) { self.inner.set_vexpand(expand); }
+        }
+        impl AsRef<*mut std::os::raw::c_void> for Expander {
+            fn as_ref(&self) -> &*mut std::os::raw::c_void { self.inner.as_ref() }
+        }
         impl SimpleAction {
             pub fn connect_activate<F: FnMut(*mut std::os::raw::c_void) + 'static>(&self, f: F) -> Result<u64, crate::Error> { self.inner.connect_activate(f) }
         }
@@ -231,22 +249,22 @@ mod common_types { common_types_mod!(); }
 mod common_types { common_types_mod!(); }
 
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander};
 
 #[cfg(all(windows, not(feature = "zork")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander};
 
 #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander};
 
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander};
 
 #[cfg(all(target_os = "android", not(feature = "zork")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander};
 
 #[cfg(feature = "zork")]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu, Expander};
 
 // Re-export Orientation from the active platform backend
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
