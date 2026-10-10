@@ -324,6 +324,12 @@ impl Applier {
     /// Absolute path of directory `id`, descending from the nearest cached
     /// ancestor. Non-UTF-8 names lose fidelity through this path (only used to
     /// reach real directories); the byte-exact crawler path does not.
+    ///
+    /// Terminates on a broken or cyclic parent chain by returning `None`. A
+    /// naive recursive walk would loop forever if an entry's parent chain never
+    /// reached a cached ancestor (an un-cached root, a self-parented entry) —
+    /// which turns a misconfigured root into a stack overflow instead of an
+    /// error. The depth bound is the index size: no real chain is longer.
     fn abs_path_for(&mut self, id: u32) -> Option<PathBuf> {
         if let Some(p) = self.dir_paths.get(&id) {
             return Some(p.clone());
@@ -333,6 +339,11 @@ impl Applier {
             let e = ix.entry(id)?;
             (ix.name(id).to_vec(), e.parent)
         };
+        // A single-entry cycle (an entry parented to itself) is the degenerate
+        // case that bites first; refuse it before recursing.
+        if parent == id {
+            return None;
+        }
         let parent_path = self.abs_path_for(parent)?;
         let mut p = parent_path;
         p.push(std::ffi::OsString::from(String::from_utf8_lossy(&name).into_owned()));
@@ -409,7 +420,8 @@ impl Applier {
         }
         // Use the hint to pick flags; the crawler will correct type later.
         let flags = EntryFlags::EMPTY.with_dir(is_dir_hint);
-        match ix.lookup(parent, &name) {
+        let lookup = ix.lookup(parent, &name);
+        let _new_id = match lookup {
             Some(id) => {
                 // Refresh the type if it changed (e.g. file → dir via rename).
                 let cur = ix.entry(id).unwrap().flags();
@@ -417,23 +429,29 @@ impl Applier {
                     let nf = EntryFlags(cur.0).with_dir(is_dir_hint);
                     ix.entry_mut(id).flags = nf.0;
                 }
-                let _ = id;
+                None
             }
             None => {
                 let id = ix.insert(parent, &name, flags);
-                drop(ix);
-                let rec = Record::Add {
-                    id,
-                    parent,
-                    name,
-                    flags: flags.0,
-                };
-                self.emit(rec);
-                return;
+                Some(id)
             }
-        }
+        };
         drop(ix);
-        // New directory: watch it, then crawl it to learn its children.
+        if let Some(id) = _new_id {
+            let rec = Record::Add { id, parent, name: name.clone(), flags: flags.0 };
+            self.emit(rec);
+        }
+
+        // A directory, new or re-typed: record its path so a later crawl/diff can
+        // reach it, ask the backend to watch it, and **crawl it** to learn its
+        // children.
+        //
+        // The crawl is not an optimization, it is load-bearing for a FID backend:
+        // a fanotify event names its parent by *file handle*, and the handle for a
+        // directory created after we started watching is only learned by asking
+        // for it — which the crawl does. Without this, every event for the new
+        // directory's children is unresolvable, and the subtree goes silently
+        // unseen. (A per-dir-watch backend gets the equivalent from its watch.)
         if is_dir_hint {
             let existing = {
                 let ix = self.shared.index.read().unwrap();
@@ -449,6 +467,7 @@ impl Applier {
                 self.pending.enqueue_crawl(id);
             }
         }
+        // (the id is not needed past this point; the crawl is what matters)
     }
 
     fn drop_subtree(&mut self, dir: u32) {

@@ -491,9 +491,23 @@ impl WatchBackend for FanotifyBackend {
         self.mark_filesystem(&root.path)
     }
 
-    fn watch_dir(&mut self, _id: u32, _path: &Path) -> io::Result<()> {
-        // Documented no-op: a filesystem mark already covers every directory.
-        // The applier learns this from `caps().per_dir_watch == false`.
+    fn watch_dir(&mut self, id: u32, path: &Path) -> io::Result<()> {
+        // Not a no-op, despite being a whole-mount backend.
+        //
+        // `watch_dir` is how the applier tells a backend "this directory
+        // exists". inotify turns that into a kernel watch. fanotify cannot — it
+        // already watches the whole mount — but it *can* and *must* do the
+        // equivalent per-directory bookkeeping: learn the directory's file
+        // handle, so future events that name it as a parent resolve. Skipping
+        // this is silent blindness: the directory is indexed, but every event
+        // about its children is unresolvable and dropped.
+        //
+        // The call is idempotent and cheap (one `name_to_handle_at`), and a
+        // failure is not fatal: an unresolvable event escalates to a rescan
+        // rather than being lost (§7).
+        if let Some(h) = crate::mount::handle_of_path(path) {
+            self.dir_of_fid.insert(HandleKey::of(&h), id);
+        }
         Ok(())
     }
 
