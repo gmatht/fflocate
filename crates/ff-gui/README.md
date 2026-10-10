@@ -48,6 +48,9 @@ depend on a checkout outside this repository.
 * Results render into a `TextView`, one path per row — a real scrollable list
   rather than one wrapping paragraph. `(no matches)` is shown as an explicit
   single line so it is never confused with an empty/absent daemon.
+* Press **Return** in either query field to search — the same code path as the
+  Search button, so the two cannot diverge. (In the `zork` fallback, `enter`
+  presses Return on the focused field.)
 * An **Advanced search** foldout (a native disclosure) holds a free-form query
   field for the full syntax (`ext:`, `path:`, `case:`, `regex:`, globs, phrases)
   together with a reminder of that syntax. Its contents are merged into the

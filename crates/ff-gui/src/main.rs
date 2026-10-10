@@ -125,16 +125,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     status.set_text(&initial_status);
 
-    // The Search button runs the query synchronously: the protocol is
-    // request/response, so there is nothing to await. (A push feed would use the
-    // `subscribe` op, which is still a v1.5 preview in the daemon.)
-    {
+    // The search runs synchronously: the protocol is request/response, so there
+    // is nothing to await. (A push feed would use the `subscribe` op, which is
+    // still a v1.5 preview in the daemon.) The same closure backs both the
+    // Search button and the Return key, so the two cannot drift apart.
+    let run_search: Rc<RefCell<Box<dyn FnMut()>>> = {
         let query = query.clone();
         let advanced_query = advanced_query.clone();
         let status = status.clone();
         let results = results.clone();
         let current = current.clone();
-        search.on_click(move || {
+        Rc::new(RefCell::new(Box::new(move || {
             let quick = query.get_text().unwrap_or_default();
             let adv = advanced_query.get_text().unwrap_or_default();
             let (q, shadowed) = effective_query(&quick, &adv);
@@ -158,7 +159,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     current.borrow_mut().clear();
                 }
             }
+        })))
+    };
+
+    {
+        let run_search = run_search.clone();
+        search.on_click(move || {
+            if let Ok(mut f) = run_search.try_borrow_mut() {
+                f();
+            }
         })?;
+    }
+
+    // Return in either query field runs the same search.
+    {
+        // GDK_KEY_Return / GDK_KEY_KP_Enter.
+        const KEYS: [u32; 2] = [0xFF0D, 0xFF8D];
+        for entry in [&query, &advanced_query] {
+            let run_search = run_search.clone();
+            entry.on_key_raw(Box::new(move |keyval, _state| {
+                if !KEYS.contains(&keyval) {
+                    return false;
+                }
+                if let Ok(mut f) = run_search.try_borrow_mut() {
+                    f();
+                }
+                // Claim the key so the entry does not also beep/act on it.
+                true
+            }));
+        }
     }
 
     // Warn live when both boxes hold text: the advanced one will run and the

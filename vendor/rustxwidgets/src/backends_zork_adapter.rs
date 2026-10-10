@@ -235,7 +235,10 @@ impl Entry {
     pub fn set_visible(&self, _visible: bool) {}
         pub fn set_size_request(&self, _w: i32, _h: i32) {}
         pub fn set_width_chars(&self, _w: i32) {}
-        pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
+        pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
+            // Fired by the REPL `enter` command with Return's keyval.
+            crate::backends::zork::set_key_cb(self.id, cb);
+        }
         pub fn set_margin_start(&self, _margin: i32) {}
         pub fn set_margin_top(&self, _margin: i32) {}
     pub fn add_class(&self, _class_name: &str) {}

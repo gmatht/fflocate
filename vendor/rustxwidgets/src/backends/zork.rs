@@ -45,6 +45,9 @@ pub struct ZorkNode {
     /// terminal, but storing it lets the `drag` command show what *would* be
     /// carried.
     pub drag_payload_cb: Option<Box<dyn FnMut() -> Option<(Vec<String>, String)>>>,
+    /// Raw key handler `(keyval, state) -> handled`. Fired by the `enter`
+    /// command (which passes Return), so Enter-to-search works in the REPL.
+    pub key_cb: Option<Box<dyn FnMut(u32, u32) -> bool>>,
 }
 
 pub struct ZorkState {
@@ -89,6 +92,7 @@ impl ZorkState {
             callbacks: Vec::new(),
             button_press_cb: None,
             drag_payload_cb: None,
+            key_cb: None,
         });
         if let Some(pid) = parent {
             if let Some(p) = self.nodes.iter_mut().find(|n| n.id == pid) {
@@ -151,8 +155,17 @@ impl crate::backends::BackendApp for ZorkApp {
                             std::cell::RefCell::new(None);
                         let pending_drag: std::cell::RefCell<bool> =
                             std::cell::RefCell::new(false);
+                        let pending_key: std::cell::RefCell<Option<(usize, u32)>> =
+                            std::cell::RefCell::new(None);
                         with_state(|s| {
-                            execute_command(s, &trimmed, &pending, &pending_press, &pending_drag)
+                            execute_command(
+                                s,
+                                &trimmed,
+                                &pending,
+                                &pending_press,
+                                &pending_drag,
+                                &pending_key,
+                            )
                         });
                         // Now that the state borrow is released, run any
                         // callbacks the command triggered. They may mutate the
@@ -164,6 +177,17 @@ impl crate::backends::BackendApp for ZorkApp {
                         // handler, likewise after the borrow is released.
                         if let Some((id, button, line)) = pending_press.into_inner() {
                             fire_button_press(id, button, 0.0, line);
+                        }
+                        // An `enter` fires the widget's key handler with Return.
+                        if let Some((id, keyval)) = pending_key.into_inner() {
+                            let (handled, had) = fire_key(id, keyval, 0);
+                            if !had {
+                                println!("No widget handles keys.");
+                            } else if handled {
+                                println!("You press Return.");
+                            } else {
+                                println!("Return was not handled.");
+                            }
                         }
                         // A `drag` command runs the press (to record the row)
                         // and only then prints the payload.
@@ -387,6 +411,7 @@ fn execute_command(
     pending_callbacks: &std::cell::RefCell<Vec<Callback>>,
     pending_press: &std::cell::RefCell<Option<(usize, u32, f64)>>,
     pending_drag: &std::cell::RefCell<bool>,
+    pending_key: &std::cell::RefCell<Option<(usize, u32)>>,
 ) {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
@@ -451,6 +476,25 @@ fn execute_command(
                     }
                 }
             }
+        }
+        "enter" | "return" => {
+            // Press Return on the current Entry (or the first widget that has a
+            // key handler), so Enter-to-search can be exercised in the REPL.
+            const KEY_RETURN: u32 = 0xFF0D;
+            let id = if state.node(state.current_id).map(|n| n.key_cb.is_some()).unwrap_or(false) {
+                state.current_id
+            } else {
+                match state.nodes.iter().find(|n| n.key_cb.is_some()) {
+                    Some(n) => n.id,
+                    None => {
+                        println!("No widget handles keys.");
+                        return;
+                    }
+                }
+            };
+            // Queue it: the handler runs after the state borrow is released
+            // (it calls back into the widget API, e.g. reading the Entry).
+            *pending_key.borrow_mut() = Some((id, KEY_RETURN));
         }
         "drag" | "dnd" => {
             // Show what a drag of `line` would carry. There is no other window
@@ -645,6 +689,7 @@ fn execute_command(
             println!("  click / press [n]     - press a button or open menu (default: current)");
             println!("  rightclick <line>     - right-click a row (context menu)");
             println!("  drag <line>           - show the drag payload for a row");
+            println!("  enter / return        - press Return in the current Entry");
             println!("  select / choose <n>   - select a menu item from a MenuBar/Menu");
             println!("  examine / x [n]       - examine something in detail");
             println!("  type / write          - enter text into an Entry (sub-prompt)");
@@ -1013,6 +1058,32 @@ pub fn set_button_press_cb(id: usize, cb: Box<dyn FnMut(u32, f64, f64)>) {
             n.button_press_cb = Some(cb);
         }
     });
+}
+
+/// Register a raw key handler on `id` (used for Return-to-search).
+pub fn set_key_cb(id: usize, cb: Box<dyn FnMut(u32, u32) -> bool>) {
+    with_state(|s| {
+        if let Some(n) = s.node_mut(id) {
+            n.key_cb = Some(cb);
+        }
+    });
+}
+
+/// Fire the raw key handler on `id` with `keyval`. Returns whether it claimed
+/// the key (and whether a handler existed at all).
+pub fn fire_key(id: usize, keyval: u32, state: u32) -> (bool, bool) {
+    let mut cb = with_state(|s| s.node_mut(id).and_then(|n| n.key_cb.take()));
+    let had = cb.is_some();
+    let handled = match cb.as_mut() {
+        Some(cb) => cb(keyval, state),
+        None => false,
+    };
+    with_state(|s| {
+        if let Some(n) = s.node_mut(id) {
+            n.key_cb = cb;
+        }
+    });
+    (handled, had)
 }
 
 /// Register a drag-payload supplier on `id`.
