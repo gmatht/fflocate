@@ -197,9 +197,97 @@ impl SearchOutcome {
     }
 }
 
+/// What the results context menu offers for a row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowAction {
+    /// Copy the row's absolute path to the clipboard.
+    CopyPath,
+    /// Open the row's file with the desktop's default handler.
+    Open,
+    /// Open the directory containing the row's file.
+    OpenContainingFolder,
+}
+
+impl RowAction {
+    /// The menu label.
+    pub fn label(self) -> &'static str {
+        match self {
+            RowAction::CopyPath => "Copy path",
+            RowAction::Open => "Open",
+            RowAction::OpenContainingFolder => "Open containing folder",
+        }
+    }
+
+    /// The program and arguments to run for this action on `path`.
+    ///
+    /// Both Open and Open-containing-folder go through `xdg-open`, which
+    /// dispatches on a file or a directory identically.
+    pub fn command(self, path: &str) -> (&'static str, Vec<String>) {
+        match self {
+            // Copy is handled in-process (clipboard); no external command.
+            RowAction::CopyPath => ("", Vec::new()),
+            RowAction::Open => ("xdg-open", vec![path.to_string()]),
+            RowAction::OpenContainingFolder => {
+                // A bare name's parent is "" (not None), so fall back to the
+                // path itself in that case too: xdg-open "." would be worse.
+                let dir = match Path::new(path).parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p.to_string_lossy().into_owned(),
+                    _ => path.to_string(),
+                };
+                ("xdg-open", vec![dir])
+            }
+        }
+    }
+}
+
+/// The result row a click at `line` (0-based) lands on, given `paths` and the
+/// number of extra trailer lines the view appends (the "… N more" line).
+///
+/// Returns `None` when the line is past the last row — clicking blank space (or
+/// the trailer) opens nothing rather than silently acting on the wrong file.
+pub fn row_at_line(paths: &[String], line: i32) -> Option<&str> {
+    if line < 0 {
+        return None;
+    }
+    paths.get(line as usize).map(|s| s.as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_at_line_picks_the_clicked_row() {
+        let rows = vec!["/a.rs".to_string(), "/b.rs".to_string()];
+        assert_eq!(row_at_line(&rows, 0), Some("/a.rs"));
+        assert_eq!(row_at_line(&rows, 1), Some("/b.rs"));
+        // Past the last row (blank space, or the "… N more" trailer line).
+        assert_eq!(row_at_line(&rows, 2), None);
+        // A click above the first row, or a negative coordinate.
+        assert_eq!(row_at_line(&rows, -1), None);
+    }
+
+    #[test]
+    fn row_action_labels_and_commands() {
+        assert_eq!(RowAction::CopyPath.label(), "Copy path");
+        // Copy needs no external command.
+        assert_eq!(RowAction::CopyPath.command("/a/b.rs").0, "");
+        // Open launches the file itself...
+        let (prog, args) = RowAction::Open.command("/a/b.rs");
+        assert_eq!(prog, "xdg-open");
+        assert_eq!(args, vec!["/a/b.rs".to_string()]);
+        // ...while "containing folder" launches the parent directory.
+        let (prog, args) = RowAction::OpenContainingFolder.command("/a/b.rs");
+        assert_eq!(prog, "xdg-open");
+        assert_eq!(args, vec!["/a".to_string()]);
+    }
+
+    #[test]
+    fn open_containing_folder_of_a_bare_name_is_the_name() {
+        // A path with no parent directory falls back to the path itself.
+        let (_, args) = RowAction::OpenContainingFolder.command("b.rs");
+        assert_eq!(args, vec!["b.rs".to_string()]);
+    }
 
     #[test]
     fn status_line_reports_totals() {

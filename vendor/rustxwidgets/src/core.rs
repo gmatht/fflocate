@@ -932,6 +932,44 @@ pub fn create_textview(&self) -> Result<crate::backends_android_adapter::TextVie
         }
     }
 
+    /// Create a new right-click context menu.
+    ///
+    /// Unlike [`new_menu`](Self::new_menu) its items are backed directly by
+    /// closures, so it needs no application action group and can be popped up
+    /// against any widget.
+    pub fn new_context_menu(&self) -> Result<crate::common::ContextMenu, Error> {
+        #[cfg(feature = "zork")]
+        {
+            let inner = crate::backends_zork_adapter::create_context_menu()?;
+            return Ok(crate::common::ContextMenu { inner });
+        }
+        #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+        {
+            let inner = crate::backends_gtk_adapter::create_context_menu()?;
+            return Ok(crate::common::ContextMenu { inner });
+        }
+        #[cfg(all(windows, not(feature = "zork")))]
+        {
+            let inner = crate::backends_nwg_adapter::create_context_menu()?;
+            Ok(crate::common::ContextMenu { inner })
+        }
+        #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
+        {
+            let inner = crate::backends_pancurses_adapter::create_context_menu()?;
+            Ok(crate::common::ContextMenu { inner })
+        }
+        #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
+        {
+            let inner = crate::backends_wasm_adapter::create_context_menu()?;
+            Ok(crate::common::ContextMenu { inner })
+        }
+        #[cfg(all(target_os = "android", not(feature = "zork")))]
+        {
+            let inner = crate::backends_android_adapter::create_context_menu()?;
+            Ok(crate::common::ContextMenu { inner })
+        }
+    }
+
     /// Create a new SimpleAction that will dispatch to the given name.
     /// On Windows the action is registered in the shared action registry.
     pub fn new_simple_action(&self, name: &str) -> Result<crate::common::SimpleAction, Error> {

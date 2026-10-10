@@ -3,7 +3,7 @@
 // Platform-specific type re-exports using cfg
 macro_rules! platform_module {
     ($backend:path, $Orientation:ident) => {
-        pub use $backend::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, Orientation as $Orientation};
+        pub use $backend::{Window, BoxWidget, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, DropDown, CheckButton, RadioButton, TextView, ContextMenu, Orientation as $Orientation};
         pub type PlatformWindow = Window;
         pub type PlatformWidgetBox = BoxWidget;
         pub type PlatformLabel = Label;
@@ -17,6 +17,7 @@ macro_rules! platform_module {
         pub type PlatformCheckButton = CheckButton;
         pub type PlatformRadioButton = RadioButton;
         pub type PlatformTextView = TextView;
+        pub type PlatformContextMenu = ContextMenu;
     };
 }
 
@@ -69,6 +70,9 @@ macro_rules! common_types_mod {
         pub struct Canvas { pub inner: PlatformCanvas }
         #[derive(Clone)]
         pub struct Menu { pub inner: PlatformMenu }
+        /// A right-click context menu: items are backed directly by closures.
+        /// Not `Clone` — the closures are owned by the menu.
+        pub struct ContextMenu { pub inner: PlatformContextMenu }
         #[derive(Clone)]
         pub struct SimpleAction { pub inner: PlatformSimpleAction }
         #[derive(Clone)]
@@ -155,6 +159,15 @@ macro_rules! common_types_mod {
             pub fn append(&mut self, label: &str, detailed_action: &str) { self.inner.append(label, detailed_action); }
             pub fn append_submenu(&mut self, label: &str, submenu: &Menu) { self.inner.append_submenu(label, &submenu.inner); }
         }
+        impl ContextMenu {
+            /// Append an item; `cb` runs when the item is activated.
+            pub fn append_item(&mut self, label: &str, cb: Box<dyn FnMut()>) { self.inner.append_item(label, cb); }
+            /// Pop the menu up at the pointer of `event` (a GdkEvent in the
+            /// GTK backend; ignored elsewhere), anchored to `widget`.
+            pub fn popup_at_pointer(&mut self, widget: *mut std::os::raw::c_void, event: *mut std::os::raw::c_void) -> Result<(), crate::Error> {
+                self.inner.popup_at_pointer(widget, event)
+            }
+        }
         impl SimpleAction {
             pub fn connect_activate<F: FnMut(*mut std::os::raw::c_void) + 'static>(&self, f: F) -> Result<u64, crate::Error> { self.inner.connect_activate(f) }
         }
@@ -218,22 +231,22 @@ mod common_types { common_types_mod!(); }
 mod common_types { common_types_mod!(); }
 
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu};
 
 #[cfg(all(windows, not(feature = "zork")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu};
 
 #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu};
 
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu};
 
 #[cfg(all(target_os = "android", not(feature = "zork")))]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu};
 
 #[cfg(feature = "zork")]
-pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog};
+pub use common_types::{Window, WidgetBox, Label, Entry, Canvas, Menu, SimpleAction, MenuBar, Dialog, ContextMenu};
 
 // Re-export Orientation from the active platform backend
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]

@@ -1936,6 +1936,119 @@ pub unsafe fn connect_gesture_click_pressed(
     }
 }
 
+/// The 0-based line of the text at `(x, y)` in a `GtkTextView`.
+///
+/// GTK reports the click position in widget coordinates (already compensating
+/// for scrolling), so no adjustment arithmetic is needed. Returns `None` if the
+/// required symbols are unavailable or the text view has no buffer.
+///
+/// `GtkTextIter` is an opaque caller-allocated struct; GTK3's is 80 bytes on
+/// LP64 (gtktextiter.h). We allocate a generously sized, correctly aligned
+/// buffer for it.
+pub unsafe fn text_view_line_at_location(
+    loader: &Arc<Loader>,
+    text_view: *mut c_void,
+    x: f64,
+    y: f64,
+) -> Option<i32> {
+    let get_iter = loader.symbols.gtk_text_view_get_iter_at_location?;
+    let get_line = loader.symbols.gtk_text_iter_get_line?;
+
+    // 80 bytes is GTK3's GtkTextIter size; round up for safety and align to a
+    // pointer. Extra bytes are harmless (GTK only writes its own struct).
+    #[repr(C, align(8))]
+    struct IterBuf([u8; 128]);
+    let mut buf = IterBuf([0u8; 128]);
+
+    unsafe {
+        get_iter(
+            text_view,
+            buf.0.as_mut_ptr() as *mut c_void,
+            x as i32,
+            y as i32,
+        );
+        Some(get_line(buf.0.as_mut_ptr() as *mut c_void))
+    }
+}
+
+/// Which mouse button produced a GDK button event (1 = left, 3 = right).
+/// Returns `None` if the symbol is unavailable or the event is not a button
+/// event.
+pub unsafe fn gdk_event_get_button(loader: &Arc<Loader>, event: *mut c_void) -> Option<u32> {
+    let get_button = loader.symbols.gdk_event_get_button?;
+    let b = unsafe { get_button(event) };
+    Some(b)
+}
+
+/// Connect a `button-press-event` handler that receives the raw GdkEvent, so
+/// the callback can inspect the button and coordinates (e.g. to open a
+/// context menu on right-click). Returns the signal handler id.
+///
+/// Unlike [`connect_signal`], this passes the event pointer through
+/// [`crate::signals::connect_signal_param`]. It works on any `GtkWidget`.
+pub unsafe fn connect_widget_button_press_event(
+    loader: &Arc<Loader>,
+    widget: *mut c_void,
+    cb: Box<dyn FnMut(*mut c_void)>,
+) -> Result<u64, Error> {
+    // GTK3 needs the widget declared to receive button-press events.
+    if let Some(add_events) = loader.symbols.gtk_widget_add_events {
+        const GDK_BUTTON_PRESS_MASK: i32 = 1 << 6;
+        unsafe { add_events(widget, GDK_BUTTON_PRESS_MASK); }
+    }
+    let res = unsafe {
+        crate::signals::connect_signal_param(&loader.symbols, widget, "button-press-event", cb)
+    };
+    res.map_err(Error::Other)
+}
+
+/// Put `text` on the default clipboard (CLIPBOARD selection).
+///
+/// `gtk_clipboard_get` takes a GdkAtom; GDK_SELECTION_CLIPBOARD is the interned
+/// atom 69 (the value is documented and stable for GTK3), obtained via
+/// `gdk_atom_intern`, which we look up lazily.
+pub unsafe fn clipboard_set_text(loader: &Arc<Loader>, text: &str) -> Result<(), Error> {
+    let get = loader
+        .symbols
+        .gtk_clipboard_get
+        .ok_or(Error::MissingSymbol("gtk_clipboard_get".into()))?;
+    let set = loader
+        .symbols
+        .gtk_clipboard_set_text
+        .ok_or(Error::MissingSymbol("gtk_clipboard_set_text".into()))?;
+
+    // GDK_SELECTION_CLIPBOARD as an interned atom. 69 is the stable value in
+    // GDK; fall back to interning "CLIPBOARD" when gdk_atom_intern is present.
+    type GdkAtomIntern = unsafe extern "C" fn(name: *const std::os::raw::c_char, only_if_exists: i32) -> *mut c_void;
+    let atom = loader
+        .libs
+        .get("libgdk")
+        .and_then(|l| unsafe { l.get::<GdkAtomIntern>(b"gdk_atom_intern").ok().map(|s| *s) })
+        .or_else(|| {
+            loader.libs.get("libgtk").and_then(|l| unsafe {
+                l.get::<GdkAtomIntern>(b"gdk_atom_intern").ok().map(|s| *s)
+            })
+        });
+    let sel = match atom {
+        Some(intern_atom) => {
+            let name = CString::new("CLIPBOARD").unwrap();
+            unsafe { intern_atom(name.as_ptr(), 0) }
+        }
+        None => 69usize as *mut c_void,
+    };
+
+    let clipboard = unsafe { get(sel) };
+    if clipboard.is_null() {
+        return Err(Error::Other("gtk_clipboard_get returned null".into()));
+    }
+    let c = CString::new(text).map_err(|_| Error::Other("clipboard text contains NUL".into()))?;
+    unsafe { set(clipboard, c.as_ptr(), text.len() as i32); }
+    if let Some(store) = loader.symbols.gtk_clipboard_store {
+        unsafe { store(clipboard); }
+    }
+    Ok(())
+}
+
 /// Get coordinates from a GDK event. Returns `None` if the symbol is unavailable.
 pub unsafe fn gdk_event_get_coords(loader: &Arc<Loader>, event: *mut c_void) -> Option<(f64, f64)> {
     type GetEventCoords = unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
@@ -2098,6 +2211,88 @@ impl Clone for MenuItem {
             detailed_action: self.detailed_action.clone(),
             submenu: self.submenu.clone(),
         }
+    }
+}
+
+/// A plain GTK3 context menu: a `GtkMenu` whose items are backed directly by
+/// Rust closures, rather than by `GAction`s on an application.
+///
+/// [Menu] (a `GMenu` model) needs an action group registered on a
+/// `GtkApplication` for its items to fire. For a right-click menu on a widget
+/// there is no application to hang actions off, so build the `GtkMenu`
+/// directly and connect each item's `activate` signal to a closure. The item
+/// owns the handler and the menu owns the item, so the closures live exactly as
+/// long as the menu (freed by the destroy-notify that `connect_signal`
+/// installs).
+pub struct ContextMenu {
+    inner: *mut c_void,
+    loader: Arc<Loader>,
+}
+
+impl ContextMenu {
+    pub fn new(loader: Arc<Loader>) -> Result<Self, Error> {
+        let ctor = loader
+            .symbols
+            .gtk_menu_new
+            .ok_or(Error::MissingSymbol("gtk_menu_new".into()))?;
+        let inner = unsafe { ctor() };
+        if inner.is_null() {
+            return Err(Error::Other("gtk_menu_new returned null".into()));
+        }
+        // Sink the floating reference so our `Drop` can balance it (the same
+        // bookkeeping `Menu::new` does via `take_ownership`).
+        unsafe { take_ownership(&loader.symbols, &loader.version, inner); }
+        Ok(ContextMenu { inner, loader })
+    }
+
+    /// Append an item labelled `label`; `cb` runs when the item is activated.
+    pub fn append_item(&mut self, label: &str, cb: Box<dyn FnMut()>) {
+        let (Some(new_item), Some(shell_append)) = (
+            self.loader.symbols.gtk_menu_item_new_with_label,
+            self.loader.symbols.gtk_menu_shell_append,
+        ) else {
+            return;
+        };
+        let c = match CString::new(label) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let item = unsafe { new_item(c.as_ptr()) };
+        if item.is_null() {
+            return;
+        }
+        // "activate" passes only (instance, user_data), so the 2-arg
+        // trampoline is the right one (the 3-arg variant would read user_data
+        // from the wrong slot). `connect_signal` takes ownership of the
+        // closure; the item's destroy-notify frees it when the menu is dropped.
+        let _ = unsafe {
+            crate::signals::connect_signal(&self.loader.symbols, item, "activate", cb, 2)
+        };
+        unsafe { shell_append(self.inner, item); }
+    }
+
+    pub fn ptr(&self) -> *mut c_void { self.inner }
+
+    /// Pop this menu up at the pointer location of `event`, anchored to
+    /// `widget` so its actions and lifetime follow that window.
+    pub fn popup_at_pointer(&self, widget: *mut c_void, event: *mut c_void) -> Result<(), Error> {
+        let popup = self
+            .loader
+            .symbols
+            .gtk_menu_popup_at_pointer
+            .ok_or(Error::MissingSymbol("gtk_menu_popup_at_pointer".into()))?;
+        if let Some(attach) = self.loader.symbols.gtk_menu_attach_to_widget {
+            unsafe { attach(self.inner, widget, std::ptr::null_mut()); }
+        }
+        unsafe { popup(self.inner, event); }
+        Ok(())
+    }
+}
+
+impl Drop for ContextMenu {
+    fn drop(&mut self) {
+        unsafe { crate::wrappers::unref_widget(&self.loader, self.inner); }
+        self.inner = std::ptr::null_mut();
     }
 }
 

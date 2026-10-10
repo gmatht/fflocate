@@ -399,6 +399,38 @@ mod gtk_adapter {
         Ok(Menu(m))
     }
 
+    // ---- Context menu (right-click) ----
+
+    /// A `GtkMenu` whose items are backed directly by closures. Unlike [`Menu`]
+    /// it needs no application action group, so it can be popped up anywhere.
+    pub struct ContextMenu(pub gtk_dynamic_loader::ContextMenu);
+
+    impl ContextMenu {
+        /// Append an item; `cb` runs when it is activated.
+        pub fn append_item(&mut self, label: &str, cb: Box<dyn FnMut()>) {
+            self.0.append_item(label, cb);
+        }
+
+        /// Pop the menu up at the pointer of `event`, anchored to `widget`.
+        pub fn popup_at_pointer(
+            &self,
+            widget: *mut std::ffi::c_void,
+            event: *mut std::ffi::c_void,
+        ) -> Result<(), Error> {
+            self.0
+                .popup_at_pointer(widget, event)
+                .map_err(|e| Error::Backend(format!("{}", e)))
+        }
+    }
+
+    pub fn create_context_menu() -> Result<ContextMenu, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+        gtk_dynamic_loader::ContextMenu::new(loader)
+            .map(ContextMenu)
+            .map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
     #[repr(transparent)]
     pub struct MenuBar(pub gtk_dynamic_loader::MenuBar);
 
@@ -570,6 +602,55 @@ mod gtk_adapter {
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+
+        /// Run `cb` on a `button-press-event`, passing the mouse button number
+        /// (1 = left, 3 = right), the (x, y) coordinates in widget space, and
+        /// the raw `GdkEvent` pointer (needed to anchor a context-menu popup).
+        /// Used to open a context menu on right-click.
+        pub fn connect_button_press_event(
+            &self,
+            mut cb: impl FnMut(u32, f64, f64, *mut std::ffi::c_void) + 'static,
+        ) -> Result<u64, Error> {
+            let loader = crate::backends::gtk::loader()
+                .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+            let widget = *self.0.as_ref();
+            let cb_loader = loader.clone();
+            let wrapper: Box<dyn FnMut(*mut std::ffi::c_void)> = Box::new(move |event| {
+                if event.is_null() {
+                    return;
+                }
+                let button = unsafe {
+                    gtk_dynamic_loader::gdk_event_get_button(&cb_loader, event)
+                }
+                .unwrap_or(0);
+                let (x, y) = unsafe {
+                    gtk_dynamic_loader::gdk_event_get_coords(&cb_loader, event)
+                }
+                .unwrap_or((0.0, 0.0));
+                cb(button, x, y, event);
+            });
+            let id = unsafe {
+                gtk_dynamic_loader::connect_widget_button_press_event(&loader, widget, wrapper)
+            }
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+            Ok(id)
+        }
+
+        /// The 0-based line of text at widget coordinates `(x, y)`, or `None`
+        /// if it cannot be determined. Used to find the row under a right-click.
+        pub fn line_at(&self, x: f64, y: f64) -> Option<i32> {
+            let loader = crate::backends::gtk::loader()?;
+            let widget = *self.0.as_ref();
+            unsafe { gtk_dynamic_loader::text_view_line_at_location(&loader, widget, x, y) }
+        }
+
+        /// Copy `text` to the system clipboard.
+        pub fn clipboard_set_text(&self, text: &str) -> Result<(), Error> {
+            let loader = crate::backends::gtk::loader()
+                .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+            unsafe { gtk_dynamic_loader::clipboard_set_text(&loader, text) }
+                .map_err(|e| Error::Backend(format!("{}", e)))
+        }
     }
 
     pub fn create_textview() -> Result<TextView, Error> {

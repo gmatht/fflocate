@@ -36,6 +36,9 @@ pub struct ZorkNode {
     pub parent: Option<usize>,
     pub children: Vec<usize>,
     pub callbacks: Vec<Callback>,
+    /// Handler for a `button-press-event`, invoked by the `rightclick`
+    /// command. The REPL has no pointer, so the caller supplies the row.
+    pub button_press_cb: Option<Box<dyn FnMut(u32, f64, f64)>>,
 }
 
 pub struct ZorkState {
@@ -78,6 +81,7 @@ impl ZorkState {
             parent,
             children: Vec::new(),
             callbacks: Vec::new(),
+            button_press_cb: None,
         });
         if let Some(pid) = parent {
             if let Some(p) = self.nodes.iter_mut().find(|n| n.id == pid) {
@@ -136,12 +140,19 @@ impl crate::backends::BackendApp for ZorkApp {
                         rl.add_history_entry(&trimmed)?;
                         let pending: std::cell::RefCell<Vec<Callback>> =
                             std::cell::RefCell::new(Vec::new());
-                        with_state(|s| execute_command(s, &trimmed, &pending));
+                        let pending_press: std::cell::RefCell<Option<(usize, u32, f64)>> =
+                            std::cell::RefCell::new(None);
+                        with_state(|s| execute_command(s, &trimmed, &pending, &pending_press));
                         // Now that the state borrow is released, run any
                         // callbacks the command triggered. They may mutate the
                         // widget tree (the whole point of a Search button).
                         for mut cb in pending.into_inner() {
                             cb();
+                        }
+                        // A `rightclick` fires the widget's button-press
+                        // handler, likewise after the borrow is released.
+                        if let Some((id, button, line)) = pending_press.into_inner() {
+                            fire_button_press(id, button, 0.0, line);
                         }
                     }
                 }
@@ -334,6 +345,7 @@ fn execute_command(
     state: &mut ZorkState,
     line: &str,
     pending_callbacks: &std::cell::RefCell<Vec<Callback>>,
+    pending_press: &std::cell::RefCell<Option<(usize, u32, f64)>>,
 ) {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.is_empty() {
@@ -398,6 +410,39 @@ fn execute_command(
                     }
                 }
             }
+        }
+        "rightclick" | "rclick" => {
+            // The REPL has no pointer, so the row must be given: `rightclick
+            // <line>` fires the widget's button-press handler with button 3
+            // (right) at that row. `line` is 0-based, matching `line_at`.
+            let line: i32 = match args.first().and_then(|a| a.parse().ok()) {
+                Some(n) => n,
+                None => {
+                    println!("Usage: rightclick <line>   (0-based row; fires button 3)");
+                    return;
+                }
+            };
+            // Prefer the current node, but fall back to the first widget that
+            // has a handler: in a REPL the user cannot always stand on the
+            // exact row view they mean to right-click.
+            let id = if state
+                .node(state.current_id)
+                .map(|n| n.button_press_cb.is_some())
+                .unwrap_or(false)
+            {
+                state.current_id
+            } else {
+                match state.nodes.iter().find(|n| n.button_press_cb.is_some()) {
+                    Some(n) => n.id,
+                    None => {
+                        println!("No widget has a button-press handler.");
+                        return;
+                    }
+                }
+            };
+            // The callback runs after the borrow is released (see the driver),
+            // so a handler that touches the widget tree cannot deadlock.
+            *pending_press.borrow_mut() = Some((id, 3, line as f64));
         }
         "select" | "choose" => {
             if args.is_empty() {
@@ -886,6 +931,32 @@ pub fn add_callback(id: usize, cb: Box<dyn FnMut()>) {
             n.callbacks.push(cb);
         }
     });
+}
+
+/// Register a `button-press-event` handler on `id`. The REPL fires it through
+/// the `rightclick` command; the button and coordinates come from that command
+/// (there is no real pointer to read).
+pub fn set_button_press_cb(id: usize, cb: Box<dyn FnMut(u32, f64, f64)>) {
+    with_state(|s| {
+        if let Some(n) = s.node_mut(id) {
+            n.button_press_cb = Some(cb);
+        }
+    });
+}
+
+/// Fire the button-press handler registered on `id`, if any. `button` is the
+/// mouse button (3 = right), `line` is the row the caller is pointing at.
+pub fn fire_button_press(id: usize, button: u32, x: f64, y: f64) {
+    let cb = with_state(|s| s.node_mut(id).and_then(|n| n.button_press_cb.take()));
+    if let Some(mut cb) = cb {
+        cb(button, x, y);
+        // Put it back for the next invocation.
+        with_state(|s| {
+            if let Some(n) = s.node_mut(id) {
+                n.button_press_cb = Some(cb);
+            }
+        });
+    }
 }
 
 pub fn set_entry_text(id: usize, text: &str) {

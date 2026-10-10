@@ -970,6 +970,24 @@ mod nwg_adapter {
         pub fn set_editable(&self, editable: bool) { self.inner.set_readonly(!editable); }
         pub fn set_size_request(&self, _w: i32, _h: i32) {}
         pub fn set_wrap_mode(&self, _mode: i32) {}
+
+        /// No button-press events on this backend.
+        pub fn connect_button_press_event(
+            &self,
+            _cb: impl FnMut(u32, f64, f64, *mut std::ffi::c_void) + 'static,
+        ) -> Result<u64, Error> {
+            Ok(0)
+        }
+
+        /// No pixel coordinates on this backend.
+        pub fn line_at(&self, _x: f64, _y: f64) -> Option<i32> {
+            None
+        }
+
+        /// No system clipboard on this backend.
+        pub fn clipboard_set_text(&self, _text: &str) -> Result<(), Error> {
+            Err(Error::Backend("clipboard not supported on this backend".into()))
+        }
     }
 
     impl AsRef<*mut c_void> for TextView {
@@ -1905,6 +1923,33 @@ mod nwg_adapter {
     impl Clone for Menu { fn clone(&self) -> Self { Menu { items: self.items.iter().map(|i| MenuItem {
         label: i.label.clone(), action: i.action.clone(), submenu: i.submenu.clone(),
     }).collect() } } }
+
+    // -- Context menu (right-click) --
+
+    /// Context-menu placeholder for backends without a pointer: items can be added
+    /// but there is nothing to pop them up against, so `popup_at_pointer` is a
+    /// no-op. Kept so the same `ff-gui` code compiles on every backend.
+    pub struct ContextMenu {
+        _items: Vec<(String, Box<dyn FnMut()>)>,
+    }
+
+    impl ContextMenu {
+        pub fn append_item(&mut self, label: &str, cb: Box<dyn FnMut()>) {
+            self._items.push((label.to_string(), cb));
+        }
+
+        pub fn popup_at_pointer(
+            &mut self,
+            _widget: *mut std::ffi::c_void,
+            _event: *mut std::ffi::c_void,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    pub fn create_context_menu() -> Result<ContextMenu, Error> {
+        Ok(ContextMenu { _items: Vec::new() })
+    }
 
     pub fn create_menu() -> Result<Menu, Error> { Ok(Menu { items: Vec::new() }) }
 

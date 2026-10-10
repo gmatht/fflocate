@@ -97,6 +97,18 @@ pub type GtkScrolledWindowGetVadjustment = unsafe extern "C" fn(sw: *mut c_void)
 pub type GtkScrolledWindowGetHadjustment = unsafe extern "C" fn(sw: *mut c_void) -> *mut c_void;
 pub type GtkAdjustmentGetValue = unsafe extern "C" fn(adj: *mut c_void) -> f64;
 pub type GtkGestureClickNew = unsafe extern "C" fn() -> *mut c_void;
+// Context-menu (right-click) support: build a GtkMenu from the GMenuModel a
+// `ContextMenu` produces, and show it at the pointer. gtk_menu_attach_to_widget
+// ties the menu's lifetime (and action lookup) to a widget in the window.
+pub type GtkMenuNewFromModel = unsafe extern "C" fn(model: *mut c_void) -> *mut c_void;
+pub type GtkMenuPopupAtPointer = unsafe extern "C" fn(menu: *mut c_void, event: *mut c_void);
+pub type GtkMenuAttachToWidget = unsafe extern "C" fn(menu: *mut c_void, widget: *mut c_void, detacher: *mut c_void);
+// Clipboard: gtk_clipboard_get takes a GdkAtom (a *mut c_void in the C API).
+pub type GtkClipboardGet = unsafe extern "C" fn(selection: *mut c_void) -> *mut c_void;
+pub type GtkClipboardSetText = unsafe extern "C" fn(clipboard: *mut c_void, text: *const std::os::raw::c_char, len: i32);
+pub type GtkClipboardStore = unsafe extern "C" fn(clipboard: *mut c_void);
+// Which mouse button produced a GdkEventButton (1=left, 3=right).
+pub type GdkEventGetButton = unsafe extern "C" fn(event: *mut c_void) -> u32;
 pub type GtkWidgetSetCanTarget = unsafe extern "C" fn(widget: *mut c_void, can_target: i32);
 pub type GtkWidgetSetHalign = unsafe extern "C" fn(widget: *mut c_void, align: i32);
 pub type GtkWidgetSetValign = unsafe extern "C" fn(widget: *mut c_void, align: i32);
@@ -148,6 +160,11 @@ pub type GtkTextBufferGetEndIter = unsafe extern "C" fn(buffer: *mut c_void, ite
 pub type GtkTextIterCopy = unsafe extern "C" fn(iter: *mut c_void) -> *mut c_void;
 pub type GtkTextIterFree = unsafe extern "C" fn(iter: *mut c_void);
 pub type GtkTextViewSetWrapMode = unsafe extern "C" fn(text_view: *mut c_void, wrap_mode: i32);
+// Map a click to a line: get_iter_at_location fills a caller-allocated
+// GtkTextIter for the (x, y) position; get_line reads its 0-based line number.
+pub type GtkTextViewGetIterAtLocation =
+    unsafe extern "C" fn(text_view: *mut c_void, iter: *mut c_void, x: i32, y: i32);
+pub type GtkTextIterGetLine = unsafe extern "C" fn(iter: *mut c_void) -> i32;
 
 // GtkWidget helper for visibility/event handling
 pub type GtkWidgetSetCanFocus = unsafe extern "C" fn(widget: *mut c_void, can_focus: i32);
@@ -365,6 +382,13 @@ pub struct Symbols {
     pub gdk_frame_clock_begin_updating: Option<GdkFrameClockBeginUpdating>,
     pub gdk_frame_clock_end_updating: Option<GdkFrameClockEndUpdating>,
     pub gtk_gesture_click_new: Option<GtkGestureClickNew>,
+    pub gtk_menu_new_from_model: Option<GtkMenuNewFromModel>,
+    pub gtk_menu_popup_at_pointer: Option<GtkMenuPopupAtPointer>,
+    pub gtk_menu_attach_to_widget: Option<GtkMenuAttachToWidget>,
+    pub gtk_clipboard_get: Option<GtkClipboardGet>,
+    pub gtk_clipboard_set_text: Option<GtkClipboardSetText>,
+    pub gtk_clipboard_store: Option<GtkClipboardStore>,
+    pub gdk_event_get_button: Option<GdkEventGetButton>,
     pub gtk_scrolled_window_new: Option<GtkScrolledWindowNew>,
     pub gtk_scrolled_window_set_policy: Option<GtkScrolledWindowSetPolicy>,
     pub gtk_scrolled_window_set_child: Option<GtkScrolledWindowSetChild>,
@@ -419,6 +443,8 @@ pub struct Symbols {
     pub gtk_text_iter_copy: Option<GtkTextIterCopy>,
     pub gtk_text_iter_free: Option<GtkTextIterFree>,
     pub gtk_text_view_set_wrap_mode: Option<GtkTextViewSetWrapMode>,
+    pub gtk_text_view_get_iter_at_location: Option<GtkTextViewGetIterAtLocation>,
+    pub gtk_text_iter_get_line: Option<GtkTextIterGetLine>,
 
     // Widget helpers
     pub gtk_widget_set_hexpand: Option<GtkWidgetSetHexpand>,
@@ -612,6 +638,13 @@ impl Symbols {
         let gdk_frame_clock_begin_updating = unsafe { sym::<GdkFrameClockBeginUpdating>(gtk, "gdk_frame_clock_begin_updating") };
         let gdk_frame_clock_end_updating = unsafe { sym::<GdkFrameClockEndUpdating>(gtk, "gdk_frame_clock_end_updating") };
         let gtk_gesture_click_new = unsafe { sym::<GtkGestureClickNew>(gtk, "gtk_gesture_click_new") };
+        let gtk_menu_new_from_model = unsafe { sym::<GtkMenuNewFromModel>(gtk, "gtk_menu_new_from_model") };
+        let gtk_menu_popup_at_pointer = unsafe { sym::<GtkMenuPopupAtPointer>(gtk, "gtk_menu_popup_at_pointer") };
+        let gtk_menu_attach_to_widget = unsafe { sym::<GtkMenuAttachToWidget>(gtk, "gtk_menu_attach_to_widget") };
+        let gtk_clipboard_get = unsafe { sym::<GtkClipboardGet>(gtk, "gtk_clipboard_get") };
+        let gtk_clipboard_set_text = unsafe { sym::<GtkClipboardSetText>(gtk, "gtk_clipboard_set_text") };
+        let gtk_clipboard_store = unsafe { sym::<GtkClipboardStore>(gtk, "gtk_clipboard_store") };
+        let gdk_event_get_button = open_sym_try!(libs, "libgdk", GdkEventGetButton, "gdk_event_get_button").or_else(|| unsafe { sym::<GdkEventGetButton>(gtk, "gdk_event_get_button") });
         let gtk_scrolled_window_new = unsafe { sym::<GtkScrolledWindowNew>(gtk, "gtk_scrolled_window_new") };
         let gtk_scrolled_window_set_policy = unsafe { sym::<GtkScrolledWindowSetPolicy>(gtk, "gtk_scrolled_window_set_policy") };
         let gtk_scrolled_window_set_child = unsafe { sym::<GtkScrolledWindowSetChild>(gtk, "gtk_scrolled_window_set_child") };
@@ -690,6 +723,8 @@ impl Symbols {
         let gtk_text_iter_copy = unsafe { sym::<GtkTextIterCopy>(gtk, "gtk_text_iter_copy") };
         let gtk_text_iter_free = unsafe { sym::<GtkTextIterFree>(gtk, "gtk_text_iter_free") };
         let gtk_text_view_set_wrap_mode = unsafe { sym::<GtkTextViewSetWrapMode>(gtk, "gtk_text_view_set_wrap_mode") };
+        let gtk_text_view_get_iter_at_location = unsafe { sym::<GtkTextViewGetIterAtLocation>(gtk, "gtk_text_view_get_iter_at_location") };
+        let gtk_text_iter_get_line = unsafe { sym::<GtkTextIterGetLine>(gtk, "gtk_text_iter_get_line") };
 
         // Widget helpers
         let gtk_widget_set_hexpand = unsafe { sym::<GtkWidgetSetHexpand>(gtk, "gtk_widget_set_hexpand") };
@@ -754,6 +789,13 @@ impl Symbols {
             gdk_frame_clock_begin_updating,
             gdk_frame_clock_end_updating,
             gtk_gesture_click_new,
+            gtk_menu_new_from_model,
+            gtk_menu_popup_at_pointer,
+            gtk_menu_attach_to_widget,
+            gtk_clipboard_get,
+            gtk_clipboard_set_text,
+            gtk_clipboard_store,
+            gdk_event_get_button,
             gtk_scrolled_window_new,
             gtk_scrolled_window_set_policy,
             gtk_scrolled_window_set_child,
@@ -765,7 +807,7 @@ impl Symbols {
             gtk_drop_down_new, gtk_drop_down_set_selected, gtk_drop_down_get_selected, gtk_string_list_new,
             gtk_check_button_new_with_label, gtk_check_button_get_active, gtk_check_button_set_active, gtk_check_button_set_group, gtk_toggle_button_get_active, gtk_toggle_button_set_active,
             gtk_radio_button_new_with_label,
-            gtk_text_view_new, gtk_text_buffer_new, gtk_text_view_get_buffer, gtk_text_buffer_set_text, gtk_text_buffer_get_text, gtk_text_buffer_get_start_iter, gtk_text_buffer_get_end_iter, gtk_text_iter_copy, gtk_text_iter_free, gtk_text_view_set_wrap_mode,
+            gtk_text_view_new, gtk_text_buffer_new, gtk_text_view_get_buffer, gtk_text_buffer_set_text, gtk_text_buffer_get_text, gtk_text_buffer_get_start_iter, gtk_text_buffer_get_end_iter, gtk_text_iter_copy, gtk_text_iter_free, gtk_text_view_set_wrap_mode, gtk_text_view_get_iter_at_location, gtk_text_iter_get_line,
             gtk_widget_set_hexpand, gtk_widget_set_vexpand,
             gtk_widget_get_hexpand, gtk_widget_get_vexpand,
             gtk_editable_get_text, gtk_editable_set_text, gtk_editable_set_position,

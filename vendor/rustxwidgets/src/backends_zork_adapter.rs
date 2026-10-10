@@ -529,6 +529,63 @@ impl TextView {
 
     pub fn set_wrap_mode(&self, _mode: i32) {}
     pub fn set_size_request(&self, _w: i32, _h: i32) {}
+
+    /// Register a button-press handler. The REPL has no pointer, so the
+    /// `rightclick <line>` command fires it, passing button 3 and the row as
+    /// the `y` coordinate. Returns a dummy handler id.
+    pub fn connect_button_press_event(
+        &self,
+        mut cb: impl FnMut(u32, f64, f64, *mut std::ffi::c_void) + 'static,
+    ) -> Result<u64, Error> {
+        // The REPL has no event pointer; pass null through to the callback.
+        crate::backends::zork::set_button_press_cb(
+            self.id,
+            Box::new(move |button, x, y| cb(button, x, y, std::ptr::null_mut())),
+        );
+        Ok(0)
+    }
+
+    /// In the REPL the `y` coordinate *is* the row (see
+    /// `connect_button_press_event`), so this is the identity.
+    pub fn line_at(&self, _x: f64, y: f64) -> Option<i32> {
+        if y < 0.0 {
+            None
+        } else {
+            Some(y as i32)
+        }
+    }
+
+    /// Copy `text` using the terminal clipboard escape (OSC 52), so it works
+    /// over ssh as well as locally. Does nothing (and reports so) when stdout is
+    /// not a terminal.
+    pub fn clipboard_set_text(&self, text: &str) -> Result<(), Error> {
+        use std::io::{IsTerminal, Write};
+        if !std::io::stdout().is_terminal() {
+            return Err(Error::Backend(
+                "no terminal to receive the clipboard".into(),
+            ));
+        }
+        // OSC 52: ESC ] 52 ; c ; <base64> BEL. `c` selects the clipboard.
+        let mut b64 = String::with_capacity(text.len().div_ceil(3) * 4);
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for chunk in text.as_bytes().chunks(3) {
+            let b = [
+                chunk[0],
+                *chunk.get(1).unwrap_or(&0),
+                *chunk.get(2).unwrap_or(&0),
+            ];
+            let n = (b[0] as u32) << 16 | (b[1] as u32) << 8 | b[2] as u32;
+            b64.push(ALPHABET[(n >> 18) as usize & 63] as char);
+            b64.push(ALPHABET[(n >> 12) as usize & 63] as char);
+            b64.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+            b64.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+        }
+        let mut out = std::io::stdout();
+        write!(out, "\x1b]52;c;{b64}\x07")
+            .and_then(|_| out.flush())
+            .map_err(|e| Error::Backend(format!("clipboard write failed: {e}")))
+    }
 }
 
 // -- Factory functions --
@@ -568,6 +625,58 @@ pub fn create_entry() -> Result<Entry, Error> {
     crate::backends::zork::create_entry()
         .map(|id| Entry { id })
         .map_err(|e| Error::Backend(format!("{}", e)))
+}
+
+// -- Context menu (right-click) --
+
+/// A context menu for the REPL backend: it collects the items and, when popped
+/// up, prints them and reads a choice from stdin. This lets the terminal
+/// fallback exercise the same Copy / Open actions as the GUI.
+pub struct ContextMenu {
+    items: Vec<(String, Box<dyn FnMut()>)>,
+}
+
+impl ContextMenu {
+    pub fn append_item(&mut self, label: &str, cb: Box<dyn FnMut()>) {
+        self.items.push((label.to_string(), cb));
+    }
+
+    /// Show the menu on stderr and act on the choice read from stdin. `_widget`
+    /// and `_event` are meaningless here (there is no pointer).
+    pub fn popup_at_pointer(
+        &mut self,
+        _widget: *mut std::ffi::c_void,
+        _event: *mut std::ffi::c_void,
+    ) -> Result<(), Error> {
+        use std::io::Write;
+        if self.items.is_empty() {
+            eprintln!("(context menu is empty)");
+            return Ok(());
+        }
+        eprintln!("Context menu:");
+        for (i, (label, _)) in self.items.iter().enumerate() {
+            eprintln!("  {}. {}", i + 1, label);
+        }
+        eprint!("Choose an item (Enter to cancel): ");
+        std::io::stderr().flush().ok();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok();
+        match input.trim().parse::<usize>() {
+            Ok(n) if n >= 1 && n <= self.items.len() => {
+                // The closure may call back into the backend; nothing is
+                // borrowed here, so that is safe.
+                let (label, cb) = &mut self.items[n - 1];
+                eprintln!("(chose: {})", label);
+                cb();
+            }
+            _ => eprintln!("(cancelled)"),
+        }
+        Ok(())
+    }
+}
+
+pub fn create_context_menu() -> Result<ContextMenu, Error> {
+    Ok(ContextMenu { items: Vec::new() })
 }
 
 pub fn create_menu() -> Result<Menu, Error> {

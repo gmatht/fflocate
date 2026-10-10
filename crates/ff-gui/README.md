@@ -35,8 +35,11 @@ with the fixes needed for the `zork` backend to run `ff-gui` (`core.rs` had no
 `Clone` impls and delegate methods; and `backends/zork.rs` invoked widget
 callbacks while it still held the state `RefCell`'s `borrow_mut`, so a button
 like Search — whose callback calls back into the widget API — panicked with
-"RefCell already borrowed"). They are vendored rather than referenced by path so
-the build does not depend on a checkout outside this repository.
+"RefCell already borrowed"). The 3.x widget API also had no context-menu or
+clipboard support at all, so `gtk_dynamic_loader` gained the missing GTK3/GTK4
+bindings and a closure-backed `ContextMenu`. They are vendored rather than
+referenced by path so the build does not depend on a checkout outside this
+repository.
 
 ## Status
 
@@ -45,6 +48,12 @@ the build does not depend on a checkout outside this repository.
 * Results render into a `TextView`, one path per row — a real scrollable list
   rather than one wrapping paragraph. `(no matches)` is shown as an explicit
   single line so it is never confused with an empty/absent daemon.
+* **Right-click a result** for a context menu: *Copy path*, *Open*, and *Open
+  containing folder*. The row under the cursor is found with GTK's own text
+  hit-test, so it stays correct under scrolling. Copy uses the system clipboard
+  on GTK and the terminal's OSC 52 escape in the `zork` fallback (so it works
+  over ssh); Open and Open-containing-folder invoke `xdg-open` on the file and
+  its parent directory respectively.
 * Results come from the daemon's `query` op; the consistency metadata
   (`fresh`, `stale_roots`, `catching_up`) is shown in the status line, so a
   stale view is never presented as an empty one.
