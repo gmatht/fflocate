@@ -102,6 +102,7 @@ macro_rules! common_types_mod {
             pub fn set_child_hexpand(&self, child: &impl AsRef<*mut std::os::raw::c_void>, expand: bool) { self.inner.set_child_hexpand(child, expand); }
             pub fn set_child_vexpand(&self, child: &impl AsRef<*mut std::os::raw::c_void>, expand: bool) { self.inner.set_child_vexpand(child, expand); }
             pub fn set_hexpand(&self, expand: bool) { self.inner.set_hexpand(expand); }
+            pub fn set_vexpand(&self, expand: bool) { self.inner.set_vexpand(expand); }
         }
         impl AsRef<*mut std::os::raw::c_void> for WidgetBox {
             fn as_ref(&self) -> &*mut std::os::raw::c_void { self.inner.as_ref() }

@@ -490,6 +490,7 @@ impl AsElement for BoxWidget {
 
         pub fn set_hexpand(&self, _expand: bool) {
         }
+        pub fn set_vexpand(&self, _expand: bool) {}
     }
 
     pub fn create_box(orientation: Orientation, spacing: i32) -> Result<BoxWidget, Error> {

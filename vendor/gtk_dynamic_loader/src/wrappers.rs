@@ -352,6 +352,16 @@ impl TreeView {
             if col.is_null() {
                 continue;
             }
+            // Every column is user-resizable, and the *last* one expands so it
+            // absorbs the spare width (otherwise a long trailing column is
+            // squeezed out of view as the window grows).
+            if let Some(f) = symbols.gtk_tree_view_column_set_resizable {
+                unsafe { f(col, 1); }
+            }
+            if let Some(f) = symbols.gtk_tree_view_column_set_expand {
+                let is_last = i + 1 == columns.len();
+                unsafe { f(col, if is_last { 1 } else { 0 }); }
+            }
             unsafe { append_col(inner, col); }
             ids.push(i as i32);
         }

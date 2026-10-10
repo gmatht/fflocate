@@ -47,6 +47,9 @@ depend on a checkout outside this repository.
 
 * Query box + Search button + a status line and a results list, driven by
   `App::run()`.
+* The window opens at 1000x700 and the results area expands to fill it; the
+  columns are all user-resizable and the Path column absorbs the spare width, so
+  it never gets squeezed out as the window grows.
 * Results are a **three-column list — Icon / Name / Path**. On GTK this is a
   real `GtkTreeView` backed by a `GtkListStore`, so the columns actually align
   and the icon column shows a real themed icon (picked from the file's name and

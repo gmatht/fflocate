@@ -43,6 +43,10 @@ const BACKEND: &str = if cfg!(feature = "gtk") {
     "unknown"
 };
 
+/// Default window size, big enough for the three columns to be readable.
+const DEFAULT_WINDOW_W: i32 = 1000;
+const DEFAULT_WINDOW_H: i32 = 700;
+
 /// How many rows to render at most (the daemon may match millions).
 const MAX_ROWS: usize = 200;
 /// How many hits to ask the daemon for (rows plus a little slack for the
@@ -66,6 +70,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let win = app.create_window()?;
     win.set_title("ff-gui — findex search");
+    // Roomy enough that all three columns are visible on launch.
+    win.set_default_size(DEFAULT_WINDOW_W, DEFAULT_WINDOW_H);
 
     let query_row = app.create_box(Orientation::Horizontal, 2)?;
     let query = app.create_entry()?;
@@ -79,9 +85,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Column index of the full path, which Copy / Open / drag act on.
     const PATH_COLUMN: usize = 2;
 
-    // On GTK the tree view needs its own scrolled container to scroll.
+    // On GTK the tree view needs its own scrolled container to scroll, and that
+    // container must expand with the window — otherwise the results stay at
+    // their minimum height while the window grows.
     #[cfg(feature = "gtk")]
-    let results_scroll = results.into_scrolled()?;
+    let results_scroll = {
+        let sw = results.into_scrolled()?;
+        sw.set_vexpand(true);
+        sw.set_hexpand(true);
+        sw
+    };
 
     // The advanced-search foldout: a native disclosure holding a free-form
     // query field (with the full syntax) plus real controls. Every control maps
@@ -373,6 +386,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     query_row.append(&search);
 
     let layout = app.create_box(Orientation::Vertical, 1)?;
+    layout.set_vexpand(true);
+    layout.set_hexpand(true);
     layout.append(&query_row);
     layout.append(&advanced);
     layout.append(&status);

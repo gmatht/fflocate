@@ -162,6 +162,7 @@ mod pancurses_adapter {
 
         pub fn set_child_vexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
         pub fn set_child_hexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
     }
 
     // -- Grid --

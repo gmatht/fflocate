@@ -199,6 +199,7 @@ mod android_adapter {
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
             });
         }
+        pub fn set_vexpand(&self, _expand: bool) {}
     }
 
     #[repr(transparent)]
