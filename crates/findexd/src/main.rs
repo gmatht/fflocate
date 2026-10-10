@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[cfg(unix)]
 use findex::server::ServerCtx;
 use findexd::config::{BackendChoice, Config};
 use findexd::daemon::Daemon;
@@ -108,6 +109,13 @@ fn run() -> anyhow::Result<()> {
         Err(e) => return Err(e.into()),
     };
 
+    // System instances are unix-only (group-owned sockets, SO_PEERCRED):
+    // refuse anywhere else rather than serve every query as nobody.
+    #[cfg(not(unix))]
+    if cfg.system {
+        return Err(anyhow::anyhow!("--system is only supported on unix"));
+    }
+    #[cfg(unix)]
     let listener = if cfg.system {
         // System instance: resolve the group *before* binding, and refuse to run
         // without it — a socket we cannot properly own is worse than no daemon.
@@ -139,6 +147,15 @@ fn run() -> anyhow::Result<()> {
             Err(e) => return Err(e.into()),
         }
     };
+    #[cfg(not(unix))]
+    let listener = match net::bind(&socket) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!("findexd: {e}");
+            std::process::exit(0); // auto-spawn contract: exit quietly if up
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     let mut daemon = Daemon::build(cfg)?;
     // System mode captures ownership as it crawls; this is the `lstat` per entry
@@ -155,6 +172,9 @@ fn run() -> anyhow::Result<()> {
     install_signal_handlers(stop.clone());
 
     // Accept loop on its own thread; the main thread runs the applier.
+    // `--system` is refused on non-unix above, so only unix can take the
+    // system branch (whose socket code has no Windows meaning).
+    #[cfg(unix)]
     {
         let stop = stop.clone();
         if system {
@@ -179,6 +199,12 @@ fn run() -> anyhow::Result<()> {
             std::thread::spawn(move || net::accept_loop(listener, ctx, stop));
         }
     }
+    #[cfg(not(unix))]
+    {
+        let stop = stop.clone();
+        debug_assert!(!system, "--system must have been refused above");
+        std::thread::spawn(move || net::accept_loop(listener, ctx, stop));
+    }
 
     // Run the applier until stopped.
     while !stop.load(Ordering::Relaxed) {
@@ -194,17 +220,27 @@ fn run() -> anyhow::Result<()> {
 }
 
 fn install_signal_handlers(stop: Arc<AtomicBool>) {
-    use std::sync::OnceLock;
-    static STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
-    let _ = STOP.set(stop);
-    extern "C" fn handler(_sig: libc::c_int) {
-        if let Some(s) = STOP.get() {
-            s.store(true, Ordering::Relaxed);
+    #[cfg(unix)]
+    {
+        use std::sync::OnceLock;
+        static STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+        let _ = STOP.set(stop);
+        extern "C" fn handler(_sig: libc::c_int) {
+            if let Some(s) = STOP.get() {
+                s.store(true, Ordering::Relaxed);
+            }
+        }
+        let h = handler as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        unsafe {
+            libc::signal(libc::SIGTERM, h);
+            libc::signal(libc::SIGINT, h);
         }
     }
-    let h = handler as extern "C" fn(libc::c_int) as libc::sighandler_t;
-    unsafe {
-        libc::signal(libc::SIGTERM, h);
-        libc::signal(libc::SIGINT, h);
+    // No libc signals on Windows: Ctrl-C terminates the process without a
+    // graceful drain (the journal replays on next start, §9). The stop flag
+    // stays for a future console handler.
+    #[cfg(windows)]
+    {
+        let _ = stop;
     }
 }

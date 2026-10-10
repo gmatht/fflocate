@@ -49,6 +49,26 @@ impl Rng {
     }
 }
 
+/// Canonical comparison form (see differential.rs): verbatim prefixes
+/// stripped, separators normalized, so the oracle compares equal to the
+/// index's `/`-canonical paths. Identity off Windows.
+fn canon(p: &Path) -> String {
+    let s = p.to_string_lossy().into_owned();
+    #[cfg(not(windows))]
+    {
+        s
+    }
+    #[cfg(windows)]
+    {
+        let s = s
+            .strip_prefix(r"\\?\UNC\")
+            .map(|r| format!(r"\\{r}"))
+            .or_else(|| s.strip_prefix(r"\\?\").map(str::to_string))
+            .unwrap_or(s);
+        s.replace('\\', "/")
+    }
+}
+
 fn truth(root: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let mut stack = vec![root.to_path_buf()];
@@ -56,7 +76,7 @@ fn truth(root: &Path) -> BTreeSet<String> {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for ent in rd.flatten() {
             let p = ent.path();
-            out.insert(p.to_string_lossy().into_owned());
+            out.insert(canon(&p));
             if ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 stack.push(p);
             }
@@ -251,7 +271,7 @@ fn soak_thousands_of_ops_zero_drift() {
 
 fn index_paths(shared: &Shared, root: &Path) -> BTreeSet<String> {
     let ix = shared.index.read().unwrap();
-    let root_path = root.to_string_lossy().as_bytes().to_vec();
+    let root_path = canon(root).into_bytes();
     let mut out = BTreeSet::new();
     for (id, e) in ix.iter_live() {
         if e.flags().is_root_dir() {

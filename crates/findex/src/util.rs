@@ -19,6 +19,18 @@ pub fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
     !crc
 }
 
+/// Canonicalize a root path for the index: `\` becomes `/`, so Windows
+/// roots (`C:\tree`) and the `/`-joined index paths (§3) share one spelling.
+/// `std::fs` accepts `/` on Windows, including UNC `//server/share`.
+pub fn normalize_separators(path: &std::path::Path) -> std::path::PathBuf {
+    let s = path.to_string_lossy();
+    if cfg!(windows) {
+        std::path::PathBuf::from(s.replace('\\', "/"))
+    } else {
+        std::path::PathBuf::from(s.into_owned())
+    }
+}
+
 /// True if `name` is a findex sync-cookie file name (§8). Cookies are never
 /// indexed and never appear in subscriber feeds.
 pub const COOKIE_PREFIX: &str = ".findex-cookie-";

@@ -51,6 +51,8 @@ fn install() -> Result<std::process::ExitCode, CliError> {
     }
 }
 
+// Only used by the Linux/macOS install paths.
+#[cfg_attr(windows, allow(dead_code))]
 fn home() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
 }

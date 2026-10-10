@@ -500,7 +500,12 @@ impl Daemon {
                 }
                 let rid = findex::applier::root_dir_id(&ix, r);
                 let cur = mount::probe_dev(&r.path);
-                if cur != Some(r.dev) && r.dev != 0 {
+                // A vanished path alarms even with no baseline dev: on
+                // platforms without device IDs (Windows) this existence
+                // check is the *only* root-gone signal; elsewhere it agrees
+                // with the dev comparison (a gone root probes `None`).
+                let gone = cur.is_none() && !r.path.exists();
+                if (cur != Some(r.dev) && r.dev != 0) || gone {
                     changed.push((rid, r.dev, cur, r.path.to_string_lossy().into_owned()));
                 }
             }

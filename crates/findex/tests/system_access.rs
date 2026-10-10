@@ -14,6 +14,11 @@
 //! Live multi-user verification (a real root daemon, a real unprivileged caller)
 //! is in `tests/system_live.rs`, because it needs a user and a group to exist.
 
+//! Unix-only, like the system daemon itself (mode bits, chown, peercred have
+//! no Windows meaning). The portable decision logic underneath is pinned by
+//! `ownership.rs` unit tests, which run everywhere.
+#![cfg(unix)]
+
 use std::sync::Arc;
 
 use findex::applier::{Applier, Shared};

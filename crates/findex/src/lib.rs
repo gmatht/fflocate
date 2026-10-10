@@ -46,6 +46,7 @@ pub mod snapshot;
 pub mod sync;
 #[cfg(feature = "trigram")]
 pub mod trigram;
+pub mod transport;
 pub mod util;
 pub mod watch;
 

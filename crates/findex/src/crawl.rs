@@ -71,7 +71,12 @@ mod tests {
         let e = enumerate(&RealFs, d.path()).unwrap();
         assert_eq!(e.dir_count(), 1);
         assert_eq!(e.file_count(), 1);
+        // The symlink above is only created on unix (Windows needs
+        // privileges for symlinks).
+        #[cfg(unix)]
         assert_eq!(e.symlinks.len(), 1);
+        #[cfg(windows)]
+        assert_eq!(e.symlinks.len(), 0);
         assert!(!e.files.iter().any(|n| crate::util::is_cookie(n)));
     }
 

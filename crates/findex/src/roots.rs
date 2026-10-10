@@ -137,6 +137,9 @@ pub struct Root {
 
 impl Root {
     pub fn new(id: RootId, path: PathBuf) -> Self {
+        // Canonical `/` separators, so `C:\tree` keys and matches exactly
+        // like the `/`-joined index paths (§3). No-op off Windows.
+        let path = crate::util::normalize_separators(&path);
         Root {
             id,
             path,

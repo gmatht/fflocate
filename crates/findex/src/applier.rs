@@ -125,7 +125,7 @@ impl FsView for RealFs {
         #[cfg(not(unix))]
         {
             let _ = abs_path;
-            return Ok(None);
+            Ok(None)
         }
         #[cfg(unix)]
         match std::fs::symlink_metadata(abs_path) {

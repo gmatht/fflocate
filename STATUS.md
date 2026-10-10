@@ -379,3 +379,56 @@ a restart crawl alone cannot (crawls only add). Exit 1 if any root is not
 `ok`; unknown roots are an error. Covered by `crates/fx/tests/update_e2e.rs`
 (kill -9 → offline delete+add → restart → update converges, with
 `last_rescan_cause=manual` proving the update's rescan did it).
+
+## Windows port (`x86_64-pc-windows-msvc`, merged to main)
+
+Validated on real Windows 11 hardware: full `cargo test --workspace` green,
+plus the release-binary e2e suites (`locate_e2e`, `update_e2e`, `fault_crash`,
+`fault_fsops` — the last two skip only what needs bind mounts/inotify
+sysctls). Findings from the bring-up, all fixed:
+
+* **IPC**: `findex::transport` (`Stream`/`Listener` aliases + `connect`);
+  unix sockets on unix, TCP loopback on Windows. The socket "path" stays a
+  `PathBuf` everywhere: on Windows it carries `127.0.0.1:PORT` text
+  (`FINDEX_PORT`, default 18923). No new dependencies.
+* **Paths**: index stays `/`-canonical; `util::normalize_separators` runs at
+  root ingestion (`Root::new`), `handle_rescan`, and the `ff` sends, so
+  `C:\tree` keys and matches. Non-UTF-8 names go lossy (documented).
+* **Files/defaults**: state under `LOCALAPPDATA`/`APPDATA`, home default from
+  `USERPROFILE`, pidfile without `flock` (the TCP bind is the exclusion),
+  no signal handlers (Ctrl-C kills; the journal replays), default backend
+  `fake` (ReadDirectoryChangesW is future work).
+* **Sync without a watcher**: the fake backend polls watched dirs for cookie
+  files and synthesizes their create events, so `sync`/`update` complete;
+  `ok` means *quiescent*, not *caught up* — `ff update` (rescan + sync) is
+  the sound operation there. Covered by a unit test proving the
+  emit → marker → completion chain.
+* **Deferred**: real watcher backend, stable file IDs (`windows-sys`
+  `GetFileInformationByHandle`), service installation (`ff service install`
+  errors), `find -user/-group/-perm/-inum/-links` (loud errors, never
+  silent), case-insensitivity defaults to the writable-dir probe.
+* **Tests**: e2e harnesses take OS-assigned loopback ports (`test_socket`)
+  and `.exe`-aware binary names; `locate` tests copy to `locate.exe`
+  (argv[0] accepts the `.exe` form); `Child::kill` everywhere (also fixing
+  a Windows hang in the old wait-only harness kill); OS-vs-index path
+  comparisons go through a `canon()` helper (verbatim prefixes stripped,
+  `/`-normalized).
+* **Winsock gotcha (the big one)**: accepted sockets inherit the listener's
+  nonblocking mode on Windows (opposite of POSIX). The nonblocking accept
+  loop therefore handed `serve_client` sockets whose first idle read failed
+  with WouldBlock → instant close → RST — killing every second request on a
+  reused connection (`ff --sync` always died). Fixed by forcing accepted
+  streams blocking in `net::accept_loop` (and the `daemon_e2e` direct
+  accept); harmless on unix.
+* **Root-gone detection**: the mount watchdog was purely device-id based,
+  and device IDs are unavailable on Windows — a vanished root never alarmed.
+  The watchdog now also alarms on a missing path (identical outcomes
+  elsewhere: a gone root already probed `None` there).
+* **Flakes fixed along the way**: the cookie-cleanup assertion now polls
+  instead of asserting once (complete-then-unlink races the check under
+  load); `resolve_bases` treats rooted paths as absolute and strips
+  verbatim `\\?\` prefixes so `ff C:\path` filters match.
+* **Windows e2e costs**: socket waits are file-existence polls that always
+  run the full 10 s (sockets aren't files there) — suites take ~30 s each;
+  a TCP-probe wait would fix that. 9P mtime granularity can make cargo skip
+  rebuilds of just-synced sources — touch before building there.

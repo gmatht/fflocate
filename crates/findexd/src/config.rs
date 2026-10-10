@@ -120,6 +120,12 @@ impl Config {
     pub fn defaults() -> Config {
         let rd = runtime_dir();
         let state = state_dir();
+        #[cfg(windows)]
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("C:/"));
+        #[cfg(not(windows))]
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"));
         let roots = match std::env::var_os("FINDEX_ROOT") {
             Some(v) if !v.is_empty() => std::env::split_paths(&v).collect(),
@@ -133,10 +139,16 @@ impl Config {
             _ => findex::excludes::Excludes::new(),
         };
         Config {
-            socket_path: rd.join("findex.sock"),
+            socket_path: findex::config_paths::socket_path(),
             pidfile: rd.join("findex.pid"),
             state_dir: state,
             roots,
+            // No kernel watcher ported on Windows yet (ReadDirectoryChangesW
+            // is future work): default to the fake backend — crawl on start
+            // plus explicit rescans — rather than refusing to start.
+            #[cfg(windows)]
+            backend: BackendChoice::Fake,
+            #[cfg(not(windows))]
             backend: BackendChoice::Inotify,
             compaction_threshold: 100_000,
             sync_timeout_ms: 2_000,
@@ -183,7 +195,16 @@ impl Config {
         self
     }
     pub fn with_socket(mut self, p: PathBuf) -> Self {
-        self.pidfile = p.with_extension("pid");
+        // On Windows the "socket path" is `127.0.0.1:PORT` text, which has no
+        // usable parent/extension — keep the pidfile in the runtime dir.
+        #[cfg(windows)]
+        {
+            self.pidfile = runtime_dir().join("findex.pid");
+        }
+        #[cfg(not(windows))]
+        {
+            self.pidfile = p.with_extension("pid");
+        }
         self.socket_path = p;
         self
     }
