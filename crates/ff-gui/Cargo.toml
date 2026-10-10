@@ -15,6 +15,12 @@ path = "src/main.rs"
 # user expects from `ff --gui`. The `zork` backend is a display-free fallback:
 # it drives the same widget API from a REPL, so the GUI still runs over ssh or
 # in a container with no X server.
+#
+# Cargo features cannot be target-conditional, so `gtk` is on everywhere; that
+# is harmless off Linux. rustxwidgets selects its backend by target as well as
+# feature (`cfg(windows)` -> nwg, `cfg(target_arch = "wasm32")` -> wasm), and the
+# gtk module itself is `cfg(target_os = "linux")`, so on Windows/macOS/wasm the
+# feature is inert rather than wrong.
 default = ["gtk"]
 gtk = ["rustxwidgets/gtk"]
 zork = ["rustxwidgets/zork"]
