@@ -102,6 +102,17 @@ struct Root {
 }
 ```
 
+**Ownership sidecar (v1.5, for the system daemon).** The core index still stores
+no per-file metadata — that remains a non-goal for the personal index. But a
+*privileged* instance has to answer "may this caller read this file?", so
+`ownership.rs` keeps `Attr { uid, gid, mode }` per entry id in a table beside the
+index rather than widening `Entry`. Two reasons it is separate rather than
+inline: filling it costs an `lstat` per file (the crawl otherwise stats nothing),
+and ownership changes without the *name* changing, so its staleness rules differ
+from the entry's. It is best-effort across rescans and **fails closed**: an entry
+with no record is not shown to anyone but root. The filter is applied on one path
+(`server::finish_query`) so no query shape can forget it.
+
 ---
 
 ## 4. Per-mount probing and configuration
@@ -160,10 +171,10 @@ trait WatchBackend {
 | dir moved | parent's `MOVED_TO` only | same | same |
 | content write | **ignore** | **ignore** | **ignore** |
 
-- **fanotify FID** (`FAN_MARK_FILESYSTEM`, `FAN_REPORT_DFID_NAME`): whole-mount watch, zero per-dir kernel memory, atomic rename events. Map `(dev, file_handle) → dir id` via `name_to_handle_at` per dir during crawl. Unprivileged use needs recent kernels (~5.13+); verify on targets, else run system daemon as root.
+- **fanotify FID** (`FAN_MARK_FILESYSTEM`, `FAN_REPORT_DFID_NAME`): whole-mount watch, zero per-dir kernel memory, atomic rename events. Map `(dev, file_handle) → dir id` via `name_to_handle_at` per dir during crawl. **Implemented** (v1.5): `crates/findex/src/watch/fanotify.rs` decodes the `fanotify_event_info_fid` record (handle + NUL-padded name), pairs rename halves by the moved object's handle, and escalates `FAN_Q_OVERFLOW` to a rescan of every root. `watch/fidmap.rs` resolves a DFID to a directory id, keyed on `(handle_type, handle)` — deliberately *not* on the event's `fsid`, which is a different namespace from `name_to_handle_at`'s mount id and silently fails to match. Selection is probed, not assumed: `mount::fanotify_available()` opens the real fd, and `--backend auto` picks fanotify when the kernel supports it else inotify (`ff stats` reports which, and why). Verified against real kernel events on a private tmpfs mount. Note that `watch_dir` is *not* a no-op for this backend: a directory created at runtime has its handle learned only by asking, and skipping that silently blinds the subtree.
 - **inotify fallback**: one watch per dir (~1 KB kernel memory each; `max_user_watches` is real). `IN_Q_OVERFLOW` → `RescanSubtree(root, cause=overflow)`. `IN_IGNORED` → drop wd→id mapping (wds get reused). `IN_UNMOUNT` → drop subtree, wait for remount.
 - **FSEvents**: file-event flag; persistent log + since-when ID gives free crash recovery (store last event ID in snapshot). `kFSEventsMustScanSubDirs` → rescan.
-- **Ignore asymmetry**: inotify can decline to attach to excluded dirs (watch-time ignore); fanotify-FID and FSEvents cannot — they filter in the applier. Encode this in backend capabilities instead of special-casing.
+- **Ignore asymmetry**: inotify can decline to attach to excluded dirs (watch-time ignore); fanotify-FID and FSEvents cannot — they filter in the applier. Encode this in backend capabilities instead of special-casing. **Implemented**: `excludes.rs` holds the rules, and an excluded *directory* is simply never inserted — because events name their parent by id, that one omission prunes the whole subtree with no ancestor walk, in both the crawl and `apply_upsert`.
 
 Plumbing: backend thread → bounded channel (100k) → pending collection → applier. Never drop events silently: a full channel escalates to `RescanSubtree`, it does not discard.
 
@@ -377,7 +388,7 @@ Lessons from the Watchman/React-Native years, applied pre-emptively:
 **Stack**: Rust — `libc` (getdents64/fanotify), `aho-corasick`, `memchr`, `crossbeam-channel`, `memmap2`, `arc-swap`, `regex`. (FSearch 0.2.x is the reference for the inotify path and GTK virtualization; Watchman docs for clocks/cookies/recrawl; Mercurial fsmonitor for the consumer side of `since`.)
 
 - **v1**: inotify backend + full reconciliation core (pending collection, diff rescans, backoff, degraded mode) + cookie sync + snapshot/journal with cursors + linear scan + differential/fake-backend test harness. *Reconciliation and sync ship in v1 — v1's lesson from Watchman is that these are correctness, not polish.*
-- **v1.5**: fanotify-FID backend, macOS FSEvents, `since`/`subscribe` ops live, regex/wildcards, `ff watch`, service units.
-- **v2**: trigram accelerator (implemented — §10; filter-only, cached by generation), fuzzy/approximate search (implemented — §10; `ff --fuzzy`, ranked by edit distance), lazy attr sidecar keyed by stable IDs, GUI client on subscriptions.
+- **v1.5**: fanotify-FID backend (implemented — §6; live-verified on a private tmpfs, selected by capability probe), the privileged multi-user system daemon (implemented — §3/§15; per-entry ownership sidecar, `SO_PEERCRED`, 0660 group socket), macOS FSEvents, `since`/`subscribe` ops live, `ff watch`, service units.
+- **v2**: trigram accelerator (implemented — §10; filter-only, cached by generation), fuzzy/approximate search (implemented — §10; `ff --fuzzy`, ranked by edit distance), lazy attr sidecar keyed by stable IDs (implemented as the system daemon's ownership sidecar — §3), GUI client on subscriptions.
 
 The durable insight of this revision: Everything's *index* is easy to replicate; Watchman's *discipline* — one pending collection, diffs over replacements, cookies for settle, clocks over guesses, loud degradation — is what turns a toy into infrastructure. Build both in from the start.

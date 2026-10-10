@@ -9,9 +9,11 @@ it is a status note.
 | Design section | Status | Where |
 |---|---|---|
 | §3 Index data model | done | `crates/findex/src/index.rs`, `roots.rs` |
-| §4 Per-mount probing | done | `crates/findex/src/mount.rs` |
+| §4 Per-mount probing | done | `crates/findex/src/mount.rs` (`fanotify_available`, `handle_of_path`) |
+| §4/§6 **exclusions** | done | `crates/findex/src/excludes.rs`, `applier.rs`; tests `tests/excludes.rs` |
+| §3/§15 **system daemon** | done | `crates/findex/src/ownership.rs`, `server.rs` (`finish_query`), `crates/findexd/src/net.rs` (`bind_system`, `peer_credentials`); tests `tests/system_access.rs`, `tests/system_live.rs` |
 | §5 Initial crawl | done | `crates/findex/src/crawl.rs`, `applier.rs` (`crawl_dir`) |
-| §6 Watcher backends | inotify + fake | `crates/findex/src/watch/{mod,inotify,fake}.rs` |
+| §6 Watcher backends | inotify + **fanotify-FID** + fake | `crates/findex/src/watch/{mod,inotify,fanotify,fake}.rs`, `watch/fidmap.rs`; tests `tests/fanotify_live.rs` |
 | §7 Reconciliation, backoff, degraded mode | done | `crates/findex/src/pending.rs`, `applier.rs` |
 | §8 Cookie sync | done | `crates/findex/src/sync.rs`, `server.rs` (`handle_sync`) |
 | §9 Snapshot + journal + cursors + compaction | done | `crates/findex/src/{snapshot,journal,persist,cursor}.rs` |
@@ -22,7 +24,7 @@ it is a status note.
 | §12 CLI | done | `crates/fx/src/{main,client,service}.rs` (binary `ff`; the `fx` name collides with the snap JSON viewer. Crate dir kept as `crates/fx`.) |
 | §13 Concurrency model | done | `crates/findex/src/applier.rs`, `crates/findexd/src/daemon.rs` |
 | §14 Testing | done (§14.1–.5) | `crates/findex/tests/*`, `crates/findexd/tests/*`, `scripts/e2e.sh` |
-| §15 Operations and hardening | mostly | `config_paths.rs`, `net.rs`, `health.rs` |
+| §15 Operations and hardening | mostly | `config_paths.rs`, `net.rs`, `health.rs`; `--system` socket/permission handling in `net.rs` |
 
 ## Verified behaviour
 
@@ -41,7 +43,7 @@ All of the following were exercised against real binaries and a real temp tree:
   the queue drained).
 * Cookie files are cleaned up on completion and on timeout (no leaks).
 
-`cargo test` runs 228 tests, all green, including a 120-step random
+`cargo test` runs 283 tests, all green, including a 120-step random
 differential test against a from-scratch filesystem walk.
 
 Zero-hit `ff` string queries with an uppercase letter get a case-folded
@@ -138,6 +140,75 @@ pattern is long enough (and `k` small enough) for the trigram bound to bite, and
 is pure overhead when it is not — a 4-letter pattern at `k = 2` leaves nothing to
 constrain. It is opt-in for exactly that reason.
 
+### fanotify-FID backend (§6, v1.5)
+
+`crates/findex/src/watch/fanotify.rs` watches whole filesystems
+(`FAN_MARK_FILESYSTEM` + `FAN_REPORT_DFID_NAME`) and reports file handles instead
+of watch descriptors. `watch/fidmap.rs` maps a handle back to a directory id.
+Renames arrive as `FAN_MOVED_FROM`/`FAN_MOVED_TO` and are paired by the moved
+object's handle; `FAN_Q_OVERFLOW` escalates to a rescan of every root. Selection
+is probed (`mount::fanotify_available()`) and `--backend auto` picks fanotify
+when the kernel supports it, else inotify; `ff stats` reports which and why.
+
+Verified **live against real kernel events** on this machine (Linux 6.18 in
+WSL2): the test mounts a private tmpfs, learns the root's file handle, and
+asserts that create, atomic rename and delete all decode and that they converge
+the *index* — not just the event stream. See `tests/fanotify_live.rs`.
+
+Three bugs that only a live test could find, all of which pass a self-consistent
+unit test:
+
+* `FAN_REPORT_NAME` is `0x800`, not `0x200`. The wrong value yields *name-less*
+  DFID records, so every event is silently lost. The constants are now pinned
+  against the kernel header by a test.
+* The fd must be non-blocking, or the drain loop hangs forever once the queue
+  empties (the first version hung a test for ten minutes).
+* A directory created at runtime was indexed but its contents never were: the
+  new dir's *file handle* was never learned, so every event naming it as a parent
+  was unresolvable. `watch_dir` for this backend is therefore not a no-op — it is
+  how the handle gets learned.
+
+### Exclusions under a whole-mount backend (§4/§6)
+
+A whole-mount watch cannot decline a subtree, so the applier filters instead
+(`excludes.rs`). An excluded **directory is never inserted**; because events name
+their parent by id, that single omission prunes the whole subtree with no
+ancestor walk. `FINDEX_EXCLUDE=build,node_modules` sets the rules; empty by
+default. Verified live on a fanotify daemon.
+
+### System daemon: privileged, multi-user (§3, §15)
+
+`findexd --system` runs as root, indexes privileged paths, and answers each
+caller **as themselves**. The pieces:
+
+* **Ownership sidecar** (`ownership.rs`): `Attr { uid, gid, mode }` per entry id,
+  beside the index rather than inside the 12-byte `Entry` — filling it costs an
+  `lstat` per file, which the personal mode does not pay. Best-effort across
+  rescans (a `chown` is not reported by the namespace mask) and **fails closed**:
+  no record ⇒ not shown to anyone but root.
+* **The filter** (`server::finish_query`, `visible_chain`): checks the entry *and
+  every ancestor*, so a world-readable file inside a `0700` directory stays
+  hidden — a per-entry check would get that wrong. All four query shapes (exact,
+  fuzzy, expression, count) go through the one function; before it existed, fuzzy
+  and expression **leaked**, and the count reported root's total.
+* **Socket and identity** (`net.rs`): `/run/findexd.sock`, mode 0660 owned by the
+  `findex` group; `SO_PEERCRED` for the caller (the kernel's answer, never the
+  client's). The daemon refuses to start without the group rather than widening
+  the mode.
+
+Verified **live in this container as root, with a real unprivileged user**:
+a client outside the `findex` group is refused at connect; one inside sees
+`public/readable.txt` and cannot see `private/secret.txt` by name, by fuzzy
+search, by expression, or in a count. See `tests/system_access.rs` (the filter's
+logic) and `tests/system_live.rs` (the privileged/unprivileged run).
+
+**What could not be verified here**, stated plainly: the live tests need root,
+`groupadd`/`useradd` and `setpriv`, and fanotify needs a mountable private tmpfs.
+They skip cleanly without those rather than failing, so a run on a restricted
+machine exercises less than a run on this one. `SO_PEERCRED` was exercised only
+for the same-uid case in the automated test; different-uid connections were
+verified by hand with `setpriv`.
+
 ### `locate` drop-in (`crates/fx/src/locate.rs`)
 
 Invoking the `ff` binary as `locate` (argv\[0\], e.g. a symlink) speaks GNU
@@ -229,8 +300,23 @@ These are deliberate and small; each is noted so the design stays honest.
    Two roots with the same basename would collide. Fine for v1; a root-id field
    on the entry would fix it.
 
-6. **fanotify-FID and FSEvents are not implemented** (v1.5 in the design). The
-   `WatchBackend` trait and `BackendCaps` are in place for them.
+6. **FSEvents is not implemented** (v1.5 in the design). fanotify-FID *is* now
+   implemented and live-verified (§6); the `WatchBackend` trait and `BackendCaps`
+   are what let it slot in without touching the applier.
+
+7. **The system daemon's ownership sidecar can be stale, by design.** It is
+   captured at crawl time and refreshed on rescan; a `chown`/`chmod` between
+   rescans is not seen, because fanotify's namespace mask does not report metadata
+   changes and adding `FAN_ATTRIB` would make every `touch` an event for no
+   benefit to a *name* index. The filter fails closed on a *missing* record, but a
+   *stale* one can show a file the caller has since lost access to (or hide one
+   they have gained). This is a deliberate trade, recorded here rather than
+   discovered later.
+
+8. **Ownership costs an `lstat` per entry, and only the system daemon pays it.**
+   `Applier::track_ownership` is off unless `--system`. A personal index crawls
+   with no stats at all, which is why the sidecar is not simply part of the
+   normal path.
 
 ## Known gaps / bugs found and fixed during the build
 
