@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/findex", "crates/findexd", "crates/fx"]
+members = ["crates/findex", "crates/findexd", "crates/fx", "crates/ff-gui"]
+# Vendored third-party code: usable as a path dependency, but not a workspace
+# member (keeps workspace-wide clippy/test runs to first-party code).
+exclude = ["vendor/rustxwidgets"]
 
 [workspace.package]
 version = "0.1.0"
