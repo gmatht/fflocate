@@ -25,6 +25,7 @@ pub mod applier;
 pub mod config_paths;
 pub mod crawl;
 pub mod cursor;
+pub mod drive;
 pub mod event;
 pub mod excludes;
 pub mod expr;

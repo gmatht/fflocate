@@ -32,6 +32,13 @@ pub struct Config {
     /// The group that owns the system socket (§15). Numeric gid; the daemon
     /// resolves `findex` from `/etc/group` when the flag is bare.
     pub system_group: u32,
+    /// Opt into cross-OS store sharing for dual-boot machines (§15): open a
+    /// store last written by another OS instead of refusing. Each OS keeps
+    /// its own roots (matched by physical drive, not by path); foreign roots
+    /// stay visible but are never queried, synced, rescanned or deleted here.
+    ///
+    /// Never the default: without it a foreign store is refused, loudly.
+    pub shared_store: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +143,7 @@ impl Config {
             excludes,
             system: false,
             system_group: 0,
+            shared_store: false,
         }
     }
 
@@ -181,6 +189,10 @@ impl Config {
     }
     pub fn with_backend(mut self, b: BackendChoice) -> Self {
         self.backend = b;
+        self
+    }
+    pub fn with_shared_store(mut self, on: bool) -> Self {
+        self.shared_store = on;
         self
     }
 }

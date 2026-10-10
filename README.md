@@ -58,7 +58,9 @@ findexd --root /path/to/tree --socket "$XDG_RUNTIME_DIR/findex.sock" \
 ```
 
 `ff` finds `findexd` next to itself or on `$PATH` (override with `FINDEXD_BIN`).
-`FINDEX_SOCKET` / `FINDEX_STATE_DIR` override the defaults.
+`FINDEX_SOCKET` / `FINDEX_STATE_DIR` override the defaults. Dual-boot with a
+shared state dir: pass `findexd --shared-store` so the other OS's database is
+adopted (generation bump, local roots rescanned) instead of refused.
 
 ## Query syntax
 

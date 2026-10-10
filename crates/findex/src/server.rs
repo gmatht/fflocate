@@ -129,9 +129,12 @@ fn handle_query(ctx: &ServerCtx, raw: &str, limit: usize, count_only: bool, t0: 
     let trigram = Some(ctx.shared.trigram_index());
     let ix = ctx.shared.index.read().unwrap();
     let roots = ctx.shared.roots.read().unwrap();
-    // Build the (root_dir_id, root_path) table once.
+    // Build the (root_dir_id, root_path) table once. Roots recorded by
+    // another OS (dual-boot shared store) are excluded: their entries are
+    // stale here by rule, and serving them would be silently wrong (§15).
+    // Legacy roots without ownership records are always local.
     let mut root_paths: Vec<(u32, Vec<u8>)> = Vec::new();
-    for r in roots.iter() {
+    for r in roots.iter().filter(|r| r.is_local()) {
         let rid = crate::applier::root_dir_id(&ix, r);
         if rid != crate::index::ROOT_ID {
             let mut p = r.path.as_os_str().to_string_lossy().as_bytes().to_vec();
@@ -281,7 +284,8 @@ fn handle_fuzzy_query(
         let ix = ctx.shared.index.read().unwrap();
         let roots = ctx.shared.roots.read().unwrap();
         let mut root_paths: Vec<(u32, Vec<u8>)> = Vec::new();
-        for r in roots.iter() {
+        // Foreign roots excluded, as in `handle_query` (§15).
+        for r in roots.iter().filter(|r| r.is_local()) {
             let rid = crate::applier::root_dir_id(&ix, r);
             if rid != crate::index::ROOT_ID {
                 root_paths.push((rid, r.path.as_os_str().to_string_lossy().as_bytes().to_vec()));
@@ -336,7 +340,8 @@ fn handle_expr_query(
     let ix = ctx.shared.index.read().unwrap();
     let roots = ctx.shared.roots.read().unwrap();
     let mut root_paths: Vec<(u32, Vec<u8>)> = Vec::new();
-    for r in roots.iter() {
+    // Foreign roots excluded, as in `handle_query` (§15).
+    for r in roots.iter().filter(|r| r.is_local()) {
         let rid = crate::applier::root_dir_id(&ix, r);
         if rid != crate::index::ROOT_ID {
             root_paths.push((rid, r.path.as_os_str().to_string_lossy().as_bytes().to_vec()));
@@ -372,6 +377,9 @@ fn handle_sync(ctx: &ServerCtx, timeout_ms: u64, only_roots: Option<&[String]>) 
                 Some(list) => list.iter().any(|k| k == &r.key()),
                 None => true,
             })
+            // Foreign roots (dual-boot shared store) are reported below,
+            // never synced: their paths do not resolve here (§15).
+            .filter(|(_, r)| r.is_local())
             .map(|(i, r)| {
                 let rid = crate::applier::root_dir_id(&ix, r);
                 (i, rid, r.key(), r.path.clone(), r.caps.writable)
@@ -380,6 +388,17 @@ fn handle_sync(ctx: &ServerCtx, timeout_ms: u64, only_roots: Option<&[String]>) 
     };
 
     let mut out_map = std::collections::BTreeMap::new();
+    // Roots excluded above keep their voice: report them as foreign rather
+    // than silently dropping them from the map.
+    for r in ctx.shared.roots.read().unwrap().iter() {
+        let selected = match &only_roots {
+            Some(list) => list.iter().any(|k| k == &r.key()),
+            None => true,
+        };
+        if selected && !r.is_local() {
+            out_map.insert(r.key(), SyncStatus::Foreign.as_str().to_string());
+        }
+    }
     // Waiters that must be serviced concurrently so one slow root cannot block
     // the others' cookies.
     let mut waits: Vec<(String, crossbeam_channel::Receiver<()>)> = Vec::new();
@@ -539,6 +558,12 @@ fn handle_stats(ctx: &ServerCtx, per_root: bool) -> Vec<Response> {
                 serde_json::json!({
                     "path": r.key(),
                     "enabled": r.enabled,
+                    "owner": r.owner_os,
+                    "local": r.is_local(),
+                    "drive": r.drive.as_ref().map(|d| serde_json::json!({
+                        "disk_serial": d.disk_serial,
+                        "volume_uuid": d.volume_uuid,
+                    })).unwrap_or(serde_json::Value::Null),
                     "state": r.state.label(),
                     "recrawl_count": r.recrawl_count,
                     "last_rescan_cause": r.last_rescan_cause.map(|c| c.as_str()),
@@ -564,6 +589,13 @@ fn handle_rescan(ctx: &ServerCtx, root: &str) -> Vec<Response> {
         let ix = ctx.shared.index.read().unwrap();
         let roots = ctx.shared.roots.read().unwrap();
         match roots.iter().find(|r| r.key() == root) {
+            // Rescanning a foreign root would reconcile a subtree this OS
+            // cannot see and risk dropping it as vanished: refuse loudly (§15).
+            Some(r) if !r.is_local() => {
+                return vec![Response::Error {
+                    message: format!("foreign root (recorded by another OS): {root}"),
+                }]
+            }
             Some(r) => (true, crate::applier::root_dir_id(&ix, r)),
             None => (false, crate::index::ROOT_ID),
         }
@@ -597,6 +629,7 @@ pub fn bytes_to_string(b: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::applier::Shared;
+    use std::path::PathBuf;
     use crate::index::{EntryFlags, Index, ROOT_ID};
     use crate::persist::Store;
     use crate::roots::Root;
@@ -632,6 +665,110 @@ mod tests {
         let store_dir = d.path().join("state");
         let _ = Store::open(&store_dir);
         (ctx, d, shared)
+    }
+
+    /// Two roots in one index: a local one (this OS or legacy) and a
+    /// foreign one (recorded by a fictitious other OS). Hits must come only
+    /// from the local side.
+    fn ctx_with_foreign_root() -> (ServerCtx, tempfile::TempDir, Arc<Shared>) {
+        let d = tempfile::tempdir().unwrap();
+        let mut ix = Index::new();
+        let mine = ix.insert(
+            ROOT_ID,
+            b"mine",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        ix.insert(mine, b"local.txt", EntryFlags::EMPTY);
+        let theirs = ix.insert(
+            ROOT_ID,
+            b"theirs",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        ix.insert(theirs, b"remote.txt", EntryFlags::EMPTY);
+        let mut local = Root::new(0, PathBuf::from("/mnt/mine"));
+        local.caps.writable = true;
+        let mut foreign = Root::new(1, PathBuf::from("/mnt/theirs"));
+        foreign.caps.writable = true;
+        foreign.owner_os = Some("definitely-not-this-os".into());
+        assert!(!foreign.is_local(), "fixture must be foreign here");
+        let shared = Shared::new(ix, vec![local, foreign]);
+        let ctx = ServerCtx {
+            shared: shared.clone(),
+            sync: SyncRegistry::new(),
+            backend: "fake".into(),
+            control: None,
+            caller: None,
+        };
+        (ctx, d, shared)
+    }
+
+    fn hits_of(out: &[Response]) -> Vec<String> {
+        out.iter()
+            .filter_map(|r| match r {
+                Response::Hit { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn foreign_roots_are_excluded_from_queries() {
+        let (ctx, _d, _s) = ctx_with_foreign_root();
+        let out = handle_request(&ctx, &Request::query("txt", 0, true, false));
+        assert_eq!(hits_of(&out), vec!["/mnt/mine/local.txt".to_string()]);
+        let out = handle_request(
+            &ctx,
+            &Request::Query {
+                q: String::new(),
+                limit: 0,
+                json: false,
+                count: false,
+                expression: Some(serde_json::json!(["suffix", "txt"])),
+                glob: None,
+                glob_includedotfiles: None,
+                glob_noescape: None,
+                suffix: None,
+                path: None,
+                relative_root: None,
+                case_sensitive: None,
+                fuzzy: false,
+                max_distance: None,
+            },
+        );
+        assert_eq!(hits_of(&out), vec!["/mnt/mine/local.txt".to_string()]);
+    }
+
+    #[test]
+    fn foreign_roots_report_foreign_and_refuse_rescan() {
+        let (ctx, _d, _s) = ctx_with_foreign_root();
+        let out = handle_request(&ctx, &Request::Sync { timeout_ms: 50, roots: None });
+        match out.last() {
+            Some(Response::Synced { roots }) => {
+                // Local root goes weak (no control channel in this harness);
+                // the foreign root must say `foreign`, never attempted.
+                assert_eq!(roots.get("/mnt/theirs").map(String::as_str), Some("foreign"));
+                assert!(roots.contains_key("/mnt/mine"), "local roots still reported");
+            }
+            other => panic!("expected synced, got {other:?}"),
+        }
+        let out = handle_request(&ctx, &Request::Rescan { root: "/mnt/theirs".into() });
+        match out.first() {
+            Some(Response::Error { message }) => assert!(message.contains("foreign"), "{message}"),
+            other => panic!("rescan of a foreign root must refuse, got {other:?}"),
+        }
+        let out = handle_request(&ctx, &Request::Stats { roots: true });
+        match out.first() {
+            Some(Response::Stats { stats }) => {
+                let roots = stats.get("roots").and_then(|v| v.as_array()).unwrap();
+                let theirs = roots.iter().find(|r| r.get("path").and_then(|v| v.as_str()) == Some("/mnt/theirs")).unwrap();
+                assert_eq!(theirs.get("local").and_then(|v| v.as_bool()), Some(false));
+                assert_eq!(
+                    theirs.get("owner").and_then(|v| v.as_str()),
+                    Some("definitely-not-this-os")
+                );
+            }
+            other => panic!("expected stats, got {other:?}"),
+        }
     }
 
     #[test]

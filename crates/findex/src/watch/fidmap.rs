@@ -30,7 +30,10 @@
 
 use std::collections::HashMap;
 
-use crate::event::{DirKey, FsEvent, RescanCause};
+use crate::event::DirKey;
+// Only the Linux-gated translate path builds events.
+#[cfg(target_os = "linux")]
+use crate::event::{FsEvent, RescanCause};
 use crate::mount::HandleId;
 
 /// A learned `handle → directory id` mapping.
@@ -67,12 +70,14 @@ impl HandleKey {
     /// The key for a fanotify-decoded [`crate::watch::fanotify::Fid`] identity.
     /// The fsid is deliberately dropped: it is not comparable across the two
     /// syscalls that produce handles.
+    #[cfg(target_os = "linux")]
     pub fn of_identity(fid: &crate::watch::fanotify::Fid) -> HandleKey {
         HandleKey { handle_type: fid.handle_type, handle: fid.handle.clone() }
     }
 
     /// As [`HandleKey::of_identity`], for the name-less identity a caller passes
     /// to `learn_fid`.
+    #[cfg(target_os = "linux")]
     pub fn of_fid_identity(fid: &crate::watch::fanotify::FidIdentity) -> HandleKey {
         HandleKey { handle_type: fid.handle_type, handle: fid.handle.clone() }
     }
@@ -132,6 +137,7 @@ impl FidMap {
     /// caller supplies it because only the daemon knows the roots. Returning
     /// `Some(root)` turns an unresolved event into `RescanSubtree(root)`, which
     /// is work, not silence.
+    #[cfg(target_os = "linux")]
     pub fn translate<F>(
         &mut self,
         handle_type: i32,
@@ -174,6 +180,7 @@ pub enum Lookup {
 /// Map a namespace event's mask + resolved parent into index events. Rename
 /// pairing is the backend's job (it needs cross-event state); this is the
 /// single-event half.
+#[cfg(target_os = "linux")]
 pub fn namespace_event(mask: u64, parent: DirKey, name: &[u8], is_dir: bool) -> Vec<FsEvent> {
     use crate::watch::fanotify::masks::*;
     if mask & FAN_MOVED_FROM != 0 {
@@ -194,7 +201,6 @@ pub fn namespace_event(mask: u64, parent: DirKey, name: &[u8], is_dir: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::watch::fanotify::masks::FAN_CREATE;
 
     fn h(bytes: &[u8]) -> HandleId {
         HandleId { mount_id: 1, handle_type: 1, handle: bytes.to_vec() }
@@ -221,7 +227,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn unresolved_foreign_event_is_dropped_quietly() {
+        use crate::watch::fanotify::masks::*;
         let mut m = FidMap::new();
         let evs = m.translate(1, b"stranger", FAN_CREATE, b"x", false, |_| None);
         assert!(evs.is_empty());
@@ -230,7 +238,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn unresolved_root_event_escalates_to_a_rescan() {
+        use crate::watch::fanotify::masks::*;
         // The map is missing a handle that belongs to a root we index: dropping
         // it would be a silent desync, so it becomes work.
         let mut m = FidMap::new();
@@ -240,7 +250,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn resolved_create_becomes_upsert() {
+        use crate::watch::fanotify::masks::*;
         let mut m = FidMap::new();
         m.learn(&h(b"dir"), 5);
         let evs = m.translate(1, b"dir", FAN_CREATE, b"new.rs", false, |_| None);
@@ -249,6 +261,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn namespace_event_covers_every_mask_we_subscribe_to() {
         use crate::watch::fanotify::masks::*;
         let d = DirKey::new(3);
@@ -273,7 +286,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn stats_are_counted_separately() {
+        use crate::watch::fanotify::masks::*;
         let mut m = FidMap::new();
         m.learn(&h(b"d"), 1);
         m.translate(1, b"d", FAN_CREATE, b"a", false, |_| None); // resolved

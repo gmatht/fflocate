@@ -243,6 +243,9 @@ snapshot.fnx:  magic "FNX2" | version | next_id | generation | roots[] | counts
                | names blob | entries array | last_lsn | checksum
 journal.log:   [op u8][len u32][crc32][payload]   ADD / DEL / MOVE / FENCE / MARK
                LSN = monotonic record index
+store.meta:    JSON sidecar: format version, creating/writing OS, resolved
+               backend, shared flag, per-root {drive identity, owner OS}.
+               Read once per boot; never part of the snapshot format.
 ```
 
 - **Load = mmap** (MAP_PRIVATE, < 50 ms at millions of entries); tombstone flips are COW. Replay journal tail on startup. Torn/corrupt tail: per-record CRC bounds the damage — keep serving, log it, enqueue `RescanSubtree(cause=journal_corrupt)`.
@@ -358,6 +361,24 @@ Lessons from the Watchman/React-Native years, applied pre-emptively:
 - **Backoff**: rate-limited rescans (§7); a pathological workload must not become a recrawl loop.
 - **sysctl guidance** for the inotify fallback documented in `ff doctor`: `fs.inotify.max_user_watches`, `max_queued_events`.
 - **Startup UX**: serve queries immediately from snapshot+journal; if the journal was unrecoverable, meta says `catching_up: true` until the rescan lands.
+- **Dual-boot shared stores** (`--shared-store`): one state dir may serve two
+  OSes at different times (never concurrently — dual boot). Rules, in order:
+  1. *Version first.* A snapshot newer than supported refuses to start; it is
+     never recrawled over. (A store with a journal but no snapshot from a
+     newer writer is the one unprotected case — documented, accepted.)
+  2. *Ownership.* The stamp records the last writer OS. A foreign store
+     without the flag refuses, loudly. Legacy (unstamped) stores are adopted
+     as-is — the one hole this cannot close, also documented.
+  3. *Handoff.* A new writer OS bumps the generation (stale cursors go fresh,
+     §9) and rescans its local roots (`os_handoff` cause: crawls only add).
+  4. *Roots are namespaced by recording OS*, not by path: entries are bare
+     names, so both spellings coexist; each OS queries, syncs and rescans
+     only its own (legacy roots count as local). Foreign roots stay visible
+     in stats, report `foreign` in sync, refuse rescan — and are never
+     deleted here. Drive identity (disk serial + volume UUID, re-probed every
+     boot) catches swapped media under a known path and forces a rescan.
+  Without the flag, none of this activates: single-OS behaviour is
+  bit-for-bit unchanged.
 
 ---
 

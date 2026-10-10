@@ -21,6 +21,7 @@ fn test_config(dir: &std::path::Path, root: PathBuf) -> Config {
         excludes: findex::excludes::Excludes::new(),
         system: false,
         system_group: 0,
+        shared_store: false,
     }
 }
 

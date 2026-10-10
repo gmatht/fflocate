@@ -1115,16 +1115,11 @@ impl Applier {
 /// stored path against the index — roots are keyed by a synthetic entry whose
 /// name is the final component of the path and parent is ROOT_ID.
 pub fn root_dir_id(ix: &Index, root: &Root) -> u32 {
-    // Roots are inserted at crawl time with the basename as their name.
-    let basename = root
-        .path
-        .file_name()
-        .map(os_str_bytes)
-        .unwrap_or_default();
-    if basename.is_empty() {
-        return ROOT_ID;
+    // Roots are inserted at crawl time under `root_entry_name`.
+    match crate::roots::root_entry_name(&root.path) {
+        Some(name) => ix.lookup(ROOT_ID, &name).unwrap_or(ROOT_ID),
+        None => ROOT_ID,
     }
-    ix.lookup(ROOT_ID, &basename).unwrap_or(ROOT_ID)
 }
 
 /// All descendants of `dir` (not including `dir`).

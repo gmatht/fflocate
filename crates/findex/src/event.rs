@@ -37,6 +37,9 @@ pub enum RescanCause {
     /// Post-crawl reconciliation: a dir got events after it was enumerated
     /// (§5).
     PostCrawl,
+    /// Cross-OS handoff in a shared store (§15): another OS wrote last, so
+    /// local roots are re-reconciled unconditionally at startup.
+    OsHandoff,
 }
 
 impl RescanCause {
@@ -49,6 +52,7 @@ impl RescanCause {
             RescanCause::MountEvent => "mount_event",
             RescanCause::Manual => "manual",
             RescanCause::PostCrawl => "post_crawl",
+            RescanCause::OsHandoff => "os_handoff",
         }
     }
 
@@ -61,6 +65,7 @@ impl RescanCause {
             "mount_event" => RescanCause::MountEvent,
             "manual" => RescanCause::Manual,
             "post_crawl" => RescanCause::PostCrawl,
+            "os_handoff" => RescanCause::OsHandoff,
             _ => return None,
         })
     }

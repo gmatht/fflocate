@@ -3,7 +3,7 @@
 //! Usage:
 //!
 //! ```text
-//! findexd [--socket PATH] [--state-dir DIR] [--root DIR]... [--backend fanotify|inotify|fake|auto] [--foreground]
+//! findexd [--socket PATH] [--state-dir DIR] [--root DIR]... [--backend fanotify|inotify|fake|auto] [--shared-store] [--foreground]
 //! ```
 //!
 //! With no `--root`, `$HOME` is indexed. The daemon binds its socket, installs
@@ -69,11 +69,14 @@ fn parse_args() -> Result<Config, String> {
                     })
                     .map_err(|e: &str| format!("--system-group: {e}"))?;
             }
+            "--shared-store" => {
+                cfg = cfg.with_shared_store(true);
+            }
             "--foreground" | "-f" => foreground = true,
             "--help" | "-h" => {
                 println!(
                     "findexd [--socket PATH] [--state-dir DIR] [--root DIR]... \
-                     [--backend fanotify|inotify|fake|auto] [--foreground]\n\
+                     [--backend fanotify|inotify|fake|auto] [--shared-store] [--foreground]\n\
                      findexd --system [--system-group GID|NAME] [--root DIR]... \
                      # system instance: /run/findexd.sock, per-entry ownership"
                 );

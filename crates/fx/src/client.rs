@@ -451,8 +451,10 @@ impl Client {
         Ok(Default::default())
     }
 
-    /// Root keys (absolute paths) currently configured on the daemon.
-    pub fn root_paths(&mut self) -> Result<Vec<String>, CliError> {
+    /// `(path, local)` per root: foreign roots (dual-boot shared store, §15)
+    /// are reported but never targeted. `local` defaults true when the daemon
+    /// predates the field.
+    pub fn root_infos(&mut self) -> Result<Vec<(String, bool)>, CliError> {
         let resp = self.send(&Request::Stats { roots: true })?;
         for r in resp {
             if let Response::Stats { stats } = r {
@@ -460,7 +462,8 @@ impl Client {
                 if let Some(roots) = stats.get("roots").and_then(|v| v.as_array()) {
                     for x in roots {
                         if let Some(p) = x.get("path").and_then(|v| v.as_str()) {
-                            out.push(p.to_string());
+                            let local = x.get("local").and_then(|v| v.as_bool()).unwrap_or(true);
+                            out.push((p.to_string(), local));
                         }
                     }
                 }
@@ -485,23 +488,42 @@ impl Client {
         Ok(())
     }
 
-    /// Full manual update (the updatedb equivalent): rescan every root — or
-    /// just `only` when non-empty — then settle. A rescan enqueued before the
-    /// sync cookie is necessarily applied before the cookie completes, so a
-    /// root reporting `ok` is reconciled with the filesystem: this heals
-    /// missed changes from daemon downtime or offline edits. Returns the
-    /// per-root status map (`ok` / `weak` / `timeout`).
+    /// Full manual update (the updatedb equivalent): rescan every *local*
+    /// root — or just `only` when non-empty — then settle. Foreign roots are
+    /// listed as `foreign` but never rescanned (reconciling a subtree this OS
+    /// cannot see risks dropping it as vanished, §15). A rescan enqueued
+    /// before the sync cookie is necessarily applied before the cookie
+    /// completes, so a root reporting `ok` is reconciled with the filesystem:
+    /// this heals missed changes from daemon downtime or offline edits.
+    /// Returns the per-root status map (`ok` / `weak` / `timeout` /
+    /// `foreign`).
     pub fn update(
         &mut self,
         only: &[String],
         timeout_ms: u64,
     ) -> Result<std::collections::BTreeMap<String, String>, CliError> {
-        let targets: Vec<String> =
-            if only.is_empty() { self.root_paths()? } else { only.to_vec() };
+        let mut foreign = Vec::new();
+        let targets: Vec<String> = if only.is_empty() {
+            let mut local = Vec::new();
+            for (path, is_local) in self.root_infos()? {
+                if is_local {
+                    local.push(path);
+                } else {
+                    foreign.push(path);
+                }
+            }
+            local
+        } else {
+            only.to_vec()
+        };
         for r in &targets {
             self.rescan_root(r)?;
         }
-        self.sync_timeout(timeout_ms)
+        let mut status = self.sync_timeout(timeout_ms)?;
+        for r in foreign {
+            status.insert(r, "foreign".to_string());
+        }
+        Ok(status)
     }
 
     pub fn since(&mut self, cursor: &str, q: &str) -> Result<ExitCode, CliError> {

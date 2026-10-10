@@ -144,6 +144,25 @@ pub fn write_atomic(path: &Path, index: &Index, roots: &[Root]) -> io::Result<()
     Ok(())
 }
 
+/// Read just the version header of a snapshot file, without decoding it.
+/// Used by the open-time compatibility gate (§15): a store from a *newer*
+/// format must refuse to start, never recrawl over something it cannot read.
+/// Returns `Ok(None)` when there is no file; `Err` on a bad magic or an
+/// unreadable header (the legacy corrupt path, which recrawls).
+pub fn peek_version(path: &Path) -> io::Result<Option<u32>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut f = File::open(path)?;
+    let mut hdr = [0u8; 8];
+    use std::io::Read;
+    f.read_exact(&mut hdr).map_err(|_| corrupt("snapshot header unreadable"))?;
+    if &hdr[0..4] != MAGIC {
+        return Err(corrupt("bad magic"));
+    }
+    Ok(Some(u32::from_le_bytes(hdr[4..8].try_into().unwrap())))
+}
+
 /// Decode a snapshot from raw bytes. Validates magic, version and checksum.
 pub fn decode(bytes: &[u8]) -> io::Result<(Index, Vec<Root>)> {
     let n = bytes.len();

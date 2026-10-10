@@ -123,6 +123,9 @@ pub enum SyncStatus {
     /// A root that repeatedly fails cookie sync.
     Degraded(String),
     Timeout,
+    /// A root recorded by another OS (dual-boot shared store, §15): not
+    /// attempted here, by rule rather than by failure.
+    Foreign,
 }
 
 impl SyncStatus {
@@ -132,6 +135,7 @@ impl SyncStatus {
             SyncStatus::Weak => "weak",
             SyncStatus::Degraded(_) => "degraded",
             SyncStatus::Timeout => "timeout",
+            SyncStatus::Foreign => "foreign",
         }
     }
 }

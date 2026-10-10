@@ -28,3 +28,8 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# Physical-drive identification on Windows (volume GUID/serial, disk serial).
+# Pinned to 0.52 for the workspace MSRV (1.75); only the listed API families.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Ioctl", "Win32_System_IO"] }

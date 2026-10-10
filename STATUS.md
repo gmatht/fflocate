@@ -43,7 +43,7 @@ All of the following were exercised against real binaries and a real temp tree:
   the queue drained).
 * Cookie files are cleaned up on completion and on timeout (no leaks).
 
-`cargo test` runs 283 tests, all green, including a 120-step random
+`cargo test` runs 286 tests, all green, including a 120-step random
 differential test against a from-scratch filesystem walk.
 
 Zero-hit `ff` string queries with an uppercase letter get a case-folded
@@ -208,6 +208,23 @@ They skip cleanly without those rather than failing, so a run on a restricted
 machine exercises less than a run on this one. `SO_PEERCRED` was exercised only
 for the same-uid case in the automated test; different-uid connections were
 verified by hand with `setpriv`.
+
+### Dual-boot store sharing (`--shared-store`, §15)
+
+One state dir may serve two OSes at different times. Version gate runs first
+(newer snapshot → refuse, never recrawl-over); then the `store.meta` stamp
+(created/last-writer OS, backend, shared flag, per-root drive map) decides:
+foreign without the flag refuses loudly, with it opens as a handoff
+(generation bump, `os_handoff` rescans of local roots). Roots are namespaced
+by recording OS — foreign roots stay visible but are excluded from queries
+(including counts), report `foreign` in sync, and refuse rescan; nothing
+deletes them. Drive identity (disk serial + volume UUID, re-probed per boot)
+forces a rescan when media swaps under a known path. Covered by
+`drive.rs` unit tests (matching, Linux `/dev/disk`+`/sys` fixtures),
+`persist.rs` gate-matrix tests, `store_gates.rs` (legacy adopt, newer
+refuses, foreign refuses, foreign+flag handoffs end to end), and server
+foreign-exclusion tests. Legacy (unstamped) stores adopt unchanged; the
+never-compacted foreign store is the one documented unprotected case.
 
 ### `locate` drop-in (`crates/fx/src/locate.rs`)
 

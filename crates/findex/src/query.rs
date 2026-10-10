@@ -728,7 +728,13 @@ pub fn execute_fuzzy(
         let root_id = index.root_of(id);
         let root_path = root_id
             .and_then(|r| root_paths.iter().find(|(rid, _)| *rid == r).map(|(_, p)| p.clone()));
-        if !q.matches_exact_terms(name, || root_path.as_ref().and_then(|rp| index.path_of(id, rp))) {
+        // Unattributable entries (foreign roots excluded upstream) are
+        // skipped before matching, as in the plain scan (§15).
+        let root_path = match root_path {
+            Some(rp) => rp,
+            None => return,
+        };
+        if !q.matches_exact_terms(name, || index.path_of(id, &root_path)) {
             return;
         }
         // Approximate terms: every needle must be within budget; sum the costs.
@@ -743,12 +749,9 @@ pub fn execute_fuzzy(
         if count_only {
             return;
         }
-        let path = match &root_path {
-            Some(rp) => match index.materialize_into(id, rp, &mut buf) {
-                Some(_) => buf.clone(),
-                None => return,
-            },
-            None => name.to_vec(),
+        let path = match index.materialize_into(id, &root_path, &mut buf) {
+            Some(_) => buf.clone(),
+            None => return,
         };
         scored.push((score, path, id));
     };
@@ -827,9 +830,14 @@ fn consider(
     }
     let root_id = index.root_of(id);
     let root_path = root_id.and_then(|r| root_paths.iter().find(|(rid, _)| *rid == r).map(|(_, p)| p.clone()));
-    let matched = q.matches(name, || {
-        root_path.as_ref().and_then(|rp| index.path_of(id, rp))
-    });
+    // No root in the table (foreign roots excluded upstream, or orphans):
+    // unattributable. A bare basename is not a valid path, and counting it
+    // would leak foreign files into totals (§15) — skip before matching.
+    let root_path = match root_path {
+        Some(rp) => rp,
+        None => return,
+    };
+    let matched = q.matches(name, || index.path_of(id, &root_path));
     if !matched {
         return;
     }
@@ -840,12 +848,9 @@ fn consider(
     if limit != 0 && results.hits.len() >= limit {
         return;
     }
-    let path = match &root_path {
-        Some(rp) => match index.materialize_into(id, rp, buf) {
-            Some(_) => buf.clone(),
-            None => return,
-        },
-        None => name.to_vec(),
+    let path = match index.materialize_into(id, &root_path, buf) {
+        Some(_) => buf.clone(),
+        None => return,
     };
     results.hits.push(Hit { id, path, score: 0 });
 }

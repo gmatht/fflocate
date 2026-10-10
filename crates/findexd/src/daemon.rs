@@ -37,6 +37,33 @@ use findex::watch::{FakeBackend, WatchBackend};
 use findex::watch::InotifyBackend;
 
 use crate::config::{BackendChoice, Config};
+use std::collections::BTreeMap;
+
+/// Root-dir ids needing a drive-change rescan: a drive was recorded for the
+/// path, a drive probes now, and they disagree. Pure for testability; `build`
+/// wires it up. Foreign roots are never touched here (their entries belong
+/// to another OS), and unknown drives on either side mean "cannot tell",
+/// never "changed".
+fn drive_changed_rids(
+    recorded: &BTreeMap<String, findex::persist::RecordedRoot>,
+    roots: &[Root],
+    index: &Index,
+) -> Vec<u32> {
+    let mut out = Vec::new();
+    for root in roots.iter().filter(|r| r.is_local()) {
+        let rec = recorded.get(&root.key()).and_then(|r| r.drive.clone());
+        match (rec, root.drive.clone()) {
+            (Some(a), Some(b)) if !a.matches(&b) => {
+                let rid = findex::applier::root_dir_id(index, root);
+                if rid != ROOT_ID {
+                    out.push(rid);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
 
 /// The backend shared between the watcher thread (poll) and the applier loop
 /// (install watches).
@@ -124,6 +151,32 @@ impl Daemon {
     /// Build a daemon from a config. Loads the snapshot + replays the journal.
     pub fn build(config: Config) -> anyhow::Result<Daemon> {
         let mut store = Store::open(&config.state_dir)?;
+        let this_os = findex::persist::current_os();
+
+        // Store gates, in order (§15): version first — a store from a newer
+        // format refuses to start rather than recrawling over data it cannot
+        // read — then ownership (a foreign store needs --shared-store).
+        let stamp = Store::read_stamp(&config.state_dir);
+        let snap_version = Store::peek_snapshot_version(&config.state_dir)?;
+        let handoff = match findex::persist::check_gate(
+            stamp.as_ref(),
+            snap_version,
+            this_os,
+            config.shared_store,
+        ) {
+            findex::persist::OpenGate::Open { handoff } => {
+                if handoff {
+                    eprintln!(
+                        "findexd: store last written by '{}'; shared mode, adopting (generation bump, local roots rescanned)",
+                        stamp.as_ref().map(|s| s.last_writer_os.as_str()).unwrap_or("?"),
+                    );
+                }
+                handoff
+            }
+            findex::persist::OpenGate::Refuse(msg) => {
+                anyhow::bail!("{msg}");
+            }
+        };
 
         let loaded = store.load_snapshot()?;
         let had_snapshot = loaded.is_some();
@@ -132,19 +185,22 @@ impl Daemon {
             None => (Index::new(), Vec::new()),
         };
 
-        // Merge configured roots into the roots table.
+        // Merge configured roots into the roots table. New records are owned
+        // by this OS; stored records keep their recorded owner (foreign roots
+        // stay visible but are never touched here).
         for p in &config.roots {
             if !roots.iter().any(|r| r.path == *p) {
                 let id = roots.len() as u32;
                 let mut root = Root::new(id, p.clone());
+                root.owner_os = Some(this_os.to_string());
                 root.caps = mount::probe_root(p);
                 roots.push(root);
             }
         }
-        // Assign each root a root-dir entry in the index (name = basename).
+        // Assign each root a root-dir entry in the index (name = basename,
+        // or the drive letter for a Windows drive root, which has none).
         for root in roots.iter_mut() {
-            if let Some(base) = root.path.file_name() {
-                let base_bytes = base.to_string_lossy().as_bytes().to_vec();
+            if let Some(base_bytes) = findex::roots::root_entry_name(&root.path) {
                 if index.lookup(ROOT_ID, &base_bytes).is_none() {
                     index.insert(
                         ROOT_ID,
@@ -155,7 +211,17 @@ impl Daemon {
             }
             root.caps = mount::probe_root(&root.path);
             root.dev = mount::probe_dev(&root.path).unwrap_or(0);
+            root.drive = findex::drive::probe_drive(&root.path);
         }
+
+        // A drive that changed under a known path (swapped removable media,
+        // or the other OS's view of a shared drive) must be re-reconciled:
+        // entries proved against the old drive are suspect.
+        let drive_changed = drive_changed_rids(
+            &stamp.as_ref().map(|s| s.drives.clone()).unwrap_or_default(),
+            &roots,
+            &index,
+        );
 
         // Replay the journal tail. `replay` reports the records; we apply them
         // to the index ourselves (the same `apply_record` the applier uses).
@@ -165,11 +231,17 @@ impl Daemon {
             findex::persist::apply_record(&mut index, rec);
         }
 
+        // Cross-OS handoff: old cursors must not silently apply to a new
+        // writer's history — bump the generation (§9) and re-reconcile.
+        if handoff {
+            index.bump_generation();
+        }
+
         let shared = Shared::new(index, roots);
         {
             let mut h = shared.health.write().unwrap();
             h.journal_corrupt = replay.corrupt_tail;
-            h.catching_up = !had_snapshot || replay.corrupt_tail;
+            h.catching_up = !had_snapshot || replay.corrupt_tail || handoff;
         }
 
         let sync = SyncRegistry::new();
@@ -182,6 +254,54 @@ impl Daemon {
             applier.set_excludes(config.excludes.clone());
         }
         let (backend, resolved_backend) = make_backend(config.backend)?;
+
+        // Reconcile queued at open: swapped drives re-verified, and on a
+        // cross-OS handoff every local root is re-reconciled unconditionally
+        // (a crawl only adds; deletions need the diff).
+        for rid in drive_changed {
+            applier.pending_mut().enqueue_rescan(rid, RescanCause::MountEvent);
+        }
+        if handoff {
+            let ix = shared.index.read().unwrap();
+            let roots = shared.roots.read().unwrap();
+            for r in roots.iter().filter(|r| r.is_local()) {
+                let rid = findex::applier::root_dir_id(&ix, r);
+                if rid != ROOT_ID {
+                    applier
+                        .pending_mut()
+                        .enqueue_rescan(rid, RescanCause::OsHandoff);
+                }
+            }
+        }
+
+        // Record this boot: ownership for new records, fresh drive probes
+        // where available (never clobbering with unknowns), us as writer.
+        {
+            let roots = shared.roots.read().unwrap();
+            let created_by_os = stamp
+                .as_ref()
+                .map(|s| s.created_by_os.clone())
+                .unwrap_or_else(|| this_os.to_string());
+            let mut drives = stamp.map(|s| s.drives).unwrap_or_default();
+            for r in roots.iter() {
+                let entry = drives.entry(r.key()).or_default();
+                if r.drive.is_some() {
+                    entry.drive = r.drive.clone();
+                }
+                if entry.owner_os.is_none() {
+                    entry.owner_os = r.owner_os.clone();
+                }
+            }
+            let next = findex::persist::StoreStamp {
+                format_version: findex::config_paths::FORMAT_VERSION,
+                created_by_os,
+                last_writer_os: this_os.to_string(),
+                backend: resolved_backend.as_str().to_string(),
+                shared: config.shared_store,
+                drives,
+            };
+            Store::write_stamp(&config.state_dir, &next)?;
+        }
 
         let (incoming_tx, incoming_rx) = bounded::<Vec<FsEvent>>(1000);
         let (control_tx, control_rx) = bounded::<Control>(64);
@@ -480,5 +600,69 @@ impl Daemon {
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use findex::drive::DriveId;
+    use findex::persist::RecordedRoot;
+
+    fn root_with(id: u32, path: &str, drive: Option<DriveId>, owner: Option<&str>) -> Root {
+        let mut r = Root::new(id, PathBuf::from(path));
+        r.drive = drive;
+        r.owner_os = owner.map(str::to_string);
+        r
+    }
+
+    fn index_with_root_entry(name: &[u8]) -> Index {
+        let mut ix = Index::new();
+        ix.insert(
+            ROOT_ID,
+            name,
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        ix
+    }
+
+    fn disk(serial: &str) -> DriveId {
+        DriveId { disk_serial: Some(serial.to_string()), volume_uuid: None }
+    }
+
+    #[test]
+    fn drive_change_needs_agreeing_mismatch() {
+        let ix = index_with_root_entry(b"data");
+        let mk = |drive: Option<DriveId>| root_with(0, "/mnt/data", drive, Some("linux"));
+        let rec = |drive: Option<DriveId>| RecordedRoot { drive, owner_os: Some("linux".into()) };
+
+        // Recorded A, probes B → rescan.
+        let mut map = BTreeMap::new();
+        map.insert("/mnt/data".to_string(), rec(Some(disk("A"))));
+        let roots = vec![mk(Some(disk("B")))];
+        assert_eq!(drive_changed_rids(&map, &roots, &ix).len(), 1);
+
+        // Agreeing (case-insensitively) → quiet.
+        let roots = vec![mk(Some(disk("a")))];
+        assert!(drive_changed_rids(&map, &roots, &ix).is_empty());
+
+        // Either side unknown → cannot tell, never "changed".
+        let roots = vec![mk(None)];
+        assert!(drive_changed_rids(&map, &roots, &ix).is_empty());
+        let map_empty: BTreeMap<String, RecordedRoot> = BTreeMap::new();
+        let roots = vec![mk(Some(disk("B")))];
+        assert!(drive_changed_rids(&map_empty, &roots, &ix).is_empty());
+
+        // Foreign roots are never touched, even on mismatch.
+        let mut foreign = mk(Some(disk("B")));
+        foreign.owner_os = Some("windows".into());
+        let roots = vec![foreign];
+        assert!(drive_changed_rids(&map, &roots, &ix).is_empty());
+
+        // Legacy (unowned) roots behave like local ones.
+        let mut legacy = mk(Some(disk("B")));
+        legacy.owner_os = None;
+        let roots = vec![legacy];
+        assert_eq!(drive_changed_rids(&map, &roots, &ix).len(), 1);
     }
 }
