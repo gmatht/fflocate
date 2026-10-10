@@ -1,4 +1,4 @@
-# DESIGN.md — implementation status (v1)
+# DESIGN.md — implementation status
 
 This file records how the implementation maps onto [`DESIGN.md`](DESIGN.md),
 where it deviates, and what is deliberately not done. It is not a walkthrough;
@@ -16,6 +16,8 @@ it is a status note.
 | §8 Cookie sync | done | `crates/findex/src/sync.rs`, `server.rs` (`handle_sync`) |
 | §9 Snapshot + journal + cursors + compaction | done | `crates/findex/src/{snapshot,journal,persist,cursor}.rs` |
 | §10 Query engine | done | `crates/findex/src/query.rs` |
+| §10/§17 **v2 trigram accelerator** | done | `crates/findex/src/trigram.rs`, `query.rs` (`execute_with_trigram`), `applier.rs` (`Shared::trigram_index`); tests `tests/trigram_differential.rs`; bench `examples/trigram_bench.rs` |
+| §10 **fuzzy search** | done | `crates/findex/src/fuzzy.rs`, `query.rs` (`execute_fuzzy`), `proto.rs`/`server.rs`/`fx` (`--fuzzy`, `--distance`) |
 | §11 IPC protocol v2 | done | `crates/findex/src/proto.rs`, `server.rs` |
 | §12 CLI | done | `crates/fx/src/{main,client,service}.rs` (binary `ff`; the `fx` name collides with the snap JSON viewer. Crate dir kept as `crates/fx`.) |
 | §13 Concurrency model | done | `crates/findex/src/applier.rs`, `crates/findexd/src/daemon.rs` |
@@ -39,13 +41,102 @@ All of the following were exercised against real binaries and a real temp tree:
   the queue drained).
 * Cookie files are cleaned up on completion and on timeout (no leaks).
 
-`cargo test` runs 186 tests, all green, including a 120-step random
+`cargo test` runs 228 tests, all green, including a 120-step random
 differential test against a from-scratch filesystem walk.
 
 Zero-hit `ff` string queries with an uppercase letter get a case-folded
 "did you mean" rerun (bounded, stderr only; stdout/exit codes untouched).
-True edit-distance fuzzy stays out — that belongs to the v2 trigram
-accelerator, not to a scan.
+That is a *suggestion*; for true edit-distance matching, ranked and on
+stdout, use `ff --fuzzy` (§10, above).
+
+### v2 trigram accelerator (§10/§17)
+
+`crates/findex/src/trigram.rs` maps each lowercased-ASCII **name** trigram to a
+sorted posting list of entry ids; a query's required literals are intersected
+through it and only the survivors are checked. It is a **filter, never an
+authority** — `execute_with_trigram` runs the full `Query::matches` on every
+candidate, so the accelerator changes only speed. The cache lives on `Shared`,
+keyed on `(generation, entry_count)`; any addition or generation bump rebuilds
+it, and stale postings that still name tombstoned ids are harmless because the
+accelerated path rechecks liveness.
+
+Measured with `cargo run --release -p findex --example trigram_bench -- 1000000`
+(1 M entries, this machine):
+
+```
+index build:           488 ms
+trigram build:        1866 ms  (2024 trigrams, 11.6 M postings)
+names arena:          13.1 MiB
+trigram postings:     44.4 MiB  (339% of name bytes)
+
+query               matches   linear ms   trigram ms  speedup
+very selective          781      275         5.1        54x
+word + ext             5663      254        19.7        13x
+common word          56 582      252        38.4         7x
+common + ext           5703      295        26.6        11x
+```
+
+The benchmark asserts accelerated and linear results are identical (count *and*
+id order) on every timed query, so a fast number can never come from a wrong
+answer. Two honest caveats:
+
+* **Memory ~ quadruples** on the name side (44 MiB of postings vs 13 MiB of
+  names; a name averaging ~13 bytes yields ~11.6 trigrams). That is the cost of
+  the accelerator and the reason the design gates it at 10 M+ files — at 50 M
+  files it would be ~2.2 GB. It is currently built eagerly on first query
+  (`Shared::trigram_index`); it is *not* persisted, so a restart rebuilds it
+  (1.9 s at 1 M). Both are deliberate v2 scope cuts.
+* **`path:` terms are not accelerated** (the index stores no path strings, §3),
+  and literals shorter than three bytes carry no trigram; those parts of a query
+  fall through to the linear scan. A query that is *only* such terms sees no
+  speedup.
+
+`crates/findex/tests/trigram_differential.rs` pins the filter contract across
+random trees and a corpus covering substrings (incl. < 3 bytes), smart-case,
+globs, regex, `path:`, phrases, negation and their combinations. The deletion
+case is the one that earned its keep: it caught stale postings producing phantom
+hits until liveness was rechecked in the accelerated path.
+
+The accelerator is behind a **default-on cargo feature, `trigram`** (`findex`,
+with passthroughs on `findexd` and `ff`). `cargo build --no-default-features`
+compiles it out entirely — no posting lists, no cache, and queries fall through
+to the plain linear scan with identical results. This is the switch to reach for
+on memory-constrained machines (the ~4× name-byte cost above) or when the
+accelerator is simply not wanted; it is compile-time, so there is no runtime
+toggle and no branch cost when off.
+
+### Fuzzy search (§10)
+
+`ff --fuzzy` (or `Request::Query.fuzzy`) turns the plain substring terms into
+approximate matches; `--distance N` sets the budget and defaults to **1**. The
+matcher (`crates/findex/src/fuzzy.rs`) is bounded, case-insensitive edit
+distance: `substring_within` answers "does some substring of the name lie within
+`k` edits of the needle" with a free-prefix first DP row and a free-suffix
+minimum over the last, falling back to an exact `memmem` find when there is one.
+`ext:`, `path:`, glob, regex, negation and `case:` are **not** fuzzed — they
+still filter exactly.
+
+Ranking is by the summed per-needle distance (an integer), then path — a total,
+deterministic order. One consequence is worth knowing before writing a test:
+fuzzy emits a **ranked list**, so its order differs from a plain query's index
+order even at `k = 0`, where the two select the same set.
+
+The trigram index's only role is candidate generation, via the same sound bound
+the design gives (`t − 3k` shared trigrams); when that bound is vacuous the query
+scans everything. Measured at 1 M entries (`trigram_bench`):
+
+```
+rare typo   k=1  781 matches   scan 279 ms   trigram  58 ms   4.8x
+rare typo   k=2  781 matches   scan 525 ms   trigram 102 ms   5.2x
+common typo k=1    0 matches   scan 301 ms   trigram 314 ms   1.0x
+common typo k=2  216471 matches scan 985 ms  trigram 1078 ms  0.9x
+```
+
+The benchmark asserts accelerated and unaccelerated fuzzy results are identical
+in count, ids **and scores**. The honest read of the table: fuzzy helps when the
+pattern is long enough (and `k` small enough) for the trigram bound to bite, and
+is pure overhead when it is not — a 4-letter pattern at `k = 2` leaves nothing to
+constrain. It is opt-in for exactly that reason.
 
 ### `locate` drop-in (`crates/fx/src/locate.rs`)
 

@@ -31,6 +31,20 @@ pub struct Client {
     socket: PathBuf,
 }
 
+/// Everything about a `ff` query that is not the query string itself.
+#[derive(Clone, Debug, Default)]
+pub struct QueryOpts {
+    pub limit: usize,
+    pub json: bool,
+    pub count: bool,
+    pub zero: bool,
+    pub expr: Option<serde_json::Value>,
+    /// Approximate matching (§10/§17 v2).
+    pub fuzzy: bool,
+    /// Edit budget for `fuzzy`; `None` uses the server default.
+    pub distance: Option<u32>,
+}
+
 impl Client {
     /// Connect to the daemon, auto-spawning it if it is not running.
     pub fn connect(socket_override: Option<&str>) -> Result<Client, CliError> {
@@ -105,18 +119,11 @@ impl Client {
 
     /// Run a query and print results. Returns the process exit code.
     ///
-    /// When `expr` is `Some`, it is a Watchman-style expression tree or a full
-    /// query object; the JSON is sent as the query and the string `q` is
+    /// When `opts.expr` is `Some`, it is a Watchman-style expression tree or a
+    /// full query object; the JSON is sent as the query and the string `q` is
     /// ignored (§10, expr).
-    pub fn query(
-        &mut self,
-        q: &str,
-        limit: usize,
-        json: bool,
-        count: bool,
-        zero: bool,
-        expr: Option<serde_json::Value>,
-    ) -> Result<ExitCode, CliError> {
+    pub fn query(&mut self, q: &str, opts: QueryOpts) -> Result<ExitCode, CliError> {
+        let QueryOpts { limit, json, count, zero, expr, fuzzy, distance } = opts;
         let is_string_query = expr.is_none();
         let req = match expr {
             Some(v) => {
@@ -144,9 +151,20 @@ impl Client {
                     path: get("path"),
                     relative_root: get("relative_root").and_then(|v| v.as_str().map(|s| s.to_string())),
                     case_sensitive: get("case_sensitive").and_then(|v| v.as_bool()),
+                    // Fuzzy applies to the string query language, not to
+                    // expression trees (§10).
+                    fuzzy: false,
+                    max_distance: None,
                 }
             }
-            None => Request::query(q, limit, json, count),
+            None => {
+                let mut r = Request::query(q, limit, json, count);
+                if let Request::Query { fuzzy: f, max_distance: d, .. } = &mut r {
+                    *f = fuzzy;
+                    *d = distance;
+                }
+                r
+            }
         };
         let resp = self.send(&req)?;
         let mut printed = 0u64;
@@ -200,8 +218,8 @@ impl Client {
     /// smart-case: an uppercase letter in the query forced sensitive matching,
     /// so a lowercased rerun may find what the user meant. Bounded to a few
     /// hits, stderr only — stdout, the exit code, and determinism are
-    /// untouched. (True edit-distance fuzzy belongs to the v2 trigram
-    /// accelerator, §17, not to a scan.)
+    /// untouched. This is a *suggestion*; for ranked edit-distance matching on
+    /// stdout use `--fuzzy` (§10).
     fn suggest_alternate(&mut self, q: &str) {
         let Some(folded) = folded_query(q) else { return };
         let req = Request::query(&folded, 5, false, false);
@@ -247,6 +265,8 @@ impl Client {
             path: None,
             relative_root: None,
             case_sensitive: None,
+            fuzzy: false,
+            max_distance: None,
         };
         let resp = self.send(&req)?;
         let mut paths: Vec<String> = Vec::new();
@@ -338,6 +358,9 @@ impl Client {
             path: get("path"),
             relative_root: get("relative_root").and_then(|v| v.as_str().map(|s| s.to_string())),
             case_sensitive: get("case_sensitive").and_then(|v| v.as_bool()),
+            // find mode is exact; fuzzy belongs to the ff string query.
+            fuzzy: false,
+            max_distance: None,
         };
         let resp = self.send(&req)?;
 

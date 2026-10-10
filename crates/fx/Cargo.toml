@@ -10,6 +10,11 @@ description = "ff: command-line client for the findex daemon."
 name = "ff"
 path = "src/main.rs"
 
+[features]
+default = ["trigram"]
+# Passthrough for findex's §17 v2 trigram accelerator.
+trigram = ["findex/trigram"]
+
 [dependencies]
 findex.workspace = true
 serde_json.workspace = true

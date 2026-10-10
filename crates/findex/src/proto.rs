@@ -48,6 +48,13 @@ pub enum Request {
         /// Override the filesystem's case sensitivity.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         case_sensitive: Option<bool>,
+        /// Approximate (edit-distance) matching for the plain substring terms
+        /// (§10/§17 v2). Off by default; when on, results are ranked by score.
+        #[serde(default)]
+        fuzzy: bool,
+        /// Maximum edit distance for `fuzzy` (defaults server-side when absent).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_distance: Option<u32>,
     },
     /// Settle barrier: complete when everything before the call is indexed (§8).
     Sync {
@@ -150,6 +157,8 @@ impl Request {
             path: None,
             relative_root: None,
             case_sensitive: None,
+            fuzzy: false,
+            max_distance: None,
         }
     }
 

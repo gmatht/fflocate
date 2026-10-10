@@ -116,6 +116,21 @@ pub struct Shared {
     pub health: RwLock<Health>,
     /// A broadcast of change events for `subscribe` (cursor-based consumers).
     pub changes: RwLock<crate::health::ChangeLog>,
+    /// §17 v2 trigram accelerator, cached against the index it was built from.
+    /// Present only with the default-on `trigram` cargo feature.
+    ///
+    /// Keyed by `(generation, entry_count)`:
+    /// * a generation bump (snapshot load / full rescan / compaction) always
+    ///   invalidates it;
+    /// * within a generation, `entry_count` rises by one for every new entry, so
+    ///   any addition invalidates it too.
+    ///
+    /// A *removal* does not bump `entry_count`, so the cached postings may still
+    /// name tombstoned ids. That is safe by construction: the accelerator is a
+    /// filter and the authoritative matcher drops dead ids — a stale posting can
+    /// only ever add a candidate, never remove a real hit.
+    #[cfg(feature = "trigram")]
+    pub trigram: RwLock<Option<(u64, usize, Arc<crate::trigram::TrigramIndex>)>>,
 }
 
 impl Shared {
@@ -129,7 +144,51 @@ impl Shared {
             lsn: AtomicU64::new(lsn),
             health: RwLock::new(Health::default()),
             changes: RwLock::new(crate::health::ChangeLog::new(4096)),
+            #[cfg(feature = "trigram")]
+            trigram: RwLock::new(None),
         })
+    }
+
+    /// The trigram accelerator for the current index, building it if the cache
+    /// is cold or stale. Cheap after the first call for a given index shape.
+    ///
+    /// The index read lock is taken by the caller separately; this takes only
+    /// the cache lock and, on a miss, the index lock to build. Callers must not
+    /// hold the index read lock while calling this to avoid a lock-order hazard
+    /// — the query path builds the accelerator *before* taking the index lock.
+    ///
+    /// Only available with the default-on `trigram` cargo feature.
+    #[cfg(feature = "trigram")]
+    pub fn trigram_index(&self) -> Arc<crate::trigram::TrigramIndex> {
+        let (gen, entries) = {
+            let ix = self.index.read().unwrap();
+            (ix.generation(), ix.entry_count())
+        };
+        if let Some((g, e, idx)) = self.trigram.read().unwrap().as_ref() {
+            if *g == gen && *e == entries {
+                return Arc::clone(idx);
+            }
+        }
+        // Rebuild under the index read lock, then publish.
+        let built = {
+            let ix = self.index.read().unwrap();
+            Arc::new(crate::trigram::TrigramIndex::build(&ix))
+        };
+        let mut slot = self.trigram.write().unwrap();
+        // Another thread may have built it while we waited; keep its result.
+        if let Some((g, e, idx)) = slot.as_ref() {
+            if *g == gen && *e == entries {
+                return Arc::clone(idx);
+            }
+        }
+        *slot = Some((gen, entries, Arc::clone(&built)));
+        built
+    }
+
+    /// Drop the cached accelerator (used by tests and by explicit invalidation).
+    #[cfg(feature = "trigram")]
+    pub fn invalidate_trigram(&self) {
+        *self.trigram.write().unwrap() = None;
     }
 
     pub fn snapshot_lsn(&self) -> u64 {

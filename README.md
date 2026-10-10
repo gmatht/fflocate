@@ -39,6 +39,8 @@ ff -0 "test" | xargs -0 rg TODO  # pipe-friendly; exit 1 on no match
 ff --count ext:pdf
 ff --json --limit 1000 "2024" | fzf
 ff --sync "notes"                # settle, then search — deterministic
+ff --fuzzy mian.rs               # approximate match (edit distance 1 by default)
+ff --fuzzy --distance 2 "notes"  # wider edit budget; results ranked by score
 ff --since c:7:481221            # what changed since
 ff stats --roots                 # entries, backend, queue depth, caps, state
 ff rescan /data
@@ -107,7 +109,10 @@ like ripgrep/fzf).
   load; journal with `[op|len|crc|payload]` framing and bounded torn-tail
   replay; cursors `c:<gen>:<lsn>`; off-lock compaction.
 * **Query engine (§10)** — linear scan over the name arena with an
-  `aho-corasick` literal prefilter.
+  `aho-corasick` literal prefilter, plus the **v2 trigram accelerator**
+  (plocate-style name posting lists, filter-only, cached by index generation;
+  `crates/findex/src/trigram.rs`) and **fuzzy search** (`ff --fuzzy`, edit
+  distance, ranked by score; `crates/findex/src/fuzzy.rs`).
 * **IPC v2 (§11)** — NDJSON over a unix socket; ops `query`, `sync`, `since`,
   `subscribe`, `stats`, `rescan`, `hello`. Every response's meta carries
   `{gen, lsn, fresh, elapsed_ms, stale_roots[], catching_up, backend, entries}`.
@@ -117,7 +122,7 @@ like ripgrep/fzf).
 ## Testing
 
 ```sh
-cargo test          # 122 tests
+cargo test          # 204 tests
 ```
 
 The suite is the design's §14, and it is the point of the project:
@@ -145,8 +150,27 @@ crates/findexd/  daemon: config, daemon threads, unix-socket transport, binary
 crates/fx/       CLI client + service install
 ```
 
-## v1.5 / v2 (not implemented)
+## v2
 
-fanotify-FID and macOS FSEvents backends, trigram accelerator, lazy attribute
-sidecar keyed by stable ids, a live GUI subscriber feed. `subscribe` currently
-emits the protocol shape (meta + current cursor) as a preview.
+**Done:**
+
+* the **trigram accelerator** (plocate-style name posting lists used as a query
+  prefilter). It is filter-only — every candidate is still checked by the full
+  matcher, and the differential suite asserts identical results — and its cache
+  is keyed by index generation. It lives behind a default-on `trigram` cargo
+  feature, so `--no-default-features` builds it out entirely (plain linear scan,
+  same results). See `crates/findex/src/trigram.rs`,
+  `crates/findex/tests/trigram_differential.rs`, and
+  `cargo run --release -p findex --example trigram_bench` (≈6–60× faster queries;
+  postings ≈4× the name bytes — the trade the design gates at 10 M+ files).
+* **fuzzy search** (`ff --fuzzy`, `--distance N`, default 1 edit). Plain
+  substring terms match approximately; `ext:`/`path:`/glob/regex/negation/`case:`
+  stay exact. Results are ranked by integer edit distance (then path), so the
+  order differs from a plain query even at `k = 0` (same set, ranked sequence).
+  The trigram index generates candidates but never decides correctness. See
+  `crates/findex/src/fuzzy.rs`, `crates/findex/src/query.rs` (`execute_fuzzy`).
+
+**Not implemented:** fanotify-FID and macOS FSEvents backends, the lazy
+attribute sidecar keyed by stable ids, and a live GUI subscriber feed.
+`subscribe` currently emits the protocol shape (meta + current cursor) as a
+preview.

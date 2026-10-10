@@ -320,6 +320,110 @@ impl Query {
         }
         self.terms.iter().any(has)
     }
+
+    /// The literals that a matching name is *required* to contain, as
+    /// `(needle, case_sensitive)` pairs — the raw material for the §17 trigram
+    /// accelerator.
+    ///
+    /// Only positive `Substr` and `Ext` terms qualify:
+    ///
+    /// * a negated term (`-foo`) is not required to be present, so it can only
+    ///   ever *widen* the candidate set — it must not appear here;
+    /// * a `Glob` or `Regex` term has no fixed substring to look up;
+    /// * a `Path` term is a substring of the *materialized path*, not the name,
+    ///   and the accelerator indexes names only (§3/§10) — it is verified the
+    ///   usual way.
+    ///
+    /// A name matches the query only if it contains every one of these needles,
+    /// which is exactly the property the trigram accelerator exploits — soundly,
+    /// because it is a superset filter.
+    pub fn required_literals(&self) -> Vec<(&[u8], bool)> {
+        let mut out: Vec<(&[u8], bool)> = Vec::new();
+        for t in &self.terms {
+            match t {
+                Term::Substr { needle, case } => out.push((needle.as_slice(), *case)),
+                Term::Ext { ext, case } => out.push((ext.as_slice(), *case)),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// A trigram plan for this query: the required literals reduced to their
+    /// distinct trigrams, with too-short and case-sensitive literals dropped. An
+    /// empty plan means "this query has no usable trigram constraint — scan as
+    /// usual".
+    ///
+    /// Only available with the default-on `trigram` cargo feature.
+    #[cfg(feature = "trigram")]
+    pub fn trigram_plan(&self) -> crate::trigram::TrigramPlan {
+        crate::trigram::TrigramIndex::plan_from_literals(self.required_literals())
+    }
+
+    /// The needles that fuzzy search makes **approximate**: the positive,
+    /// case-insensitive plain substrings of the name.
+    ///
+    /// Deliberately excluded, and therefore still matched exactly:
+    ///
+    /// * `Ext` — `ext:rs` means the extension is exactly `rs`; a fuzzy extension
+    ///   would match unrelated files and surprises more than it helps;
+    /// * `Path` — a substring of the materialized path, not the name (and the
+    ///   trigram index cannot see it);
+    /// * `Glob`/`Regex` — already pattern languages of their own;
+    /// * `Not(_)` — a negation must stay exact or it stops being a filter;
+    /// * any explicitly case-sensitive term (`case:`, or a smart-case uppercase
+    ///   needle) — fuzzy edits across case would make `case:` meaningless.
+    pub fn approx_needles(&self) -> Vec<&[u8]> {
+        let mut out = Vec::new();
+        for t in &self.terms {
+            if let Term::Substr { needle, case } = t {
+                if !*case {
+                    out.push(needle.as_slice());
+                }
+            }
+        }
+        out
+    }
+
+    /// Evaluate every term **except** the approximate ones (see
+    /// [`Self::approx_needles`]), i.e. the exact part of a fuzzy query: `ext:`,
+    /// `path:`, glob, regex and negation still apply in full.
+    ///
+    /// Fuzzy search runs this alongside the edit-distance scoring so a term
+    /// never gets to be both.
+    pub fn matches_exact_terms<F>(&self, name: &[u8], mut path_provider: F) -> bool
+    where
+        F: FnMut() -> Option<Vec<u8>>,
+    {
+        let mut path_cache: Option<Option<Vec<u8>>> = None;
+        for t in &self.terms {
+            // Skip the terms fuzzy search owns.
+            if let Term::Substr { case, .. } = t {
+                if !*case {
+                    continue;
+                }
+            }
+            let ok = match t {
+                Term::Substr { needle, case } => contains(name, needle, *case),
+                Term::Glob { pattern } => pattern.matches(name),
+                Term::Ext { ext, case } => ext_matches(name, ext, *case),
+                Term::Path { needle, case } => {
+                    #[allow(clippy::redundant_closure)] // FnMut cannot be moved into FnOnce
+                    let p = path_cache.get_or_insert_with(|| path_provider());
+                    match p {
+                        Some(p) => contains(p, needle, *case),
+                        None => false,
+                    }
+                }
+                Term::Regex { re } => re.is_match(name),
+                Term::Not(inner) => !self.match_inner(inner, name, &mut path_cache, &mut path_provider),
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 // ------------------------------------------------------------------ parsing
@@ -451,56 +555,299 @@ fn ext_matches(name: &[u8], ext: &[u8], case: bool) -> bool {
 pub struct Hit {
     pub id: u32,
     pub path: Vec<u8>,
+    /// Fuzzy match cost: 0 for an exact match, otherwise the summed edit distance
+    /// (§10/§17). Only fuzzy search sets it; every other path leaves it 0, which
+    /// keeps `Hit` comparable and ordering in index order unchanged.
+    pub score: u32,
 }
 
 /// Run `q` over `index`, attributing paths using each root dir's stored path.
 ///
 /// `limit == 0` means unlimited. When `count_only`, paths are never
 /// materialized and the returned vec is empty with `total` set.
+///
+/// With the default-on `trigram` cargo feature this consults the §17
+/// accelerator (building/using the caller's cache is the daemon's job — this
+/// entry point uses none, so it behaves exactly like the plain scan). Without
+/// the feature it is a straight linear scan. Either way the results are
+/// identical.
 pub fn execute(index: &Index, root_paths: &[(u32, Vec<u8>)], q: &Query, limit: usize, count_only: bool) -> Results {
-    let mut results = Results { hits: Vec::new(), total: 0 };
-    let mut buf: Vec<u8> = Vec::with_capacity(256);
-    let use_prefilter = q.ac.is_some();
+    #[cfg(feature = "trigram")]
+    {
+        execute_with_trigram(index, root_paths, q, limit, count_only, None)
+    }
+    #[cfg(not(feature = "trigram"))]
+    {
+        execute_scan(index, root_paths, q, limit, count_only)
+    }
+}
 
-    for (id, entry) in index.iter_live() {
-        if entry.flags().is_root_dir() {
-            continue; // the root dir itself is not a search hit
+/// As [`execute`], but consulting the §17 trigram accelerator when one is
+/// supplied.
+///
+/// The accelerator is a **filter only**: it narrows the set of entries whose
+/// names are worth checking, and every candidate still goes through the full
+/// [`Query::matches`] path. It can therefore never change the result set — only
+/// the time taken to produce it. `None` (or a query with no usable trigram
+/// constraint) restores the plain linear scan.
+///
+/// Only available with the `trigram` cargo feature (on by default).
+#[cfg(feature = "trigram")]
+pub fn execute_with_trigram(
+    index: &Index,
+    root_paths: &[(u32, Vec<u8>)],
+    q: &Query,
+    limit: usize,
+    count_only: bool,
+    trigram: Option<&crate::trigram::TrigramIndex>,
+) -> Results {
+    // Ask the accelerator which ids can possibly match. `None` = no usable
+    // constraint (scan everything); `Some(empty)` = the required literals are
+    // unsatisfiable, so nothing can match.
+    let candidates: Option<Vec<u32>> = match trigram {
+        Some(tg) if tg.is_useful() => tg.candidates(&q.trigram_plan()),
+        _ => None,
+    };
+    if let Some(c) = &candidates {
+        if c.is_empty() {
+            return Results { hits: Vec::new(), total: 0 };
         }
-        let name = index.name(id);
-        // aho-corasick prefilter over the lowercased name (cheap, one pass)
-        if use_prefilter {
-            let lower: Vec<u8> = name.iter().map(|c| c.to_ascii_lowercase()).collect();
-            if !q.prefilter(&lower) {
-                continue;
+    }
+    match candidates {
+        // Accelerated: ids are ascending, so result order matches the linear
+        // scan exactly.
+        Some(ids) => {
+            let mut results = Results { hits: Vec::new(), total: 0 };
+            let mut buf: Vec<u8> = Vec::with_capacity(256);
+            for id in ids {
+                // Guard the (impossible in practice) case of an id past the end
+                // after a shrink; the scan body also rechecks liveness.
+                if (id as usize) < index.len() {
+                    consider(index, root_paths, q, limit, count_only, id, &mut results, &mut buf);
+                }
+            }
+            results
+        }
+        None => execute_scan(index, root_paths, q, limit, count_only),
+    }
+}
+
+/// Fuzzy (approximate) search (§10/§17 v2).
+///
+/// Each plain case-insensitive substring term (see [`Query::approx_needles`]) is
+/// matched **approximately**: a name qualifies when some substring of it is
+/// within `max_distance` edits of the needle. Every other term — `ext:`, `path:`,
+/// glob, regex, negation and explicit `case:` — still filters *exactly*.
+///
+/// The score is the **sum of the per-needle edit distances**: 0 is a perfect
+/// match, larger is looser. Results are sorted by `(score, path)` — the path
+/// tie-break makes the order total and deterministic, so the same index and
+/// query always yield the same sequence (nothing here depends on hash or
+/// iteration order).
+///
+/// `trigram` is used only to generate a **superset** of candidates (see
+/// [`crate::trigram::TrigramIndex::candidates_sharing_at_least`]); every candidate
+/// is then scored for real, so the accelerator can never change the result set —
+/// only the time. When the edit budget is too large for the trigram bound to say
+/// anything, this scans every live entry, honestly.
+///
+/// Only available with the default-on `trigram` cargo feature.
+#[cfg(feature = "trigram")]
+pub fn execute_fuzzy(
+    index: &Index,
+    root_paths: &[(u32, Vec<u8>)],
+    q: &Query,
+    max_distance: u32,
+    limit: usize,
+    count_only: bool,
+    trigram: Option<&crate::trigram::TrigramIndex>,
+) -> Results {
+    use crate::fuzzy::substring_within;
+
+    let needles: Vec<Vec<u8>> = q.approx_needles().iter().map(|n| n.to_vec()).collect();
+    // No approximate terms at all: this is just the exact query.
+    if needles.is_empty() {
+        return match trigram {
+            Some(tg) => execute_with_trigram(index, root_paths, q, limit, count_only, Some(tg)),
+            None => execute_scan(index, root_paths, q, limit, count_only),
+        };
+    }
+
+    // Candidate generation. Each needle contributes a *necessary* condition: a
+    // name within `max_distance` of it must share enough of its trigrams. If
+    // every needle can be constrained we intersect their candidate sets; if any
+    // one cannot (too short, or the edit budget makes the bound vacuous) we fall
+    // back to a full scan for the whole query. That keeps the generator a
+    // superset filter in all cases — it may do more work than needed, never less.
+    let candidates: Option<Vec<u32>> = match trigram {
+        Some(tg) if tg.is_useful() => {
+            let mut acc: Option<Vec<u32>> = None;
+            let mut all_constrained = true;
+            for n in &needles {
+                let constrained = crate::trigram::TrigramIndex::literal_trigrams(n, false).and_then(|tris| {
+                    let need =
+                        crate::trigram::TrigramIndex::required_shared_after_edits(tris.len(), max_distance);
+                    tg.candidates_sharing_at_least(&tris, need)
+                });
+                match constrained {
+                    Some(ids) => {
+                        acc = Some(match acc {
+                            None => ids,
+                            Some(prev) => crate::trigram::intersect(&prev, &ids),
+                        });
+                    }
+                    None => {
+                        all_constrained = false;
+                        break;
+                    }
+                }
+            }
+            if all_constrained {
+                acc // Some(list); empty means genuinely unsatisfiable
+            } else {
+                None // scan everything
             }
         }
-        // Which root does this belong to? Needed only for path materialization.
+        _ => None,
+    };
+
+    let mut scored: Vec<(u32, Vec<u8>, u32)> = Vec::new();
+    let mut total = 0u64;
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+
+    let mut consider_id = |id: u32| {
+        if !index.is_alive(id) {
+            return;
+        }
+        let entry = &index.entries[id as usize];
+        if entry.flags().is_root_dir() {
+            return;
+        }
+        let name = index.name(id);
+        // Exact terms still apply in full.
         let root_id = index.root_of(id);
-        let root_path = root_id.and_then(|r| root_paths.iter().find(|(rid, _)| *rid == r).map(|(_, p)| p.clone()));
-        let matched = q.matches(name, || {
-            root_path.as_ref().and_then(|rp| index.path_of(id, rp))
-        });
-        if !matched {
-            continue;
+        let root_path = root_id
+            .and_then(|r| root_paths.iter().find(|(rid, _)| *rid == r).map(|(_, p)| p.clone()));
+        if !q.matches_exact_terms(name, || root_path.as_ref().and_then(|rp| index.path_of(id, rp))) {
+            return;
         }
-        results.total += 1;
+        // Approximate terms: every needle must be within budget; sum the costs.
+        let mut score = 0u32;
+        for n in &needles {
+            match substring_within(name, n, max_distance) {
+                Some(d) => score = score.saturating_add(d),
+                None => return,
+            }
+        }
+        total += 1;
         if count_only {
-            continue;
-        }
-        if limit != 0 && results.hits.len() >= limit {
-            // Keep counting for `total`, but stop materializing.
-            continue;
+            return;
         }
         let path = match &root_path {
             Some(rp) => match index.materialize_into(id, rp, &mut buf) {
                 Some(_) => buf.clone(),
-                None => continue,
+                None => return,
             },
             None => name.to_vec(),
         };
-        results.hits.push(Hit { id, path });
+        scored.push((score, path, id));
+    };
+
+    match &candidates {
+        Some(ids) => {
+            for &id in ids {
+                if (id as usize) < index.len() {
+                    consider_id(id);
+                }
+            }
+        }
+        None => {
+            for (id, _) in index.iter_live() {
+                consider_id(id);
+            }
+        }
+    }
+
+    // Deterministic ranking: by score, then by path (bytes), then id.
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+    let hits = scored
+        .into_iter()
+        .take(if limit == 0 { usize::MAX } else { limit })
+        .map(|(score, path, id)| Hit { id, path, score })
+        .collect();
+    Results { hits, total }
+}
+
+/// The plain linear scan — the shared body both the unaccelerated and the
+/// accelerated (`None`-candidate) paths run.
+fn execute_scan(
+    index: &Index,
+    root_paths: &[(u32, Vec<u8>)],
+    q: &Query,
+    limit: usize,
+    count_only: bool,
+) -> Results {
+    let mut results = Results { hits: Vec::new(), total: 0 };
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    for (id, _) in index.iter_live() {
+        consider(index, root_paths, q, limit, count_only, id, &mut results, &mut buf);
     }
     results
+}
+
+/// Evaluate one candidate id and fold it into `results`. Shared by the
+/// accelerated path and the linear scan so the two can never drift.
+#[allow(clippy::too_many_arguments)]
+fn consider(
+    index: &Index,
+    root_paths: &[(u32, Vec<u8>)],
+    q: &Query,
+    limit: usize,
+    count_only: bool,
+    id: u32,
+    results: &mut Results,
+    buf: &mut Vec<u8>,
+) {
+    // Liveness is the accelerator's one blind spot: postings built before a
+    // deletion still name the dead id. The authoritative scan skips tombstones,
+    // so this must too, or a stale posting becomes a phantom hit.
+    if !index.is_alive(id) {
+        return;
+    }
+    let entry = &index.entries[id as usize];
+    if entry.flags().is_root_dir() {
+        return;
+    }
+    let name = index.name(id);
+    if q.ac.is_some() {
+        let lower: Vec<u8> = name.iter().map(|c| c.to_ascii_lowercase()).collect();
+        if !q.prefilter(&lower) {
+            return;
+        }
+    }
+    let root_id = index.root_of(id);
+    let root_path = root_id.and_then(|r| root_paths.iter().find(|(rid, _)| *rid == r).map(|(_, p)| p.clone()));
+    let matched = q.matches(name, || {
+        root_path.as_ref().and_then(|rp| index.path_of(id, rp))
+    });
+    if !matched {
+        return;
+    }
+    results.total += 1;
+    if count_only {
+        return;
+    }
+    if limit != 0 && results.hits.len() >= limit {
+        return;
+    }
+    let path = match &root_path {
+        Some(rp) => match index.materialize_into(id, rp, buf) {
+            Some(_) => buf.clone(),
+            None => return,
+        },
+        None => name.to_vec(),
+    };
+    results.hits.push(Hit { id, path, score: 0 });
 }
 
 #[derive(Clone, Debug, Default)]
@@ -591,7 +938,7 @@ pub fn execute_expr(
         }
         // Report the path exactly as `abs` (root-anchored), matching the string
         // query path's behaviour.
-        results.hits.push(Hit { id, path: abs });
+        results.hits.push(Hit { id, path: abs, score: 0 });
     }
     results
 }
@@ -600,6 +947,8 @@ pub fn execute_expr(
 mod tests {
     use super::*;
     use crate::index::{EntryFlags, ROOT_ID};
+    #[cfg(feature = "trigram")]
+    use crate::trigram::TrigramIndex;
 
     fn tree() -> (Index, Vec<(u32, Vec<u8>)>) {
         let mut ix = Index::new();
@@ -731,5 +1080,162 @@ mod tests {
         assert!(GlobPattern::parse(b"a?c", false).matches(b"abc"));
         assert!(!GlobPattern::parse(b"a?c", false).matches(b"ac"));
         assert!(GlobPattern::parse(b"*.RS", false).matches(b"x.rs"));
+    }
+
+    #[test]
+    fn required_literals_exclude_negation_glob_regex_path() {
+        // Positive substrings and `ext:` are required; everything else is not.
+        let q = Query::compile("main rs -skip *.tmp regex:^x ext:md path:src").unwrap();
+        let lits: Vec<(String, bool)> = q
+            .required_literals()
+            .into_iter()
+            .map(|(n, c)| (String::from_utf8_lossy(n).into_owned(), c))
+            .collect();
+        assert_eq!(
+            lits,
+            vec![
+                ("main".to_string(), false),
+                ("rs".to_string(), false),
+                ("md".to_string(), false),
+            ],
+            "only positive substring/ext literals are required"
+        );
+    }
+
+    #[test]
+    fn required_literals_preserve_case_flag() {
+        // `case:Notes` is an explicitly case-sensitive substring.
+        let q = Query::compile("case:Notes").unwrap();
+        let lits = q.required_literals();
+        assert_eq!(lits.len(), 1);
+        assert_eq!(lits[0].0, b"Notes");
+        assert!(lits[0].1, "smart/explicit case must be preserved");
+    }
+
+    #[cfg(feature = "trigram")]
+    #[test]
+    fn trigram_plan_drops_short_and_case_sensitive() {
+        // "rs" is 2 bytes -> no trigram; "Notes" is case-sensitive -> no
+        // trigram; "main" survives.
+        let q = Query::compile("main rs case:Notes").unwrap();
+        let plan = q.trigram_plan();
+        assert_eq!(plan.literals.len(), 1, "only `main` yields usable trigrams");
+        // "main" -> {"mai", "ain"}, sorted.
+        let mut expected: Vec<[u8; 3]> = vec![*b"mai", *b"ain"];
+        expected.sort_unstable();
+        assert_eq!(plan.literals[0], expected);
+
+        // A query with nothing usable yields an empty plan.
+        let q = Query::compile("ab cd").unwrap();
+        assert!(q.trigram_plan().is_empty());
+    }
+
+    #[cfg(feature = "trigram")]
+    #[test]
+    fn fuzzy_finds_a_typo_that_exact_does_not() {
+        let (ix, rp) = tree();
+        let tg = TrigramIndex::build(&ix);
+        // "main.js" is one substitution from "main.rs": exact finds nothing...
+        let q = Query::compile("main.js").unwrap();
+        assert_eq!(execute(&ix, &rp, &q, 0, false).total, 0);
+        // ...fuzzy at distance 1 finds it.
+        let res = execute_fuzzy(&ix, &rp, &q, 1, 0, false, Some(&tg));
+        assert_eq!(res.total, 1);
+        assert_eq!(res.hits[0].path, b"/home/me/proj/src/main.rs".to_vec());
+        assert_eq!(res.hits[0].score, 1);
+    }
+
+    #[cfg(feature = "trigram")]
+    #[test]
+    fn zero_distance_fuzzy_equals_exact_scan() {
+        // With k=0 fuzzy selects exactly the same entries as the plain scan.
+        // The *order* differs by design: fuzzy is a ranked result list (by
+        // score, then path) while a plain query streams in index order, so
+        // compare as sets, not sequences.
+        let (ix, rp) = tree();
+        let tg = TrigramIndex::build(&ix);
+        for raw in ["rs", "main", "ext:rs", "path:src"] {
+            let q = Query::compile(raw).unwrap();
+            let exact = execute(&ix, &rp, &q, 0, false);
+            let fuzzy = execute_fuzzy(&ix, &rp, &q, 0, 0, false, Some(&tg));
+            let mut a: Vec<u32> = exact.hits.iter().map(|h| h.id).collect();
+            let mut b: Vec<u32> = fuzzy.hits.iter().map(|h| h.id).collect();
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "q={raw:?}: k=0 must select the same entries as exact");
+            assert_eq!(exact.total, fuzzy.total, "q={raw:?}");
+            assert!(fuzzy.hits.iter().all(|h| h.score == 0), "k=0 hits score 0");
+        }
+    }
+
+    #[cfg(feature = "trigram")]
+    #[test]
+    fn fuzzy_ranking_is_by_score_then_path() {
+        let (ix, rp) = tree();
+        let tg = TrigramIndex::build(&ix);
+        // "main.rs" scores 0; "main.js" scores 1 but is not in the tree, so pick a
+        // query that hits both main.rs and lib.rs at different distances.
+        let q = Query::compile("lib.rs").unwrap();
+        let res = execute_fuzzy(&ix, &rp, &q, 2, 0, false, Some(&tg));
+        // lib.rs is exact (0); main.rs is further but within 2.
+        assert!(!res.hits.is_empty());
+        assert_eq!(res.hits[0].path, b"/home/me/proj/src/lib.rs".to_vec());
+        assert_eq!(res.hits[0].score, 0);
+        // Scores are non-decreasing down the list.
+        for w in res.hits.windows(2) {
+            assert!(w[0].score <= w[1].score, "ranking must be by score");
+        }
+    }
+
+    #[cfg(feature = "trigram")]
+    #[test]
+    fn fuzzy_respects_exact_terms() {
+        let (ix, rp) = tree();
+        let tg = TrigramIndex::build(&ix);
+        // "main.js ext:rs" -> the ext: term is exact, so main.rs qualifies (its
+        // extension really is rs) ...
+        let q = Query::compile("main.js ext:rs").unwrap();
+        assert_eq!(execute_fuzzy(&ix, &rp, &q, 1, 0, false, Some(&tg)).total, 1);
+        // ... but ext:md does not, even though the name is only 1 edit away.
+        let q = Query::compile("main.js ext:md").unwrap();
+        assert_eq!(execute_fuzzy(&ix, &rp, &q, 1, 0, false, Some(&tg)).total, 0);
+    }
+
+    #[cfg(feature = "trigram")]
+    #[test]
+    fn fuzzy_negation_stays_exact() {
+        let (ix, rp) = tree();
+        let tg = TrigramIndex::build(&ix);
+        // `-main` must exclude main.rs exactly; the positive term is fuzzy.
+        let q = Query::compile("main.js -main").unwrap();
+        let res = execute_fuzzy(&ix, &rp, &q, 1, 0, false, Some(&tg));
+        assert_eq!(res.total, 0, "negation must not be fuzzed into matching");
+    }
+
+    #[cfg(feature = "trigram")]
+    #[test]
+    fn fuzzy_count_only_and_limit_agree() {
+        let (ix, rp) = tree();
+        let tg = TrigramIndex::build(&ix);
+        let q = Query::compile("lib.rs").unwrap();
+        let full = execute_fuzzy(&ix, &rp, &q, 2, 0, false, Some(&tg));
+        let counted = execute_fuzzy(&ix, &rp, &q, 2, 0, true, Some(&tg));
+        assert_eq!(full.total, counted.total);
+        assert!(counted.hits.is_empty());
+        let limited = execute_fuzzy(&ix, &rp, &q, 2, 1, false, Some(&tg));
+        assert_eq!(limited.hits.len(), 1);
+        assert_eq!(limited.total, full.total);
+    }
+
+    #[cfg(feature = "trigram")]
+    #[test]
+    fn approx_needles_exclude_ext_path_case_glob_regex() {
+        let q = Query::compile("main.js ext:rs path:src case:Notes *.tmp regex:^x -skip").unwrap();
+        let needles: Vec<String> = q
+            .approx_needles()
+            .iter()
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect();
+        assert_eq!(needles, vec!["main.js".to_string()], "only the plain lowercase substring");
     }
 }

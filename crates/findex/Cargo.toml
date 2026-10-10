@@ -6,6 +6,14 @@ license.workspace = true
 rust-version.workspace = true
 description = "Headless realtime filename index: core library (data model, persistence, query, reconciliation)."
 
+[features]
+default = ["trigram"]
+# §17 v2: the plocate-style name-trigram posting-list accelerator (§10). On by
+# default. Disable with `--no-default-features` to build findex without the
+# accelerator (and without its ~4x name-byte memory cost); queries then fall
+# back to the plain linear scan, with identical results.
+trigram = []
+
 [dependencies]
 libc.workspace = true
 aho-corasick.workspace = true
