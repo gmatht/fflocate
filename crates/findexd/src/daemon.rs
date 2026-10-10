@@ -331,9 +331,76 @@ impl Daemon {
         })
     }
 
+    /// Warm the trigram accelerator on its own thread, once the index has settled.
+    ///
+    /// ## Why a thread, and why the waiting
+    ///
+    /// The accelerator is built lazily on first use and costs ~0.7 s on a 325 k
+    /// entry index (1.9 s at 1 M). Left alone, that lands on whoever issues the
+    /// first query — the worst possible moment, and in a GUI it looks like the
+    /// search box has hung.
+    ///
+    /// It cannot simply be built at startup, because the initial crawl is still
+    /// mutating the index then: the cache is keyed by generation, and anything
+    /// built mid-crawl is invalidated by the next batch of inserts. Nor can it hang
+    /// off the applier tick: on a large root `Applier::drain` does not return until
+    /// the crawl has finished, so the tick is not a place that runs promptly.
+    ///
+    /// So: a thread that polls the index for a stable shape and then builds. It
+    /// never blocks startup, never blocks the applier, and if it gives up the query
+    /// path still builds on demand — warming is an optimisation, never a
+    /// prerequisite.
+    fn spawn_trigram_warmer(&self) {
+        #[cfg(feature = "trigram")]
+        {
+            let shared = self.shared.clone();
+            std::thread::Builder::new()
+                .name("trigram-warm".into())
+                .spawn(move || {
+                    // Wait for the index to stop growing. A rebuild mid-crawl is
+                    // wasted, so this is patience rather than readiness.
+                    let mut last = (0u64, 0usize);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                    loop {
+                        let (gen, entries) = {
+                            let ix = shared.index.read().unwrap();
+                            (ix.generation(), ix.entry_count())
+                        };
+                        if (gen, entries) == last && entries > 1 {
+                            break; // stable for a whole poll interval
+                        }
+                        last = (gen, entries);
+                        if std::time::Instant::now() >= deadline {
+                            break; // warm anyway; correctness does not depend on it
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                    let t = std::time::Instant::now();
+                    let tg = shared.trigram_index();
+                    eprintln!(
+                        "findexd: trigram index warmed in {:.0} ms ({} trigrams); \
+                         the first search will not pay for it",
+                        t.elapsed().as_secs_f64() * 1000.0,
+                        tg.trigram_count()
+                    );
+                })
+                .ok();
+        }
+        #[cfg(not(feature = "trigram"))]
+        {
+            // Nothing to warm; the query path is a plain scan.
+        }
+    }
+
     /// Install watches on the root dirs and start the watcher thread.
     pub fn start(&mut self) -> anyhow::Result<()> {
         self.applier.rebuild_dir_cache();
+
+        // Warm the trigram accelerator off the user's critical path (§10, §17).
+        // The thread waits for the index to stop growing before building, because a
+        // build mid-crawl is invalidated by the next insert; see the method for why
+        // neither startup nor the applier tick can host it directly.
+        self.spawn_trigram_warmer();
 
         // Watch the roots first, then enumerate (§5).
         let roots: Vec<(u32, PathBuf)> = {
