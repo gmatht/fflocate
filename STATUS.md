@@ -188,9 +188,11 @@ a restart crawl alone cannot (crawls only add). Exit 1 if any root is not
 
 ## Windows port (`windows` branch; `x86_64-pc-windows-msvc`)
 
-The workspace type-checks and is clippy-clean for the Windows target; the
-Linux suite stays green (189 tests). Runtime validation needs real Windows
-hardware — nothing here has executed there yet.
+Validated on real Windows 11 hardware (sources at `C:\Users\s_pam\fx-windows`):
+full `cargo test --workspace` green, plus the release-binary e2e suites
+(`locate_e2e`, `update_e2e`, `fault_crash`, `fault_fsops` — the last two skip
+only what needs bind mounts/inotify sysctls). Linux suite stays green (189
+tests). Findings from the bring-up, all fixed in-branch:
 
 * **IPC**: `findex::transport` (`Stream`/`Listener` aliases + `connect`);
   unix sockets on unix, TCP loopback on Windows. The socket "path" stays a
@@ -215,4 +217,25 @@ hardware — nothing here has executed there yet.
 * **Tests**: e2e harnesses take OS-assigned loopback ports (`test_socket`)
   and `.exe`-aware binary names; `locate` tests copy to `locate.exe`
   (argv[0] accepts the `.exe` form); `Child::kill` everywhere (also fixing
-  a Windows hang in the old wait-only harness kill).
+  a Windows hang in the old wait-only harness kill); OS-vs-index path
+  comparisons go through a `canon()` helper (verbatim prefixes stripped,
+  `/`-normalized).
+* **Winsock gotcha (the big one)**: accepted sockets inherit the listener's
+  nonblocking mode on Windows (opposite of POSIX). The nonblocking accept
+  loop therefore handed `serve_client` sockets whose first idle read failed
+  with WouldBlock → instant close → RST — killing every second request on a
+  reused connection (`ff --sync` always died). Fixed by forcing accepted
+  streams blocking in `net::accept_loop` (and the `daemon_e2e` direct
+  accept); harmless on unix.
+* **Root-gone detection**: the mount watchdog was purely device-id based,
+  and device IDs are unavailable on Windows — a vanished root never alarmed.
+  The watchdog now also alarms on a missing path (identical outcomes
+  elsewhere: a gone root already probed `None` there).
+* **Flakes fixed along the way**: the cookie-cleanup assertion now polls
+  instead of asserting once (complete-then-unlink races the check under
+  load); `resolve_bases` treats rooted paths as absolute and strips
+  verbatim `\\?\` prefixes so `ff C:\path` filters match.
+* **Windows e2e costs**: socket waits are file-existence polls that always
+  run the full 10 s (sockets aren't files there) — suites take ~30 s each;
+  a TCP-probe wait would fix that. 9P mtime granularity can make cargo skip
+  rebuilds of just-synced sources — touch before building there.

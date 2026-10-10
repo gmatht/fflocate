@@ -48,6 +48,29 @@ fn test_socket(dir: &std::path::Path) -> PathBuf {
     }
 }
 
+/// Canonical comparison form: verbatim `\\?\` prefixes stripped, separators
+/// normalized to `/`, so OS-built expected paths compare equal to the
+/// index's `/`-canonical reported paths. Identity off Windows.
+fn canon(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy().into_owned();
+    #[cfg(not(windows))]
+    {
+        s
+    }
+    #[cfg(windows)]
+    {
+        let s = s
+            .strip_prefix(r"\\?\UNC\")
+            .map(|r| format!(r"\\{r}"))
+            .or_else(|| s.strip_prefix(r"\\?\").map(str::to_string))
+            .unwrap_or(s);
+        s.replace('\\', "/")
+    }
+}
+
+
+
+
 fn spawn(findexd: &Path, socket: &Path, state: &Path, root: &Path) -> Child {
     let child = Command::new(findexd)
         .arg("--socket")
@@ -125,7 +148,7 @@ fn update_heals_offline_edits_after_downtime() {
     // Baseline: daemon up, both files indexed.
     let mut daemon = spawn(&findexd, &socket, &state, &root);
     settle(&fxbin, &socket);
-    let rel = |p: &str| root.join(p).to_string_lossy().into_owned();
+    let rel = |p: &str| canon(&root.join(p));
     assert!(listing(&fxbin, &socket).contains(&rel("gone.txt")));
 
     // Downtime with offline edits: one deletion, one addition, no watcher.
@@ -147,7 +170,7 @@ fn update_heals_offline_edits_after_downtime() {
     let (out, code) = ff(&fxbin, &socket, &["update", "--timeout", "60"]);
     assert_eq!(code, 0, "update output:\n{out}");
     assert!(out.contains("ok"), "per-root status expected:\n{out}");
-    assert!(out.contains(&root.to_string_lossy().into_owned()), "output names the root:\n{out}");
+    assert!(out.contains(&canon(&root)), "output names the root:\n{out}");
     let got = listing(&fxbin, &socket);
     let want: std::collections::BTreeSet<String> =
         [rel("keep.txt"), rel("new.txt")].into_iter().collect();

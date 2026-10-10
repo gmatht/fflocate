@@ -126,6 +126,26 @@ fn ff(fxbin: &Path, socket: &Path, args: &[&str]) -> (String, i32) {
     )
 }
 
+/// Canonical comparison form: verbatim `\\?\` prefixes stripped, separators
+/// normalized to `/`, so the OS-path oracle compares equal to the daemon's
+/// `/`-canonical reported paths. Identity off Windows.
+fn canon(p: &Path) -> String {
+    let s = p.to_string_lossy().into_owned();
+    #[cfg(not(windows))]
+    {
+        s
+    }
+    #[cfg(windows)]
+    {
+        let s = s
+            .strip_prefix(r"\\?\UNC\")
+            .map(|r| format!(r"\\{r}"))
+            .or_else(|| s.strip_prefix(r"\\?\").map(str::to_string))
+            .unwrap_or(s);
+        s.replace('\\', "/")
+    }
+}
+
 fn truth(root: &Path) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
     let mut stack = vec![root.to_path_buf()];
@@ -133,7 +153,7 @@ fn truth(root: &Path) -> std::collections::BTreeSet<String> {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for ent in rd.flatten() {
             let p = ent.path();
-            out.insert(p.to_string_lossy().into_owned());
+            out.insert(canon(&p));
             if ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 stack.push(p);
             }

@@ -221,12 +221,19 @@ pub fn run(argv: &[String]) -> Result<ExitCode, CliError> {
 /// * A relative path is joined to the cwd and canonicalized. If it does not
 ///   resolve, it can never match anything, so we return it as `Err` for the
 ///   caller to report — an empty result would be a lie.
+///
+/// "Absolute" includes merely *rooted* paths: on Windows `/x` is
+/// drive-relative (`is_absolute` is false without a drive prefix) but must
+/// still get the absolute treatment, never the must-exist relative one.
+/// Resolved bases are separator-canonicalized so they compare with the
+/// `/`-form index paths.
 fn resolve_bases(paths: &[String]) -> Result<Vec<String>, std::path::PathBuf> {
     let cwd = std::env::current_dir().ok();
     let mut out = Vec::with_capacity(paths.len());
     for p in paths {
         let raw = Path::new(p);
-        let resolved = if raw.is_absolute() {
+        let rooted = raw.is_absolute() || raw.has_root();
+        let resolved = if rooted {
             raw.canonicalize().ok()
         } else {
             cwd.as_ref().and_then(|c| c.join(raw).canonicalize().ok())
@@ -235,17 +242,41 @@ fn resolve_bases(paths: &[String]) -> Result<Vec<String>, std::path::PathBuf> {
             // `.` at the filesystem root canonicalizes to `/`; keep the string
             // form the index uses (no trailing slash), which `path_under`
             // already normalizes.
-            Some(rp) => match rp.to_str() {
-                Some(s) => out.push(s.to_string()),
-                None => out.push(p.clone()),
-            },
-            // Absolute but unresolvable: leave it be (it simply won't match).
-            None if raw.is_absolute() => out.push(p.clone()),
+            Some(rp) => {
+                // On Windows, canonicalize yields verbatim `\\?\` paths;
+                // strip the prefix so bases compare with index paths.
+                #[cfg(windows)]
+                let rp = std::path::PathBuf::from(strip_verbatim_prefix(
+                    &rp.to_string_lossy(),
+                ));
+                let rp = findex::util::normalize_separators(&rp);
+                match rp.to_str() {
+                    Some(s) => out.push(s.to_string()),
+                    None => out.push(p.clone()),
+                }
+            }
+            // Absolute (or rooted) but unresolvable: leave it be (it simply
+            // won't match).
+            None if rooted => out.push(p.clone()),
             // Relative and unresolvable: loud failure, not silent empty.
             None => return Err(raw.to_path_buf()),
         }
     }
     Ok(out)
+}
+
+/// Strip a Windows verbatim path prefix (`\\?\C:\x` → `C:\x`,
+/// `\\?\UNC\server\share` → `\\server\share`) so canonicalized bases compare
+/// with index paths.
+#[cfg(windows)]
+fn strip_verbatim_prefix(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 /// A compiled `find` command: index-level expression + phase-2 tests.
@@ -664,13 +695,20 @@ mod tests {
         // index stores absolute paths, so an unresolved base would filter every
         // hit away and exit 0 — the silent-empty bug.
         let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        // Expect the same normalized form `resolve_bases` produces
+        // (verbatim `\\?\` prefixes never survive it on Windows).
+        #[cfg(windows)]
+        let cwd = std::path::PathBuf::from(strip_verbatim_prefix(&cwd.to_string_lossy()));
+        let cwd = findex::util::normalize_separators(&cwd);
         let got = resolve_bases(&[".".to_string()]).unwrap();
         assert_eq!(got, vec![cwd.to_string_lossy().to_string()]);
 
         // An absolute path that exists round-trips through canonicalization.
-        let abs = cwd.join("Cargo.toml");
+        // (`join` reintroduces `\` separators; the expectation is normalized
+        // like the result.)
+        let abs = findex::util::normalize_separators(&cwd.join("Cargo.toml"));
         let got = resolve_bases(&[abs.to_string_lossy().to_string()]).unwrap();
-        assert_eq!(got, vec![cwd.join("Cargo.toml").to_string_lossy().to_string()]);
+        assert_eq!(got, vec![abs.to_string_lossy().to_string()]);
     }
 
     #[test]

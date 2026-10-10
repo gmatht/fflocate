@@ -106,9 +106,11 @@ impl FsView for ModelFs {
     fn read_dir(&self, abs_path: &Path) -> io::Result<Vec<DirItem>> {
         // The model is flat: `/model`, `/model/<dir>`, `/model/<dir>/<sub>`.
         // We resolve by stripping the `/model` prefix and walking components.
+        // `Path::join` in the applier uses `\` on Windows, so normalize first
+        // (the model's canonical form is `/`, like the index).
         let g = self.inner.lock().unwrap();
-        let rel = abs_path
-            .to_string_lossy()
+        let s = abs_path.to_string_lossy().replace('\\', "/");
+        let rel = s
             .strip_prefix("/model")
             .unwrap_or("")
             .trim_start_matches('/')

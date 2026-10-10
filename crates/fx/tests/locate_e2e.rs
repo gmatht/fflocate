@@ -43,6 +43,27 @@ fn test_socket(dir: &std::path::Path) -> PathBuf {
     }
 }
 
+/// Canonical comparison form: verbatim `\\?\` prefixes stripped, separators
+/// normalized to `/`, so OS-built expected paths compare equal to the
+/// index's `/`-canonical reported paths. Identity off Windows.
+fn canon(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy().into_owned();
+    #[cfg(not(windows))]
+    {
+        s
+    }
+    #[cfg(windows)]
+    {
+        let s = s
+            .strip_prefix(r"\\?\UNC\")
+            .map(|r| format!(r"\\{r}"))
+            .or_else(|| s.strip_prefix(r"\\?\").map(str::to_string))
+            .unwrap_or(s);
+        s.replace('\\', "/")
+    }
+}
+
+
 /// Spawn a daemon over `root`, and symlink `ff` to `locate` in a fresh dir.
 /// Returns (daemon child, socket, locate path).
 fn setup(root: &Path, tag: &str) -> (std::process::Child, PathBuf, PathBuf) {
@@ -142,12 +163,12 @@ fn locate_substring_glob_and_regex() {
     // Bare substring behaves as *PATTERN*.
     let (out, _, code) = locate(&locate_bin, &socket, &fxbin, &["foo"]);
     assert_eq!(code, 0);
-    assert_eq!(lines(&out), vec![root.join("foo.c").to_string_lossy().into_owned()]);
+    assert_eq!(lines(&out), vec![canon(&root.join("foo.c"))]);
 
     // Shell glob matched against the whole path.
     let (out, _, code) = locate(&locate_bin, &socket, &fxbin, &["*.rs"]);
     assert_eq!(code, 0);
-    assert_eq!(lines(&out), vec![root.join("sub/baz.rs").to_string_lossy().into_owned()]);
+    assert_eq!(lines(&out), vec![canon(&root.join("sub/baz.rs"))]);
 
     // Glob does not leak across the anchor: '*.txt' at any depth, but only .txt.
     let (out, _, _) = locate(&locate_bin, &socket, &fxbin, &["*.txt"]);
@@ -156,15 +177,15 @@ fn locate_substring_glob_and_regex() {
     assert_eq!(
         got,
         vec![
-            root.join("bar.txt").to_string_lossy().into_owned(),
-            root.join("sub/notes.txt").to_string_lossy().into_owned(),
+            canon(&root.join("bar.txt")),
+            canon(&root.join("sub/notes.txt")),
         ]
     );
 
     // Explicit regex, unanchored.
     let (out, _, code) = locate(&locate_bin, &socket, &fxbin, &["-r", "ba.*\\.txt$"]);
     assert_eq!(code, 0);
-    assert_eq!(lines(&out), vec![root.join("bar.txt").to_string_lossy().into_owned()]);
+    assert_eq!(lines(&out), vec![canon(&root.join("bar.txt"))]);
 
     // No match → exit 1, no output.
     let (out, _, code) = locate(&locate_bin, &socket, &fxbin, &["no-such-file-xyz"]);
@@ -183,7 +204,7 @@ fn locate_flags_count_limit_case_all_basename() {
     let (_tree, root) = fixture_tree();
     let (mut daemon, socket, locate_bin) = setup(&root, "flags");
     let fxbin = bindir.join(format!("ff{}", std::env::consts::EXE_SUFFIX));
-    let hit = |p: &str| root.join(p).to_string_lossy().into_owned();
+    let hit = |p: &str| canon(&root.join(p));
 
     // -c counts.
     let (out, _, code) = locate(&locate_bin, &socket, &fxbin, &["-c", ".txt"]);
@@ -239,7 +260,7 @@ fn locate_existing_filters_dangling_symlink() {
     std::os::unix::fs::symlink(root.join("gone-target"), root.join("dangling")).unwrap();
     let (mut daemon, socket, locate_bin) = setup(&root, "existing");
     let fxbin = bindir.join(format!("ff{}", std::env::consts::EXE_SUFFIX));
-    let hit = root.join("dangling").to_string_lossy().into_owned();
+    let hit = canon(&root.join("dangling"));
 
     // The symlink itself is indexed, so plain locate lists it.
     let (out, _, code) = locate(&locate_bin, &socket, &fxbin, &["dangling"]);

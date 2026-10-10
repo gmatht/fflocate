@@ -178,6 +178,9 @@ fn socket_roundtrip_serves_a_query() {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
+            // See net::accept_loop: accepted streams must be blocking (on
+            // Windows they inherit the listener's nonblocking mode).
+            stream.set_nonblocking(false).unwrap();
             net::serve_client(ctx, stream);
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
         });

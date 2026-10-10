@@ -654,11 +654,25 @@ mod tests {
             }
             other => panic!("expected synced, got {other:?}"),
         }
-        // The cookie file must have been cleaned up by the sync path.
-        assert!(!std::fs::read_dir(&root)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .any(|e| crate::util::is_cookie(e.file_name().as_encoded_bytes())));
+        // The cookie file must have been cleaned up by the sync path. The
+        // applier completes the waiter just before unlinking, so poll
+        // briefly: asserting once would race the unlink (flaky under load,
+        // routinely observed on Windows).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let littered = std::fs::read_dir(&root)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| crate::util::is_cookie(e.file_name().as_encoded_bytes()));
+            if !littered {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cookie file was never cleaned up"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         drop(ctx);
         let _ = handle.join();
         let _ = rid;

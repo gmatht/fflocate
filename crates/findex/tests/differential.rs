@@ -17,6 +17,26 @@ use findex::persist::Store;
 use findex::roots::Root;
 use findex::sync::SyncRegistry;
 
+/// Canonical comparison form: verbatim `\\?\` prefixes stripped, separators
+/// normalized to `/`, so the OS-path oracle (`truth`) compares equal to the
+/// index's `/`-canonical paths. Identity off Windows.
+fn canon(p: &Path) -> String {
+    let s = p.to_string_lossy().into_owned();
+    #[cfg(not(windows))]
+    {
+        s
+    }
+    #[cfg(windows)]
+    {
+        let s = s
+            .strip_prefix(r"\\?\UNC\")
+            .map(|r| format!(r"\\{r}"))
+            .or_else(|| s.strip_prefix(r"\\?\").map(str::to_string))
+            .unwrap_or(s);
+        s.replace('\\', "/")
+    }
+}
+
 /// A minimal deterministic PRNG (xorshift64*) so failures reproduce.
 struct Rng(u64);
 
@@ -110,7 +130,7 @@ impl Fixture {
     fn indexed(&self) -> BTreeSet<String> {
         let ix = self.shared.index.read().unwrap();
         let mut out = BTreeSet::new();
-        let root_path = self.root.to_string_lossy().as_bytes().to_vec();
+        let root_path = canon(&self.root).into_bytes();
         for (id, e) in ix.iter_live() {
             if e.flags().is_root_dir() {
                 continue;
@@ -131,7 +151,7 @@ fn truth(root: &Path) -> BTreeSet<String> {
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for ent in rd.flatten() {
             let p = ent.path();
-            out.insert(p.to_string_lossy().into_owned());
+            out.insert(canon(&p));
             if ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 stack.push(p);
             }

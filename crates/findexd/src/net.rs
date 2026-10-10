@@ -238,6 +238,13 @@ pub fn accept_loop(
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
+                // The listener is nonblocking for the stop flag; accepted
+                // streams must be blocking for `serve_client`'s read loop.
+                // (On Windows they inherit the nonblocking mode, which turns
+                // every first idle read into WouldBlock → close → RST.)
+                if stream.set_nonblocking(false).is_err() {
+                    continue;
+                }
                 let ctx = ctx.clone();
                 std::thread::spawn(move || serve_client(ctx, stream));
             }
