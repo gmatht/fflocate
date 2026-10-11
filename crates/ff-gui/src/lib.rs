@@ -11,15 +11,21 @@
 //!
 //! Design notes:
 //! * The daemon is the source of truth; the GUI never walks the filesystem.
-//! * Queries are debounced by the driver loop, not by timers in the UI layer.
-//! * Every failure (daemon absent, protocol error) surfaces in the status line —
-//!   the tool must never silently show an empty list for a broken connection.
+//! * Queries are debounced, and the socket is non-blocking: a request is stepped
+//!   from the UI's timer pump rather than awaited, so a slow or wedged daemon
+//!   cannot freeze the window.
+//! * Every failure (daemon absent, protocol error, truncated reply) surfaces in
+//!   the status line — the tool must never silently show an empty list for a
+//!   broken connection.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use findex::config_paths::socket_path_from_env;
 use findex::proto::{Request, Response};
+
+/// Re-exported because `PendingRequest::records` hands these back to the GUI.
+pub use findex::proto::Response as WireResponse;
 
 /// Errors surfaced to the status line.
 #[derive(Debug)]
@@ -89,6 +95,12 @@ impl DaemonClient {
             );
         }
         let line = serde_json::to_string(&v).map_err(|e| GuiError::Protocol(e.to_string()))?;
+        // FINDEX_DEBUG=1 prints each request, so a setting that "does nothing"
+        // can be traced to what was actually sent (e.g. whether case_sensitive
+        // was included at all).
+        if std::env::var_os("FINDEX_DEBUG").is_some() {
+            eprintln!("ff-gui -> {line}");
+        }
         writeln!(writer, "{line}").map_err(|e| GuiError::Io(e.to_string()))?;
         writer.flush().map_err(|e| GuiError::Io(e.to_string()))?;
 
@@ -134,7 +146,17 @@ impl DaemonClient {
         limit: usize,
         opts: &SearchOptions,
     ) -> Result<SearchOutcome, GuiError> {
-        let resp = self.request(&Request::Query {
+        let req = Self::query_request(query, limit, opts);
+        let resp = self.request(&req)?;
+        self.outcome_from_records(&resp)
+    }
+
+    /// Build the `query` request a search should send.
+    ///
+    /// Separate from sending it so the non-blocking path can serialize a request
+    /// now and transmit it over several event-loop ticks.
+    pub fn query_request(query: &str, limit: usize, opts: &SearchOptions) -> Request {
+        Request::Query {
             q: query.to_string(),
             limit,
             json: false,
@@ -149,14 +171,23 @@ impl DaemonClient {
             case_sensitive: opts.case_sensitive.then_some(true),
             fuzzy: opts.fuzzy,
             max_distance: if opts.fuzzy { opts.max_distance } else { None },
-        })?;
+        }
+    }
 
+    /// Turn a complete set of response records into a [`SearchOutcome`].
+    ///
+    /// Shared by the blocking `search_with` and the non-blocking GUI path, so the
+    /// two cannot interpret a reply differently.
+    pub fn outcome_from_records(
+        &self,
+        resp: &[Response],
+    ) -> Result<SearchOutcome, GuiError> {
         let mut paths = Vec::new();
         let mut total = 0u64;
         let mut fresh = true;
         let mut stale: Vec<String> = Vec::new();
         let mut catching_up = false;
-        for r in &resp {
+        for r in resp {
             match r {
                 Response::Meta { fresh: f, stale_roots, catching_up: c, .. } => {
                     fresh = *f;
@@ -725,6 +756,229 @@ pub fn query_is_searchable(q: &str) -> bool {
     !q.trim().is_empty()
 }
 
+// ---------------------------------------------------------------------------
+// Non-blocking request.
+//
+// A query's reply is *multi-record* — a `Meta`, then one `Hit` per match, then a
+// terminal record — so it arrives in several packets. That rules out "set the
+// socket non-blocking and read once": the read must be resumable across event-loop
+// ticks, remembering a partial line across calls.
+//
+// `PendingRequest` is that resumable machine. Every method returns promptly; none
+// of them block. A caller drives it from whatever loop it has (the GUI's 30 ms
+// timer pump) and keeps rendering in between, so a daemon that is slow — or wedged
+// — cannot freeze the window.
+//
+// The socket is non-blocking for the write as well as the read: a request line can
+// be large (a long expression query) and `write` is allowed to accept only part of
+// it, or none of it.
+// ---------------------------------------------------------------------------
+
+/// How far a [`PendingRequest`] has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestState {
+    /// Still sending the request line.
+    Writing,
+    /// Request sent; accumulating response records.
+    Reading,
+    /// A terminal record was seen. The result is ready.
+    Done,
+}
+
+/// Progress from one non-blocking step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    /// Nothing more can be done until the socket is readable/writable again.
+    /// The caller should return to its loop and call [`PendingRequest::advance`]
+    /// on a later tick — *not* mark the request failed.
+    WouldBlock,
+    /// Work was done; call again immediately (there may be more buffered).
+    Advanced,
+    /// The terminal record arrived.
+    Finished,
+}
+
+/// A request in flight over a non-blocking socket.
+pub struct PendingRequest {
+    stream: findex::transport::Stream,
+    /// The request line, held until it has been fully written. `sent` is how many
+    /// bytes of it the kernel has accepted so far.
+    out: Vec<u8>,
+    sent: usize,
+    /// Bytes received but not yet a complete line (the tail of a partial record).
+    partial: Vec<u8>,
+    /// Records parsed so far, in arrival order.
+    records: Vec<Response>,
+    state: RequestState,
+    /// Set when a terminal record has been seen, so `is_done` needs no re-parse.
+    terminal_seen: bool,
+}
+
+/// A record that ends a reply. After one of these the daemon stops talking.
+fn is_terminal(r: &Response) -> bool {
+    matches!(
+        r,
+        Response::Done { .. }
+            | Response::Error { .. }
+            | Response::Synced { .. }
+            | Response::Stats { .. }
+            | Response::Pong { .. }
+            | Response::Rescanning { .. }
+    )
+}
+
+impl PendingRequest {
+    /// Start a request on `stream`, which is set non-blocking here.
+    ///
+    /// The socket must be non-blocking *before* any I/O, hence this constructor
+    /// rather than a flag a caller could forget.
+    pub fn start(
+        stream: findex::transport::Stream,
+        line: &str,
+    ) -> Result<PendingRequest, GuiError> {
+        stream
+            .set_nonblocking(true)
+            .map_err(|e| GuiError::Io(format!("set_nonblocking: {e}")))?;
+        let mut out = String::with_capacity(line.len() + 1);
+        out.push_str(line);
+        out.push('\n');
+        Ok(PendingRequest {
+            stream,
+            out: out.into_bytes(),
+            sent: 0,
+            partial: Vec::new(),
+            records: Vec::new(),
+            state: RequestState::Writing,
+            terminal_seen: false,
+        })
+    }
+
+    pub fn state(&self) -> RequestState {
+        self.state
+    }
+
+    /// True once a terminal record has been parsed.
+    pub fn is_done(&self) -> bool {
+        self.terminal_seen
+    }
+
+    /// The records received so far (including the terminal one, once parsed).
+    pub fn records(&self) -> &[Response] {
+        &self.records
+    }
+
+    /// Take the finished records out, leaving the machine empty.
+    pub fn take_records(&mut self) -> Vec<Response> {
+        std::mem::take(&mut self.records)
+    }
+
+    /// Make whatever progress is possible right now, without blocking.
+    ///
+    /// Safe to call repeatedly and after completion (which returns `Finished`).
+    /// `WouldBlock` is *not* an error and must not abort the request: it means the
+    /// kernel has nothing for us yet and the caller should come back later.
+    pub fn advance(&mut self) -> Result<Progress, GuiError> {
+        if self.terminal_seen {
+            return Ok(Progress::Finished);
+        }
+        let mut did_something = false;
+
+        // 1. Finish the write. `write` may accept only part of the line.
+        while self.sent < self.out.len() {
+            match std::io::Write::write(&mut self.stream, &self.out[self.sent..]) {
+                Ok(0) => {
+                    return Err(GuiError::Io("daemon closed the socket while writing".into()))
+                }
+                Ok(n) => {
+                    self.sent += n;
+                    did_something = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(GuiError::Io(e.to_string())),
+            }
+        }
+        if self.sent < self.out.len() {
+            // Not all sent; the caller must wait for writability.
+            return Ok(if did_something { Progress::Advanced } else { Progress::WouldBlock });
+        }
+        self.state = RequestState::Reading;
+
+        // 2. Drain whatever is readable, parsing whole lines as they complete.
+        let mut buf = [0u8; 8192];
+        loop {
+            match std::io::Read::read(&mut self.stream, &mut buf) {
+                Ok(0) => {
+                    // EOF. The daemon closes after the terminal record, so this is
+                    // only a surprise when the terminal has not arrived.
+                    if self.terminal_seen {
+                        return Ok(Progress::Finished);
+                    }
+                    return Err(GuiError::Io(
+                        "daemon closed the connection before the reply finished".into(),
+                    ));
+                }
+                Ok(n) => {
+                    did_something = true;
+                    self.partial.extend_from_slice(&buf[..n]);
+                    self.drain_lines()?;
+                    if self.terminal_seen {
+                        return Ok(Progress::Finished);
+                    }
+                    // Keep reading: more records may already be buffered.
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(GuiError::Io(e.to_string())),
+            }
+        }
+
+        Ok(if did_something { Progress::Advanced } else { Progress::WouldBlock })
+    }
+
+    /// Turn every complete line in `partial` into a record, leaving any trailing
+    /// fragment for the next packet.
+    fn drain_lines(&mut self) -> Result<(), GuiError> {
+        loop {
+            let Some(nl) = self.partial.iter().position(|&b| b == b'\n') else {
+                return Ok(()); // no complete line yet
+            };
+            let line: Vec<u8> = self.partial.drain(..=nl).collect();
+            let text = String::from_utf8_lossy(&line[..line.len() - 1]);
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let rec: Response = serde_json::from_str(text)
+                .map_err(|e| GuiError::Protocol(format!("{e}: {text}")))?;
+            if is_terminal(&rec) {
+                self.terminal_seen = true;
+            }
+            self.records.push(rec);
+            if self.terminal_seen {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Serialize a request, stamping the protocol version.
+///
+/// The version matters: a daemon built before a behaviour change rejects the
+/// request rather than silently ignoring a field it does not understand (that is
+/// how a stale daemon once made the Case-sensitive checkbox look broken).
+pub fn encode_request(req: &Request) -> Result<String, GuiError> {
+    let mut v: serde_json::Value =
+        serde_json::to_value(req).map_err(|e| GuiError::Protocol(e.to_string()))?;
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "v".into(),
+            serde_json::Value::from(findex::proto::PROTOCOL_VERSION),
+        );
+    }
+    serde_json::to_string(&v).map_err(|e| GuiError::Protocol(e.to_string()))
+}
+
 #[cfg(test)]
 mod asyou_type_tests {
     use super::*;
@@ -781,5 +1035,268 @@ mod asyou_type_tests {
             g.finish(r.seq, ());
         }
         assert_eq!(g.issued(), last);
+    }
+}
+
+#[cfg(test)]
+mod nonblocking_tests {
+    //! These use a real loopback socket pair rather than a mock: the whole point is
+    //! `WouldBlock`, which only a real non-blocking fd produces.
+
+    use super::*;
+    use std::io::Write;
+    use std::net::Shutdown;
+
+    /// A listener on a private temp path, plus a connected client stream.
+    fn pair() -> (tempfile::TempDir, findex::transport::Stream, findex::transport::Stream) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.sock");
+        let listener = findex::transport::Listener::bind(&path).unwrap();
+        let client = findex::transport::Stream::connect(&path).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (dir, client, server)
+    }
+
+    /// Serialize a real `Response`, so these fixtures cannot drift from the wire
+    /// format (`Response` is tagged with a `type` field).
+    fn line(r: &Response) -> String {
+        format!("{}\n", serde_json::to_string(r).unwrap())
+    }
+
+    fn meta() -> Response {
+        Response::Meta {
+            gen: 1,
+            lsn: 1,
+            fresh: true,
+            elapsed_ms: 0.1,
+            stale_roots: vec![],
+            catching_up: None,
+            backend: None,
+            entries: None,
+        }
+    }
+
+    fn hit(path: &str, id: u32) -> Response {
+        Response::Hit { path: path.into(), id }
+    }
+
+    fn done(count: u64) -> Response {
+        Response::Done { count, cursor: "c1".into() }
+    }
+
+    fn pong() -> Response {
+        Response::Pong { pid: 1, version: 2, backend: "fake".into() }
+    }
+
+    /// Drive a request to completion, giving the peer a chance to write between
+    /// steps. Returns the number of ticks it took and the final progress.
+    fn pump_until_done(
+        p: &mut PendingRequest,
+        server: &mut findex::transport::Stream,
+        max_ticks: usize,
+    ) -> (usize, Progress) {
+        let mut last = Progress::WouldBlock;
+        for i in 0..max_ticks {
+            last = p.advance().unwrap();
+            // Let the peer make progress too (it is non-blocking as well).
+            let _ = server.flush();
+            if last == Progress::Finished {
+                return (i + 1, last);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        (max_ticks, last)
+    }
+
+    #[test]
+    fn a_reply_split_across_packets_is_reassembled() {
+        let (_d, client, mut server) = pair();
+        let mut p = PendingRequest::start(client, "{\"op\":\"query\"}").unwrap();
+
+        // Send a reply in pieces, including *mid-record* splits, which is the case
+        // a one-shot read would get wrong.
+        let whole = format!("{}{}{}", line(&meta()), line(&hit("/a/main.rs", 1)), line(&done(1)));
+        let bytes = whole.as_bytes();
+        for chunk in bytes.chunks(7) {
+            server.write_all(chunk).unwrap();
+            server.flush().unwrap();
+            p.advance().unwrap();
+        }
+
+        let (_, last) = pump_until_done(&mut p, &mut server, 50);
+        assert_eq!(last, Progress::Finished, "should finish once the terminal arrives");
+        let recs = p.records();
+        assert_eq!(recs.len(), 3, "Meta + Hit + Done");
+        assert!(matches!(recs[0], Response::Meta { .. }));
+        assert!(matches!(recs[1], Response::Hit { .. }));
+        assert!(matches!(recs[2], Response::Done { count: 1, .. }));
+    }
+
+    #[test]
+    fn would_block_is_not_an_error_and_is_resumable() {
+        let (_d, client, mut server) = pair();
+        let mut p = PendingRequest::start(client, "{\"op\":\"query\"}").unwrap();
+
+        // Nothing written by the peer yet: we must get through the write phase and
+        // then report WouldBlock, *not* fail.
+        let mut saw_would_block = false;
+        for _ in 0..5 {
+            if p.advance().unwrap() == Progress::WouldBlock {
+                saw_would_block = true;
+                break;
+            }
+        }
+        assert!(saw_would_block, "an idle socket must report WouldBlock, not an error");
+        assert!(!p.is_done(), "and the request must still be pending");
+
+        // Now the peer answers; the same object must pick up where it left off.
+        server.write_all(line(&done(0)).as_bytes()).unwrap();
+        server.flush().unwrap();
+        let (_, last) = pump_until_done(&mut p, &mut server, 50);
+        assert_eq!(last, Progress::Finished, "resumable across ticks");
+        assert_eq!(p.records().len(), 1);
+    }
+
+    #[test]
+    fn the_request_line_is_written_before_reading() {
+        let (_d, client, mut server) = pair();
+        let mut p = PendingRequest::start(client, "{\"op\":\"ping\"}").unwrap();
+        // Nothing is sent merely by constructing the request: the socket may not be
+        // writable yet, so the bytes are buffered until `advance` can flush them.
+        // (This is why the write must be resumable and not one `writeln!`.)
+        let _ = p.advance().unwrap();
+
+        // The peer should now receive the request line, newline-terminated.
+        use std::io::Read;
+        server.set_nonblocking(true).unwrap();
+        let mut got = Vec::new();
+        for _ in 0..100 {
+            let mut buf = [0u8; 64];
+            match server.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    if got.ends_with(b"\n") {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => panic!("read: {e}"),
+            }
+        }
+        assert!(!got.is_empty(), "the request line must actually be sent");
+        assert!(got.ends_with(b"\n"), "NDJSON: newline-terminated, got {got:?}");
+        assert!(
+            got.starts_with(b"{\"op\":\"ping\"}"),
+            "and it must be the request we asked for, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_clean_eof_after_the_terminal_is_not_an_error() {
+        let (_d, client, mut server) = pair();
+        let mut p = PendingRequest::start(client, "{\"op\":\"ping\"}").unwrap();
+        server.write_all(line(&pong()).as_bytes()).unwrap();
+        server.flush().unwrap();
+        // The daemon closes once it has answered — a normal ending.
+        server.shutdown(Shutdown::Write).unwrap();
+
+        let (_, last) = pump_until_done(&mut p, &mut server, 50);
+        assert_eq!(last, Progress::Finished);
+        assert_eq!(p.records().len(), 1);
+    }
+
+    #[test]
+    fn an_eof_before_the_terminal_is_a_loud_error() {
+        let (_d, client, mut server) = pair();
+        let mut p = PendingRequest::start(client, "{\"op\":\"ping\"}").unwrap();
+        // A truncated reply: a Meta but no terminal record.
+        server.write_all(line(&meta()).as_bytes()).unwrap();
+        server.flush().unwrap();
+        server.shutdown(Shutdown::Write).unwrap();
+
+        let mut err = None;
+        for _ in 0..50 {
+            match p.advance() {
+                Ok(Progress::Finished) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let err = err.expect("a truncated reply must be reported, not silently accepted");
+        assert!(
+            format!("{err}").contains("before the reply finished"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_record_is_a_protocol_error() {
+        let (_d, client, mut server) = pair();
+        let mut p = PendingRequest::start(client, "{\"op\":\"ping\"}").unwrap();
+        server.write_all(b"this is not json\n").unwrap();
+        server.flush().unwrap();
+
+        let mut err = None;
+        for _ in 0..20 {
+            if let Err(e) = p.advance() {
+                err = Some(e);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let err = err.expect("garbage must not be silently dropped");
+        assert!(matches!(err, GuiError::Protocol(_)), "got: {err:?}");
+    }
+
+    #[test]
+    fn advance_after_completion_is_idempotent() {
+        let (_d, client, mut server) = pair();
+        let mut p = PendingRequest::start(client, "{\"op\":\"ping\"}").unwrap();
+        server.write_all(line(&done(0)).as_bytes()).unwrap();
+        server.flush().unwrap();
+        let _ = pump_until_done(&mut p, &mut server, 50);
+        assert_eq!(p.advance().unwrap(), Progress::Finished);
+        assert_eq!(p.advance().unwrap(), Progress::Finished, "still Finished");
+        assert_eq!(p.records().len(), 1, "records must not be duplicated");
+    }
+
+    #[test]
+    fn a_large_request_line_survives_a_partial_write() {
+        // A long expression query is bigger than one socket buffer flush in the
+        // worst case; the writer must track its offset, not assume one write.
+        let (_d, client, mut server) = pair();
+        let big = format!("{{\"op\":\"query\",\"q\":\"{}\"}}", "x".repeat(200_000));
+        let mut p = PendingRequest::start(client, &big).unwrap();
+        let mut saw_block = false;
+        for _ in 0..2000 {
+            match p.advance().unwrap() {
+                Progress::WouldBlock => {
+                    // Drain the peer so the kernel buffer can accept more.
+                    use std::io::Read;
+                    server.set_nonblocking(true).unwrap();
+                    let mut sink = [0u8; 65536];
+                    while let Ok(n) = server.read(&mut sink) {
+                        if n == 0 {
+                            break;
+                        }
+                    }
+                    saw_block = true;
+                }
+                Progress::Advanced => {}
+                Progress::Finished => break,
+            }
+        }
+        assert!(saw_block, "a 200 KB line should not fit in one write");
+        server.write_all(line(&done(0)).as_bytes()).unwrap();
+        server.flush().unwrap();
+        let (_, last) = pump_until_done(&mut p, &mut server, 100);
+        assert_eq!(last, Progress::Finished, "the whole line must still be sent");
     }
 }

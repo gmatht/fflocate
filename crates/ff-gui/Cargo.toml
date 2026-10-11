@@ -33,4 +33,12 @@ serde_json.workspace = true
 # needs. Two crates rather than a path into a checkout outside this repository
 # so the build is self-contained; see README.md for why they are vendored and
 # what was fixed in them.
+#
+# NB: this must stay in [dependencies]. A [dev-dependencies] table placed above
+# it silently swallows it into the dev-dependency set, so the library and binary
+# no longer link it (the symptom is "cannot find crate `rustxwidgets`" despite
+# Cargo reporting the dependency normally).
 rustxwidgets = { path = "../../vendor/rustxwidgets", default-features = false }
+
+[dev-dependencies]
+tempfile.workspace = true

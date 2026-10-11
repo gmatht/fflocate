@@ -172,6 +172,7 @@ dependencies = [
  "findex",
  "rustxwidgets",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

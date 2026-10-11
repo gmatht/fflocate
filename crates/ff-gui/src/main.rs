@@ -25,16 +25,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use ff_gui::{
-    effective_query, query_is_searchable, render_count, rows_from_paths, DaemonClient, GuiError,
-    RowAction, SearchGate, SearchOptions, SearchOutcome, ADVANCED_SYNTAX_HELP,
-    DEFAULT_MAX_DISTANCE,
+    effective_query, encode_request, query_is_searchable, render_count, rows_from_paths,
+    DaemonClient, GuiError, PendingRequest, Progress, RowAction, SearchGate,
+    SearchOptions, SearchOutcome, WireResponse, ADVANCED_SYNTAX_HELP, DEFAULT_MAX_DISTANCE,
 };
 
 /// A search's result, plus whether the advanced box's query was the one that ran.
 type SearchResult = Result<(SearchOutcome, bool), GuiError>;
-
-/// Runs the query and returns its result. Reads widget text, so main-thread only.
-type FetchFn = Rc<dyn Fn() -> SearchResult>;
 
 /// Applies a result to the widgets. Main-thread only: the widgets are not `Send`.
 type RenderFn = Rc<dyn Fn(SearchResult)>;
@@ -194,7 +191,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Search button and the Return key, so the three cannot drift apart. (It also
     // means the expensive half *could* move to a worker thread, but it is 0.00 s
     // against a warm daemon, so it does not: see the note at the as-you-type code.)
-    let fetch: FetchFn = {
+    // Turn the current widgets into the pair (request line, shadowed?). This is the
+    // *only* part of a search that needs the widgets, so it is the only part that
+    // must run on the main thread — the I/O below is stepped from the pump.
+    let build_request: Rc<dyn Fn() -> Result<(String, bool), GuiError>> = {
         let query = query.clone();
         let advanced_query = advanced_query.clone();
         let opt_case = opt_case.clone();
@@ -206,7 +206,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let adv = advanced_query.get_text().unwrap_or_default();
             let (q, shadowed) = effective_query(&quick, &adv);
             let opts = gather_options(&opt_case, &opt_fuzzy, &opt_count, &opt_distance);
-            run_query(&q, &opts).map(|o| (o, shadowed))
+            let req = DaemonClient::query_request(&q, FETCH_LIMIT, &opts);
+            encode_request(&req).map(|line| (line, shadowed))
         })
     };
 
@@ -250,13 +251,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    // The same closure backs the Search button, the Return key and the
-    // as-you-type debounce, so the three cannot drift apart.
-    let run_search: Rc<RefCell<Box<dyn FnMut()>>> = {
-        let fetch = fetch.clone();
-        let render = render.clone();
-        Rc::new(RefCell::new(Box::new(move || render(fetch()))))
-    };
+    // The same closure backs the Search button, the Return key and the as-you-type
+    // debounce, so the three cannot drift apart. It does not run the query itself —
+    // it asks the pump to start one *now* (bypassing the debounce), so even an
+    // explicit click cannot block the window on a slow daemon.
+    let run_search: Rc<RefCell<Box<dyn FnMut()>>> = Rc::new(RefCell::new(Box::new(|| {})));
 
     {
         let run_search = run_search.clone();
@@ -268,21 +267,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ---------------------------------------------------------------------
-    // Search as you type.
+    // Search as you type, over a **non-blocking** socket.
     //
-    // Each keystroke arms a short timer via the toolkit's `timeout_add` (the
-    // primitive this added to the vendored rustxWidgets). If another key arrives
-    // first the timer is re-armed, so only a pause in typing issues a query.
+    // Each keystroke arms a 150 ms deadline; a 30 ms timer (`App::timeout_add`, a
+    // primitive added to the vendored rustxWidgets) issues the query once typing
+    // pauses, so a burst of keystrokes collapses to one query.
     //
-    // The query runs *on the main thread*, deliberately. A worker thread was the
-    // first design, but the widget text to read and the rows to write are both
-    // `Rc`/`RefCell` and cannot cross a thread boundary, so only the socket hop
-    // could move — and that hop is 0.00 s once the daemon's index is warm. A
-    // mailbox plus ordering machinery would buy nothing measurable. What actually
-    // matters is the debounce: without it, holding a key fires a query per repeat.
+    // The socket is set non-blocking and the request is *stepped* from the pump
+    // (`PendingRequest::advance`), never awaited. That is what keeps the window
+    // responsive: a daemon that is slow, or wedged entirely, leaves the pump
+    // returning `WouldBlock` each tick rather than sitting in `read`. A blocking
+    // read — even one with a timeout — would freeze the window for the duration;
+    // this does not freeze it at all.
     //
-    // `SearchGate` still guards the ordering hazard, because a debounce only
-    // *reduces* overlapping queries rather than eliminating them.
+    // The reply is multi-record (Meta, Hit*, terminal), so a request spans many
+    // ticks; `PendingRequest` remembers the partial line between them.
+    //
+    // Only two things must run on the main thread, because the widgets cannot cross
+    // a thread boundary: reading the query out of the boxes, and writing the rows
+    // back. Everything between is now pure I/O and could run anywhere.
     // ---------------------------------------------------------------------
     {
         let due_at: Rc<RefCell<Option<std::time::Instant>>> = Rc::new(RefCell::new(None));
@@ -290,6 +293,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // and keeps a burst of keystrokes from queuing a query each. It is plain
         // logic, tested in `ff_gui::asyou_type_tests`.
         let gate = Rc::new(RefCell::new(SearchGate::new()));
+
+        // Which issued request was the one whose query came from the *advanced* box,
+        // so the status line can say so when the reply finally lands. Keyed by the
+        // gate's sequence number, because the widgets may have changed by then.
+        let shadowed_by_seq: Rc<RefCell<std::collections::HashMap<u64, bool>>> =
+            Rc::new(RefCell::new(std::collections::HashMap::new()));
 
         const DEBOUNCE_MS: u64 = 150;
         const PUMP_MS: u32 = 30;
@@ -303,28 +312,86 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
+        // Set by the Search button / Return: "start the next request without waiting
+        // for the debounce". They share the pump rather than making their own request
+        // so that every path through the GUI does the I/O the same non-blocking way.
+        let start_now: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+        {
+            let start_now = start_now.clone();
+            *run_search.borrow_mut() = Box::new(move || *start_now.borrow_mut() = true);
+        }
+
         let pump = {
             let due_at = due_at.clone();
             let gate = gate.clone();
-            let fetch = fetch.clone();
             let render = render.clone();
+            let build_request = build_request.clone();
+            // The request currently in flight, if any. Advancing it is what the
+            // pump does: it never blocks, so a slow or wedged daemon leaves the
+            // window fully responsive (the pump simply keeps returning `true`).
+            let pending: Rc<RefCell<Option<(u64, PendingRequest)>>> =
+                Rc::new(RefCell::new(None));
             App::timeout_add(PUMP_MS, Box::new(move || {
-                let Some(t) = *due_at.borrow() else { return true };
-                if std::time::Instant::now() < t {
-                    return true; // still typing
+                // 1. Advance a request in flight. `WouldBlock` is normal, not an
+                //    error: it means "come back next tick", which is exactly what
+                //    keeps the loop live.
+                let mut finished: Option<(u64, Result<Vec<WireResponse>, GuiError>)> = None;
+                if let Some((seq, p)) = pending.borrow_mut().as_mut() {
+                    let seq = *seq;
+                    match p.advance() {
+                        Ok(Progress::Finished) => {
+                            finished = Some((seq, Ok(p.take_records())));
+                        }
+                        Ok(_) => {}
+                        Err(e) => finished = Some((seq, Err(e))),
+                    }
                 }
-                // Ask the gate whether a query may go out; it refuses while one is
-                // in flight, and we retry on a later tick.
-                let Some(ticket) = gate.borrow_mut().begin()
-                else {
+                if finished.is_some() {
+                    *pending.borrow_mut() = None;
+                }
+                if let Some((seq, result)) = finished {
+                    let outcome = result
+                        .and_then(|recs| DaemonClient::new().outcome_from_records(&recs))
+                        .map(|o| (o, take_shadowed(&shadowed_by_seq, seq)));
+                    if let Some(outcome) = gate.borrow_mut().finish(seq, outcome) {
+                        render(outcome);
+                    }
+                }
+
+                // 2. Start a new request if the debounce has elapsed (or the Search
+                //    button asked for one now) and nothing is in flight. `begin`
+                //    refuses while one is out, so a burst of keystrokes cannot queue
+                //    up round-trips.
+                if pending.borrow().is_some() {
+                    return true;
+                }
+                let immediate = std::mem::replace(&mut *start_now.borrow_mut(), false);
+                if !immediate {
+                    let Some(t) = *due_at.borrow() else { return true };
+                    if std::time::Instant::now() < t {
+                        return true; // still typing
+                    }
+                }
+                let Some(ticket) = gate.borrow_mut().begin() else {
                     return true;
                 };
                 *due_at.borrow_mut() = None;
-                // Both ends are main-thread; `fetch` reads the widgets and does the
-                // socket round-trip, which is microseconds once the daemon is warm.
-                let outcome = fetch();
-                if let Some(outcome) = gate.borrow_mut().finish(ticket.seq, outcome) {
-                    render(outcome);
+
+                match build_request().and_then(|(line, shadowed)| {
+                    let stream = connect_stream()?;
+                    PendingRequest::start(stream, &line).map(|p| (p, shadowed))
+                }) {
+                    Ok((p, shadowed)) => {
+                        shadowed_by_seq.borrow_mut().insert(ticket.seq, shadowed);
+                        *pending.borrow_mut() = Some((ticket.seq, p));
+                    }
+                    Err(e) => {
+                        // The request never started, so it can never finish: release
+                        // the gate's slot or every later search would be refused.
+                        if let Some(outcome) = gate.borrow_mut().finish(ticket.seq, Err(e)) {
+                            render(outcome);
+                        }
+                    }
                 }
                 true // keep ticking for the life of the app
             }))
@@ -558,10 +625,20 @@ impl TextViewLike for TextView {
     }
 }
 
-/// Run one search against the daemon.
-fn run_query(query: &str, opts: &SearchOptions) -> Result<SearchOutcome, GuiError> {
-    let client = DaemonClient::new();
-    client.search_with(query, FETCH_LIMIT, opts)
+/// Open a non-blocking connection for a query.
+fn connect_stream() -> Result<findex::transport::Stream, GuiError> {
+    let path = DaemonClient::new().socket().to_path_buf();
+    findex::transport::connect(&path)
+        .map_err(|e| GuiError::Connect(format!("{}: {e}", path.display())))
+}
+
+/// Look up (and forget) whether a finished request's query came from the advanced
+/// box. Forgetting matters: the map would otherwise grow for the life of the app.
+fn take_shadowed(
+    map: &Rc<RefCell<std::collections::HashMap<u64, bool>>>,
+    seq: u64,
+) -> bool {
+    map.borrow_mut().remove(&seq).unwrap_or(false)
 }
 
 /// Read the foldout's controls into a [`SearchOptions`].

@@ -27,14 +27,16 @@ to a REPL rather than a window, so the GUI still runs over ssh or in a container
 with no X server. Both backends are selected at build time via the crate's
 `gtk` / `zork` features.
 
-## As-you-type search, and why the query is not async
+## As-you-type search over a non-blocking socket
 
 Each change to either query box arms a 150 ms deadline; a 30 ms timer runs the
 query once the deadline passes with no further typing, so a burst of keystrokes
 collapses to one query. An emptied box clears the list immediately rather than
 searching for nothing. `SearchGate` (`src/lib.rs`) refuses to start a query while
-one is in flight and drops a result a newer one has superseded, so the answers
-cannot arrive out of order.
+one is in flight and drops a result that a newer one has superseded, so the
+answers cannot arrive out of order. The Search button and Return go through the
+same pump — they just set a flag to skip the debounce — so no path through the GUI
+does blocking I/O.
 
 The timer is not part of the original toolkit. `connect_changed` fires
 synchronously on every keystroke and there was no timer or idle primitive, so
@@ -42,27 +44,29 @@ synchronously on every keystroke and there was no timer or idle primitive, so
 backend, having no timer, returns `Err` and the GUI says so rather than silently
 never firing.
 
-The query runs **on the main thread**, and this was measured rather than assumed.
-The first design ran it on a worker thread with a mailbox, but the text to read
-and the rows to write are both `Rc`/`RefCell` and cannot cross a thread boundary,
-so only the socket hop could move — and that hop is 0.00 s against a warm daemon.
-The mailbox bought nothing; the debounce is what matters.
+**The socket is non-blocking, and a request is *stepped*, never awaited.**
+`PendingRequest` (`src/lib.rs`) sets the socket non-blocking, writes the request
+line tracking a byte offset (a long expression query can be larger than one
+write), and accumulates records until a terminal one arrives. A query's reply is
+*multi-record* — a `Meta`, one `Hit` per match, then `Done` — so it arrives in
+several packets and the machine has to remember a partial line between them. The
+pump calls `advance()` once per tick and treats `WouldBlock` as "come back later",
+never as an error.
 
-**Async was investigated and is not reachable.** The GTK backend runs glib's own
-`g_main_loop_run` (`vendor/rustxwidgets/src/backends/gtk.rs:33-38`, resolved from
-the dynamic loader and called directly): the application does not own the event
-loop, so there is no executor in which to `.await`. Worse, the one thing that
-would need to yield is exactly the thing that cannot:
-`DaemonClient::request` (`src/lib.rs`) blocks in `reader.lines()` on a Unix
-socket, and there is no yield point inside `g_main_loop_run`.
+That is what keeps the window responsive. A **timeout** would not: it bounds the
+freeze rather than removing it, so a wedged daemon would still lock the window for
+the duration. Non-blocking removes the freeze entirely. Measured against a daemon
+that accepts a connection and never replies, the loop regained control **60 times
+in 605 ms**; a blocking read would have managed about one.
 
-Making it async would therefore mean inverting the loop — pumping the glib
-context from an executor and having the toolkit's "block until event" call back
-into it, the way `asyncio-glib` does in Python. That is a far larger change to the
-vendored toolkit than the timer was, and it would be to await a query that already
-answers in microseconds. The crate has no async runtime in its dependency tree at
-all. If a query ever becomes genuinely slow, the loop inversion is the prerequisite;
-until then the honest fix is a socket timeout, not an executor.
+The query is still not *async*. Async needs a loop you own, and the GTK backend
+runs glib's own `g_main_loop_run` (`vendor/rustxwidgets/src/backends/gtk.rs:33-38`,
+resolved from the dynamic loader and called directly), so there is no executor in
+which to `.await`. Reaching that would mean inverting the loop — pumping the glib
+context from an executor, the way `asyncio-glib` does in Python — which is a far
+larger change to the vendored toolkit than the timer was, and the crate has no
+async runtime in its dependency tree. Non-blocking I/O gives the responsiveness
+that async was wanted for, without the inversion.
 
 ## Vendored dependencies
 
