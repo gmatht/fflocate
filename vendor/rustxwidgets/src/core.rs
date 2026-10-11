@@ -306,7 +306,7 @@ impl App {
     }
 
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
-    pub fn create_treeview(&self, columns: &[(&str, bool)]) -> Result<crate::backends_gtk_adapter::TreeView, Error> {
+    pub fn create_treeview(&self, columns: &[(&str, bool, bool)]) -> Result<crate::backends_gtk_adapter::TreeView, Error> {
         crate::backends_gtk_adapter::create_treeview(columns)
     }
 
@@ -443,7 +443,7 @@ impl App {
     }
 
     #[cfg(all(windows, not(feature = "zork")))]
-    pub fn create_treeview(&self, columns: &[(&str, bool)]) -> Result<crate::backends_nwg_adapter::TreeView, Error> {
+    pub fn create_treeview(&self, columns: &[(&str, bool, bool)]) -> Result<crate::backends_nwg_adapter::TreeView, Error> {
         crate::backends_nwg_adapter::create_treeview(columns)
     }
 
@@ -557,7 +557,7 @@ impl App {
     }
 
 #[cfg(all(feature = "pancurses", not(any(feature = "gtk", windows, target_arch = "wasm32", target_os = "android"))))]
-    pub fn create_treeview(&self, columns: &[(&str, bool)]) -> Result<crate::backends_pancurses_adapter::TreeView, Error> {
+    pub fn create_treeview(&self, columns: &[(&str, bool, bool)]) -> Result<crate::backends_pancurses_adapter::TreeView, Error> {
         crate::backends_pancurses_adapter::create_treeview(columns)
     }
 
@@ -594,7 +594,7 @@ impl App {
     }
 
 #[cfg(feature = "zork")]
-    pub fn create_treeview(&self, columns: &[(&str, bool)]) -> Result<crate::backends_zork_adapter::TreeView, Error> {
+    pub fn create_treeview(&self, columns: &[(&str, bool, bool)]) -> Result<crate::backends_zork_adapter::TreeView, Error> {
         crate::backends_zork_adapter::create_treeview(columns)
     }
 
@@ -771,7 +771,7 @@ impl App {
     }
 
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
-    pub fn create_treeview(&self, columns: &[(&str, bool)]) -> Result<crate::backends_wasm_adapter::TreeView, Error> {
+    pub fn create_treeview(&self, columns: &[(&str, bool, bool)]) -> Result<crate::backends_wasm_adapter::TreeView, Error> {
         crate::backends_wasm_adapter::create_treeview(columns)
     }
     #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]

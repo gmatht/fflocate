@@ -1025,7 +1025,7 @@ pub fn clipboard_set_text(text: &str) -> Result<(), Error> {
         .map_err(|e| Error::Backend(format!("clipboard write failed: {e}")))
 }
 
-pub fn create_treeview(_columns: &[(&str, bool)]) -> Result<TreeView, Error> {
+pub fn create_treeview(_columns: &[(&str, bool, bool)]) -> Result<TreeView, Error> {
     // The multi-column list is backed by a TextView node, which `set_rows`
     // fills with aligned text columns.
     let id = crate::backends::zork::create_textview()

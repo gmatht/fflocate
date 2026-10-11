@@ -1133,12 +1133,14 @@ mod gtk_adapter {
 
     impl TreeView {
         /// Create a tree view with `columns`: `(title, is_icon)`.
-        pub fn new(&self, columns: &[(&str, bool)]) -> Result<TreeView, Error> {
+        pub fn new(&self, columns: &[(&str, bool, bool)]) -> Result<TreeView, Error> {
             let loader = crate::backends::gtk::loader()
                 .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
-            let specs: Vec<(&str, &str, bool)> = columns
+            let specs: Vec<(&str, &str, bool, bool)> = columns
                 .iter()
-                .map(|(title, is_icon)| (*title, if *is_icon { "pixbuf" } else { "text" }, *is_icon))
+                .map(|(title, is_icon, sortable)| {
+                    (*title, if *is_icon { "pixbuf" } else { "text" }, *is_icon, *sortable)
+                })
                 .collect();
             gtk_dynamic_loader::TreeView::new(loader, &specs)
                 .map(TreeView)
@@ -1269,12 +1271,14 @@ mod gtk_adapter {
             .map_err(|e| Error::Backend(format!("{}", e)))
     }
 
-    pub fn create_treeview(columns: &[(&str, bool)]) -> Result<TreeView, Error> {
+    pub fn create_treeview(columns: &[(&str, bool, bool)]) -> Result<TreeView, Error> {
         let loader = crate::backends::gtk::loader()
             .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
-        let specs: Vec<(&str, &str, bool)> = columns
+        let specs: Vec<(&str, &str, bool, bool)> = columns
             .iter()
-            .map(|(title, is_icon)| (*title, if *is_icon { "pixbuf" } else { "text" }, *is_icon))
+            .map(|(title, is_icon, sortable)| {
+                (*title, if *is_icon { "pixbuf" } else { "text" }, *is_icon, *sortable)
+            })
             .collect();
         gtk_dynamic_loader::TreeView::new(loader, &specs)
             .map(TreeView)

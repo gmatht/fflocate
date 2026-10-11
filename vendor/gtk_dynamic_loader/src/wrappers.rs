@@ -240,8 +240,10 @@ impl Drop for Expander {
 
 /// A real multi-column list: a `GtkTreeView` backed by a `GtkListStore`.
 ///
-/// Columns are `(title, attribute, is_pixbuf)`. Text cells show a string; a
-/// pixbuf column shows a `GdkPixbuf` (e.g. an icon-theme icon).
+/// Columns are `(title, attribute, is_pixbuf, sortable)`. Text cells show a
+/// string; a pixbuf column shows a `GdkPixbuf` (e.g. an icon-theme icon). A
+/// sortable column is clickable and makes the model sort by it (the store is a
+/// `GtkTreeSortable`, so GTK does the sorting).
 pub struct TreeView {
     inner: *mut c_void,
     store: *mut c_void,
@@ -271,7 +273,7 @@ impl TreeView {
     /// derived from `columns`: pixbuf columns hold objects, the rest strings.
     pub fn new(
         loader: Arc<Loader>,
-        columns: &[(&str, &str, bool)],
+        columns: &[(&str, &str, bool, bool)],
     ) -> Result<Self, Error> {
         let symbols = &loader.symbols;
         let view_new = symbols
@@ -332,7 +334,7 @@ impl TreeView {
         unsafe { set_model(inner, store); }
 
         let mut ids = Vec::new();
-        for (i, (title, attr, is_pixbuf)) in columns.iter().enumerate() {
+        for (i, (title, attr, is_pixbuf, sortable)) in columns.iter().enumerate() {
             let cell = unsafe { if *is_pixbuf { pixbuf_new() } else { text_new() } };
             if cell.is_null() {
                 continue;
@@ -362,6 +364,18 @@ impl TreeView {
                 let is_last = i + 1 == columns.len();
                 unsafe { f(col, if is_last { 1 } else { 0 }); }
             }
+            // A sortable column is clickable, and its click sorts the model by
+            // this column: GtkListStore implements GtkTreeSortable, so assigning
+            // the sort column id is enough -- GTK handles the ordering and the
+            // header arrow.
+            if *sortable {
+                if let Some(f) = symbols.gtk_tree_view_column_set_clickable {
+                    unsafe { f(col, 1); }
+                }
+                if let Some(f) = symbols.gtk_tree_view_column_set_sort_column_id {
+                    unsafe { f(col, i as i32); }
+                }
+            }
             unsafe { append_col(inner, col); }
             ids.push(i as i32);
         }
@@ -369,6 +383,16 @@ impl TreeView {
             unsafe { f(inner, 1); }
         }
         Ok(TreeView { inner, store, loader, columns: ids, _not_send: PhantomData })
+    }
+
+    /// Sort the model by `column`. Clicking a sortable column's header does this
+    /// automatically; this lets a caller do it programmatically (and makes the
+    /// behaviour testable).
+    pub fn sort_by_column(&self, column: i32) {
+        if let Some(f) = self.loader.symbols.gtk_tree_sortable_set_sort_column_id {
+            // GTK_SORT_ASCENDING = 0.
+            unsafe { f(self.store, column, 0); }
+        }
     }
 
     /// Remove every row.

@@ -1898,7 +1898,7 @@ impl SimpleAction {
             }
         }
 
-        pub fn create_treeview(_columns: &[(&str, bool)]) -> Result<TreeView, Error> {
+        pub fn create_treeview(_columns: &[(&str, bool, bool)]) -> Result<TreeView, Error> {
             Ok(TreeView { _id: 0 })
         }
 

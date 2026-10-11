@@ -93,7 +93,9 @@ depend on a checkout outside this repository.
   it never gets squeezed out as the window grows.
 * Results are a **three-column list — Icon / Name / Path**. On GTK this is a
   real `GtkTreeView` backed by a `GtkListStore`, so the columns actually align
-  and the icon column shows a real themed icon (picked from the file's name and
+  and the icon column shows a real themed icon. **Click the Name or Path header
+  to sort by it** (GTK sorts the store and draws the header arrow); the icon
+  column is not sortable. (picked from the file's name and
   type, with a generic fallback when the theme lacks a specific one). The
   display-free fallback renders the same three columns as aligned text (glyph,
   padded name, path). Clicking blank space below the rows does nothing rather

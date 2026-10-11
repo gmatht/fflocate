@@ -88,7 +88,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The results are a three-column list: icon, name, path. On GTK this is a
     // real GtkTreeView (so the columns align and the icon column shows a themed
     // icon); the display-free fallbacks render the same three columns as text.
-    let results = app.create_treeview(&[("", true), ("Name", false), ("Path", false)])?;
+    // (title, is_icon, sortable): the icon column is not sortable; Name and Path
+    // sort when their headers are clicked.
+    let results = app.create_treeview(&[("", true, false), ("Name", false, true), ("Path", false, true)])?;
     // Column index of the full path, which Copy / Open / drag act on.
     const PATH_COLUMN: usize = 2;
 
