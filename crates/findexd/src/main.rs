@@ -6,9 +6,10 @@
 //! findexd [--socket PATH] [--state-dir DIR] [--root DIR]... [--backend fanotify|inotify|fake|auto] [--shared-store] [--foreground]
 //! ```
 //!
-//! With no `--root`, `$HOME` is indexed. The daemon binds its socket, installs
-//! watches, crawls in the background, and serves NDJSON requests until
-//! `SIGTERM`/`SIGINT`.
+//! With no `--root` (and no `$FINDEX_ROOT`), every readable native filesystem
+//! is indexed on Linux (§4); elsewhere `$HOME` is. The daemon binds its
+//! socket, installs watches, crawls in the background, and serves NDJSON
+//! requests until `SIGTERM`/`SIGINT`.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,8 +49,9 @@ fn parse_args() -> Result<Config, String> {
             }
             "--backend" => {
                 let b = it.next().ok_or("--backend needs a value")?;
-                cfg.backend = BackendChoice::parse(&b)
-                    .ok_or_else(|| format!("unknown backend: {b} (want fanotify|inotify|fake|auto)"))?;
+                cfg.backend = BackendChoice::parse(&b).ok_or_else(|| {
+                    format!("unknown backend: {b} (want fanotify|inotify|fake|auto)")
+                })?;
             }
             "--system" => {
                 cfg = cfg.with_system(true);
@@ -88,6 +90,18 @@ fn parse_args() -> Result<Config, String> {
     }
     if !roots.is_empty() {
         cfg.roots = roots;
+    } else {
+        // No `--root` flags: `$FINDEX_ROOT` (already applied by
+        // `Config::defaults`) still wins when set; otherwise discover this
+        // boot's filesystems. Discovery runs here — not in `defaults()` — so
+        // an explicit configuration never pays for mountinfo it ignores.
+        let findex_root_unset = match std::env::var_os("FINDEX_ROOT") {
+            None => true,
+            Some(v) => v.is_empty(),
+        };
+        if findex_root_unset {
+            cfg.roots = Config::default_roots();
+        }
     }
     std::env::set_var("FINDEX_FOREGROUND", if foreground { "1" } else { "0" });
     Ok(cfg)
@@ -184,16 +198,17 @@ fn run() -> anyhow::Result<()> {
             let sync = daemon.sync.clone();
             let backend = daemon.backend_name();
             let control = daemon.control_sender();
-            let make: Arc<dyn Fn(Option<findex::ownership::Caller>) -> Arc<ServerCtx> + Send + Sync> =
-                Arc::new(move |caller| {
-                    Arc::new(ServerCtx {
-                        shared: shared.clone(),
-                        sync: sync.clone(),
-                        backend: backend.clone(),
-                        control: Some(control.clone()),
-                        caller,
-                    })
-                });
+            let make: Arc<
+                dyn Fn(Option<findex::ownership::Caller>) -> Arc<ServerCtx> + Send + Sync,
+            > = Arc::new(move |caller| {
+                Arc::new(ServerCtx {
+                    shared: shared.clone(),
+                    sync: sync.clone(),
+                    backend: backend.clone(),
+                    control: Some(control.clone()),
+                    caller,
+                })
+            });
             std::thread::spawn(move || net::accept_loop_system(listener, make, stop));
         } else {
             std::thread::spawn(move || net::accept_loop(listener, ctx, stop));

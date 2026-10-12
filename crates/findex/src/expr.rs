@@ -98,10 +98,7 @@ fn posix_class_hit(name: &[u8], ch: u8, flags: u32) -> Option<bool> {
         b"print" => c.is_ascii_graphic() || c == b' ',
         b"punct" => c.is_ascii_graphic() && !c.is_ascii_alphanumeric(),
         b"space" => c.is_ascii_whitespace(),
-        b"upper" => {
-            c.is_ascii_uppercase()
-                || (flags & wm::CASEFOLD != 0 && c.is_ascii_lowercase())
-        }
+        b"upper" => c.is_ascii_uppercase() || (flags & wm::CASEFOLD != 0 && c.is_ascii_lowercase()),
         b"xdigit" => c.is_ascii_hexdigit(),
         _ => return None,
     };
@@ -288,8 +285,7 @@ fn wi_match(pattern: &[u8], text: &[u8], flags: u32, needs_period: bool) -> bool
                         let at_segment_start = p == 0 || pattern[p - 1] == b'/';
                         let rest_ok = rest >= pattern.len()
                             || pattern[rest] == b'/'
-                            || (pattern[rest] == b'\\'
-                                && pattern.get(rest + 1) == Some(&b'/'));
+                            || (pattern[rest] == b'\\' && pattern.get(rest + 1) == Some(&b'/'));
                         if !(at_segment_start && rest_ok) {
                             return false;
                         }
@@ -541,14 +537,20 @@ fn parse_clock_string(s: &str) -> Option<ClockSpec> {
         [pid, ticks] => {
             let _ = pid.parse::<u64>().ok()?;
             let ticks = ticks.parse::<i64>().ok()?;
-            Some(ClockSpec::Clock { ticks, is_fresh_instance: true })
+            Some(ClockSpec::Clock {
+                ticks,
+                is_fresh_instance: true,
+            })
         }
         [start, pid, root, ticks] => {
             let _ = start.parse::<u64>().ok()?;
             let _ = pid.parse::<u64>().ok()?;
             let _ = root.parse::<u64>().ok()?;
             let ticks = ticks.parse::<i64>().ok()?;
-            Some(ClockSpec::Clock { ticks, is_fresh_instance: false })
+            Some(ClockSpec::Clock {
+                ticks,
+                is_fresh_instance: false,
+            })
         }
         _ => None,
     }
@@ -561,7 +563,11 @@ enum ClockSpecOutcome {
 
 fn parse_clock_value(v: &Value) -> Result<ClockSpecOutcome, ()> {
     match v {
-        Value::Number(n) => n.as_i64().map(ClockSpec::Timestamp).map(ClockSpecOutcome::Spec).ok_or(()),
+        Value::Number(n) => n
+            .as_i64()
+            .map(ClockSpec::Timestamp)
+            .map(ClockSpecOutcome::Spec)
+            .ok_or(()),
         Value::String(s) => {
             if s.starts_with("n:") {
                 return Ok(ClockSpecOutcome::NamedCursor);
@@ -573,9 +579,7 @@ fn parse_clock_value(v: &Value) -> Result<ClockSpecOutcome, ()> {
                 ticks: 0,
                 is_fresh_instance: true,
             })),
-            Some(Value::String(s)) => {
-                parse_clock_string(s).map(ClockSpecOutcome::Spec).ok_or(())
-            }
+            Some(Value::String(s)) => parse_clock_string(s).map(ClockSpecOutcome::Spec).ok_or(()),
             Some(_) => Err(()),
         },
         _ => Err(()),
@@ -596,9 +600,19 @@ pub enum Expr {
     /// `false`
     False,
     /// `["name", pattern(s), scope?]` / `["iname", ...]`
-    Name { pats: Vec<Vec<u8>>, scope: Scope, case_sensitive: bool },
+    Name {
+        pats: Vec<Vec<u8>>,
+        scope: Scope,
+        case_sensitive: bool,
+    },
     /// `["match", pattern, scope?, {noescape,includedotfiles}?]` / `["imatch", ...]`
-    Match { pattern: Vec<u8>, scope: Scope, case_sensitive: bool, noescape: bool, include_dotfiles: bool },
+    Match {
+        pattern: Vec<u8>,
+        scope: Scope,
+        case_sensitive: bool,
+        noescape: bool,
+        include_dotfiles: bool,
+    },
     /// `["suffix", suffix(es)]` — always case-insensitive, basename.
     Suffix { suffixes: Vec<Vec<u8>> },
     /// `["type", "x"]`
@@ -606,7 +620,11 @@ pub enum Expr {
     /// `["size", op, n]`
     Size { op: Cmp, n: i64 },
     /// `["dirname", name, ["depth", op, n]?]` / `["idirname", ...]`
-    Dirname { name: Vec<u8>, depth: Option<(Cmp, i64)>, case_sensitive: bool },
+    Dirname {
+        name: Vec<u8>,
+        depth: Option<(Cmp, i64)>,
+        case_sensitive: bool,
+    },
     /// `["pcre", pattern, scope?]` / `["ipcre", ...]`
     Pcre { re: Box<Regex>, scope: Scope },
     /// `["since", clockspec, field?]`
@@ -615,8 +633,17 @@ pub enum Expr {
     Empty,
     /// `["exists"]`
     Exists,
+    /// `["executable"]` — findex extension, no Watchman equivalent: any
+    /// execute bit set (`find -perm /111`). Parsed as its own term (not
+    /// `["type", "x"]`) so the ported `type` grammar and its error strings
+    /// stay byte-identical to Watchman's.
+    Executable,
     /// The top-level `glob` generator: `glob: [patterns]`.
-    GlobSet { patterns: Vec<Vec<u8>>, case_sensitive: bool, include_dotfiles: bool },
+    GlobSet {
+        patterns: Vec<Vec<u8>>,
+        case_sensitive: bool,
+        include_dotfiles: bool,
+    },
     /// The top-level `path` generator.
     PathSet { paths: Vec<QueryPath> },
 }
@@ -637,6 +664,8 @@ pub struct MatchCtx<'a> {
     pub rel_path: &'a [u8],
     pub is_dir: bool,
     pub is_symlink: bool,
+    /// Any execute bit set (`find -perm /111`), from the `IS_EXEC` flag.
+    pub is_exec: bool,
     /// Size in bytes; `None` when unknown (dirs).
     pub size: Option<u64>,
     /// Mount/change clock positions (seconds) and stat timestamps. The v1
@@ -684,12 +713,22 @@ impl Expr {
             Expr::Not(e) => !e.eval(ctx),
             Expr::True => true,
             Expr::False => false,
-            Expr::Name { pats, scope, case_sensitive } => {
+            Expr::Name {
+                pats,
+                scope,
+                case_sensitive,
+            } => {
                 let hay = ctx.scope_str(*scope);
                 let fold = !*case_sensitive;
                 pats.iter().any(|p| bytes_eq(hay, p, fold))
             }
-            Expr::Match { pattern, scope, case_sensitive, noescape, include_dotfiles } => {
+            Expr::Match {
+                pattern,
+                scope,
+                case_sensitive,
+                noescape,
+                include_dotfiles,
+            } => {
                 let hay = ctx.scope_str(*scope);
                 let mut flags = 0u32;
                 if scope == &Scope::Wholename {
@@ -706,12 +745,10 @@ impl Expr {
                 }
                 wildmatch(pattern, hay, flags)
             }
-            Expr::Suffix { suffixes } => {
-                suffixes.iter().any(|s| {
-                    ctx.name.len() > s.len()
-                        && ctx.name[ctx.name.len() - s.len()..].eq_ignore_ascii_case(s)
-                })
-            }
+            Expr::Suffix { suffixes } => suffixes.iter().any(|s| {
+                ctx.name.len() > s.len()
+                    && ctx.name[ctx.name.len() - s.len()..].eq_ignore_ascii_case(s)
+            }),
             Expr::Type(t) => match t {
                 TypeKind::File => !ctx.is_dir && !ctx.is_symlink,
                 TypeKind::Dir => ctx.is_dir,
@@ -721,20 +758,27 @@ impl Expr {
                 // falls through to stat, which findex does not carry).
                 _ => false,
             },
+            // findex extension (no Watchman equivalent): any execute bit set
+            // (`find -perm /111`), from the `IS_EXEC` flag — never a stat.
+            Expr::Executable => ctx.is_exec,
             Expr::Size { op, n } => match ctx.size {
                 Some(sz) => op.eval(sz as i64, *n),
                 None => false,
             },
-            Expr::Dirname { name, depth, case_sensitive } => {
-                eval_dirname(ctx, name, *depth, *case_sensitive)
-            }
+            Expr::Dirname {
+                name,
+                depth,
+                case_sensitive,
+            } => eval_dirname(ctx, name, *depth, *case_sensitive),
             Expr::Pcre { re, scope } => re.is_match(ctx.scope_str(*scope)),
             Expr::Since { spec, field } => eval_since(ctx, spec, *field),
             Expr::Empty => matches!(ctx.size, Some(0)),
             Expr::Exists => true,
-            Expr::GlobSet { patterns, case_sensitive, include_dotfiles } => {
-                glob_set_matches(patterns, ctx, *case_sensitive, *include_dotfiles)
-            }
+            Expr::GlobSet {
+                patterns,
+                case_sensitive,
+                include_dotfiles,
+            } => glob_set_matches(patterns, ctx, *case_sensitive, *include_dotfiles),
             Expr::PathSet { paths } => paths.iter().any(|p| path_matches(p, ctx)),
         }
     }
@@ -747,10 +791,17 @@ impl Expr {
 fn eval_since(ctx: &MatchCtx, spec: &ClockSpec, field: SinceField) -> bool {
     match field {
         SinceField::Oclock | SinceField::Cclock => {
-            let pos = if field == SinceField::Oclock { ctx.otime } else { ctx.ctime };
+            let pos = if field == SinceField::Oclock {
+                ctx.otime
+            } else {
+                ctx.ctime
+            };
             match spec {
                 ClockSpec::Timestamp(ts) => matches!(pos, Some(t) if t >= *ts),
-                ClockSpec::Clock { ticks, is_fresh_instance } => {
+                ClockSpec::Clock {
+                    ticks,
+                    is_fresh_instance,
+                } => {
                     if *is_fresh_instance {
                         // Every candidate the engine visits exists.
                         return true;
@@ -761,8 +812,14 @@ fn eval_since(ctx: &MatchCtx, spec: &ClockSpec, field: SinceField) -> bool {
         }
         SinceField::Mtime | SinceField::Ctime => {
             // Non-timestamp specs are rejected at parse time.
-            let ClockSpec::Timestamp(ts) = spec else { return false };
-            let val = if field == SinceField::Mtime { ctx.mtime } else { ctx.ctime };
+            let ClockSpec::Timestamp(ts) = spec else {
+                return false;
+            };
+            let val = if field == SinceField::Mtime {
+                ctx.mtime
+            } else {
+                ctx.ctime
+            };
             matches!(val, Some(t) if t >= *ts)
         }
     }
@@ -779,7 +836,12 @@ fn bytes_eq(a: &[u8], b: &[u8], fold: bool) -> bool {
     }
 }
 
-fn eval_dirname(ctx: &MatchCtx, dirname: &[u8], depth: Option<(Cmp, i64)>, case_sensitive: bool) -> bool {
+fn eval_dirname(
+    ctx: &MatchCtx,
+    dirname: &[u8],
+    depth: Option<(Cmp, i64)>,
+    case_sensitive: bool,
+) -> bool {
     let s = ctx.rel_path;
     if s.len() <= dirname.len() {
         return false;
@@ -803,7 +865,12 @@ fn eval_dirname(ctx: &MatchCtx, dirname: &[u8], depth: Option<(Cmp, i64)>, case_
 }
 
 /// `glob:` generator: match the whole relative path with `**` semantics.
-fn glob_set_matches(patterns: &[Vec<u8>], ctx: &MatchCtx, case_sensitive: bool, include_dotfiles: bool) -> bool {
+fn glob_set_matches(
+    patterns: &[Vec<u8>],
+    ctx: &MatchCtx,
+    case_sensitive: bool,
+    include_dotfiles: bool,
+) -> bool {
     let mut flags = wm::PATHNAME;
     if !include_dotfiles {
         flags |= wm::PERIOD;
@@ -841,7 +908,9 @@ fn path_matches(p: &QueryPath, ctx: &MatchCtx) -> bool {
 /// Parse a full Watchman query object (`{"expression":..., "glob":..., ...}`)
 /// into a single [`Expr`] (generators folded into the expression).
 pub fn parse_query(query: &Value) -> Result<Expr, String> {
-    let obj = query.as_object().ok_or("expected a JSON object for a query")?;
+    let obj = query
+        .as_object()
+        .ok_or("expected a JSON object for a query")?;
 
     let case_sensitive = match obj.get("case_sensitive") {
         Some(Value::Bool(b)) => *b,
@@ -865,7 +934,10 @@ pub fn parse_query(query: &Value) -> Result<Expr, String> {
             None => false,
         };
         if !include_dotfiles
-            && obj.get("glob_noescape").map(|v| !v.is_boolean()).unwrap_or(false)
+            && obj
+                .get("glob_noescape")
+                .map(|v| !v.is_boolean())
+                .unwrap_or(false)
         {
             return Err("glob_noescape must be a boolean".into());
         }
@@ -883,7 +955,11 @@ pub fn parse_query(query: &Value) -> Result<Expr, String> {
         if patterns.is_empty() {
             exprs.push(Expr::False);
         } else {
-            exprs.push(Expr::GlobSet { patterns, case_sensitive, include_dotfiles });
+            exprs.push(Expr::GlobSet {
+                patterns,
+                case_sensitive,
+                include_dotfiles,
+            });
         }
     }
 
@@ -930,7 +1006,10 @@ fn parse_paths(v: &Value) -> Result<Vec<QueryPath>, String> {
     let mut out = Vec::new();
     for ele in arr {
         if let Some(s) = ele.as_str() {
-            out.push(QueryPath { name: normalize_separators(s.as_bytes()), depth: -1 });
+            out.push(QueryPath {
+                name: normalize_separators(s.as_bytes()),
+                depth: -1,
+            });
         } else if let Some(o) = ele.as_object() {
             let name = o
                 .get("path")
@@ -940,7 +1019,10 @@ fn parse_paths(v: &Value) -> Result<Vec<QueryPath>, String> {
                 .get("depth")
                 .and_then(|d| d.as_i64())
                 .ok_or("path.depth must be an integer")?;
-            out.push(QueryPath { name: normalize_separators(name.as_bytes()), depth });
+            out.push(QueryPath {
+                name: normalize_separators(name.as_bytes()),
+                depth,
+            });
         } else {
             return Err("expected object with 'path' and 'depth' properties".into());
         }
@@ -967,7 +1049,9 @@ fn parse_suffix_list(v: &Value) -> Result<Vec<Vec<u8>>, String> {
 }
 
 fn normalize_separators(b: &[u8]) -> Vec<u8> {
-    b.iter().map(|&c| if c == b'\\' { b'/' } else { c }).collect()
+    b.iter()
+        .map(|&c| if c == b'\\' { b'/' } else { c })
+        .collect()
 }
 
 /// The core term dispatcher, mirroring `parseQueryExpr` + `TermRegistry`.
@@ -1017,30 +1101,46 @@ fn parse_expr(exp: &Value, case_sensitive: bool) -> Result<Expr, String> {
 }
 
 fn parse_list(exp: &Value, case_sensitive: bool, allof: bool) -> Result<Expr, String> {
-    let arr = exp
-        .as_array()
-        .ok_or(if allof { "must use [\"allof\", expr...]" } else { "must use [\"anyof\", expr...]" })?;
+    let arr = exp.as_array().ok_or(if allof {
+        "must use [\"allof\", expr...]"
+    } else {
+        "must use [\"anyof\", expr...]"
+    })?;
     if arr.len() < 2 {
-        return Err(if allof { "must use [\"allof\", expr...]" } else { "must use [\"anyof\", expr...]" }.into());
+        return Err(if allof {
+            "must use [\"allof\", expr...]"
+        } else {
+            "must use [\"anyof\", expr...]"
+        }
+        .into());
     }
     let mut list = Vec::new();
     for e in &arr[1..] {
         list.push(parse_expr(e, case_sensitive)?);
     }
-    Ok(if allof { Expr::AllOf(list) } else { Expr::AnyOf(list) })
+    Ok(if allof {
+        Expr::AllOf(list)
+    } else {
+        Expr::AnyOf(list)
+    })
 }
 
 /// `["name", pat | [pats], scope?]`. `which` selects the error-message wording.
 fn parse_name(exp: &Value, case_sensitive: bool) -> Result<Expr, String> {
     let which = if case_sensitive { "name" } else { "iname" };
-    let arr = exp.as_array().ok_or_else(|| format!("Expected array for '{which}' term"))?;
+    let arr = exp
+        .as_array()
+        .ok_or_else(|| format!("Expected array for '{which}' term"))?;
     if arr.len() > 3 {
         return Err(format!("Invalid number of arguments for '{which}' term"));
     }
     let mut scope = Scope::Basename;
     if arr.len() == 3 {
-        let s = arr[2].as_str().ok_or_else(|| format!("Argument 3 to '{which}' must be a string"))?;
-        scope = parse_scope(s).ok_or_else(|| format!("Invalid scope '{s}' for {which} expression"))?;
+        let s = arr[2]
+            .as_str()
+            .ok_or_else(|| format!("Argument 3 to '{which}' must be a string"))?;
+        scope =
+            parse_scope(s).ok_or_else(|| format!("Invalid scope '{s}' for {which} expression"))?;
     }
     let mut pats = Vec::new();
     match &arr[1] {
@@ -1059,39 +1159,50 @@ fn parse_name(exp: &Value, case_sensitive: bool) -> Result<Expr, String> {
             ))
         }
     }
-    Ok(Expr::Name { pats, scope, case_sensitive })
+    Ok(Expr::Name {
+        pats,
+        scope,
+        case_sensitive,
+    })
 }
 
 fn parse_match(exp: &Value, case_sensitive: bool) -> Result<Expr, String> {
     let which = if case_sensitive { "match" } else { "imatch" };
-    let arr = exp.as_array().ok_or_else(|| format!("First parameter to \"{which}\" term must be a pattern string"))?;
+    let arr = exp
+        .as_array()
+        .ok_or_else(|| format!("First parameter to \"{which}\" term must be a pattern string"))?;
     let pattern = arr
         .get(1)
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("First parameter to \"{which}\" term must be a pattern string"))?;
     let mut scope = Scope::Basename;
     if arr.len() > 2 {
-        let s = arr[2]
-            .as_str()
-            .ok_or_else(|| format!("Second parameter to \"{which}\" term must be an optional scope string"))?;
-        scope = parse_scope(s).ok_or_else(|| format!("Invalid scope '{s}' for {which} expression"))?;
+        let s = arr[2].as_str().ok_or_else(|| {
+            format!("Second parameter to \"{which}\" term must be an optional scope string")
+        })?;
+        scope =
+            parse_scope(s).ok_or_else(|| format!("Invalid scope '{s}' for {which} expression"))?;
     }
     let (mut noescape, mut include_dotfiles) = (false, false);
     if arr.len() > 3 {
-        let o = arr[3]
-            .as_object()
-            .ok_or_else(|| format!("Third parameter to \"{which}\" term must be an optional object"))?;
+        let o = arr[3].as_object().ok_or_else(|| {
+            format!("Third parameter to \"{which}\" term must be an optional object")
+        })?;
         if let Some(v) = o.get("noescape") {
-            noescape = v.as_bool().ok_or_else(|| format!("noescape option for \"{which}\" term must be a boolean"))?;
+            noescape = v
+                .as_bool()
+                .ok_or_else(|| format!("noescape option for \"{which}\" term must be a boolean"))?;
         }
         if let Some(v) = o.get("includedotfiles") {
-            include_dotfiles = v
-                .as_bool()
-                .ok_or_else(|| format!("includedotfiles option for \"{which}\" term must be a boolean"))?;
+            include_dotfiles = v.as_bool().ok_or_else(|| {
+                format!("includedotfiles option for \"{which}\" term must be a boolean")
+            })?;
         }
     }
     if arr.len() > 4 {
-        return Err(format!("too many parameters passed to \"{which}\" expression"));
+        return Err(format!(
+            "too many parameters passed to \"{which}\" expression"
+        ));
     }
     Ok(Expr::Match {
         pattern: pattern.as_bytes().to_vec(),
@@ -1116,9 +1227,12 @@ fn parse_suffix_term(exp: &Value) -> Result<Expr, String> {
         return Err("Invalid number of arguments for 'suffix' term".into());
     }
     let suffixes = parse_suffix_list(
-        arr.get(1).ok_or("Invalid number of arguments for 'suffix' term")?,
+        arr.get(1)
+            .ok_or("Invalid number of arguments for 'suffix' term")?,
     )
-    .map_err(|_| "Argument 2 to 'suffix' must be either a string or an array of string".to_string())?;
+    .map_err(|_| {
+        "Argument 2 to 'suffix' must be either a string or an array of string".to_string()
+    })?;
     Ok(Expr::Suffix { suffixes })
 }
 
@@ -1132,7 +1246,9 @@ fn parse_type(exp: &Value) -> Result<Expr, String> {
         .ok_or("First parameter to \"type\" term must be a type string")?;
     let mut chars = s.chars();
     let kind = match (chars.next(), chars.next()) {
-        (Some(c), None) => TypeKind::parse(c).ok_or_else(|| format!("invalid type string '{s}'"))?,
+        (Some(c), None) => {
+            TypeKind::parse(c).ok_or_else(|| format!("invalid type string '{s}'"))?
+        }
         _ => return Err(format!("invalid type string '{s}'")),
     };
     Ok(Expr::Type(kind))
@@ -1148,15 +1264,26 @@ fn parse_int_compare(arr: &[Value]) -> Result<(Cmp, i64), String> {
     if arr.len() != 3 {
         return Err("integer comparator must have 3 elements".into());
     }
-    let opname = arr[1].as_str().ok_or("integer comparator op must be a string")?;
-    let operand = arr[2].as_i64().ok_or("integer comparator operand must be an integer")?;
-    let op = Cmp::parse(opname).ok_or_else(|| format!("integer comparator opname `{opname}' is invalid"))?;
+    let opname = arr[1]
+        .as_str()
+        .ok_or("integer comparator op must be a string")?;
+    let operand = arr[2]
+        .as_i64()
+        .ok_or("integer comparator operand must be an integer")?;
+    let op = Cmp::parse(opname)
+        .ok_or_else(|| format!("integer comparator opname `{opname}' is invalid"))?;
     Ok((op, operand))
 }
 
 fn parse_dirname(exp: &Value, case_sensitive: bool) -> Result<Expr, String> {
-    let which = if case_sensitive { "dirname" } else { "idirname" };
-    let arr = exp.as_array().ok_or_else(|| format!("Expected array for '{which}' term"))?;
+    let which = if case_sensitive {
+        "dirname"
+    } else {
+        "idirname"
+    };
+    let arr = exp
+        .as_array()
+        .ok_or_else(|| format!("Expected array for '{which}' term"))?;
     if arr.len() < 2 || arr.len() > 3 {
         return Err(format!("Invalid number of arguments for '{which}' term"));
     }
@@ -1186,7 +1313,11 @@ fn parse_dirname(exp: &Value, case_sensitive: bool) -> Result<Expr, String> {
             break;
         }
     }
-    Ok(Expr::Dirname { name: dn.to_vec(), depth, case_sensitive })
+    Ok(Expr::Dirname {
+        name: dn.to_vec(),
+        depth,
+        case_sensitive,
+    })
 }
 
 fn parse_pcre(exp: &Value, case_sensitive: bool) -> Result<Expr, String> {
@@ -1200,10 +1331,11 @@ fn parse_pcre(exp: &Value, case_sensitive: bool) -> Result<Expr, String> {
         .ok_or_else(|| format!("First parameter to \"{which}\" term must be a pattern string"))?;
     let mut scope = Scope::Basename;
     if arr.len() > 2 {
-        let s = arr[2]
-            .as_str()
-            .ok_or_else(|| format!("Second parameter to \"{which}\" term must be an optional scope string"))?;
-        scope = parse_scope(s).ok_or_else(|| format!("Invalid scope '{s}' for {which} expression"))?;
+        let s = arr[2].as_str().ok_or_else(|| {
+            format!("Second parameter to \"{which}\" term must be an optional scope string")
+        })?;
+        scope =
+            parse_scope(s).ok_or_else(|| format!("Invalid scope '{s}' for {which} expression"))?;
     }
     let re = if case_sensitive {
         Regex::new(pattern)
@@ -1211,7 +1343,10 @@ fn parse_pcre(exp: &Value, case_sensitive: bool) -> Result<Expr, String> {
         Regex::new(&format!("(?i){pattern}"))
     }
     .map_err(|e| format!("invalid {which}: {e} at offset in {pattern}"))?;
-    Ok(Expr::Pcre { re: Box::new(re), scope })
+    Ok(Expr::Pcre {
+        re: Box::new(re),
+        scope,
+    })
 }
 
 fn parse_since(exp: &Value) -> Result<Expr, String> {
@@ -1377,6 +1512,7 @@ mod tests {
                     rel_path: rel,
                     is_dir: e.flags().is_dir(),
                     is_symlink: e.flags().is_symlink(),
+                    is_exec: e.flags().is_exec(),
                     size: None,
                     otime: None,
                     ctime: None,
@@ -1395,8 +1531,10 @@ mod tests {
         /// Like [`Fixture::run`] but scoped to `rel_root` (see
         /// [`Fixture::query_in`]).
         fn run_in(&self, expr: &Expr, rel_root: &str) -> Vec<String> {
-            let prefix: Vec<u8> =
-                rel_root.bytes().map(|c| if c == b'\\' { b'/' } else { c }).collect();
+            let prefix: Vec<u8> = rel_root
+                .bytes()
+                .map(|c| if c == b'\\' { b'/' } else { c })
+                .collect();
             let mut out = Vec::new();
             for (id, e) in self.ix.iter_live() {
                 if e.flags().is_root_dir() {
@@ -1419,6 +1557,7 @@ mod tests {
                     rel_path: rel,
                     is_dir: e.flags().is_dir(),
                     is_symlink: e.flags().is_symlink(),
+                    is_exec: e.flags().is_exec(),
                     size: None,
                     otime: None,
                     ctime: None,
@@ -1460,8 +1599,8 @@ mod tests {
         assert!(!wm_match("*f", "foo", p));
         assert!(wm_match("*ob*a*r*", "foobar", p));
         assert!(!wm_match("foo*bar", "foo/baz/bar", p)); // '*' cannot cross '/'
-        // A `**` run outside a segment boundary is malformed and never
-        // matches under WM_PATHNAME (WildmatchTest.json: `foo**bar` is false).
+                                                         // A `**` run outside a segment boundary is malformed and never
+                                                         // matches under WM_PATHNAME (WildmatchTest.json: `foo**bar` is false).
         assert!(!wm_match("foo**bar", "foo/baz/bar", p));
         assert!(!wm_match("foo?bar", "foo/bar", p));
         assert!(wm_match("t[a-g]n", "ten", p));
@@ -1837,12 +1976,25 @@ mod tests {
 
     #[test]
     fn name_expr() {
-        let f = Fixture::new(&[("foo.c", false), ("subdir", true), ("subdir/bar.txt", false)]);
+        let f = Fixture::new(&[
+            ("foo.c", false),
+            ("subdir", true),
+            ("subdir/bar.txt", false),
+        ]);
         assert_eq!(f.expr(json!(["iname", "FOO.c"])), sorted(&["foo.c"]));
-        assert_eq!(f.expr(json!(["iname", ["FOO.c", "INVALID.txt"]])), sorted(&["foo.c"]));
+        assert_eq!(
+            f.expr(json!(["iname", ["FOO.c", "INVALID.txt"]])),
+            sorted(&["foo.c"])
+        );
         assert_eq!(f.expr(json!(["name", "foo.c"])), sorted(&["foo.c"]));
-        assert_eq!(f.expr(json!(["name", ["foo.c", "invalid"]])), sorted(&["foo.c"]));
-        assert_eq!(f.expr(json!(["name", "foo.c", "wholename"])), sorted(&["foo.c"]));
+        assert_eq!(
+            f.expr(json!(["name", ["foo.c", "invalid"]])),
+            sorted(&["foo.c"])
+        );
+        assert_eq!(
+            f.expr(json!(["name", "foo.c", "wholename"])),
+            sorted(&["foo.c"])
+        );
         // wholename is anchored: `bar.txt` != `subdir/bar.txt`.
         assert!(f.expr(json!(["name", "bar.txt", "wholename"])).is_empty());
 
@@ -1856,7 +2008,10 @@ mod tests {
         );
         // ...and `foo.c` is not under `subdir`, so it no longer matches.
         assert!(f
-            .query_in(&json!({"expression": ["name", "foo.c", "wholename"]}), "subdir")
+            .query_in(
+                &json!({"expression": ["name", "foo.c", "wholename"]}),
+                "subdir"
+            )
             .is_empty());
     }
 
@@ -1864,42 +2019,76 @@ mod tests {
     fn name_expr_errors() {
         let e = |v: Value| parse_expr(&v, true).unwrap_err();
         assert_eq!(e(json!("name")), "Expected array for 'name' term");
-        assert_eq!(e(json!(["name", "one", "two", "three"])), "Invalid number of arguments for 'name' term");
+        assert_eq!(
+            e(json!(["name", "one", "two", "three"])),
+            "Invalid number of arguments for 'name' term"
+        );
         assert_eq!(
             e(json!(["name", 2])),
             "Argument 2 to 'name' must be either a string or an array of string"
         );
-        assert_eq!(e(json!(["name", "one", 2])), "Argument 3 to 'name' must be a string");
-        assert_eq!(e(json!(["name", "one", "invalid"])), "Invalid scope 'invalid' for name expression");
+        assert_eq!(
+            e(json!(["name", "one", 2])),
+            "Argument 3 to 'name' must be a string"
+        );
+        assert_eq!(
+            e(json!(["name", "one", "invalid"])),
+            "Invalid scope 'invalid' for name expression"
+        );
     }
 
     // ---- match (test_match.py) ------------------------------------------
 
     fn match_fixture() -> Fixture {
-        Fixture::new(&[("foo.c", false), ("bar.txt", false), ("foo", true), ("foo/.bar.c", false), ("foo/baz.c", false)])
+        Fixture::new(&[
+            ("foo.c", false),
+            ("bar.txt", false),
+            ("foo", true),
+            ("foo/.bar.c", false),
+            ("foo/baz.c", false),
+        ])
     }
 
     #[test]
     fn match_expr() {
         let f = match_fixture();
-        assert_eq!(f.expr(json!(["match", "*.c"])), sorted(&["foo.c", "foo/baz.c"]));
-        assert_eq!(f.expr(json!(["match", "*.c", "wholename"])), sorted(&["foo.c"]));
-        assert_eq!(f.expr(json!(["match", "foo/*.c", "wholename"])), sorted(&["foo/baz.c"]));
-        assert_eq!(f.expr(json!(["match", "**/*.c", "wholename"])), sorted(&["foo.c", "foo/baz.c"]));
+        assert_eq!(
+            f.expr(json!(["match", "*.c"])),
+            sorted(&["foo.c", "foo/baz.c"])
+        );
+        assert_eq!(
+            f.expr(json!(["match", "*.c", "wholename"])),
+            sorted(&["foo.c"])
+        );
+        assert_eq!(
+            f.expr(json!(["match", "foo/*.c", "wholename"])),
+            sorted(&["foo/baz.c"])
+        );
+        assert_eq!(
+            f.expr(json!(["match", "**/*.c", "wholename"])),
+            sorted(&["foo.c", "foo/baz.c"])
+        );
         assert_eq!(
             f.expr(json!(["match", "**/*.c", "wholename", {"includedotfiles": true}])),
             sorted(&["foo.c", "foo/.bar.c", "foo/baz.c"])
         );
-        assert_eq!(f.expr(json!(["match", "foo/**/*.c", "wholename"])), sorted(&["foo/baz.c"]));
+        assert_eq!(
+            f.expr(json!(["match", "foo/**/*.c", "wholename"])),
+            sorted(&["foo/baz.c"])
+        );
 
         // Case sensitivity follows the query, not the filesystem.
         assert!(f.expr(json!(["match", "FOO/*.c", "wholename"])).is_empty());
         assert_eq!(
-            f.query(&json!({"expression": ["match", "FOO/*.c", "wholename"], "case_sensitive": true})),
+            f.query(
+                &json!({"expression": ["match", "FOO/*.c", "wholename"], "case_sensitive": true})
+            ),
             Vec::<String>::new()
         );
         assert_eq!(
-            f.query(&json!({"expression": ["match", "FOO/*.c", "wholename"], "case_sensitive": false})),
+            f.query(
+                &json!({"expression": ["match", "FOO/*.c", "wholename"], "case_sensitive": false})
+            ),
             sorted(&["foo/baz.c"])
         );
     }
@@ -1908,9 +2097,21 @@ mod tests {
 
     #[test]
     fn suffix_expr_and_generator() {
-        let f = Fixture::new(&[("foo.c", false), ("README.pdf", false), ("html", true), ("html/frames.html", false), ("win", true), ("win/ms.dll", false)]);
+        let f = Fixture::new(&[
+            ("foo.c", false),
+            ("README.pdf", false),
+            ("html", true),
+            ("html/frames.html", false),
+            ("win", true),
+            ("win/ms.dll", false),
+        ]);
         assert_eq!(
-            f.expr(json!(["anyof", ["suffix", "pdf"], ["suffix", "nomatch"], ["suffix", "dll"]])),
+            f.expr(json!([
+                "anyof",
+                ["suffix", "pdf"],
+                ["suffix", "nomatch"],
+                ["suffix", "dll"]
+            ])),
             sorted(&["README.pdf", "win/ms.dll"])
         );
         // Equivalent to the array form.
@@ -1919,12 +2120,21 @@ mod tests {
             sorted(&["README.pdf", "win/ms.dll"])
         );
         // Empty boundary.
-        assert!(f.expr(json!(["anyof", ["suffix", "nomatch"], ["suffix", "none"]])).is_empty());
+        assert!(f
+            .expr(json!(["anyof", ["suffix", "nomatch"], ["suffix", "none"]]))
+            .is_empty());
 
         // Case-insensitive: uppercase '.C' matches lower-case generator 'c'.
-        let g = Fixture::new(&[("foo.C", false), ("subdir", true), ("subdir/bar.txt", false)]);
+        let g = Fixture::new(&[
+            ("foo.C", false),
+            ("subdir", true),
+            ("subdir/bar.txt", false),
+        ]);
         assert_eq!(g.query(&json!({"suffix": "c"})), sorted(&["foo.C"]));
-        assert_eq!(g.query(&json!({"suffix": ["c", "txt"]})), sorted(&["foo.C", "subdir/bar.txt"]));
+        assert_eq!(
+            g.query(&json!({"suffix": ["c", "txt"]})),
+            sorted(&["foo.C", "subdir/bar.txt"])
+        );
         assert_eq!(
             g.query_in(&json!({"suffix": ["c", "txt"]}), "subdir"),
             sorted(&["bar.txt"])
@@ -1934,7 +2144,10 @@ mod tests {
 
     #[test]
     fn suffix_errors() {
-        assert_eq!(parse_expr(&json!("suffix"), true).unwrap_err(), "Expected array for 'suffix' term");
+        assert_eq!(
+            parse_expr(&json!("suffix"), true).unwrap_err(),
+            "Expected array for 'suffix' term"
+        );
         assert_eq!(
             parse_query(&json!({"suffix": {"a": "b"}})).unwrap_err(),
             "'suffix' must be a string or an array of strings"
@@ -1945,11 +2158,24 @@ mod tests {
 
     #[test]
     fn type_expr() {
-        let f = Fixture::new(&[("foo.c", false), ("subdir", true), ("subdir/bar.txt", false)]);
-        assert_eq!(f.expr(json!(["type", "f"])), sorted(&["foo.c", "subdir/bar.txt"]));
+        let f = Fixture::new(&[
+            ("foo.c", false),
+            ("subdir", true),
+            ("subdir/bar.txt", false),
+        ]);
+        assert_eq!(
+            f.expr(json!(["type", "f"])),
+            sorted(&["foo.c", "subdir/bar.txt"])
+        );
         assert_eq!(f.expr(json!(["type", "d"])), sorted(&["subdir"]));
-        assert_eq!(parse_expr(&json!(["type", "x"]), true).unwrap_err(), "invalid type string 'x'");
-        assert_eq!(parse_expr(&json!("type"), true).unwrap_err(), "\"type\" term requires a type string parameter");
+        assert_eq!(
+            parse_expr(&json!(["type", "x"]), true).unwrap_err(),
+            "invalid type string 'x'"
+        );
+        assert_eq!(
+            parse_expr(&json!("type"), true).unwrap_err(),
+            "\"type\" term requires a type string parameter"
+        );
         assert_eq!(
             parse_expr(&json!(["type", 123]), true).unwrap_err(),
             "First parameter to \"type\" term must be a type string"
@@ -1982,6 +2208,7 @@ mod tests {
                     rel_path: name.as_bytes(),
                     is_dir: false,
                     is_symlink: false,
+                    is_exec: false,
                     size: Some(*sz),
                     otime: None,
                     ctime: None,
@@ -2026,10 +2253,20 @@ mod tests {
         assert_eq!(all_a.len(), 26, "all `a` files: {all_a:?}");
 
         // ["dirname","", ["depth","gt",4]] -> only depth-5 files.
-        let d5 = f.expr(json!(["allof", ["dirname", "", ["depth", "gt", 4]], ["name", "a"]]));
+        let d5 = f.expr(json!([
+            "allof",
+            ["dirname", "", ["depth", "gt", 4]],
+            ["name", "a"]
+        ]));
         assert_eq!(
             d5,
-            sorted(&["0/0/0/0/0/a", "1/1/1/1/1/a", "2/2/2/2/2/a", "3/3/3/3/3/a", "4/4/4/4/4/a"])
+            sorted(&[
+                "0/0/0/0/0/a",
+                "1/1/1/1/1/a",
+                "2/2/2/2/2/a",
+                "3/3/3/3/3/a",
+                "4/4/4/4/4/a"
+            ])
         );
 
         // ["dirname","1"] -> only files under 1/.
@@ -2040,11 +2277,19 @@ mod tests {
 
         // ["dirname","1", ["depth","gt",0]] excludes depth-0 `1/a`.
         assert_eq!(
-            f.expr(json!(["allof", ["dirname", "1", ["depth", "gt", 0]], ["name", "a"]])),
+            f.expr(json!([
+                "allof",
+                ["dirname", "1", ["depth", "gt", 0]],
+                ["name", "a"]
+            ])),
             sorted(&["1/1/1/1/1/a", "1/1/1/1/a", "1/1/1/a", "1/1/a"])
         );
         assert_eq!(
-            f.expr(json!(["allof", ["dirname", "1", ["depth", "gt", 4]], ["name", "a"]])),
+            f.expr(json!([
+                "allof",
+                ["dirname", "1", ["depth", "gt", 4]],
+                ["name", "a"]
+            ])),
             Vec::<String>::new()
         );
     }
@@ -2054,7 +2299,10 @@ mod tests {
     #[test]
     fn path_generator() {
         let f = Fixture::new(&[("foo", true), ("foo/bar", false)]);
-        assert_eq!(f.query(&json!({"path": ["foo"]})), sorted(&["foo", "foo/bar"]));
+        assert_eq!(
+            f.query(&json!({"path": ["foo"]})),
+            sorted(&["foo", "foo/bar"])
+        );
         assert!(f.query(&json!({"path": ["."]})).is_empty()); // '.' never resolves
         assert!(f.query(&json!({"path": []})).is_empty()); // empty generator
 
@@ -2072,7 +2320,10 @@ mod tests {
         // filesystems (Watchman: "Case insensitive matching not implemented
         // for path generator").
         let g = Fixture::new(&[("Foo", true), ("Foo/bar", false)]);
-        assert_eq!(g.query(&json!({"path": ["Foo"]})), sorted(&["Foo", "Foo/bar"]));
+        assert_eq!(
+            g.query(&json!({"path": ["Foo"]})),
+            sorted(&["Foo", "Foo/bar"])
+        );
         assert!(g.query(&json!({"path": ["foo"]})).is_empty());
     }
 
@@ -2081,7 +2332,11 @@ mod tests {
     #[test]
     fn invalid_expr_terms() {
         let e = parse_expr(
-            &json!(["allof", "dont-implement-this-term", ["anyof", ["suffix", "apcarc"]]]),
+            &json!([
+                "allof",
+                "dont-implement-this-term",
+                ["anyof", ["suffix", "apcarc"]]
+            ]),
             true,
         )
         .unwrap_err();
@@ -2134,7 +2389,10 @@ mod tests {
         // ...and matches the filesystem default would, case-insensitively
         // with `ipcre`.
         assert_eq!(f.expr(json!(["ipcre", ".*C$"])), sorted(&["foo.c"]));
-        assert_eq!(f.expr(json!(["pcre", ".*c$", "wholename"])), sorted(&["foo.c"]));
+        assert_eq!(
+            f.expr(json!(["pcre", ".*c$", "wholename"])),
+            sorted(&["foo.c"])
+        );
 
         let err = parse_expr(&json!(["pcre", "("]), true).unwrap_err();
         assert!(err.contains("invalid pcre"), "{err}");
@@ -2170,7 +2428,10 @@ mod tests {
         assert!(ssg(json!(["type", "f"])).is_empty());
 
         assert_eq!(sst(json!(["suffix", ["a", "f"]])), SimpleSuffixType::Suffix);
-        assert_eq!(ssg(json!(["suffix", ["a", "f"]])), sorted(&["**/*.a", "**/*.f"]));
+        assert_eq!(
+            ssg(json!(["suffix", ["a", "f"]])),
+            sorted(&["**/*.a", "**/*.f"])
+        );
 
         assert_eq!(
             sst(json!(["allof", ["type", "f"], ["exists"]])),
@@ -2193,12 +2454,20 @@ mod tests {
     #[test]
     fn since_term() {
         let base: i64 = 1_700_000_000;
-        let f = Fixture::new(&[("foo.c", false), ("subdir", true), ("subdir/bar.txt", false)]);
+        let f = Fixture::new(&[
+            ("foo.c", false),
+            ("subdir", true),
+            ("subdir/bar.txt", false),
+        ]);
 
         // `mtime` with a timestamp: `>=` (boundary inclusive).
         let e = parse_expr(&json!(["since", base, "mtime"]), true).unwrap();
         let got = f.run_with(&e, |rel, ctx| {
-            ctx.mtime = Some(if rel == b"subdir/bar.txt" { base - 1 } else { base });
+            ctx.mtime = Some(if rel == b"subdir/bar.txt" {
+                base - 1
+            } else {
+                base
+            });
         });
         assert_eq!(got, sorted(&["foo.c", "subdir"]));
 
@@ -2255,12 +2524,18 @@ mod tests {
     fn since_term_errors() {
         let e = |v: Value| parse_expr(&v, true).unwrap_err();
         assert_eq!(e(json!("since")), "\"since\" term must be an array");
-        assert_eq!(e(json!(["since"])), "\"since\" term has invalid number of parameters");
+        assert_eq!(
+            e(json!(["since"])),
+            "\"since\" term has invalid number of parameters"
+        );
         assert_eq!(
             e(json!(["since", 1, "mtime", 2])),
             "\"since\" term has invalid number of parameters"
         );
-        assert_eq!(e(json!(["since", "bogus"])), "invalid clockspec for \"since\" term");
+        assert_eq!(
+            e(json!(["since", "bogus"])),
+            "invalid clockspec for \"since\" term"
+        );
         assert_eq!(
             e(json!(["since", "n:foo"])),
             "named cursors are not allowed in \"since\" terms"
@@ -2296,16 +2571,30 @@ mod tests {
         ]);
         let res1 = f.expr(json!([
             "anyof",
-            ["allof", ["dirname", "html"], ["type", "f"], ["anyof", ["suffix", "pdf"], ["suffix", "html"], ["suffix", "nomatch"]]],
+            [
+                "allof",
+                ["dirname", "html"],
+                ["type", "f"],
+                [
+                    "anyof",
+                    ["suffix", "pdf"],
+                    ["suffix", "html"],
+                    ["suffix", "nomatch"]
+                ]
+            ],
             ["name", ".never-match-this", "wholename"]
         ]));
         assert_eq!(res1, sorted(&["html/frames.html"]));
         let res2 = f.expr(json!([
             "anyof",
-            ["allof", ["dirname", "html"], ["type", "f"], ["anyof", ["suffix", ["pdf", "html", "nomatch"]]]],
+            [
+                "allof",
+                ["dirname", "html"],
+                ["type", "f"],
+                ["anyof", ["suffix", ["pdf", "html", "nomatch"]]]
+            ],
             ["name", ".never-match-this", "wholename"]
         ]));
         assert_eq!(res1, res2);
     }
 }
-

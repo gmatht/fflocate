@@ -79,10 +79,7 @@ fn crawl_indexes_a_real_tree() {
     settle(&mut daemon, 2000);
 
     let ctx = daemon.server_ctx();
-    let out = findex::server::handle_request(
-        &ctx,
-        &Request::query("", 0, true, false),
-    );
+    let out = findex::server::handle_request(&ctx, &Request::query("", 0, true, false));
     let paths: Vec<String> = out
         .iter()
         .filter_map(|r| match r {
@@ -90,9 +87,18 @@ fn crawl_indexes_a_real_tree() {
             _ => None,
         })
         .collect();
-    assert!(paths.iter().any(|p| p.ends_with("/src/main.rs")), "got {paths:?}");
-    assert!(paths.iter().any(|p| p.ends_with("/src/deep/nested.txt")), "got {paths:?}");
-    assert!(paths.iter().any(|p| p.ends_with("/README.md")), "got {paths:?}");
+    assert!(
+        paths.iter().any(|p| p.ends_with("/src/main.rs")),
+        "got {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.ends_with("/src/deep/nested.txt")),
+        "got {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.ends_with("/README.md")),
+        "got {paths:?}"
+    );
 
     daemon.stop();
 }
@@ -192,6 +198,8 @@ fn socket_roundtrip_serves_a_query() {
 
     let resp = net::roundtrip(&sock, &Request::query("hello", 0, true, false)).unwrap();
     assert!(matches!(resp.first(), Some(Response::Meta { .. })));
-    assert!(resp.iter().any(|r| matches!(r, Response::Hit { path, .. } if path.ends_with("hello.rs"))));
+    assert!(resp
+        .iter()
+        .any(|r| matches!(r, Response::Hit { path, .. } if path.ends_with("hello.rs"))));
     daemon.stop();
 }

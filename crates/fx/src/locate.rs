@@ -16,7 +16,7 @@
 use std::ffi::OsStr;
 use std::process::ExitCode;
 
-use crate::client::{Client, CliError};
+use crate::client::{CliError, Client};
 
 const USAGE: &str = "\
 locate — find files by name in the findex index (locate-compatible)
@@ -204,11 +204,15 @@ fn build_expression(o: &LocateArgs) -> serde_json::Value {
         terms.pop().unwrap()
     } else if o.match_all {
         serde_json::Value::Array(
-            std::iter::once(serde_json::json!("allof")).chain(terms).collect(),
+            std::iter::once(serde_json::json!("allof"))
+                .chain(terms)
+                .collect(),
         )
     } else {
         serde_json::Value::Array(
-            std::iter::once(serde_json::json!("anyof")).chain(terms).collect(),
+            std::iter::once(serde_json::json!("anyof"))
+                .chain(terms)
+                .collect(),
         )
     }
 }
@@ -234,17 +238,17 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<LocateArgs, CliEr
                 "basename" => a.basename = true,
                 "count" => a.count = true,
                 "database" => {
-                    let _ = val.or_else(|| it.next()).ok_or_else(|| {
-                        CliError::Usage("locate: --database needs a path".into())
-                    })?;
+                    let _ = val
+                        .or_else(|| it.next())
+                        .ok_or_else(|| CliError::Usage("locate: --database needs a path".into()))?;
                 }
                 "existing" => a.existing = true,
                 "all" => a.match_all = true,
                 "ignore-case" => a.ignore_case = true,
                 "limit" => {
-                    let v = val.or_else(|| it.next()).ok_or_else(|| {
-                        CliError::Usage("locate: --limit needs a number".into())
-                    })?;
+                    let v = val
+                        .or_else(|| it.next())
+                        .ok_or_else(|| CliError::Usage("locate: --limit needs a number".into()))?;
                     a.limit = v
                         .parse()
                         .map_err(|_| CliError::Usage(format!("locate: bad limit: {v}")))?;
@@ -317,9 +321,7 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<LocateArgs, CliEr
                         break;
                     }
                     other => {
-                        return Err(CliError::Usage(format!(
-                            "locate: unknown option -{other}"
-                        )));
+                        return Err(CliError::Usage(format!("locate: unknown option -{other}")));
                     }
                 }
             }
@@ -401,8 +403,14 @@ mod tests {
 
     #[test]
     fn expression_shapes() {
-        let o = LocateArgs { patterns: vec!["foo".into()], ..Default::default() };
-        assert_eq!(build_expression(&o), serde_json::json!(["pcre", "foo", "wholename"]));
+        let o = LocateArgs {
+            patterns: vec!["foo".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            build_expression(&o),
+            serde_json::json!(["pcre", "foo", "wholename"])
+        );
         let o = LocateArgs {
             patterns: vec!["*.rs".into()],
             ignore_case: true,
@@ -419,7 +427,11 @@ mod tests {
         };
         assert_eq!(
             build_expression(&o),
-            serde_json::json!(["anyof", ["pcre", "a", "wholename"], ["pcre", "b", "wholename"]])
+            serde_json::json!([
+                "anyof",
+                ["pcre", "a", "wholename"],
+                ["pcre", "b", "wholename"]
+            ])
         );
         let o = LocateArgs {
             patterns: vec!["a".into(), "b".into()],
@@ -429,7 +441,11 @@ mod tests {
         };
         assert_eq!(
             build_expression(&o),
-            serde_json::json!(["allof", ["pcre", "a", "wholename"], ["pcre", "b", "wholename"]])
+            serde_json::json!([
+                "allof",
+                ["pcre", "a", "wholename"],
+                ["pcre", "b", "wholename"]
+            ])
         );
     }
 }

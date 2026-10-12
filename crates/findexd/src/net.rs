@@ -101,7 +101,10 @@ pub fn bind_system(socket: &Path, group: Option<u32>) -> std::io::Result<Listene
     if let Some(gid) = group {
         use std::os::unix::ffi::OsStrExt;
         let Ok(c) = std::ffi::CString::new(socket.as_os_str().as_bytes()) else {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "socket path has NUL"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "socket path has NUL",
+            ));
         };
         // chown requires privilege; a non-root daemon trying to run --system is a
         // configuration error, so surface it rather than pretend.
@@ -113,8 +116,8 @@ pub fn bind_system(socket: &Path, group: Option<u32>) -> std::io::Result<Listene
     Ok(listener)
 }
 
-/// The credentials of the process on the other end of `stream`, from
-/// `SO_PEERCRED`.
+/// The credentials of the process on the other end of `stream`, from the
+/// kernel (Linux `SO_PEERCRED`, macOS `LOCAL_PEERCRED`).
 ///
 /// This is the *only* trustworthy source of caller identity: it is filled in by
 /// the kernel from the connected socket, so a client cannot claim to be someone
@@ -124,21 +127,58 @@ pub fn bind_system(socket: &Path, group: Option<u32>) -> std::io::Result<Listene
 pub fn peer_credentials(stream: &Stream) -> std::io::Result<findex::ownership::Caller> {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut _ as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(findex::ownership::Caller::new(cred.uid, cred.gid))
     }
-    Ok(findex::ownership::Caller::new(cred.uid, cred.gid))
+    #[cfg(target_os = "macos")]
+    {
+        // macOS has no SO_PEERCRED: peer credentials arrive as an `xucred`
+        // (uid + advisory groups, no single primary gid — `cr_groups[0]` is
+        // the conventional stand-in, matching the kernel's `cr_gid` macro).
+        let mut cred: libc::xucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERCRED,
+                &mut cred as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let gid = if cred.cr_ngroups > 0 {
+            cred.cr_groups[0]
+        } else {
+            0
+        };
+        Ok(findex::ownership::Caller::new(cred.cr_uid, gid))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = fd;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "peer credentials are only supported on Linux and macOS",
+        ))
+    }
 }
 
 /// Serve one client connection of a **system** instance, answering every query as
@@ -166,7 +206,9 @@ pub fn serve_client_system(
         let req = match Request::from_line(&line) {
             Ok(r) => r,
             Err(e) => {
-                let resp = Response::Error { message: format!("bad request: {e}") };
+                let resp = Response::Error {
+                    message: format!("bad request: {e}"),
+                };
                 let _ = writeln!(writer, "{}", resp.to_line());
                 continue;
             }
@@ -242,7 +284,10 @@ impl PidFile {
                 return Err(e);
             }
             Self::write_pid(&file)?;
-            Ok(PidFile { path: path.to_path_buf(), file })
+            Ok(PidFile {
+                path: path.to_path_buf(),
+                file,
+            })
         }
         // No `flock` on Windows: the TCP bind is the mutual exclusion (the OS
         // releases it on crash, so no stale-lock class exists). The pidfile
@@ -259,7 +304,10 @@ impl PidFile {
                 .truncate(false)
                 .open(path)?;
             Self::write_pid(&file)?;
-            Ok(PidFile { path: path.to_path_buf(), file })
+            Ok(PidFile {
+                path: path.to_path_buf(),
+                file,
+            })
         }
     }
 
@@ -308,7 +356,9 @@ pub fn serve_client(ctx: Arc<ServerCtx>, stream: Stream) {
         let req = match Request::from_line(&line) {
             Ok(r) => r,
             Err(e) => {
-                let resp = Response::Error { message: format!("bad request: {e}") };
+                let resp = Response::Error {
+                    message: format!("bad request: {e}"),
+                };
                 let _ = writeln!(writer, "{}", resp.to_line());
                 continue;
             }
@@ -343,7 +393,15 @@ pub fn roundtrip(socket: &Path, req: &Request) -> std::io::Result<Vec<Response>>
             continue;
         }
         if let Ok(r) = serde_json::from_str::<Response>(&line) {
-            let done = matches!(r, Response::Done { .. } | Response::Error { .. } | Response::Pong { .. } | Response::Synced { .. } | Response::Stats { .. } | Response::Rescanning { .. });
+            let done = matches!(
+                r,
+                Response::Done { .. }
+                    | Response::Error { .. }
+                    | Response::Pong { .. }
+                    | Response::Synced { .. }
+                    | Response::Stats { .. }
+                    | Response::Rescanning { .. }
+            );
             out.push(r);
             if done {
                 break;
@@ -359,9 +417,7 @@ pub fn accept_loop(
     ctx: Arc<ServerCtx>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    listener
-        .set_nonblocking(true)
-        .expect("set_nonblocking");
+    listener.set_nonblocking(true).expect("set_nonblocking");
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -393,9 +449,7 @@ pub fn accept_loop_system(
     make_ctx: Arc<dyn Fn(Option<findex::ownership::Caller>) -> Arc<ServerCtx> + Send + Sync>,
     stop: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    listener
-        .set_nonblocking(true)
-        .expect("set_nonblocking");
+    listener.set_nonblocking(true).expect("set_nonblocking");
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {

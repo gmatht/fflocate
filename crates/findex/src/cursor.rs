@@ -88,10 +88,7 @@ mod tests {
 
     #[test]
     fn bare_lsn_with_gen() {
-        assert_eq!(
-            Cursor::parse_with_gen("42", 3),
-            Some(Cursor::new(3, 42))
-        );
+        assert_eq!(Cursor::parse_with_gen("42", 3), Some(Cursor::new(3, 42)));
         assert_eq!(Cursor::parse_with_gen("c:1:2", 3), Some(Cursor::new(1, 2)));
     }
 

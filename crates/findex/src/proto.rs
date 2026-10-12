@@ -138,12 +138,17 @@ pub enum Response {
     /// An error, terminating the request.
     Error { message: String },
     /// Handshake answer.
-    Pong { pid: u32, version: u32, backend: String },
+    Pong {
+        pid: u32,
+        version: u32,
+        backend: String,
+    },
 }
 
 impl Response {
     pub fn to_line(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| "{\"type\":\"error\",\"message\":\"serialize\"}".into())
+        serde_json::to_string(self)
+            .unwrap_or_else(|_| "{\"type\":\"error\",\"message\":\"serialize\"}".into())
     }
 }
 
@@ -191,9 +196,17 @@ mod tests {
 
     #[test]
     fn parse_query() {
-        let r = Request::from_line(r#"{"v":3,"op":"query","q":"src ext:rs","limit":50,"json":true}"#).unwrap();
+        let r =
+            Request::from_line(r#"{"v":3,"op":"query","q":"src ext:rs","limit":50,"json":true}"#)
+                .unwrap();
         match r {
-            Request::Query { q, limit, json, count, .. } => {
+            Request::Query {
+                q,
+                limit,
+                json,
+                count,
+                ..
+            } => {
                 assert_eq!(q, "src ext:rs");
                 assert_eq!(limit, 50);
                 assert!(json);
@@ -225,7 +238,10 @@ mod tests {
             Request::from_line(r#"{"op":"stats","roots":true}"#).unwrap(),
             Request::Stats { roots: true }
         ));
-        assert!(matches!(Request::from_line(r#"{"op":"hello"}"#).unwrap(), Request::Hello));
+        assert!(matches!(
+            Request::from_line(r#"{"op":"hello"}"#).unwrap(),
+            Request::Hello
+        ));
     }
 
     #[test]
@@ -253,7 +269,10 @@ mod tests {
         let line = m.to_line();
         assert!(line.contains("\"type\":\"meta\""));
         assert!(line.contains("\"gen\":7"));
-        let d = Response::Done { count: 412, cursor: "c:7:481221".into() };
+        let d = Response::Done {
+            count: 412,
+            cursor: "c:7:481221".into(),
+        };
         assert!(d.to_line().contains("\"count\":412"));
     }
 

@@ -20,14 +20,15 @@ aho-corasick.workspace = true
 memchr.workspace = true
 memmap2.workspace = true
 crossbeam-channel.workspace = true
-crossbeam-utils.workspace = true
-arc-swap.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Deaf-daemon lock tests hold a real flock (unix-only code path).
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
 
 # Physical-drive identification on Windows (volume GUID/serial, disk serial).
 # Pinned to 0.52 for the workspace MSRV (1.75); only the listed API families.

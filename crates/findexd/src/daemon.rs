@@ -14,8 +14,7 @@
 //! Startup is *load → replay → serve immediately*, with `catching_up: true` in
 //! meta until the initial crawl lands (§9/§15). Watch first, then enumerate
 //! (§5): watches are installed on every directory before it is crawled.
-
-
+//!
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,15 +25,15 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use findex::applier::{Applier, FsView, RealFs, Shared};
 use findex::event::{FsEvent, RescanCause};
 use findex::index::{EntryFlags, Index, ROOT_ID};
+use findex::journal::Record;
 use findex::mount;
 use findex::persist::Store;
-use findex::journal::Record;
 use findex::roots::Root;
 use findex::server::{Control, ControlSender, ServerCtx};
 use findex::sync::SyncRegistry;
-use findex::watch::{FakeBackend, WatchBackend};
 #[cfg(target_os = "linux")]
 use findex::watch::InotifyBackend;
+use findex::watch::{FakeBackend, WatchBackend};
 
 use crate::config::{BackendChoice, Config};
 use std::collections::BTreeMap;
@@ -63,6 +62,55 @@ fn drive_changed_rids(
         }
     }
     out
+}
+
+/// Stored roots made redundant by configured ones: same filesystem (equal,
+/// nonzero device ids) with the configured root strictly above the stored
+/// one. Pure for testability; `build` probes the device ids. Returns the
+/// stored paths to drop (records and subtrees).
+///
+/// This is the defaults migration (yesterday's `$HOME` root under today's
+/// `/home` filesystem root) and the general same-filesystem nesting rule —
+/// without it the subtree would be indexed twice. Only provable coverage
+/// prunes: unknown device ids never count, and a stored root on its own
+/// filesystem (a mount point) is never covered, only adopted or kept.
+fn covered_root_paths(stored: &[(String, u64)], configured: &[(String, u64)]) -> Vec<String> {
+    let norm = |p: &str| {
+        let t = p.trim_end_matches('/');
+        if t.is_empty() {
+            "/".to_string()
+        } else {
+            t.to_string()
+        }
+    };
+    let mut out = Vec::new();
+    for (spath, sdev) in stored {
+        if *sdev == 0 {
+            continue; // unprobed: cannot prove coverage, keep
+        }
+        let spath = norm(spath);
+        for (cpath, cdev) in configured {
+            if *cdev == 0 || *cdev != *sdev {
+                continue;
+            }
+            let cpath = norm(cpath);
+            if cpath != spath && is_ancestor_path(&cpath, &spath) {
+                out.push(spath.clone());
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Is `parent` a strict ancestor directory of `path` (component-wise, not a
+/// string prefix: `/home` covers `/home/me` but not `/home2`)? Both already
+/// slash-normalized; `/` covers everything below it.
+fn is_ancestor_path(parent: &str, path: &str) -> bool {
+    if parent == "/" {
+        return path.len() > 1 && path.starts_with('/');
+    }
+    path.len() > parent.len() && path.starts_with(parent) && path.as_bytes()[parent.len()] == b'/'
 }
 
 /// The backend shared between the watcher thread (poll) and the applier loop
@@ -190,24 +238,65 @@ impl Daemon {
         // stay visible but are never touched here).
         for p in &config.roots {
             if !roots.iter().any(|r| r.path == *p) {
-                let id = roots.len() as u32;
+                // max-plus-one, not len: pruned roots below leave holes, and
+                // ids must never be reused within a table.
+                let id = roots.iter().map(|r| r.id + 1).max().unwrap_or(0);
                 let mut root = Root::new(id, p.clone());
                 root.owner_os = Some(this_os.to_string());
                 root.caps = mount::probe_root(p);
                 roots.push(root);
             }
         }
-        // Assign each root a root-dir entry in the index (name = basename,
-        // or the drive letter for a Windows drive root, which has none).
-        for root in roots.iter_mut() {
-            if let Some(base_bytes) = findex::roots::root_entry_name(&root.path) {
-                if index.lookup(ROOT_ID, &base_bytes).is_none() {
-                    index.insert(
-                        ROOT_ID,
-                        &base_bytes,
-                        EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        // Drop stored roots a configured root now covers (same filesystem,
+        // strictly above): without this yesterday's `$HOME` root would
+        // double-index everything today's `/home` filesystem root covers.
+        // Records and subtrees go; the covering crawl re-adds the entries.
+        {
+            let configured: Vec<(String, u64)> = config
+                .roots
+                .iter()
+                .map(|p| {
+                    (
+                        p.to_string_lossy().into_owned(),
+                        mount::probe_dev(p).unwrap_or(0),
+                    )
+                })
+                .collect();
+            let stored: Vec<(String, u64)> = roots
+                .iter()
+                .filter(|r| !config.roots.iter().any(|c| c == &r.path))
+                .map(|r| (r.key(), mount::probe_dev(&r.path).unwrap_or(0)))
+                .collect();
+            for gone in covered_root_paths(&stored, &configured) {
+                if let Some(pos) = roots.iter().position(|r| r.key() == gone) {
+                    let root = roots.remove(pos);
+                    let rid = findex::applier::root_dir_id(&index, &root);
+                    if rid != ROOT_ID {
+                        let mut ids = vec![rid];
+                        ids.extend(findex::applier::descendants(&index, rid));
+                        for id in ids.into_iter().rev() {
+                            index.remove(id);
+                        }
+                    }
+                    eprintln!(
+                        "findexd: root {} is covered by a configured root on the same filesystem; dropping its redundant entries",
+                        root.key()
                     );
                 }
+            }
+        }
+        // Assign each root a root-dir entry in the index (name = full path,
+        // which cannot collide across roots). A legacy store may already hold
+        // a basename entry for the root: `root_dir_id` resolves either, and
+        // only a root with *neither* gets a fresh entry — the legacy one is
+        // adopted, never duplicated.
+        for root in roots.iter_mut() {
+            if findex::applier::root_dir_id(&index, root) == ROOT_ID {
+                index.insert(
+                    ROOT_ID,
+                    &findex::roots::root_entry_name(&root.path),
+                    EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+                );
             }
             root.caps = mount::probe_root(&root.path);
             root.dev = mount::probe_dev(&root.path).unwrap_or(0);
@@ -253,13 +342,18 @@ impl Daemon {
         if !config.excludes.is_empty() {
             applier.set_excludes(config.excludes.clone());
         }
+        // §4: mount boundaries for the mount-aware crawl, from this boot's
+        // mount table (each filesystem indexed through its own root).
+        applier.set_mountpoints(mount::mountpoint_set(&mount::read_mountinfo()));
         let (backend, resolved_backend) = make_backend(config.backend)?;
 
         // Reconcile queued at open: swapped drives re-verified, and on a
         // cross-OS handoff every local root is re-reconciled unconditionally
         // (a crawl only adds; deletions need the diff).
         for rid in drive_changed {
-            applier.pending_mut().enqueue_rescan(rid, RescanCause::MountEvent);
+            applier
+                .pending_mut()
+                .enqueue_rescan(rid, RescanCause::MountEvent);
         }
         if handoff {
             let ix = shared.index.read().unwrap();
@@ -381,7 +475,7 @@ impl Daemon {
                         "findexd: trigram index warmed in {:.0} ms ({} trigrams); \
                          the first search will not pay for it",
                         t.elapsed().as_secs_f64() * 1000.0,
-                        tg.trigram_count()
+                        tg.read().unwrap().trigram_count()
                     );
                 })
                 .ok();
@@ -416,9 +510,7 @@ impl Daemon {
         };
         for (id, path) in roots {
             self.watch_dir(id, &path);
-            self.applier
-                .pending_mut()
-                .enqueue_crawl(id);
+            self.applier.pending_mut().enqueue_crawl(id);
         }
 
         // Watcher thread: poll the backend and forward events, and service
@@ -440,26 +532,45 @@ impl Daemon {
                 // Service pending watch additions (non-blocking). A failure is
                 // *never* silent: it is reported so the applier can degrade the
                 // root loudly (§7, §15).
+                let mut busy = false;
                 while let Ok((id, path)) = watch_rx.try_recv() {
+                    busy = true;
                     let mut b = backend.lock().unwrap();
                     if let Err(e) = b.watch_dir(id, &path) {
-                        let _ = fail_tx.send(WatchFailure { dir: id, reason: e.to_string() });
+                        let _ = fail_tx.send(WatchFailure {
+                            dir: id,
+                            reason: e.to_string(),
+                        });
                     }
                 }
                 let evs = {
                     let mut b = backend.lock().unwrap();
                     b.poll(Duration::from_millis(50)).unwrap_or_default()
                 };
-                if !evs.is_empty() && tx.send(evs).is_err() {
+                let has_events = !evs.is_empty();
+                if has_events && tx.send(evs).is_err() {
                     break;
                 }
+                busy |= has_events;
                 // Drain watch requests again promptly so a new dir is watched
                 // before its contents change.
                 while let Ok((id, path)) = watch_rx.try_recv() {
+                    busy = true;
                     let mut b = backend.lock().unwrap();
                     if let Err(e) = b.watch_dir(id, &path) {
-                        let _ = fail_tx.send(WatchFailure { dir: id, reason: e.to_string() });
+                        let _ = fail_tx.send(WatchFailure {
+                            dir: id,
+                            reason: e.to_string(),
+                        });
                     }
+                }
+                // Kernel backends block in `poll` for up to the timeout, but
+                // the fake backend drains a queue and returns instantly — so
+                // on platforms without a kernel watcher (macOS/Windows) this
+                // loop would spin a core at 100%. Sleep when idle, matching
+                // the poll budget; the stop flag still lands within ~50 ms.
+                if !busy {
+                    std::thread::sleep(Duration::from_millis(50));
                 }
             }
         }));
@@ -495,7 +606,9 @@ impl Daemon {
                     self.applier.register_cookie_existing(token, root);
                 }
                 Control::RescanRoot { root } => {
-                    self.applier.pending_mut().enqueue_rescan(root, RescanCause::Manual);
+                    self.applier
+                        .pending_mut()
+                        .enqueue_rescan(root, RescanCause::Manual);
                 }
             }
             work_done = true;
@@ -523,7 +636,6 @@ impl Daemon {
 
         let applied = self.applier.drain();
         work_done |= applied > 0;
-
         // Install watches for directories discovered during the crawl. The
         // applier records them via `take_watch_requests`.
         for (id, path) in self.applier.take_watch_requests() {
@@ -539,6 +651,8 @@ impl Daemon {
         }
         self.applier.maybe_compact();
         self.shared.health.write().unwrap().queue_depth = self.applier.pending().depth() as u64;
+        self.shared.health.write().unwrap().rescans_collapsed =
+            self.applier.pending().rescans_collapsed();
         !work_done
     }
 
@@ -557,6 +671,12 @@ impl Daemon {
             return false;
         }
         self.last_mount_check_ms = now;
+        // Keep the crawl's mount-boundary set current: mounts come and go
+        // while a crawl is in flight, and a stale set errs safe in both
+        // directions (a missed new mount is healed by the next rescan, a
+        // stale entry merely skips an already-gone path).
+        self.applier
+            .set_mountpoints(mount::mountpoint_set(&mount::read_mountinfo()));
         let mut changed: Vec<(u32, u64, Option<u64>, String)> = Vec::new();
         {
             let ix = self.shared.index.read().unwrap();
@@ -591,9 +711,12 @@ impl Daemon {
             } else {
                 // A different filesystem is now mounted: rescan the root.
                 if rid != ROOT_ID {
-                    self.applier.pending_mut().enqueue_rescan(rid, RescanCause::MountEvent);
+                    self.applier
+                        .pending_mut()
+                        .enqueue_rescan(rid, RescanCause::MountEvent);
                 }
-                self.applier.note_mount_remounted(rid, old_dev, cur.unwrap_or(0));
+                self.applier
+                    .note_mount_remounted(rid, old_dev, cur.unwrap_or(0));
             }
         }
         true
@@ -605,7 +728,8 @@ impl Daemon {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             self.tick();
-            if self.applier.pending().is_drained() && !self.shared.health.read().unwrap().catching_up
+            if self.applier.pending().is_drained()
+                && !self.shared.health.read().unwrap().catching_up
             {
                 return true;
             }
@@ -699,14 +823,25 @@ mod tests {
     }
 
     fn disk(serial: &str) -> DriveId {
-        DriveId { disk_serial: Some(serial.to_string()), volume_uuid: None }
+        DriveId {
+            disk_serial: Some(serial.to_string()),
+            volume_uuid: None,
+        }
     }
 
     #[test]
     fn drive_change_needs_agreeing_mismatch() {
         let ix = index_with_root_entry(b"data");
-        let mk = |drive: Option<DriveId>| root_with(0, "/mnt/data", drive, Some("linux"));
-        let rec = |drive: Option<DriveId>| RecordedRoot { drive, owner_os: Some("linux".into()) };
+        // `drive_changed_rids` only considers local roots (`is_local` checks
+        // the host OS), so the test roots must be owned by *this* OS — a
+        // hardcoded "linux" reads as foreign on macOS/Windows and the first
+        // assertion fails there.
+        let this_os = std::env::consts::OS;
+        let mk = |drive: Option<DriveId>| root_with(0, "/mnt/data", drive, Some(this_os));
+        let rec = |drive: Option<DriveId>| RecordedRoot {
+            drive,
+            owner_os: Some(this_os.into()),
+        };
 
         // Recorded A, probes B → rescan.
         let mut map = BTreeMap::new();
@@ -725,9 +860,15 @@ mod tests {
         let roots = vec![mk(Some(disk("B")))];
         assert!(drive_changed_rids(&map_empty, &roots, &ix).is_empty());
 
-        // Foreign roots are never touched, even on mismatch.
+        // Foreign roots are never touched, even on mismatch: pick an OS that
+        // is not this one, so the test is foreign on every platform.
+        let other_os = if this_os == "windows" {
+            "linux"
+        } else {
+            "windows"
+        };
         let mut foreign = mk(Some(disk("B")));
-        foreign.owner_os = Some("windows".into());
+        foreign.owner_os = Some(other_os.into());
         let roots = vec![foreign];
         assert!(drive_changed_rids(&map, &roots, &ix).is_empty());
 
@@ -736,5 +877,57 @@ mod tests {
         legacy.owner_os = None;
         let roots = vec![legacy];
         assert_eq!(drive_changed_rids(&map, &roots, &ix).len(), 1);
+    }
+
+    #[test]
+    fn ancestor_matching_is_component_wise() {
+        assert!(is_ancestor_path("/home", "/home/me"));
+        assert!(is_ancestor_path("/", "/home/me"));
+        assert!(
+            !is_ancestor_path("/", "/"),
+            "strict even for the filesystem root"
+        );
+        assert!(
+            !is_ancestor_path("/home", "/home"),
+            "strict: a path does not cover itself"
+        );
+        assert!(
+            !is_ancestor_path("/home", "/home2"),
+            "prefix is not ancestry"
+        );
+        assert!(
+            !is_ancestor_path("/home/me", "/home"),
+            "a child never covers its parent"
+        );
+    }
+
+    #[test]
+    fn covered_roots_need_same_fs_and_strict_nesting() {
+        let stored = vec![
+            ("/home/me".to_string(), 11u64),  // yesterday's $HOME root
+            ("/mnt/data".to_string(), 22u64), // its own filesystem
+            ("/gone".to_string(), 0u64),      // unprobed: unknowable
+        ];
+        // Configured `/home` (same fs as the $HOME root) covers it; `/`
+        // (another fs) covers nothing here.
+        let configured = vec![("/home".to_string(), 11u64), ("/".to_string(), 99u64)];
+        assert_eq!(
+            covered_root_paths(&stored, &configured),
+            vec!["/home/me".to_string()],
+            "only provable same-filesystem nesting prunes"
+        );
+        // Same paths, unknown devices: nothing is provable, nothing prunes.
+        let stored_unknown = vec![("/home/me".to_string(), 0u64)];
+        assert!(covered_root_paths(&stored_unknown, &configured).is_empty());
+        // Self-coverage is not coverage (dedup by path happens at merge).
+        let self_cover = vec![("/home".to_string(), 11u64)];
+        assert!(covered_root_paths(&self_cover, &configured).is_empty());
+        // Trailing-slash spellings still match.
+        let slashed = vec![("/home/me/".to_string(), 11u64)];
+        let cfg_slashed = vec![("/home/".to_string(), 11u64)];
+        assert_eq!(
+            covered_root_paths(&slashed, &cfg_slashed),
+            vec!["/home/me".to_string()]
+        );
     }
 }

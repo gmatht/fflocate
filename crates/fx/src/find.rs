@@ -26,7 +26,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::client::{Client, CliError};
+use crate::client::{CliError, Client};
 
 const USAGE: &str = "\
 find — find files by name in the findex index (find-compatible)
@@ -91,15 +91,32 @@ pub struct Meta {
 /// A test that the index cannot answer, evaluated on a candidate's `Meta`.
 #[derive(Debug, Clone)]
 pub enum MetaTest {
-    Size { sign: Sign, bytes: u64 },
-    MtimeDays { sign: Sign, days: i64 },
-    Mmin { sign: Sign, mins: i64 },
-    NewerThan { path: std::path::PathBuf },
-    Perm { mode: u32, exact: bool },
+    Size {
+        sign: Sign,
+        bytes: u64,
+    },
+    MtimeDays {
+        sign: Sign,
+        days: i64,
+    },
+    Mmin {
+        sign: Sign,
+        mins: i64,
+    },
+    NewerThan {
+        path: std::path::PathBuf,
+    },
+    Perm {
+        mode: u32,
+        exact: bool,
+    },
     User(u32),
     Group(u32),
     Inum(u64),
-    Links { sign: Sign, n: u64 },
+    Links {
+        sign: Sign,
+        n: u64,
+    },
     /// `-empty`: true for an empty directory (no children) or a zero-size file.
     /// Directories are decided from the index; files need `size == 0`.
     Empty,
@@ -142,7 +159,9 @@ pub fn parse_size(s: &str) -> Result<(Sign, u64), String> {
         Some('G') => (1024 * 1024 * 1024, &rest[..rest.len() - 1]),
         _ => (512, rest),
     };
-    let n: u64 = digits.parse().map_err(|_| format!("find: invalid -size argument '{s}'"))?;
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| format!("find: invalid -size argument '{s}'"))?;
     Ok((sign, n.saturating_mul(mult)))
 }
 
@@ -246,9 +265,7 @@ fn resolve_bases(paths: &[String]) -> Result<Vec<String>, std::path::PathBuf> {
                 // On Windows, canonicalize yields verbatim `\\?\` paths;
                 // strip the prefix so bases compare with index paths.
                 #[cfg(windows)]
-                let rp = std::path::PathBuf::from(strip_verbatim_prefix(
-                    &rp.to_string_lossy(),
-                ));
+                let rp = std::path::PathBuf::from(strip_verbatim_prefix(&rp.to_string_lossy()));
                 let rp = findex::util::normalize_separators(&rp);
                 match rp.to_str() {
                     Some(s) => out.push(s.to_string()),
@@ -322,7 +339,10 @@ impl Plan {
             // No uid/gid/mode/ino/nlink on Windows: reject those tests here,
             // once, instead of silently ignoring them (the file's rule).
             #[cfg(windows)]
-            if matches!(a.as_str(), "-perm" | "-user" | "-group" | "-inum" | "-links") {
+            if matches!(
+                a.as_str(),
+                "-perm" | "-user" | "-group" | "-inum" | "-links"
+            ) {
                 return Err(CliError::Usage(format!(
                     "find: {} is not supported on Windows (no unix identity metadata)",
                     a.as_str()
@@ -376,25 +396,30 @@ impl Plan {
                     );
                 }
                 "-size" => {
-                    let (sign, bytes) = parse_size(&need(&mut it, a)?)
-                        .map_err(CliError::Usage)?;
+                    let (sign, bytes) = parse_size(&need(&mut it, a)?).map_err(CliError::Usage)?;
                     p.meta.push(MetaTest::Size { sign, bytes });
                 }
                 "-mtime" => {
                     let raw = need(&mut it, a)?;
                     let (sign, d) = parse_sign(&raw);
-                    let d: i64 = d.parse().map_err(|_| CliError::Usage("find: bad -mtime".into()))?;
+                    let d: i64 = d
+                        .parse()
+                        .map_err(|_| CliError::Usage("find: bad -mtime".into()))?;
                     p.meta.push(MetaTest::MtimeDays { sign, days: d });
                 }
                 "-mmin" => {
                     let raw = need(&mut it, a)?;
                     let (sign, d) = parse_sign(&raw);
-                    let d: i64 = d.parse().map_err(|_| CliError::Usage("find: bad -mmin".into()))?;
+                    let d: i64 = d
+                        .parse()
+                        .map_err(|_| CliError::Usage("find: bad -mmin".into()))?;
                     p.meta.push(MetaTest::Mmin { sign, mins: d });
                 }
                 "-newer" => {
                     let f = need(&mut it, a)?;
-                    p.meta.push(MetaTest::NewerThan { path: std::path::PathBuf::from(f) });
+                    p.meta.push(MetaTest::NewerThan {
+                        path: std::path::PathBuf::from(f),
+                    });
                     p.sync = true;
                 }
                 "-empty" => p.meta.push(MetaTest::Empty),
@@ -421,7 +446,9 @@ impl Plan {
                 "-links" => {
                     let raw = need(&mut it, a)?;
                     let (sign, n) = parse_sign(&raw);
-                    let n: u64 = n.parse().map_err(|_| CliError::Usage("find: bad -links".into()))?;
+                    let n: u64 = n
+                        .parse()
+                        .map_err(|_| CliError::Usage("find: bad -links".into()))?;
                     p.meta.push(MetaTest::Links { sign, n });
                 }
                 "-print" => {}
@@ -601,10 +628,7 @@ pub fn meta_matches(tests: &[MetaTest], m: &Meta, is_empty_dir: bool, now: i64) 
                 .mtime
                 .map(|t| sign.holds((now - t) / 86_400, *days))
                 .unwrap_or(false),
-            MetaTest::Mmin { sign, mins } => m
-                .mmin
-                .map(|v| sign.holds(v, *mins))
-                .unwrap_or(false),
+            MetaTest::Mmin { sign, mins } => m.mmin.map(|v| sign.holds(v, *mins)).unwrap_or(false),
             MetaTest::NewerThan { path } => match (m.mtime, std::fs::metadata(path).ok()) {
                 (Some(t), Some(ref_md)) => match mtime_secs(&ref_md) {
                     Some(rt) => t > rt,
@@ -653,8 +677,20 @@ mod tests {
         assert!(is_find_name(OsStr::new("find.exe")));
         assert!(is_find_name(OsStr::new("ffind.exe")));
         // These must NOT select find mode.
-        for other in ["ff", "fx", "fxfind", "findx", "locate", "locate.exe", "", "FIND"] {
-            assert!(!is_find_name(OsStr::new(other)), "{other:?} must not select find mode");
+        for other in [
+            "ff",
+            "fx",
+            "fxfind",
+            "findx",
+            "locate",
+            "locate.exe",
+            "",
+            "FIND",
+        ] {
+            assert!(
+                !is_find_name(OsStr::new(other)),
+                "{other:?} must not select find mode"
+            );
         }
 
         // Sanity: the pure helpers we can test without touching argv.
@@ -761,19 +797,49 @@ mod tests {
             ino: Some(42),
             mmin: Some(3 * 1440),
         };
-        assert!(meta_matches(&[MetaTest::Size { sign: Sign::Eq, bytes: 0 }], &m, false, now));
-        assert!(meta_matches(&[MetaTest::MtimeDays { sign: Sign::Eq, days: 3 }], &m, false, now));
-        assert!(meta_matches(&[MetaTest::Perm { mode: 0o644, exact: true }], &m, false, now));
+        assert!(meta_matches(
+            &[MetaTest::Size {
+                sign: Sign::Eq,
+                bytes: 0
+            }],
+            &m,
+            false,
+            now
+        ));
+        assert!(meta_matches(
+            &[MetaTest::MtimeDays {
+                sign: Sign::Eq,
+                days: 3
+            }],
+            &m,
+            false,
+            now
+        ));
+        assert!(meta_matches(
+            &[MetaTest::Perm {
+                mode: 0o644,
+                exact: true
+            }],
+            &m,
+            false,
+            now
+        ));
         assert!(meta_matches(&[MetaTest::User(1000)], &m, false, now));
         assert!(meta_matches(&[MetaTest::Inum(42)], &m, false, now));
-        assert!(meta_matches(&[MetaTest::Empty], &m, false, now), "size 0 file is empty");
+        assert!(
+            meta_matches(&[MetaTest::Empty], &m, false, now),
+            "size 0 file is empty"
+        );
         assert!(!meta_matches(&[MetaTest::User(0)], &m, false, now));
     }
 
     #[test]
     fn empty_dir_is_decided_by_the_index() {
         let now = 0;
-        let m = Meta { size: Some(4096), ..Default::default() };
+        let m = Meta {
+            size: Some(4096),
+            ..Default::default()
+        };
         assert!(meta_matches(&[MetaTest::Empty], &m, true, now));
         assert!(!meta_matches(&[MetaTest::Empty], &m, false, now));
     }

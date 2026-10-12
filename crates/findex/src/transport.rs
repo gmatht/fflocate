@@ -26,7 +26,12 @@ pub fn parse_addr(path: &Path) -> io::Result<std::net::SocketAddr> {
     path.to_str()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket address is not UTF-8"))?
         .parse::<std::net::SocketAddr>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("bad socket address: {e}")))
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("bad socket address: {e}"),
+            )
+        })
 }
 
 /// Connect to the daemon at `socket`.
@@ -38,5 +43,18 @@ pub fn connect(socket: &Path) -> io::Result<Stream> {
     #[cfg(windows)]
     {
         Stream::connect(parse_addr(socket)?)
+    }
+}
+
+/// Bind a listener at `socket`: a filesystem path on unix, `127.0.0.1:PORT`
+/// text on Windows.
+pub fn bind(socket: &Path) -> io::Result<Listener> {
+    #[cfg(unix)]
+    {
+        Listener::bind(socket)
+    }
+    #[cfg(windows)]
+    {
+        Listener::bind(parse_addr(socket)?)
     }
 }

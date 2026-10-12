@@ -118,7 +118,129 @@ impl TrigramIndex {
             }
         }
 
-        TrigramIndex { postings, indexed, total_postings }
+        TrigramIndex {
+            postings,
+            indexed,
+            total_postings,
+        }
+    }
+
+    /// Index one entry's name into existing postings (incremental maintenance).
+    ///
+    /// This is the per-entry half of [`TrigramIndex::build`], factored so the
+    /// applier can keep a cached accelerator current as entries arrive instead
+    /// of rebuilding over the whole index. The caller supplies the entry id
+    /// and its name bytes; ids must ascend per posting list for the
+    /// sorted+deduped invariant to hold.
+    ///
+    /// That holds in practice: live `Add` records always carry fresh ids from
+    /// `Index::insert` (`next_id` strictly grows, never reused), while
+    /// `apply_add` replays and `revive` restore an id under its *original*
+    /// name — whose postings already name that id, so the per-trigram
+    /// `last() != id` check makes the re-insertion a no-op rather than a
+    /// duplicate. Root dirs and sub-3-byte names contribute nothing, exactly
+    /// as in `build`.
+    ///
+    /// Returns the number of (trigram, id) postings added.
+    pub fn index_entry(&mut self, id: u32, name: &[u8], is_root_dir: bool) -> u64 {
+        if is_root_dir {
+            return 0;
+        }
+        // Counted as indexed whether or not the name yields trigrams, exactly
+        // as `build` counts every live non-root entry it visits.
+        self.indexed += 1;
+        if name.len() < 3 {
+            return 0;
+        }
+        let lower: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
+        let mut added = 0u64;
+        // Distinct trigrams only: a repeat within one name must not push twice.
+        let mut prev: Option<[u8; 3]> = None;
+        let mut tris: Vec<[u8; 3]> = lower.windows(3).map(|w| [w[0], w[1], w[2]]).collect();
+        tris.sort_unstable();
+        for tri in tris {
+            if prev == Some(tri) {
+                continue;
+            }
+            prev = Some(tri);
+            let list = self.postings.entry(tri).or_default();
+            // Ids ascend within a generation (fresh ids always exceed every
+            // id already posted), so `last()` decides membership: equal means
+            // "already indexed under this name" (replay/revive idempotence),
+            // and anything else means "append".
+            if list.last() != Some(&id) {
+                // Defensive: a replayed `apply_add` can reuse an id *below*
+                // ids posted since (pad-forward slots). A blind push would
+                // break the ascending invariant that `candidates` intersects
+                // on, so insert in order instead. This path is rare (replay
+                // only) and short lists dominate.
+                if list.last().is_some_and(|&last| last > id) {
+                    match list.binary_search(&id) {
+                        Ok(_) => {}
+                        Err(pos) => {
+                            list.insert(pos, id);
+                            added += 1;
+                            self.total_postings += 1;
+                        }
+                    }
+                } else {
+                    list.push(id);
+                    added += 1;
+                    self.total_postings += 1;
+                }
+            }
+        }
+        added
+    }
+
+    /// Forget one entry's postings (incremental maintenance for deletions).
+    ///
+    /// Removal is best-effort pruning, not correctness: tombstoned ids are
+    /// already filtered by the authoritative matcher (`is_alive`), so a stale
+    /// posting only ever adds a wasted candidate. This keeps lists from
+    /// growing without bound on churn-heavy indexes; it removes the id from
+    /// the posting lists of its *current* name's trigrams and drops lists
+    /// left empty. Returns the number of postings removed.
+    pub fn remove_entry(&mut self, id: u32, name: &[u8]) -> u64 {
+        if name.len() < 3 {
+            return 0;
+        }
+        let lower: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
+        let mut removed = 0u64;
+        let mut prev: Option<[u8; 3]> = None;
+        let mut tris: Vec<[u8; 3]> = lower.windows(3).map(|w| [w[0], w[1], w[2]]).collect();
+        tris.sort_unstable();
+        let mut empty: Vec<[u8; 3]> = Vec::new();
+        for tri in tris {
+            if prev == Some(tri) {
+                continue;
+            }
+            prev = Some(tri);
+            if let Some(list) = self.postings.get_mut(&tri) {
+                let before = list.len();
+                list.retain(|&x| x != id);
+                let gone = (before - list.len()) as u64;
+                removed += gone;
+                self.total_postings -= gone;
+                if list.is_empty() {
+                    empty.push(tri);
+                }
+            }
+        }
+        for tri in empty {
+            self.postings.remove(&tri);
+        }
+        // Keep `indexed` (live non-root entries visited) exact for add/remove
+        // cycles: an entry counted by `index_entry` un-counts here. Entries
+        // whose names post nothing (sub-3-byte) were still counted, so they
+        // decrement too. This over-counts by one per rename/replayed-Add
+        // (same id indexed twice without an intervening remove) — rare, and
+        // documented rather than tracked with a per-id set. `indexed` is
+        // diagnostic only; answers never depend on it.
+        if removed > 0 || name.len() < 3 {
+            self.indexed = self.indexed.saturating_sub(1);
+        }
+        removed
     }
 
     /// The distinct trigrams in a literal, as a query would see them.
@@ -262,7 +384,11 @@ impl TrigramIndex {
     /// Candidate ids come from *counting* how many of the given trigrams each
     /// name shares (not intersecting), which is why this is a distinct operation
     /// from [`Self::candidates`].
-    pub fn candidates_sharing_at_least(&self, trigrams: &[[u8; 3]], min_shared: usize) -> Option<Vec<u32>> {
+    pub fn candidates_sharing_at_least(
+        &self,
+        trigrams: &[[u8; 3]],
+        min_shared: usize,
+    ) -> Option<Vec<u32>> {
         if min_shared == 0 || trigrams.is_empty() {
             return None; // no usable constraint
         }
@@ -321,7 +447,11 @@ mod tests {
 
     fn tree() -> Index {
         let mut ix = Index::new();
-        let r = ix.insert(ROOT_ID, b"proj", EntryFlags::EMPTY.with_dir(true).with_root_dir(true));
+        let r = ix.insert(
+            ROOT_ID,
+            b"proj",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
         let src = ix.insert(r, b"src", EntryFlags::EMPTY.with_dir(true));
         ix.insert(src, b"main.rs", EntryFlags::EMPTY);
         ix.insert(src, b"lib.rs", EntryFlags::EMPTY);
@@ -424,7 +554,10 @@ mod tests {
         // The estimate must at least cover the ids it actually stores.
         assert!(tg.approx_bytes() >= tg.posting_total() as usize * 4);
         assert!(tg.trigram_count() > 0);
-        assert_eq!(tg.posting_total(), tg.postings.values().map(|v| v.len() as u64).sum::<u64>());
+        assert_eq!(
+            tg.posting_total(),
+            tg.postings.values().map(|v| v.len() as u64).sum::<u64>()
+        );
     }
 
     #[test]
@@ -434,7 +567,11 @@ mod tests {
         // pass reserved — a count that ignored the repetition would reserve too
         // much, and one that double-pushed would corrupt membership.
         let mut ix = Index::new();
-        let r = ix.insert(ROOT_ID, b"p", EntryFlags::EMPTY.with_dir(true).with_root_dir(true));
+        let r = ix.insert(
+            ROOT_ID,
+            b"p",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
         ix.insert(r, b"ababab", EntryFlags::EMPTY);
         ix.insert(r, b"abcdabcd", EntryFlags::EMPTY); // 4 distinct trigrams, repeated
         let tg = TrigramIndex::build(&ix);
@@ -462,7 +599,11 @@ mod tests {
         assert_eq!(TrigramIndex::required_shared_after_edits(5, 0), 5);
         assert_eq!(TrigramIndex::required_shared_after_edits(5, 1), 2);
         assert_eq!(TrigramIndex::required_shared_after_edits(5, 2), 0);
-        assert_eq!(TrigramIndex::required_shared_after_edits(2, 1), 0, "saturates at zero");
+        assert_eq!(
+            TrigramIndex::required_shared_after_edits(2, 1),
+            0,
+            "saturates at zero"
+        );
     }
 
     #[test]
@@ -493,7 +634,10 @@ mod tests {
         // min_shared == 0 means "no usable constraint": scan everything.
         assert!(tg.candidates_sharing_at_least(&tris, 0).is_none());
         // An impossible ask is empty, not a scan.
-        assert_eq!(tg.candidates_sharing_at_least(&tris, 99).unwrap(), Vec::<u32>::new());
+        assert_eq!(
+            tg.candidates_sharing_at_least(&tris, 99).unwrap(),
+            Vec::<u32>::new()
+        );
     }
 
     #[test]
@@ -504,7 +648,12 @@ mod tests {
         let ix = tree();
         let tg = TrigramIndex::build(&ix);
 
-        for (pattern, k) in [(&b"main.rs"[..], 0u32), (b"main.rs", 1), (b"mian.rs", 1), (b"notes", 1)] {
+        for (pattern, k) in [
+            (&b"main.rs"[..], 0u32),
+            (b"main.rs", 1),
+            (b"mian.rs", 1),
+            (b"notes", 1),
+        ] {
             let tris = TrigramIndex::literal_trigrams(pattern, false).unwrap();
             let need = TrigramIndex::required_shared_after_edits(tris.len(), k);
             // True matches by brute force over every name.
@@ -533,6 +682,113 @@ mod tests {
                     String::from_utf8_lossy(ix.name(*id))
                 );
             }
+        }
+    }
+
+    /// Incremental maintenance equals a full rebuild, posting for posting.
+    ///
+    /// Builds over half a tree, then applies the other half entry-by-entry
+    /// through `index_entry` (the same call the applier's `emit` path makes),
+    /// deletes a slice through `remove_entry`, and asserts the result is
+    /// identical to `build` over the final index: same posting lists, same
+    /// counts, same query answers.
+    #[test]
+    fn incremental_maintenance_matches_full_rebuild() {
+        use crate::index::{EntryFlags, ROOT_ID};
+        let mut ix = Index::new();
+        let r = ix.insert(
+            ROOT_ID,
+            b"proj",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        // Deterministic names with heavy trigram overlap.
+        let names: Vec<String> = (0..300)
+            .map(|i| {
+                format!(
+                    "{}{}.{}",
+                    ["alpha", "beta", "gamma", "delta"][i % 4],
+                    i % 37,
+                    ["rs", "md", "txt"][i % 3]
+                )
+            })
+            .collect();
+        for n in &names[..150] {
+            ix.insert(r, n.as_bytes(), EntryFlags::EMPTY);
+        }
+        let mut tg = TrigramIndex::build(&ix);
+        // Second half, one entry at a time through the incremental path.
+        for n in &names[150..] {
+            let id = ix.insert(r, n.as_bytes(), EntryFlags::EMPTY);
+            let added = tg.index_entry(id, n.as_bytes(), false);
+            assert!(added > 0, "every test name is long enough to post");
+        }
+        // Delete every 7th entry through the incremental path.
+        let doomed: Vec<(u32, Vec<u8>)> = ix
+            .iter_live()
+            .filter(|(id, e)| !e.flags().is_root_dir() && id % 7 == 0)
+            .map(|(id, _)| (id, ix.name(id).to_vec()))
+            .collect();
+        for (id, nm) in &doomed {
+            ix.remove(*id);
+            tg.remove_entry(*id, nm);
+        }
+        // Posting-for-posting equality with a fresh full build.
+        let fresh = TrigramIndex::build(&ix);
+        assert_eq!(
+            tg.trigram_count(),
+            fresh.trigram_count(),
+            "distinct trigram count"
+        );
+        assert_eq!(tg.posting_total(), fresh.posting_total(), "total postings");
+        assert_eq!(
+            tg.indexed_entries(),
+            fresh.indexed_entries(),
+            "indexed count"
+        );
+        for (tri, list) in fresh.postings.iter() {
+            assert_eq!(
+                tg.raw_postings(tri),
+                Some(list.as_slice()),
+                "posting list differs for {tri:?}"
+            );
+        }
+        // And no list the fresh build lacks.
+        for tri in tg.postings.keys() {
+            assert!(
+                fresh.postings.contains_key(tri),
+                "stale trigram {tri:?} left after deletion"
+            );
+        }
+    }
+
+    /// A replayed `Add` for an already-indexed id is a no-op, not a duplicate.
+    ///
+    /// `apply_add` can restore an id under its original name (snapshot older
+    /// than journal); the per-trigram `last() != id` / binary-search guard
+    /// must keep the lists deduplicated.
+    #[test]
+    fn reindexing_the_same_id_does_not_duplicate() {
+        use crate::index::{EntryFlags, ROOT_ID};
+        let mut ix = Index::new();
+        let r = ix.insert(
+            ROOT_ID,
+            b"p",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        let id = ix.insert(r, b"repeatable.rs", EntryFlags::EMPTY);
+        let mut tg = TrigramIndex::build(&ix);
+        let before = tg.posting_total();
+        // Same id, same name: pure no-op.
+        tg.index_entry(id, b"repeatable.rs", false);
+        assert_eq!(tg.posting_total(), before, "replay must not duplicate");
+        // Same id, *shorter* name (rename path indexes the new name; the old
+        // postings stay stale-but-safe by design, tested at query level).
+        tg.index_entry(id, b"a", false);
+        assert_eq!(tg.posting_total(), before, "sub-trigram name posts nothing");
+        for (tri, list) in tg.postings.iter() {
+            let mut sorted = list.clone();
+            sorted.dedup();
+            assert_eq!(sorted.len(), list.len(), "duplicate in {tri:?}");
         }
     }
 }

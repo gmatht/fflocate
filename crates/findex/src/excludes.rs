@@ -51,7 +51,12 @@ impl Excludes {
     /// could surprise someone looking for a file they know exists.
     pub fn defaults() -> Excludes {
         Excludes {
-            names: vec![b".git".to_vec(), b"node_modules".to_vec(), b".hg".to_vec(), b".svn".to_vec()],
+            names: vec![
+                b".git".to_vec(),
+                b"node_modules".to_vec(),
+                b".hg".to_vec(),
+                b".svn".to_vec(),
+            ],
             suffixes: vec![],
             prefixes: vec![],
         }
@@ -69,7 +74,10 @@ impl Excludes {
                 e.prefixes.push(v);
             } else if let Some(suf) = raw.strip_prefix("*.") {
                 e.suffixes.push(format!(".{suf}").into_bytes());
-            } else if raw.starts_with('.') && raw.len() > 1 && raw[1..].chars().all(|c| c.is_ascii_alphanumeric()) {
+            } else if raw.starts_with('.')
+                && raw.len() > 1
+                && raw[1..].chars().all(|c| c.is_ascii_alphanumeric())
+            {
                 // ".git" — a leading-dot name, not a suffix.
                 e.names.push(raw.as_bytes().to_vec());
             } else if let Some(suf) = raw.strip_prefix('.') {
@@ -116,14 +124,20 @@ mod tests {
         assert!(e.excludes_dir_name(b".git"));
         assert!(e.excludes_dir_name(b"node_modules"));
         assert!(!e.excludes_dir_name(b"src"));
-        assert!(!e.excludes_dir_name(b".gitignore"), "a file that merely starts with .git is not the dir");
+        assert!(
+            !e.excludes_dir_name(b".gitignore"),
+            "a file that merely starts with .git is not the dir"
+        );
     }
 
     #[test]
     fn name_matching_is_exact_not_prefix() {
         let e = Excludes::parse_list("build");
         assert!(e.excludes_dir_name(b"build"));
-        assert!(!e.excludes_dir_name(b"builds"), "exact name, so a sibling is not swallowed");
+        assert!(
+            !e.excludes_dir_name(b"builds"),
+            "exact name, so a sibling is not swallowed"
+        );
         assert!(!e.excludes_dir_name(b"prebuild"));
     }
 
@@ -141,7 +155,10 @@ mod tests {
         assert!(e.excludes_path(b"/proc/self/fd"));
         assert!(e.excludes_path(b"/sys/kernel"));
         assert!(!e.excludes_path(b"/home/proc"));
-        assert!(!e.excludes_dir_name(b"proc"), "a prefix rule is not a name rule");
+        assert!(
+            !e.excludes_dir_name(b"proc"),
+            "a prefix rule is not a name rule"
+        );
     }
 
     #[test]

@@ -50,7 +50,11 @@ ff service install               # systemd user unit / launchd plist
 ln -s "$(command -v ff)" ~/bin/locate  # drop-in locate replacement (argv[0])
 ```
 
-By default the daemon indexes `$HOME`. To index something else:
+By default the daemon indexes every readable native filesystem on Linux
+(`ext4`, `btrfs`, `xfs`, … — each through its own root, so nested mounts are
+indexed exactly once and network/pseudo filesystems stay out unless explicitly
+asked for with `--root`/`$FINDEX_ROOT`); elsewhere it indexes `$HOME`. To
+index something else:
 
 ```sh
 findexd --root /path/to/tree --socket "$XDG_RUNTIME_DIR/findex.sock" \

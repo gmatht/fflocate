@@ -111,7 +111,11 @@ pub fn state_dir() -> PathBuf {
 }
 
 impl Config {
-    /// Default configuration: index `$HOME`, socket under the runtime dir.
+    /// Default configuration: `$FINDEX_ROOT` when set, else `$HOME`; socket
+    /// under the runtime dir. Deliberately cheap (no mountinfo, no probes):
+    /// the Linux filesystem discovery (`default_roots`) runs only when the
+    /// daemon actually starts without roots (see `main`), never on every
+    /// config construction.
     ///
     /// `$FINDEX_ROOT` overrides the root list; entries are separated by the
     /// platform path separator (`:` on Unix). This lets `ff` forward the roots
@@ -120,16 +124,9 @@ impl Config {
     pub fn defaults() -> Config {
         let rd = runtime_dir();
         let state = state_dir();
-        #[cfg(windows)]
-        let home = std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("C:/"));
-        #[cfg(not(windows))]
-        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"));
         let roots = match std::env::var_os("FINDEX_ROOT") {
             Some(v) if !v.is_empty() => std::env::split_paths(&v).collect(),
-            _ => vec![home],
+            _ => vec![home_dir()],
         };
         // §4/§6: exclusions are opt-in. `FINDEX_EXCLUDE` takes comma/colon
         // separated names (`build,node_modules`), absolute prefixes (`/proc`)
@@ -216,6 +213,59 @@ impl Config {
         self.shared_store = on;
         self
     }
+
+    /// Roots to index when neither `--root` nor `$FINDEX_ROOT` says otherwise.
+    ///
+    /// On Linux every readable native filesystem gets its own root (§4: one
+    /// database, one root per filesystem), so the whole machine is indexed
+    /// with each filesystem exactly once; the mount-aware crawl enforces the
+    /// boundaries. Mounts the daemon cannot list are skipped loudly rather
+    /// than degrading every status line, and when discovery yields nothing
+    /// usable (containers, exotic fstypes) the historical `$HOME` root
+    /// applies. Elsewhere `$HOME` is the default, unchanged.
+    pub fn default_roots() -> Vec<PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            let mounts = findex::mount::read_mountinfo();
+            let mut roots: Vec<PathBuf> = Vec::new();
+            for mp in findex::mount::default_root_candidates(&mounts) {
+                let p = PathBuf::from(&mp);
+                if findex::mount::is_readable_dir(&p) {
+                    roots.push(p);
+                } else {
+                    eprintln!(
+                        "findexd: skipping default root {mp} (not listable; run as a user that can read it, or index it explicitly with --root)"
+                    );
+                }
+            }
+            if roots.is_empty() {
+                eprintln!("findexd: no readable native filesystems discovered; indexing $HOME");
+                roots.push(home_dir());
+            }
+            roots
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            vec![home_dir()]
+        }
+    }
+}
+
+/// The historical single default: the user's home directory.
+fn home_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("C:/"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("/"))
+    }
 }
 
 /// The socket path a client should try, honouring an override env var so the
@@ -251,7 +301,17 @@ mod tests {
     #[test]
     fn defaults_never_tmp() {
         let c = Config::defaults();
-        assert!(!c.socket_path.starts_with("/tmp"), "socket must not live in /tmp");
+        assert!(
+            !c.socket_path.starts_with("/tmp"),
+            "socket must not live in /tmp"
+        );
+    }
+
+    #[test]
+    fn default_roots_never_empty() {
+        // Discovery or the $HOME fallback: starting with nowhere to index is
+        // never an option, on any platform.
+        assert!(!Config::default_roots().is_empty());
     }
 
     #[test]
@@ -268,7 +328,10 @@ mod tests {
             assert_eq!(c.as_str(), name);
         }
         assert!(BackendChoice::parse("nope").is_none());
-        assert!(BackendChoice::parse("Inotify").is_none(), "case-sensitive, like the CLI flag");
+        assert!(
+            BackendChoice::parse("Inotify").is_none(),
+            "case-sensitive, like the CLI flag"
+        );
     }
 
     #[test]
@@ -285,7 +348,11 @@ mod tests {
     fn explicit_choices_resolve_to_themselves() {
         // Asking for a backend must not silently become a different one; if it
         // is unavailable, `make_backend` errors instead.
-        for c in [BackendChoice::Inotify, BackendChoice::Fanotify, BackendChoice::Fake] {
+        for c in [
+            BackendChoice::Inotify,
+            BackendChoice::Fanotify,
+            BackendChoice::Fake,
+        ] {
             assert_eq!(c.resolve(), Some(c));
         }
     }

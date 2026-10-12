@@ -20,6 +20,8 @@
 //! * [`proto`]     — §11 IPC protocol v2 (NDJSON messages)
 //! * [`server`]    — §8/§11 sync engine + request handling shared by the daemon
 //! * [`health`]    — §15 health counters/telemetry
+//! * [`spawn`]     — §15 daemon lifecycle: locate and auto-spawn `findexd`,
+//!   shared by the `ff` and `ff-gui` front ends
 
 pub mod applier;
 pub mod config_paths;
@@ -33,26 +35,26 @@ pub mod fuzzy;
 pub mod health;
 pub mod index;
 pub mod journal;
-pub mod pending;
 pub mod modelfs;
 pub mod mount;
 pub mod ownership;
+pub mod pending;
 pub mod persist;
 pub mod proto;
 pub mod query;
 pub mod roots;
 pub mod server;
 pub mod snapshot;
+pub mod spawn;
 pub mod sync;
+pub mod transport;
 #[cfg(feature = "trigram")]
 pub mod trigram;
-pub mod transport;
 pub mod util;
 pub mod watch;
 
 pub use cursor::Cursor;
 pub use event::{DirKey, FsEvent, RescanCause, RootId};
 pub use index::{Entry, EntryFlags, Index, ROOT_ID};
-
 
 pub use roots::{MountCaps, Root, RootState};

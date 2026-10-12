@@ -26,13 +26,58 @@ const EXCLUDED_FSTYPES: &[&str] = &[
     "hugetlbfs",
     "configfs",
     "fusectl",
-
     "rpc_pipefs",
 ];
 
+/// Native Linux filesystems: indexed by default on Linux (§4). Everything else
+/// needs an explicit root — pseudo-FS never, network/fuse/removable media only
+/// when asked for — and the mount-aware crawl enforces that boundary even when
+/// such a mount sits inside an indexed tree.
+const NATIVE_FSTYPES: &[&str] = &[
+    "ext2", "ext3", "ext4", "btrfs", "xfs", "f2fs", "jfs", "reiserfs", "nilfs2", "zfs", "bcachefs",
+];
+
+pub fn is_native_fstype(fstype: &str) -> bool {
+    NATIVE_FSTYPES.contains(&fstype.to_ascii_lowercase().as_str())
+}
+
+/// Default roots on Linux: the mount points of native filesystems (§4).
+///
+/// Pure over parsed mountinfo so it is unit-testable; the caller filters by
+/// readability (a personal daemon skips what it cannot read, loudly) and falls
+/// back to `$HOME` when discovery yields nothing (containers, odd fstypes).
+/// Nested mounts are included — each filesystem gets its own root, and the
+/// mount-aware crawl indexes each exactly once. Exact-duplicate mount points
+/// (a bind mount listed twice) collapse to one. Sorted for determinism.
+pub fn default_root_candidates(mounts: &[MountInfo]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for m in mounts {
+        if !is_native_fstype(&m.fstype) {
+            continue;
+        }
+        if is_excluded_fstype(&m.fstype) {
+            continue; // belt and braces: exclusion beats nativity
+        }
+        seen.insert(normalize_mount_point(&m.mount_point));
+    }
+    seen.into_iter().collect()
+}
+
+/// Canonicalize a mount-point spelling: unescaped already by the parser, so
+/// only a trailing slash is stripped (`/` keeps its own). Config paths and
+/// mountinfo spellings must compare equal for root merging and the
+/// mountpoint set the crawl consults.
+pub fn normalize_mount_point(p: &str) -> String {
+    if p.len() > 1 {
+        p.trim_end_matches('/').to_string()
+    } else {
+        p.to_string()
+    }
+}
 /// Filesystems treated as case-insensitive by default (the fstype table; the
 /// optional temp-file-pair probe overrides this when the dir is writable).
-const CASE_INSENSITIVE_FSTYPES: &[&str] = &["vfat", "exfat", "msdos", "ntfs", "ntfs3", "cifs", "smbfs"];
+const CASE_INSENSITIVE_FSTYPES: &[&str] =
+    &["vfat", "exfat", "msdos", "ntfs", "ntfs3", "cifs", "smbfs"];
 
 pub fn is_excluded_fstype(fstype: &str) -> bool {
     let f = fstype.to_ascii_lowercase();
@@ -42,7 +87,9 @@ pub fn is_excluded_fstype(fstype: &str) -> bool {
 }
 
 fn overlay_opt_in() -> bool {
-    std::env::var("FINDEX_ALLOW_OVERLAY").map(|v| v == "1").unwrap_or(false)
+    std::env::var("FINDEX_ALLOW_OVERLAY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// One parsed `/proc/self/mountinfo` line (the fields we care about).
@@ -59,23 +106,84 @@ pub fn parse_mountinfo(text: &str) -> Vec<MountInfo> {
     for line in text.lines() {
         // Fields: id parent major:minor root mount_point opts [optional...] - fstype source superopts
         let parts: Vec<&str> = line.split_whitespace().collect();
-        let Some(dash) = parts.iter().position(|p| *p == "-") else { continue };
+        let Some(dash) = parts.iter().position(|p| *p == "-") else {
+            continue;
+        };
         if parts.len() < dash + 3 || parts.len() < 5 {
             continue;
         }
-        let mount_point = parts[4].to_string();
-        let fstype = parts[dash + 1].to_string();
-        let source = parts[dash + 2].to_string();
-        out.push(MountInfo { mount_point, fstype, source });
+        let mount_point = unescape_mountinfo_field(parts[4]);
+        let fstype = unescape_mountinfo_field(parts[dash + 1]);
+        let source = unescape_mountinfo_field(parts[dash + 2]);
+        out.push(MountInfo {
+            mount_point,
+            fstype,
+            source,
+        });
     }
     out
 }
 
+/// Unescape mountinfo octal escapes (`\040` space, `\011` tab, `\012`
+/// newline, `\134` backslash). Without this a mount point containing a space
+/// never matches the path it names, and longest-prefix classification quietly
+/// picks the wrong mount. A backslash not followed by three octal digits is
+/// kept literally. All slicing is on ASCII boundaries (`\` never appears
+/// inside a UTF-8 multibyte sequence), so non-UTF-8-hostile bytes pass
+/// through untouched.
+pub fn unescape_mountinfo_field(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut start = 0;
+    let mut i = 0;
+    while i < b.len() {
+        let is_esc = b[i] == b'\\'
+            && i + 4 <= b.len()
+            && b[i + 1..i + 4].iter().all(|c| matches!(c, b'0'..=b'7'));
+        if is_esc {
+            out.push_str(&s[start..i]);
+            let n = ((b[i + 1] - b'0') * 64 + (b[i + 2] - b'0') * 8 + (b[i + 3] - b'0')) as u32;
+            match char::from_u32(n) {
+                Some(c) => out.push(c),
+                None => out.push_str(&s[i..i + 4]),
+            }
+            i += 4;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&s[start..]);
+    out
+}
+
 pub fn read_mountinfo() -> Vec<MountInfo> {
-    match std::fs::read_to_string("/proc/self/mountinfo") {
-        Ok(t) => parse_mountinfo(&t),
+    // Lossy: a non-UTF-8 mount point must not make the whole table unreadable
+    // (it degrades to a replacement character and may miss its boundary, but
+    // every other mount still resolves).
+    match std::fs::read("/proc/self/mountinfo") {
+        Ok(bytes) => parse_mountinfo(&String::from_utf8_lossy(&bytes)),
         Err(_) => Vec::new(),
     }
+}
+
+/// The mountpoint set a mount-aware crawl consults: every mount point as
+/// bytes (mountinfo spellings, unescaped, trailing slash stripped).
+pub fn mountpoint_set(mounts: &[MountInfo]) -> std::collections::HashSet<Vec<u8>> {
+    mounts
+        .iter()
+        .map(|m| normalize_mount_point(&m.mount_point).into_bytes())
+        .collect()
+}
+
+/// Can the daemon enumerate `path` at all? Used to skip unreadable default
+/// roots loudly at discovery time rather than degrading every status line. A
+/// successful open (not a full listing) is the probe — cheap, one syscall.
+pub fn is_readable_dir(path: &Path) -> bool {
+    std::fs::read_dir(path).is_ok()
 }
 
 /// Find the mount whose mount_point is the longest prefix of `path`.
@@ -106,9 +214,9 @@ pub struct ProbeInputs {
 
 /// Classify a mount from parsed inputs.
 pub fn caps_from_probe(inp: &ProbeInputs) -> MountCaps {
-    let case_insensitive = inp
-        .case_probe
-        .unwrap_or_else(|| CASE_INSENSITIVE_FSTYPES.contains(&inp.fstype.to_ascii_lowercase().as_str()));
+    let case_insensitive = inp.case_probe.unwrap_or_else(|| {
+        CASE_INSENSITIVE_FSTYPES.contains(&inp.fstype.to_ascii_lowercase().as_str())
+    });
     MountCaps {
         file_handles: inp.file_handles,
         dtype_unreliable: inp.dtype_unreliable,
@@ -123,11 +231,17 @@ pub fn caps_from_probe(inp: &ProbeInputs) -> MountCaps {
 /// conservative value rather than an error.
 pub fn probe_root(path: &Path) -> MountCaps {
     let mounts = read_mountinfo();
-    let fstype = mount_for(&mounts, path).map(|m| m.fstype.clone()).unwrap_or_default();
+    let fstype = mount_for(&mounts, path)
+        .map(|m| m.fstype.clone())
+        .unwrap_or_default();
     let writable = is_writable(path);
     let file_handles = has_file_handle(path);
     let dtype_unreliable = dtype_probe(path);
-    let case_probe = if writable { Some(case_probe(path)) } else { None };
+    let case_probe = if writable {
+        Some(case_probe(path))
+    } else {
+        None
+    };
     caps_from_probe(&ProbeInputs {
         fstype,
         writable,
@@ -143,14 +257,18 @@ pub fn is_writable(path: &Path) -> bool {
     {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
-        let Ok(c) = CString::new(path.as_os_str().as_bytes()) else { return false };
+        let Ok(c) = CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
         unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
     }
     // Best-effort: the readonly attribute. ACLs may still deny writes; the
     // classifier treats this as a hint, not a promise.
     #[cfg(windows)]
     {
-        std::fs::metadata(path).map(|m| !m.permissions().readonly()).unwrap_or(false)
+        std::fs::metadata(path)
+            .map(|m| !m.permissions().readonly())
+            .unwrap_or(false)
     }
 }
 
@@ -190,7 +308,12 @@ pub fn handle_of_path(path: &Path) -> Option<HandleId> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
     if fd < 0 {
         return None;
     }
@@ -223,7 +346,11 @@ pub fn handle_of_path(path: &Path) -> Option<HandleId> {
     if 8 + n > buf.len() {
         return None;
     }
-    Some(HandleId { mount_id, handle_type, handle: buf[8..8 + n].to_vec() })
+    Some(HandleId {
+        mount_id,
+        handle_type,
+        handle: buf[8..8 + n].to_vec(),
+    })
 }
 
 /// The identity of a file handle as the kernel reports it, independent of any
@@ -307,8 +434,15 @@ pub fn has_file_handle(path: &Path) -> bool {
     {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
-        let Ok(c) = CString::new(path.as_os_str().as_bytes()) else { return false };
-        let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        let Ok(c) = CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        let fd = unsafe {
+            libc::open(
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
         if fd < 0 {
             return false;
         }
@@ -399,12 +533,22 @@ mod tests {
 
     #[test]
     fn case_insensitive_table_and_probe_precedence() {
-        let inp = ProbeInputs { fstype: "vfat".into(), ..Default::default() };
+        let inp = ProbeInputs {
+            fstype: "vfat".into(),
+            ..Default::default()
+        };
         assert!(caps_from_probe(&inp).case_insensitive);
-        let inp = ProbeInputs { fstype: "ext4".into(), ..Default::default() };
+        let inp = ProbeInputs {
+            fstype: "ext4".into(),
+            ..Default::default()
+        };
         assert!(!caps_from_probe(&inp).case_insensitive);
         // An explicit probe beats the table.
-        let inp = ProbeInputs { fstype: "ext4".into(), case_probe: Some(true), ..Default::default() };
+        let inp = ProbeInputs {
+            fstype: "ext4".into(),
+            case_probe: Some(true),
+            ..Default::default()
+        };
         assert!(caps_from_probe(&inp).case_insensitive);
     }
 
@@ -421,7 +565,10 @@ mod tests {
         std::fs::write(&upper, b"").unwrap();
         let insensitive = lower.exists();
         let _ = std::fs::remove_file(&upper);
-        assert_eq!(caps.case_insensitive, insensitive, "classifier must match the direct probe");
+        assert_eq!(
+            caps.case_insensitive, insensitive,
+            "classifier must match the direct probe"
+        );
     }
 
     #[test]
@@ -429,5 +576,88 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         assert!(is_writable(d.path()));
         assert!(!is_writable(Path::new("/nonexistent-xyz")));
+    }
+
+    #[test]
+    fn mountinfo_escapes_decode() {
+        assert_eq!(unescape_mountinfo_field("/plain"), "/plain");
+        assert_eq!(unescape_mountinfo_field("/mnt/my\\040disk"), "/mnt/my disk");
+        assert_eq!(
+            unescape_mountinfo_field("a\\011b\\012c\\134d"),
+            "a\tb\nc\\d"
+        );
+        // Not an escape: kept literally.
+        assert_eq!(unescape_mountinfo_field("/mnt/back\\"), "/mnt/back\\");
+        assert_eq!(unescape_mountinfo_field("/mnt/\\d41"), "/mnt/\\d41");
+        // ...and through the parser onto the mount point.
+        let mounts =
+            parse_mountinfo("99 81 8:1 / /mnt/my\\040disk rw,relatime - ext4 /dev/sda1 rw\n");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].mount_point, "/mnt/my disk");
+    }
+
+    const NATIVE_SAMPLE: &str = "\
+23 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw
+24 1 8:2 / /home rw,relatime - ext4 /dev/sda2 rw
+25 1 8:3 / /var rw,relatime - xfs /dev/sda3 rw
+26 1 8:4 / /mnt/data rw,relatime - btrfs /dev/sdb1 rw
+27 1 8:4 /sub /mnt/data/sub rw,relatime - btrfs /dev/sdb1 rw
+28 1 8:1 / /mnt/data rw,relatime - ext4 /dev/sda1 rw
+29 1 0:5 / /proc rw,nosuid - proc proc rw
+30 1 0:6 / /sys rw,nosuid - sysfs sysfs rw
+31 1 8:5 / /boot/efi rw,relatime - vfat /dev/sda4 rw
+32 1 8:6 / /mnt/usb rw,relatime - ntfs3 /dev/sdc1 rw
+33 1 7:7 / /snap/core ro,relatime - squashfs /dev/loop0 ro
+34 1 0:8 / /mnt/nfs rw,relatime - nfs server:/export rw
+35 1 0:9 / /dev/shm rw,nosuid - tmpfs shm rw
+36 1 0:10 / / rw,relatime - overlay overlay rw
+";
+
+    #[test]
+    fn native_fstype_table() {
+        for fs in [
+            "ext4", "ext3", "ext2", "btrfs", "xfs", "f2fs", "zfs", "bcachefs", "EXT4",
+        ] {
+            assert!(is_native_fstype(fs), "{fs} must count as native");
+        }
+        for fs in [
+            "vfat", "ntfs", "ntfs3", "nfs", "cifs", "tmpfs", "squashfs", "overlay", "proc",
+            "fuseblk",
+        ] {
+            assert!(!is_native_fstype(fs), "{fs} must not count as native");
+        }
+    }
+
+    #[test]
+    fn default_roots_are_native_mounts_only() {
+        let mounts = parse_mountinfo(NATIVE_SAMPLE);
+        assert_eq!(mounts.len(), 14);
+        // `/`, `/home`, `/var`, `/mnt/data` and its nested `/mnt/data/sub`
+        // subvolume mount — each filesystem gets its own root, so nesting is
+        // kept. vfat/ntfs removable media, squashfs snaps, NFS, tmpfs, proc,
+        // sysfs and overlay are not native and stay out.
+        assert_eq!(
+            default_root_candidates(&mounts),
+            vec!["/", "/home", "/mnt/data", "/mnt/data/sub", "/var"],
+        );
+    }
+
+    #[test]
+    fn duplicate_mount_points_collapse() {
+        // The same mount listed twice (bind) yields one root.
+        let mounts = parse_mountinfo(
+            "\
+23 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw
+28 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw
+",
+        );
+        assert_eq!(default_root_candidates(&mounts), vec!["/"]);
+    }
+
+    #[test]
+    fn normalize_mount_point_strips_trailing_slash() {
+        assert_eq!(normalize_mount_point("/mnt/data/"), "/mnt/data");
+        assert_eq!(normalize_mount_point("/"), "/");
+        assert_eq!(normalize_mount_point("/home"), "/home");
     }
 }

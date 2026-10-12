@@ -54,7 +54,22 @@ pub fn handle_request(ctx: &ServerCtx, req: &Request) -> Vec<Response> {
             version: crate::proto::PROTOCOL_VERSION,
             backend: ctx.backend.clone(),
         }],
-        Request::Query { q, limit, json: _, count, expression, glob, glob_includedotfiles, glob_noescape, suffix, path, relative_root, case_sensitive, fuzzy, max_distance } => {
+        Request::Query {
+            q,
+            limit,
+            json: _,
+            count,
+            expression,
+            glob,
+            glob_includedotfiles,
+            glob_noescape,
+            suffix,
+            path,
+            relative_root,
+            case_sensitive,
+            fuzzy,
+            max_distance,
+        } => {
             if expression.is_some() || glob.is_some() || suffix.is_some() || path.is_some() {
                 let mut obj = serde_json::Map::new();
                 if let Some(e) = expression {
@@ -76,7 +91,10 @@ pub fn handle_request(ctx: &ServerCtx, req: &Request) -> Vec<Response> {
                     obj.insert("path".into(), p.clone());
                 }
                 if let Some(rr) = relative_root {
-                    obj.insert("relative_root".into(), serde_json::Value::String(rr.clone()));
+                    obj.insert(
+                        "relative_root".into(),
+                        serde_json::Value::String(rr.clone()),
+                    );
                 }
                 if let Some(cs) = case_sensitive {
                     obj.insert("case_sensitive".into(), serde_json::Value::Bool(*cs));
@@ -134,8 +152,13 @@ fn handle_query(
     // §17 v2: fetch (build-once, cached by generation) the trigram accelerator
     // *before* taking the index read lock, so the two locks are never held in a
     // conflicting order. Only compiled in with the default-on `trigram` feature.
+    // The postings read guard is held for the whole query: `emit` takes the
+    // write guard for one entry's trigrams, so a concurrent insert waits out
+    // the intersection rather than racing it.
     #[cfg(feature = "trigram")]
     let trigram = Some(ctx.shared.trigram_index());
+    #[cfg(feature = "trigram")]
+    let trigram_guard = trigram.as_ref().map(|t| t.read().unwrap());
     let ix = ctx.shared.index.read().unwrap();
     let roots = ctx.shared.roots.read().unwrap();
     // Build the (root_dir_id, root_path) table once. Roots recorded by
@@ -164,7 +187,7 @@ fn handle_query(
         &q,
         effective_limit,
         engine_count_only,
-        trigram.as_deref(),
+        trigram_guard.as_deref(),
     );
     #[cfg(not(feature = "trigram"))]
     let res = query::execute(&ix, &root_paths, &q, effective_limit, engine_count_only);
@@ -192,10 +215,17 @@ fn finish_query(
         // what root can — otherwise it leaks the existence of files they cannot
         // open. Counting therefore respects the same filter as listing.
         let total = match &ctx.caller {
-            Some(caller) => res.hits.iter().filter(|h| visible_chain(ctx, h.id, caller)).count() as u64,
+            Some(caller) => res
+                .hits
+                .iter()
+                .filter(|h| visible_chain(ctx, h.id, caller))
+                .count() as u64,
             None => res.total,
         };
-        out.push(Response::Done { count: total, cursor });
+        out.push(Response::Done {
+            count: total,
+            cursor,
+        });
         return out;
     }
     let mut shown = 0u64;
@@ -206,10 +236,20 @@ fn finish_query(
             }
         }
         shown += 1;
-        out.push(Response::Hit { path: bytes_to_string(&h.path), id: h.id });
+        out.push(Response::Hit {
+            path: bytes_to_string(&h.path),
+            id: h.id,
+        });
     }
-    let total = if ctx.caller.is_some() { shown } else { res.total };
-    out.push(Response::Done { count: total, cursor });
+    let total = if ctx.caller.is_some() {
+        shown
+    } else {
+        res.total
+    };
+    out.push(Response::Done {
+        count: total,
+        cursor,
+    });
     out
 }
 
@@ -288,8 +328,10 @@ fn handle_fuzzy_query(
         };
         let k = max_distance.unwrap_or(DEFAULT_FUZZY_DISTANCE);
         // Same lock-order rule as `handle_query`: build the accelerator before
-        // taking the index read lock.
+        // taking the index read lock. The read guard lives for the query, as
+        // there.
         let trigram = ctx.shared.trigram_index();
+        let trigram_guard = trigram.read().unwrap();
         let ix = ctx.shared.index.read().unwrap();
         let roots = ctx.shared.roots.read().unwrap();
         let mut root_paths: Vec<(u32, Vec<u8>)> = Vec::new();
@@ -297,7 +339,10 @@ fn handle_fuzzy_query(
         for r in roots.iter().filter(|r| r.is_local()) {
             let rid = crate::applier::root_dir_id(&ix, r);
             if rid != crate::index::ROOT_ID {
-                root_paths.push((rid, r.path.as_os_str().to_string_lossy().as_bytes().to_vec()));
+                root_paths.push((
+                    rid,
+                    r.path.as_os_str().to_string_lossy().as_bytes().to_vec(),
+                ));
             }
         }
         // As in `handle_query`: never take the engine's count-only fast path when
@@ -313,7 +358,7 @@ fn handle_fuzzy_query(
             k,
             effective_limit,
             engine_count_only,
-            Some(trigram.as_ref()),
+            Some(&trigram_guard),
         );
         let cursor = ctx.shared.cursor().to_string_repr();
         let elapsed = t0.elapsed();
@@ -353,13 +398,23 @@ fn handle_expr_query(
     for r in roots.iter().filter(|r| r.is_local()) {
         let rid = crate::applier::root_dir_id(&ix, r);
         if rid != crate::index::ROOT_ID {
-            root_paths.push((rid, r.path.as_os_str().to_string_lossy().as_bytes().to_vec()));
+            root_paths.push((
+                rid,
+                r.path.as_os_str().to_string_lossy().as_bytes().to_vec(),
+            ));
         }
     }
     let effective_limit = if count_only { 0 } else { limit };
     let filtering = ctx.caller.is_some();
     let engine_count_only = count_only && !filtering;
-    let res = query::execute_expr(&ix, &root_paths, &rel_root, &expr, effective_limit, engine_count_only);
+    let res = query::execute_expr(
+        &ix,
+        &root_paths,
+        &rel_root,
+        &expr,
+        effective_limit,
+        engine_count_only,
+    );
     let cursor = ctx.shared.cursor().to_string_repr();
     let elapsed = t0.elapsed();
     drop(roots);
@@ -433,13 +488,13 @@ fn handle_sync(ctx: &ServerCtx, timeout_ms: u64, only_roots: Option<&[String]>) 
                 continue;
             }
         };
-        let rx = ctx.sync.expect(token, *rid, name.clone(), Some(cookie_path.clone()));
+        let rx = ctx
+            .sync
+            .expect(token, *rid, name.clone(), Some(cookie_path.clone()));
         // Ask the applier to register the cookie with the pending collection.
         let mut asked = false;
         if let Some(ctl) = &ctx.control {
-            asked = ctl
-                .send(Control::Cookie { token, root: *rid })
-                .is_ok();
+            asked = ctl.send(Control::Cookie { token, root: *rid }).is_ok();
         }
         if !asked {
             // No applier control channel (read-only server): fall back to
@@ -466,7 +521,11 @@ fn handle_sync(ctx: &ServerCtx, timeout_ms: u64, only_roots: Option<&[String]>) 
     // Fallback for timeouts: clean up the cookie file, then mark weak rather
     // than lying about success.
     for (key, tok) in &to_retry {
-        if out_map.get(key).map(|s| s == SyncStatus::Timeout.as_str()).unwrap_or(false) {
+        if out_map
+            .get(key)
+            .map(|s| s == SyncStatus::Timeout.as_str())
+            .unwrap_or(false)
+        {
             if let Ok(token) = tok.parse::<u64>() {
                 if let Some(p) = ctx.sync.forget(token) {
                     let _ = std::fs::remove_file(p);
@@ -483,7 +542,11 @@ fn handle_since(ctx: &ServerCtx, cursor: &str, q: &str) -> Vec<Response> {
     let current_gen = ctx.shared.generation();
     let parsed = match crate::cursor::Cursor::parse_with_gen(cursor, current_gen) {
         Some(c) => c,
-        None => return vec![Response::Error { message: format!("bad cursor: {cursor}") }],
+        None => {
+            return vec![Response::Error {
+                message: format!("bad cursor: {cursor}"),
+            }]
+        }
     };
     let stale = parsed.is_stale(current_gen);
     let t0 = Instant::now();
@@ -503,8 +566,12 @@ fn handle_since(ctx: &ServerCtx, cursor: &str, q: &str) -> Vec<Response> {
         .iter()
         .filter_map(|r| {
             let rid = crate::applier::root_dir_id(&ix, r);
-            (rid != crate::index::ROOT_ID)
-                .then(|| (rid, r.path.as_os_str().to_string_lossy().as_bytes().to_vec()))
+            (rid != crate::index::ROOT_ID).then(|| {
+                (
+                    rid,
+                    r.path.as_os_str().to_string_lossy().as_bytes().to_vec(),
+                )
+            })
         })
         .collect();
     let mut buf = Vec::new();
@@ -614,12 +681,16 @@ fn handle_rescan(ctx: &ServerCtx, root: &str) -> Vec<Response> {
         }
     };
     if !found {
-        return vec![Response::Error { message: format!("unknown root: {root}") }];
+        return vec![Response::Error {
+            message: format!("unknown root: {root}"),
+        }];
     }
     if let Some(ctl) = &ctx.control {
         let _ = ctl.send(Control::RescanRoot { root: rid });
     }
-    vec![Response::Rescanning { root: root.to_string() }]
+    vec![Response::Rescanning {
+        root: root.to_string(),
+    }]
 }
 
 fn handle_subscribe(ctx: &ServerCtx) -> Vec<Response> {
@@ -642,11 +713,10 @@ pub fn bytes_to_string(b: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::applier::Shared;
-    use std::path::PathBuf;
     use crate::index::{EntryFlags, Index, ROOT_ID};
     use crate::persist::Store;
     use crate::roots::Root;
-
+    use std::path::PathBuf;
 
     fn ctx_with_tree() -> (ServerCtx, tempfile::TempDir, Arc<Shared>) {
         let d = tempfile::tempdir().unwrap();
@@ -754,17 +824,34 @@ mod tests {
     #[test]
     fn foreign_roots_report_foreign_and_refuse_rescan() {
         let (ctx, _d, _s) = ctx_with_foreign_root();
-        let out = handle_request(&ctx, &Request::Sync { timeout_ms: 50, roots: None });
+        let out = handle_request(
+            &ctx,
+            &Request::Sync {
+                timeout_ms: 50,
+                roots: None,
+            },
+        );
         match out.last() {
             Some(Response::Synced { roots }) => {
                 // Local root goes weak (no control channel in this harness);
                 // the foreign root must say `foreign`, never attempted.
-                assert_eq!(roots.get("/mnt/theirs").map(String::as_str), Some("foreign"));
-                assert!(roots.contains_key("/mnt/mine"), "local roots still reported");
+                assert_eq!(
+                    roots.get("/mnt/theirs").map(String::as_str),
+                    Some("foreign")
+                );
+                assert!(
+                    roots.contains_key("/mnt/mine"),
+                    "local roots still reported"
+                );
             }
             other => panic!("expected synced, got {other:?}"),
         }
-        let out = handle_request(&ctx, &Request::Rescan { root: "/mnt/theirs".into() });
+        let out = handle_request(
+            &ctx,
+            &Request::Rescan {
+                root: "/mnt/theirs".into(),
+            },
+        );
         match out.first() {
             Some(Response::Error { message }) => assert!(message.contains("foreign"), "{message}"),
             other => panic!("rescan of a foreign root must refuse, got {other:?}"),
@@ -773,7 +860,10 @@ mod tests {
         match out.first() {
             Some(Response::Stats { stats }) => {
                 let roots = stats.get("roots").and_then(|v| v.as_array()).unwrap();
-                let theirs = roots.iter().find(|r| r.get("path").and_then(|v| v.as_str()) == Some("/mnt/theirs")).unwrap();
+                let theirs = roots
+                    .iter()
+                    .find(|r| r.get("path").and_then(|v| v.as_str()) == Some("/mnt/theirs"))
+                    .unwrap();
                 assert_eq!(theirs.get("local").and_then(|v| v.as_bool()), Some(false));
                 assert_eq!(
                     theirs.get("owner").and_then(|v| v.as_str()),
@@ -790,7 +880,13 @@ mod tests {
         let out = handle_request(&ctx, &Request::query("rs", 0, true, false));
         assert!(matches!(out.first(), Some(Response::Meta { .. })));
         assert!(matches!(out.last(), Some(Response::Done { .. })));
-        let hits: Vec<_> = out.iter().filter_map(|r| match r { Response::Hit { path, .. } => Some(path.clone()), _ => None }).collect();
+        let hits: Vec<_> = out
+            .iter()
+            .filter_map(|r| match r {
+                Response::Hit { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].ends_with("/src/main.rs"));
     }
@@ -799,7 +895,13 @@ mod tests {
     fn count_fast_path() {
         let (ctx, _d, _s) = ctx_with_tree();
         let out = handle_request(&ctx, &Request::query("rs", 0, false, true));
-        let done = out.iter().find_map(|r| match r { Response::Done { count, .. } => Some(*count), _ => None }).unwrap();
+        let done = out
+            .iter()
+            .find_map(|r| match r {
+                Response::Done { count, .. } => Some(*count),
+                _ => None,
+            })
+            .unwrap();
         assert_eq!(done, 1);
         assert!(!out.iter().any(|r| matches!(r, Response::Hit { .. })));
     }
@@ -826,7 +928,13 @@ mod tests {
             max_distance: None,
         };
         let out = handle_request(&ctx, &req);
-        let hits: Vec<_> = out.iter().filter_map(|r| match r { Response::Hit { path, .. } => Some(path.clone()), _ => None }).collect();
+        let hits: Vec<_> = out
+            .iter()
+            .filter_map(|r| match r {
+                Response::Hit { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(hits.len(), 1, "got {hits:?}");
         assert!(hits[0].ends_with("/src/main.rs"));
     }
@@ -852,7 +960,9 @@ mod tests {
         };
         let out = handle_request(&ctx, &req);
         match &out[0] {
-            Response::Error { message } => assert!(message.contains("invalid type string 'x'"), "{message}"),
+            Response::Error { message } => {
+                assert!(message.contains("invalid type string 'x'"), "{message}")
+            }
             other => panic!("expected error, got {other:?}"),
         }
     }
@@ -860,8 +970,16 @@ mod tests {
     #[test]
     fn since_stale_generation_is_fresh() {
         let (ctx, _d, shared) = ctx_with_tree();
-        shared.generation.store(9, std::sync::atomic::Ordering::Release);
-        let out = handle_request(&ctx, &Request::Since { cursor: "c:1:0".into(), q: String::new() });
+        shared
+            .generation
+            .store(9, std::sync::atomic::Ordering::Release);
+        let out = handle_request(
+            &ctx,
+            &Request::Since {
+                cursor: "c:1:0".into(),
+                q: String::new(),
+            },
+        );
         match out.first() {
             Some(Response::Meta { fresh, gen, .. }) => {
                 assert!(fresh, "generation mismatch must report fresh");
@@ -888,18 +1006,32 @@ mod tests {
     #[test]
     fn rescan_unknown_root_errors() {
         let (ctx, _d, _s) = ctx_with_tree();
-        let out = handle_request(&ctx, &Request::Rescan { root: "/nope".into() });
+        let out = handle_request(
+            &ctx,
+            &Request::Rescan {
+                root: "/nope".into(),
+            },
+        );
         assert!(matches!(out[0], Response::Error { .. }));
     }
 
     #[test]
     fn sync_without_control_reports_weak() {
         let (ctx, _d, _s) = ctx_with_tree();
-        let out = handle_request(&ctx, &Request::Sync { timeout_ms: 100, roots: None });
+        let out = handle_request(
+            &ctx,
+            &Request::Sync {
+                timeout_ms: 100,
+                roots: None,
+            },
+        );
         match &out[0] {
             Response::Synced { roots } => {
                 assert_eq!(roots.len(), 1);
-                assert!(roots.values().all(|v| v == "weak"), "read-only fallback must not claim ok");
+                assert!(
+                    roots.values().all(|v| v == "weak"),
+                    "read-only fallback must not claim ok"
+                );
             }
             _ => panic!("expected synced"),
         }
@@ -971,11 +1103,21 @@ mod tests {
             control: Some(tx),
             caller: None,
         };
-        let out = handle_request(&ctx, &Request::Sync { timeout_ms: 1000, roots: None });
+        let out = handle_request(
+            &ctx,
+            &Request::Sync {
+                timeout_ms: 1000,
+                roots: None,
+            },
+        );
         match &out[0] {
             Response::Synced { roots } => {
                 let v: Vec<&String> = roots.values().collect();
-                assert_eq!(v, vec![&"ok".to_string()], "cookie marker seen → sync ok, got {roots:?}");
+                assert_eq!(
+                    v,
+                    vec![&"ok".to_string()],
+                    "cookie marker seen → sync ok, got {roots:?}"
+                );
             }
             other => panic!("expected synced, got {other:?}"),
         }
@@ -1010,7 +1152,10 @@ mod tests {
         // "main.rs": an exact query misses, a fuzzy query finds and ranks it.
         let (ctx, _d, _s) = ctx_with_tree();
         let exact = handle_request(&ctx, &Request::query("main.js", 0, false, false));
-        assert!(matches!(exact.last(), Some(Response::Done { count: 0, .. })));
+        assert!(matches!(
+            exact.last(),
+            Some(Response::Done { count: 0, .. })
+        ));
 
         let req = Request::Query {
             q: "main.js".into(),
@@ -1097,7 +1242,10 @@ mod tests {
             max_distance: Some(1),
         };
         let out = handle_request(&ctx, &req);
-        assert!(!out.iter().any(|r| matches!(r, Response::Hit { .. })), "--count skips hits");
+        assert!(
+            !out.iter().any(|r| matches!(r, Response::Hit { .. })),
+            "--count skips hits"
+        );
         let count = out.iter().find_map(|r| match r {
             Response::Done { count, .. } => Some(*count),
             _ => None,

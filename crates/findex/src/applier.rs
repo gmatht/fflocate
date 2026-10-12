@@ -53,6 +53,11 @@ pub struct DirItem {
     pub name: Vec<u8>,
     pub is_dir: bool,
     pub is_symlink: bool,
+    /// Any execute bit set on the entry (`find -perm /111`). Decided from
+    /// `stat`, so symlinks report their *target's* mode (`lstat` says 0777 on
+    /// every link); always false for directories (`type:exec` answers "is
+    /// this file executable"). Unstatable entries read false.
+    pub is_exec: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,10 +84,13 @@ impl FsView for RealFs {
             let ent = ent?;
             let name = os_str_bytes(&ent.file_name());
             let ft = ent.file_type()?;
+            let is_dir = ft.is_dir();
+            let is_symlink = ft.is_symlink();
             out.push(DirItem {
                 name,
-                is_dir: ft.is_dir(),
-                is_symlink: ft.is_symlink(),
+                is_dir,
+                is_symlink,
+                is_exec: is_executable(&ent.path(), is_dir, is_symlink),
             });
         }
         Ok(out)
@@ -155,6 +163,30 @@ pub fn os_str_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
     }
 }
 
+/// Decide `IS_EXEC` for one directory entry: any execute bit set
+/// (`find -perm /111`), read from `stat` so symlinks report their *target's*
+/// mode — `lstat` claims 0777 for every link. Directories are never
+/// executable (`type:exec` is a file predicate); unstatable entries and
+/// non-unix platforms read false rather than failing the whole listing.
+pub fn is_executable(path: &Path, is_dir: bool, _is_symlink: bool) -> bool {
+    if is_dir {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match std::fs::metadata(path) {
+            Ok(md) => md.is_file() && md.mode() & 0o111 != 0,
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// The shared, query-visible state. Readers take this lock; the applier is the
 /// only writer.
 pub struct Shared {
@@ -168,18 +200,33 @@ pub struct Shared {
     /// §17 v2 trigram accelerator, cached against the index it was built from.
     /// Present only with the default-on `trigram` cargo feature.
     ///
-    /// Keyed by `(generation, entry_count)`:
-    /// * a generation bump (snapshot load / full rescan / compaction) always
-    ///   invalidates it;
-    /// * within a generation, `entry_count` rises by one for every new entry, so
-    ///   any addition invalidates it too.
+    /// Keyed by **generation only**, and kept current incrementally: every
+    /// `Record::Add` funnels through `Applier::emit`, which indexes the new
+    /// name's trigrams into the cached postings under the same index lock
+    /// that mutates the index. Removals need no work for correctness
+    /// (tombstoned ids are filtered by the authoritative matcher), though
+    /// `emit` prunes them best-effort so lists do not bloat on churn.
     ///
-    /// A *removal* does not bump `entry_count`, so the cached postings may still
-    /// name tombstoned ids. That is safe by construction: the accelerator is a
-    /// filter and the authoritative matcher drops dead ids — a stale posting can
-    /// only ever add a candidate, never remove a real hit.
+    /// The `RwLock` inside the `Arc` is what makes concurrent maintenance
+    /// safe: queries hold the read guard while intersecting postings, and
+    /// `emit` holds the write guard for one entry's trigrams. Without it a
+    /// mutation landing mid-query would force dropping the whole cache —
+    /// which, on a churning index, would reintroduce the per-query rebuild
+    /// this design exists to eliminate.
+    ///
+    /// A generation bump (whole-root rescan / compaction, which may remap
+    /// ids) still invalidates: the next query rebuilds once, in the
+    /// background-warmed path if the daemon is idle, on demand otherwise.
+    ///
+    /// Lock discipline (deadlock observed live, §15): the query path holds the
+    /// postings *read* guard across its whole intersection while taking the
+    /// index read lock, so `emit` must never take the postings *write* guard
+    /// while holding the index write guard. `emit` therefore snapshots the
+    /// delta under the index guard, releases it, and only then touches the
+    /// slot/postings — slot → postings with nothing else held cannot invert
+    /// against postings → index.
     #[cfg(feature = "trigram")]
-    pub trigram: RwLock<Option<(u64, usize, Arc<crate::trigram::TrigramIndex>)>>,
+    pub trigram: RwLock<Option<(u64, Arc<RwLock<crate::trigram::TrigramIndex>>)>>,
     /// Per-entry ownership, for the privileged system instance (§3, §15).
     ///
     /// Read by the query path to answer "may *this* caller see this file?".
@@ -206,38 +253,42 @@ impl Shared {
     }
 
     /// The trigram accelerator for the current index, building it if the cache
-    /// is cold or stale. Cheap after the first call for a given index shape.
+    /// is cold or from an older generation. Cheap after the first call for a
+    /// given generation: within a generation the cached postings are kept
+    /// current by `Applier::emit`, so the entry count is deliberately *not*
+    /// part of the key — a churning index must not pay a full rebuild per query.
     ///
-    /// The index read lock is taken by the caller separately; this takes only
-    /// the cache lock and, on a miss, the index lock to build. Callers must not
-    /// hold the index read lock while calling this to avoid a lock-order hazard
-    /// — the query path builds the accelerator *before* taking the index lock.
+    /// Returns the shared, internally-locked index: queries take the read
+    /// guard for the duration of candidate intersection (see the call sites
+    /// in `server.rs`), while `emit` takes the write guard for one entry's
+    /// trigrams. The index read lock is taken by the caller separately; this
+    /// takes only the cache lock and, on a miss, the index lock to build.
+    /// Callers must not hold the index read lock while calling this to avoid
+    /// a lock-order hazard — the query path builds the accelerator *before*
+    /// taking the index lock.
     ///
     /// Only available with the default-on `trigram` cargo feature.
     #[cfg(feature = "trigram")]
-    pub fn trigram_index(&self) -> Arc<crate::trigram::TrigramIndex> {
-        let (gen, entries) = {
-            let ix = self.index.read().unwrap();
-            (ix.generation(), ix.entry_count())
-        };
-        if let Some((g, e, idx)) = self.trigram.read().unwrap().as_ref() {
-            if *g == gen && *e == entries {
+    pub fn trigram_index(&self) -> Arc<RwLock<crate::trigram::TrigramIndex>> {
+        let gen = self.index.read().unwrap().generation();
+        if let Some((g, idx)) = self.trigram.read().unwrap().as_ref() {
+            if *g == gen {
                 return Arc::clone(idx);
             }
         }
         // Rebuild under the index read lock, then publish.
         let built = {
             let ix = self.index.read().unwrap();
-            Arc::new(crate::trigram::TrigramIndex::build(&ix))
+            Arc::new(RwLock::new(crate::trigram::TrigramIndex::build(&ix)))
         };
         let mut slot = self.trigram.write().unwrap();
         // Another thread may have built it while we waited; keep its result.
-        if let Some((g, e, idx)) = slot.as_ref() {
-            if *g == gen && *e == entries {
+        if let Some((g, idx)) = slot.as_ref() {
+            if *g == gen {
                 return Arc::clone(idx);
             }
         }
-        *slot = Some((gen, entries, Arc::clone(&built)));
+        *slot = Some((gen, Arc::clone(&built)));
         built
     }
 
@@ -294,6 +345,16 @@ pub struct Applier {
     /// is what prunes its whole subtree for a whole-mount backend that cannot
     /// decline the watch.
     excludes: crate::excludes::Excludes,
+    /// Mount points the crawl must not descend into (§4): each filesystem is
+    /// indexed through its own root, so a crawl never crosses into another
+    /// mount — no double indexing of nested mounts, no leakage of
+    /// never-indexed mounts (network, pseudo-FS) via a parent root. The
+    /// mountpoint directory entry itself is still inserted; only the descend
+    /// (watch + enumerate) is skipped. Refreshed from mountinfo on the
+    /// daemon's mount-watchdog tick; empty (notably under ModelFs/fake
+    /// filesystems and on platforms without mountinfo) means no boundaries —
+    /// the historical crossing behaviour.
+    mountpoints: std::collections::HashSet<Vec<u8>>,
     /// How many names were dropped by [`Self::excludes`]. For `ff stats`.
     pub excluded_names: u64,
     /// Whether to capture ownership as entries are created. Populated only in
@@ -301,6 +362,30 @@ pub struct Applier {
     /// mode should not pay. The records themselves live in
     /// [`Shared::ownership`] so the query path can read them.
     track_ownership: bool,
+}
+
+/// Max wall time one drain call spends before yielding to the rest of the
+/// tick (control, watch forwarding, health flags). A count budget cannot bound
+/// latency: with linear-scan lookups over a large index a single work item can
+/// take seconds, so N items is unbounded minutes of starvation. FIFO order is
+/// preserved; only the rate changes.
+const DRAIN_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// One entry's worth of trigram-postings maintenance, snapshotted under the
+/// index guard and published after it is released (see the lock-discipline
+/// note on [`Shared::trigram`]). Owned bytes throughout: nothing borrows the
+/// index past the guard's lifetime.
+#[cfg(feature = "trigram")]
+enum TrigDelta {
+    Add {
+        id: u32,
+        name: Vec<u8>,
+        is_root: bool,
+    },
+    Del {
+        id: u32,
+        name: Vec<u8>,
+    },
 }
 
 impl Applier {
@@ -315,10 +400,26 @@ impl Applier {
             let roots = shared.roots.read().unwrap();
             roots.iter().map(|r| root_dir_id(&ix, r)).collect()
         };
+        let mut pending = Pending::new(100_000);
+        // The collapse oracle: parent ids straight from the live index.
+        // `RwLock` + `Arc` because `ParentOf` is `Fn` (shared, not exclusive)
+        // and `Applier::new` only has `shared` by move — the closure clones it.
+        let ix_for_parents = shared.clone();
+        pending.set_parent_of(std::sync::Arc::new(move |id: u32| {
+            let ix = ix_for_parents.index.read().unwrap();
+            let e = ix.entry(id)?;
+            // Root dirs are the ceiling: report them as their own parent so
+            // collapse lands on them rather than climbing past into ROOT_ID.
+            if e.flags().is_root_dir() {
+                return Some(id);
+            }
+            let p = e.parent;
+            (p != ROOT_ID && p != id).then_some(p)
+        }));
         Applier {
             shared,
             store,
-            pending: Pending::new(100_000),
+            pending,
             fs,
             sync,
             dir_paths: HashMap::new(),
@@ -331,6 +432,7 @@ impl Applier {
             watch_requested: std::collections::HashSet::new(),
             excludes: crate::excludes::Excludes::new(),
             excluded_names: 0,
+            mountpoints: std::collections::HashSet::new(),
             track_ownership: false,
         }
     }
@@ -347,6 +449,31 @@ impl Applier {
 
     pub fn excludes(&self) -> &crate::excludes::Excludes {
         &self.excludes
+    }
+
+    /// Install the mount-boundary set (§4). Called before the initial crawl
+    /// and refreshed as mounts change, so a crawl never crosses into another
+    /// filesystem. Backends must likewise not deliver events for unindexed
+    /// mounts (inotify watches and fanotify marks only ever cover descended
+    /// roots, so this holds by construction).
+    pub fn set_mountpoints(&mut self, mps: std::collections::HashSet<Vec<u8>>) {
+        self.mountpoints = mps;
+    }
+
+    /// Is `abs` a mount point (and therefore not to be descended into)?
+    /// Exact byte match against the mountinfo spellings; mountinfo paths are
+    /// unescaped and slash-stripped by the parser helpers, and crawl-built
+    /// paths never carry a trailing slash.
+    fn is_mountpoint(&self, abs: &std::path::Path) -> bool {
+        self.mountpoints.contains(&os_str_bytes(abs.as_os_str()))
+    }
+
+    /// May `dir` (at `abs`) be enumerated? A mount point that is not itself a
+    /// root is another filesystem's business: the directory itself is
+    /// recorded, but it is never descended into, watched, or queued — its own
+    /// root (if indexed at all) covers it.
+    fn may_descend(&self, dir: u32, abs: &std::path::Path) -> bool {
+        self.root_dir_ids.contains(&dir) || !self.is_mountpoint(abs)
     }
 
     /// Turn on per-entry ownership capture (system mode). Once on, every entry
@@ -448,7 +575,9 @@ impl Applier {
         }
         let parent_path = self.abs_path_for(parent)?;
         let mut p = parent_path;
-        p.push(std::ffi::OsString::from(String::from_utf8_lossy(&name).into_owned()));
+        p.push(std::ffi::OsString::from(
+            String::from_utf8_lossy(&name).into_owned(),
+        ));
         self.dir_paths.insert(id, p.clone());
         Some(p)
     }
@@ -471,12 +600,104 @@ impl Applier {
         // bug: a file discovered by a *rescan* had no record, and the filter —
         // which fails closed — then hid a world-readable file from everyone but
         // root. One funnel means a fourth creation path cannot forget.
-        if let Record::Add { id, parent, name, .. } = &rec {
+        if let Record::Add {
+            id, parent, name, ..
+        } = &rec
+        {
             self.note_ownership_for(*id, *parent, name);
         }
         // Apply to the live index regardless of journaling.
-        let mut ix = self.shared.index.write().unwrap();
-        apply_record(&mut ix, &rec);
+        // §17 v2 incremental maintenance: keep the cached trigram postings
+        // current, so the cache stays keyed on generation alone and a churning
+        // index never pays a full rebuild. Done here — the single funnel every
+        // mutation passes through — so no creation path can forget (the same
+        // reason ownership is noted here).
+        //
+        // Lock order matters more than locality: the query path holds the
+        // postings read guard across its whole intersection while taking the
+        // index read lock (`handle_query`), so taking the postings write guard
+        // while holding the index write guard here is an ABBA deadlock — a
+        // query intersecting over millions of entries overlaps this window
+        // with certainty, wedging the applier, the querier and every later
+        // reader (observed live: frozen CPU, handlers piling up, stats
+        // silent). The snapshot-then-publish below keeps the funnel but drops
+        // the index guard first: the slot check re-validates the generation
+        // after re-locking, so a bump in between only skips one incremental
+        // update (the next query rebuilds), never corrupts.
+        #[cfg(feature = "trigram")]
+        let trigram_delta: Option<(u64, TrigDelta)> = {
+            use crate::journal::Record as Rec;
+            // Read-only: the mutation happens in the next block. A read guard
+            // also keeps query readers flowing past the snapshot.
+            let ix = self.shared.index.read().unwrap();
+            let delta = match &rec {
+                Rec::Add {
+                    id, name, flags, ..
+                } => {
+                    let is_root = crate::index::EntryFlags(*flags).is_root_dir();
+                    Some(TrigDelta::Add {
+                        id: *id,
+                        name: name.clone(),
+                        is_root,
+                    })
+                }
+                Rec::Del { id } => {
+                    // Best-effort prune (correctness never depends on it: the
+                    // matcher filters tombstones). The name bytes survive
+                    // tombstoning, so copy the name it had while guarded.
+                    if (*id as usize) < ix.len() {
+                        Some(TrigDelta::Del {
+                            id: *id,
+                            name: ix.name(*id).to_vec(),
+                        })
+                    } else {
+                        None
+                    }
+                }
+                // A rename keeps the id but changes the name: the old
+                // postings go stale-but-safe (filtered by the authoritative
+                // matcher), and the new name's trigrams must be added or the
+                // entry becomes invisible to the accelerator.
+                Rec::Move { id, new_name, .. } => Some(TrigDelta::Add {
+                    id: *id,
+                    name: new_name.clone(),
+                    is_root: false,
+                }),
+                Rec::Fence | Rec::Mark { .. } => None,
+            };
+            // A generation bump (whole-root rescan / compaction, which may
+            // remap ids) invalidates; the next query rebuilds. Within a
+            // generation, ids only ascend, so postings only gain.
+            delta.map(|d| (ix.generation(), d))
+        };
+        {
+            let mut ix = self.shared.index.write().unwrap();
+            apply_record(&mut ix, &rec);
+        }
+        #[cfg(feature = "trigram")]
+        if let Some((gen, delta)) = trigram_delta {
+            // Index guard already released: slot → postings nests with
+            // nothing else held, so no lock order can invert.
+            let slot = self.shared.trigram.read().unwrap();
+            if let Some((g, idx)) = slot.as_ref() {
+                if *g == gen {
+                    let mut tg = idx.write().unwrap();
+                    match delta {
+                        TrigDelta::Add { id, name, is_root } => {
+                            tg.index_entry(id, &name, is_root);
+                        }
+                        TrigDelta::Del { id, name } => {
+                            tg.remove_entry(id, &name);
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "trigram"))]
+        {
+            let mut ix = self.shared.index.write().unwrap();
+            apply_record(&mut ix, &rec);
+        }
     }
 
     /// Record ownership for a newly inserted entry, resolving its absolute path
@@ -493,7 +714,9 @@ impl Applier {
         let Some(parent_path) = self.dir_paths.get(&parent).cloned() else {
             return;
         };
-        let abs = parent_path.join(std::ffi::OsString::from(String::from_utf8_lossy(name).into_owned()));
+        let abs = parent_path.join(std::ffi::OsString::from(
+            String::from_utf8_lossy(name).into_owned(),
+        ));
         if let Ok(Some(a)) = self.fs.attr(&abs) {
             // The query path reads this table; the applier is its only writer.
             self.shared.ownership.write().unwrap().set(id, a);
@@ -503,8 +726,15 @@ impl Applier {
     /// Apply one event.
     fn apply_event(&mut self, ev: FsEvent) {
         match ev {
-            FsEvent::Upsert { parent, name, is_dir } => {
+            FsEvent::Upsert {
+                parent,
+                name,
+                is_dir,
+            } => {
                 self.apply_upsert(parent.0, name, is_dir);
+            }
+            FsEvent::RefreshExec { parent, name } => {
+                self.apply_refresh_exec(parent.0, &name);
             }
             FsEvent::Remove { parent, name } => {
                 let ix = self.shared.index.write().unwrap();
@@ -551,7 +781,6 @@ impl Applier {
             return;
         }
         // Use the hint to pick flags; the crawler will correct type later.
-        let flags = EntryFlags::EMPTY.with_dir(is_dir_hint);
         // Make sure the parent's path is cached before the entry is emitted, so
         // `note_ownership_for` can resolve this file's absolute path. This takes
         // the index read lock, so it must happen before we take the write lock.
@@ -561,6 +790,24 @@ impl Applier {
             return;
         }
         let _ = self.abs_path_for(parent);
+        // The exec bit is statted now rather than defaulting false: a fresh
+        // file that arrives via event (not crawl) must carry its real bit
+        // from birth, not only after the next rescan. The parent path was
+        // just cached above, so this is one `stat`, not a walk.
+        let exec_hint = self
+            .dir_paths
+            .get(&parent)
+            .map(|p| {
+                is_executable(
+                    &p.join(std::ffi::OsString::from(
+                        String::from_utf8_lossy(&name).into_owned(),
+                    )),
+                    is_dir_hint,
+                    false,
+                )
+            })
+            .unwrap_or(false);
+        let flags = EntryFlags::EMPTY.with_dir(is_dir_hint).with_exec(exec_hint);
         let mut ix = self.shared.index.write().unwrap();
         let lookup = ix.lookup(parent, &name);
         let (created_id, existing_id) = match lookup {
@@ -580,7 +827,12 @@ impl Applier {
         };
         drop(ix);
         if let Some(id) = created_id {
-            let rec = Record::Add { id, parent, name: name.clone(), flags: flags.0 };
+            let rec = Record::Add {
+                id,
+                parent,
+                name: name.clone(),
+                flags: flags.0,
+            };
             self.emit(rec);
         } else if let Some(id) = existing_id {
             // An upsert for an entry we already have. The name is unchanged, but
@@ -609,8 +861,9 @@ impl Applier {
             };
             if let Some(id) = existing {
                 if let Some(abs) = self.abs_path_for(parent) {
-                    let child_abs =
-                        abs.join(std::ffi::OsString::from(String::from_utf8_lossy(&name).into_owned()));
+                    let child_abs = abs.join(std::ffi::OsString::from(
+                        String::from_utf8_lossy(&name).into_owned(),
+                    ));
                     self.dir_paths.insert(id, child_abs.clone());
                     self.record_watch_request(id, child_abs);
                 }
@@ -629,6 +882,52 @@ impl Applier {
         };
         for id in ids.into_iter().rev() {
             self.emit(Record::Del { id });
+        }
+    }
+
+    /// Re-read one entry's exec bit after a metadata change (`chmod`), correcting
+    /// the flag in place.
+    ///
+    /// Deliberately journal-free: the bit is derived state, re-derivable from the
+    /// filesystem on every crawl and rescan diff. A replayed journal that
+    /// re-applies Add records rebuilds the same flags from the crawl path, so a
+    /// `RefreshExec` record would be redundant — and worse, it would pin a stale
+    /// bit across a restart instead of re-reading the live one. The rescan diff
+    /// (which corrects the same flag on survivors) is the durability story.
+    fn apply_refresh_exec(&mut self, parent: u32, name: &[u8]) {
+        if crate::util::is_cookie(name) {
+            return;
+        }
+        let id = {
+            let ix = self.shared.index.read().unwrap();
+            match ix.lookup(parent, name) {
+                Some(id) => id,
+                None => return, // not indexed: nothing to correct
+            }
+        };
+        let (is_dir, cur_exec) = {
+            let ix = self.shared.index.read().unwrap();
+            match ix.entry(id) {
+                Some(e) => (e.flags().is_dir(), e.flags().is_exec()),
+                None => return,
+            }
+        };
+        if is_dir {
+            return; // directories are never executable
+        }
+        let abs = match self.abs_path_for(parent) {
+            Some(p) => p.join(std::ffi::OsString::from(
+                String::from_utf8_lossy(name).into_owned(),
+            )),
+            None => return,
+        };
+        let fresh = is_executable(&abs, false, false);
+        if fresh != cur_exec {
+            let mut ix = self.shared.index.write().unwrap();
+            if let Some(e) = ix.entry(id) {
+                let nf = e.flags().with_exec(fresh);
+                ix.entry_mut(id).flags = nf.0;
+            }
         }
     }
 
@@ -658,13 +957,8 @@ impl Applier {
     /// Add any children of `dir` not yet indexed. Used after an upsert of a new
     /// directory, and by the initial crawl's work loop.
     fn crawl_dir(&mut self, dir: u32) {
-        let Some(abs) = self.abs_path_for(dir) else { return };
-        let items = match self.fs.read_dir(&abs) {
-            Ok(v) => v,
-            Err(_) => {
-                self.shared.health.write().unwrap().read_dir_errors += 1;
-                return;
-            }
+        let Some(abs) = self.abs_path_for(dir) else {
+            return;
         };
         // Record this dir's own path first, so `note_ownership_for` can resolve a
         // child's absolute path the moment it is emitted — and record the
@@ -674,6 +968,20 @@ impl Applier {
         // record at all unless the walk that descends into it records it.
         self.dir_paths.insert(dir, abs.clone());
         self.note_ownership(dir, &abs);
+        // Mount boundary (§4): another filesystem is never ours to enumerate —
+        // its own root covers it, or it is not indexed at all. The directory
+        // itself stays recorded (see above); only the descend stops here. This
+        // runs before the listing so a huge foreign mount is never even read.
+        if !self.may_descend(dir, &abs) {
+            return;
+        }
+        let items = match self.fs.read_dir(&abs) {
+            Ok(v) => v,
+            Err(_) => {
+                self.shared.health.write().unwrap().read_dir_errors += 1;
+                return;
+            }
+        };
         let mut new_dirs = Vec::new();
         let mut known_dirs = Vec::new();
         for it in items {
@@ -694,9 +1002,11 @@ impl Applier {
                 continue;
             }
             if self.excludes.excludes_path(
-                abs.join(std::ffi::OsString::from(String::from_utf8_lossy(&it.name).into_owned()))
-                    .to_string_lossy()
-                    .as_bytes(),
+                abs.join(std::ffi::OsString::from(
+                    String::from_utf8_lossy(&it.name).into_owned(),
+                ))
+                .to_string_lossy()
+                .as_bytes(),
             ) {
                 self.excluded_names += 1;
                 continue;
@@ -706,20 +1016,32 @@ impl Applier {
                 ix.lookup(dir, &it.name)
             };
             if exists.is_none() {
-                let flags = EntryFlags::EMPTY.with_dir(it.is_dir).with_symlink(it.is_symlink);
+                let flags = EntryFlags::EMPTY
+                    .with_dir(it.is_dir)
+                    .with_symlink(it.is_symlink)
+                    .with_exec(it.is_exec);
                 let child_abs = abs.join(std::ffi::OsString::from(
                     String::from_utf8_lossy(&it.name).into_owned(),
                 ));
                 let mut ix = self.shared.index.write().unwrap();
                 let id = ix.insert(dir, &it.name, flags);
                 drop(ix);
-                self.emit(Record::Add { id, parent: dir, name: it.name.clone(), flags: flags.0 });
+                self.emit(Record::Add {
+                    id,
+                    parent: dir,
+                    name: it.name.clone(),
+                    flags: flags.0,
+                });
                 if it.is_dir && !it.is_symlink {
                     // Watch before enumerating: install a watch, then queue the
-                    // crawl of the new directory (§5 race rule).
-                    self.dir_paths.insert(id, child_abs.clone());
-                    self.record_watch_request(id, child_abs);
-                    new_dirs.push(id);
+                    // crawl of the new directory (§5 race rule) — unless a
+                    // mount boundary says this subtree is not ours (§4): the
+                    // entry stays as a leaf, covered by its own root if at all.
+                    if self.may_descend(id, &child_abs) {
+                        self.dir_paths.insert(id, child_abs.clone());
+                        self.record_watch_request(id, child_abs);
+                        new_dirs.push(id);
+                    }
                 }
             } else if it.is_dir && !it.is_symlink {
                 // A directory we already know: make sure its path is cached so
@@ -734,7 +1056,22 @@ impl Applier {
                 // directory already scheduled is not walked twice.
                 if let Some(id) = exists {
                     let _ = self.abs_path_for(id);
-                    known_dirs.push(id);
+                    // ...but a mount boundary still stops the descend: another
+                    // filesystem is covered by its own root, if at all.
+                    let child_abs = abs.join(std::ffi::OsString::from(
+                        String::from_utf8_lossy(&it.name).into_owned(),
+                    ));
+                    if self.may_descend(id, &child_abs) {
+                        // A restart must re-request the watch, not just the
+                        // walk: after a snapshot/journal replay every directory
+                        // is "known", so without this no per-dir watch is ever
+                        // installed and the daemon goes blind to creates until
+                        // a rescan. The request dedupes (`watch_requested`), so
+                        // a directory already watched costs one HashSet probe.
+                        self.dir_paths.insert(id, child_abs.clone());
+                        self.record_watch_request(id, child_abs);
+                        known_dirs.push(id);
+                    }
                 }
             }
             // An entry that already exists still needs its ownership recorded, and
@@ -811,6 +1148,12 @@ impl Applier {
         // root dir in particular has none, and the whole tree would go dark.
         self.dir_paths.insert(dir, abs.to_path_buf());
         self.note_ownership(dir, abs);
+        // Mount boundary (§4): like `crawl_dir`, never enumerate another
+        // filesystem — unless this dir is itself a root, whose mount *is* the
+        // assignment.
+        if !self.may_descend(dir, abs) {
+            return;
+        }
         // 1. Snapshot the index's children of `dir`.
         let indexed: HashMap<Vec<u8>, u32> = {
             let ix = self.shared.index.read().unwrap();
@@ -846,19 +1189,32 @@ impl Applier {
         for (name, it) in &real_names {
             match indexed.get(name) {
                 None => {
-                    let flags = EntryFlags::EMPTY.with_dir(it.is_dir).with_symlink(it.is_symlink);
+                    let flags = EntryFlags::EMPTY
+                        .with_dir(it.is_dir)
+                        .with_symlink(it.is_symlink)
+                        .with_exec(it.is_exec);
                     let id = {
                         let mut ix = self.shared.index.write().unwrap();
                         ix.insert(dir, name, flags)
                     };
-                    self.emit(Record::Add { id, parent: dir, name: name.clone(), flags: flags.0 });
+                    self.emit(Record::Add {
+                        id,
+                        parent: dir,
+                        name: name.clone(),
+                        flags: flags.0,
+                    });
                     if it.is_dir && !it.is_symlink {
                         let child_abs = abs.join(std::ffi::OsString::from(
                             String::from_utf8_lossy(name).into_owned(),
                         ));
-                        self.dir_paths.insert(id, child_abs.clone());
-                        self.record_watch_request(id, child_abs);
-                        self.pending.enqueue_crawl(id);
+                        // Mount boundary: record the mountpoint, never descend.
+                        if self.may_descend(id, &child_abs) {
+                            self.dir_paths.insert(id, child_abs.clone());
+                            self.record_watch_request(id, child_abs);
+                            self.pending.enqueue_crawl(id);
+                        } else {
+                            self.dir_paths.insert(id, child_abs);
+                        }
                     }
                 }
                 Some(id) => {
@@ -871,6 +1227,15 @@ impl Applier {
                             let nf = cur.with_dir(it.is_dir);
                             self.shared.index.write().unwrap().entry_mut(*id).flags = nf.0;
                         }
+                        // A survivor's exec bit can have changed even though its
+                        // name did not (`chmod +x` between rescans): refresh it
+                        // in place — no journal record, since flags-only edits
+                        // ride the existing type-fix path. Without this the
+                        // rescan diff converges names but not permission bits.
+                        if cur.is_exec() != it.is_exec {
+                            let nf = cur.with_exec(it.is_exec);
+                            self.shared.index.write().unwrap().entry_mut(*id).flags = nf.0;
+                        }
                         // A survivor's ownership can have changed even though its
                         // name did not (a chown or a replaced file), and after a
                         // restart the record may be missing entirely. Either way a
@@ -880,10 +1245,31 @@ impl Applier {
                             String::from_utf8_lossy(name).into_owned(),
                         ));
                         self.note_ownership(*id, &survivor_abs);
-                        // Recurse into surviving directories.
+                        // Recurse into surviving directories — but never across a
+                        // mount boundary: beneath one only legacy leakage can
+                        // exist (nothing current is ever inserted there), so
+                        // drop it and let the mountpoint stand as a leaf. This
+                        // is what heals pre-boundary stores on their next rescan.
                         if it.is_dir && !it.is_symlink {
                             self.dir_paths.insert(*id, survivor_abs.clone());
-                            self.diff_subtree(*id, &survivor_abs);
+                            if self.may_descend(*id, &survivor_abs) {
+                                // As in `crawl_dir`'s known-dir branch: a
+                                // rescan that only re-walks without
+                                // re-requesting the watch leaves restarted
+                                // subtrees unwatched (every dir here is a
+                                // survivor, never "new"). Dedupes via
+                                // `watch_requested`.
+                                self.record_watch_request(*id, survivor_abs.clone());
+                                self.diff_subtree(*id, &survivor_abs);
+                            } else {
+                                let stale: Vec<u32> = {
+                                    let ix = self.shared.index.read().unwrap();
+                                    descendants(&ix, *id)
+                                };
+                                for dead in stale.into_iter().rev() {
+                                    self.emit(Record::Del { id: dead });
+                                }
+                            }
                         }
                     }
                 }
@@ -916,7 +1302,19 @@ impl Applier {
     // -------------------------------------------------------------- the loop
 
     /// Apply everything currently pending. Returns the number of items applied.
+    ///
+    /// Work items are paced: at most [] per call. Events
+    /// always fully drain first (they are the latency-sensitive live updates,
+    /// and a flood escalates to a rescan via queue capacity anyway), but an
+    /// unbounded work loop starves everything else a tick does — control
+    /// requests (rescan/cookies), watch-request forwarding, and the
+    ///  clear. Observed live: a post-replay crawl of ~760k
+    /// entries (each directory paying linear-scan lookups) held a single
+    /// drain call for so long that  never ran, no per-dir watch
+    /// was ever installed, and every sync went weak. Pacing keeps the
+    /// FIFO order (only the *rate* changes), so the §7/§8 guarantees hold.
     pub fn drain(&mut self) -> usize {
+        let t0 = std::time::Instant::now();
         let mut n = 0;
         loop {
             let mut progressed = false;
@@ -924,6 +1322,9 @@ impl Applier {
                 self.apply_event(ev);
                 n += 1;
                 progressed = true;
+            }
+            if t0.elapsed() >= DRAIN_TIME_BUDGET {
+                break;
             }
             if let Some(w) = self.pending.pop_work() {
                 let progressed_this = self.run_work(w);
@@ -992,7 +1393,10 @@ impl Applier {
     /// equals `path`. Used by tests that emulate the watcher's `wd -> dir id`
     /// lookup; `None` if the directory is not known.
     pub fn dir_id_for_path(&self, path: &Path) -> Option<u32> {
-        self.dir_paths.iter().find(|(_, p)| p.as_path() == path).map(|(id, _)| *id)
+        self.dir_paths
+            .iter()
+            .find(|(_, p)| p.as_path() == path)
+            .map(|(id, _)| *id)
     }
 
     /// A watch could not be installed for `dir` (e.g. inotify watch-limit
@@ -1089,6 +1493,15 @@ impl Applier {
             let mut own = self.shared.ownership.write().unwrap();
             own.remap(&id_map);
         }
+        // The root-dir table is keyed by id too: without this every
+        // watch/crawl/rescan/drop targets the wrong dir after a compaction.
+        // A remap to 0 (the entry died) means unresolvable, exactly like a
+        // missing root entry — callers already treat `ROOT_ID` that way.
+        for rid in self.root_dir_ids.iter_mut() {
+            if (*rid as usize) < id_map.len() {
+                *rid = id_map[*rid as usize];
+            }
+        }
         self.shared.generation.store(new_gen, Ordering::Release);
         let (snap_index, snap_roots) = {
             let ix = self.shared.index.read().unwrap();
@@ -1113,11 +1526,18 @@ impl Applier {
 
 /// Find the root-dir entry id for a root path by looking up the root's own
 /// stored path against the index — roots are keyed by a synthetic entry whose
-/// name is the final component of the path and parent is ROOT_ID.
+/// name is the full path and parent is ROOT_ID.
 pub fn root_dir_id(ix: &Index, root: &Root) -> u32 {
-    // Roots are inserted at crawl time under `root_entry_name`.
-    match crate::roots::root_entry_name(&root.path) {
-        Some(name) => ix.lookup(ROOT_ID, &name).unwrap_or(ROOT_ID),
+    // Roots are inserted at crawl time under `root_entry_name` (the full
+    // path, which cannot collide). Stores written before path qualification
+    // used the bare basename: fall back to that so they resolve with no
+    // migration — and the daemon only inserts when *neither* resolves, so a
+    // legacy entry is adopted rather than duplicated.
+    if let Some(id) = ix.lookup(ROOT_ID, &crate::roots::root_entry_name(&root.path)) {
+        return id;
+    }
+    match crate::roots::legacy_root_entry_name(&root.path) {
+        Some(old) => ix.lookup(ROOT_ID, &old).unwrap_or(ROOT_ID),
         None => ROOT_ID,
     }
 }
@@ -1142,12 +1562,240 @@ mod tests {
     #[test]
     fn descendants_walk() {
         let mut ix = Index::new();
-        let r = ix.insert(ROOT_ID, b"r", EntryFlags::EMPTY.with_dir(true).with_root_dir(true));
+        let r = ix.insert(
+            ROOT_ID,
+            b"r",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
         let a = ix.insert(r, b"a", EntryFlags::EMPTY.with_dir(true));
         let b = ix.insert(r, b"b", EntryFlags::EMPTY.with_dir(true));
         ix.insert(a, b"x", EntryFlags::EMPTY);
         ix.insert(b, b"y", EntryFlags::EMPTY);
         let d = descendants(&ix, r);
         assert_eq!(d.len(), 4);
+    }
+
+    #[test]
+    fn compaction_remaps_root_dir_ids() {
+        use crate::modelfs::{model_root, ModelFs, Node};
+        use crate::persist::Store;
+        use crate::roots::Root;
+        use crate::sync::SyncRegistry;
+        use std::sync::Arc;
+
+        // The second root arrives *after* files exist (a newly configured
+        // mount), so its entry sits above a tombstone: compaction renumbers
+        // it down, and without the remap the root table would keep pointing
+        // at whatever moved into the old slot.
+        let model = ModelFs::with([("gone.rs", Node::File), ("sub", Node::dir(&["kept.rs"]))]);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state")).unwrap();
+        let mut ix = Index::new();
+        let r0 = ix.insert(
+            ROOT_ID,
+            b"/model",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        let roots = vec![Root::new(0, model_root())];
+        let shared = Shared::new(ix, roots);
+        let mut a = Applier::new(
+            shared.clone(),
+            store,
+            Arc::new(model.clone()),
+            SyncRegistry::new(),
+        );
+        a.rebuild_dir_cache();
+        a.pending_mut().enqueue_crawl(r0);
+        a.drain();
+
+        let r1 = shared.index.write().unwrap().insert(
+            ROOT_ID,
+            b"/model/sub",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        shared
+            .roots
+            .write()
+            .unwrap()
+            .push(Root::new(1, model_root().join("sub")));
+        a.rebuild_dir_cache();
+        assert_eq!(a.root_dir_ids, vec![r0, r1]);
+        a.pending_mut().enqueue_crawl(r1);
+        a.drain();
+
+        model.remove(b"gone.rs");
+        a.pending_mut()
+            .enqueue_rescan(r0, crate::event::RescanCause::Manual);
+        a.drain();
+        assert!(a.compact_now());
+
+        // The table must track the renumbering, matching a fresh resolution.
+        let ix = shared.index.read().unwrap();
+        let roots = shared.roots.read().unwrap();
+        let expect: Vec<u32> = roots.iter().map(|r| root_dir_id(&ix, r)).collect();
+        assert_ne!(r1, expect[1], "the test must actually move the second root");
+        assert_eq!(
+            a.root_dir_ids, expect,
+            "compaction must remap the root table"
+        );
+        // ...and the second root still names a live root-dir entry.
+        let rid1 = a.root_dir_ids[1];
+        assert_ne!(rid1, ROOT_ID);
+        assert!(ix.is_alive(rid1) && ix.entry(rid1).unwrap().flags().is_root_dir());
+    }
+
+    /// The trigram cache survives churn without rebuilding, and stays correct.
+    ///
+    /// Drives the real mutation funnel (`apply_event`, which funnels through
+    /// `emit`) with interleaved inserts and deletes, then asserts:
+    /// (a) the cache key is still the same generation (no rebuild happened —
+    /// exactly the disease this fixes: every insert used to invalidate);
+    /// (b) an accelerated query finds a file created *after* the cache was
+    /// built (incremental postings, not a stale snapshot);
+    /// (c) a deleted file is gone from accelerated results (no phantoms);
+    /// (d) accelerated and linear results agree on the whole corpus.
+    #[test]
+    fn trigram_cache_survives_churn_without_rebuilding() {
+        use crate::event::{DirKey, FsEvent};
+        use crate::modelfs::{model_root, ModelFs, Node};
+        use crate::persist::Store;
+        use crate::query::{self, Query};
+        use crate::roots::Root;
+        use crate::sync::SyncRegistry;
+        use std::sync::Arc;
+
+        let model = ModelFs::with([("seed_alpha.rs", Node::File)]);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state")).unwrap();
+        let mut ix = Index::new();
+        let r0 = ix.insert(
+            ROOT_ID,
+            b"/model",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        let shared = Shared::new(ix, vec![Root::new(0, model_root())]);
+        let mut a = Applier::new(
+            shared.clone(),
+            store,
+            Arc::new(model.clone()),
+            SyncRegistry::new(),
+        );
+        a.rebuild_dir_cache();
+        a.pending_mut().enqueue_crawl(r0);
+        a.drain();
+
+        // Build the accelerator once, over the crawled index.
+        let first = shared.trigram_index();
+        let gen = shared.index.read().unwrap().generation();
+        let rp = vec![(r0, b"/model".to_vec())];
+
+        // Churn: 50 inserts + 20 deletes through the real event funnel.
+        for i in 0..50 {
+            let name = format!("churn_file_{i:03}_beta.rs");
+            a.apply_event(FsEvent::Upsert {
+                parent: DirKey(r0),
+                name: name.into_bytes(),
+                is_dir: false,
+            });
+        }
+        for i in (0..50).step_by(5) {
+            // Delete every 5th (10 files); plus the seed file.
+            let name = format!("churn_file_{i:03}_beta.rs");
+            a.apply_event(FsEvent::Remove {
+                parent: DirKey(r0),
+                name: name.into_bytes(),
+            });
+        }
+        a.apply_event(FsEvent::Remove {
+            parent: DirKey(r0),
+            name: b"seed_alpha.rs".to_vec(),
+        });
+
+        // (a) same generation, same cache object: no rebuild.
+        let second = shared.trigram_index();
+        assert_eq!(
+            shared.index.read().unwrap().generation(),
+            gen,
+            "test must not bump generation (that path rebuilds by design)"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "cache must be the same object after churn: a rebuild happened"
+        );
+        // Indexed count grew by the net inserts: 1 seed + 50 churned files
+        // were built over... actually the build saw seed + crawled entries;
+        // what matters is the delta: +50 inserts, -11 removes (10 churned +
+        // the seed). Recompute from the live index instead of hardcoding.
+        // (`live_count` includes the root dir, which the accelerator never
+        // indexes — hence minus one.)
+        let live_nonroot = shared
+            .index
+            .read()
+            .unwrap()
+            .iter_live()
+            .filter(|(_, e)| !e.flags().is_root_dir())
+            .count() as u64;
+        assert_eq!(
+            second.read().unwrap().indexed_entries(),
+            live_nonroot,
+            "incremental indexed count must track the live non-root index"
+        );
+
+        // (b) a file created after the cache build is found accelerated.
+        let q = Query::compile("churn_file_042_beta").unwrap();
+        let accel = query::execute_with_trigram(
+            &shared.index.read().unwrap(),
+            &rp,
+            &q,
+            0,
+            false,
+            Some(&second.read().unwrap()),
+        );
+        assert_eq!(
+            accel.total, 1,
+            "incrementally-indexed file must be a candidate"
+        );
+        assert!(
+            accel.hits[0]
+                .path
+                .ends_with(b"churn_file_042_beta.rs".as_slice()),
+            "wrong hit: {:?}",
+            String::from_utf8_lossy(&accel.hits[0].path)
+        );
+
+        // (c) deleted files are gone (no phantoms from pruned-or-stale postings).
+        for raw in ["churn_file_005_beta", "seed_alpha"] {
+            let q = Query::compile(raw).unwrap();
+            let accel = query::execute_with_trigram(
+                &shared.index.read().unwrap(),
+                &rp,
+                &q,
+                0,
+                false,
+                Some(&second.read().unwrap()),
+            );
+            assert_eq!(accel.total, 0, "q={raw:?}: deleted file must not match");
+        }
+
+        // (d) full-corpus agreement between accelerated and linear.
+        for raw in ["churn", "beta", "rs", "alpha", "file_01", "ext:rs", "main"] {
+            let q = Query::compile(raw).unwrap();
+            let plain = query::execute(&shared.index.read().unwrap(), &rp, &q, 0, false);
+            let accel = query::execute_with_trigram(
+                &shared.index.read().unwrap(),
+                &rp,
+                &q,
+                0,
+                false,
+                Some(&second.read().unwrap()),
+            );
+            assert_eq!(
+                plain.total, accel.total,
+                "q={raw:?}: total differs after churn"
+            );
+            let p: Vec<u32> = plain.hits.iter().map(|h| h.id).collect();
+            let x: Vec<u32> = accel.hits.iter().map(|h| h.id).collect();
+            assert_eq!(p, x, "q={raw:?}: rows differ after churn");
+        }
     }
 }

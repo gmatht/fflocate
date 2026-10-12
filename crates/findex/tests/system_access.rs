@@ -32,10 +32,18 @@ use findex::server::{handle_request, ServerCtx};
 use findex::sync::SyncRegistry;
 
 fn file(mode: u32, uid: u32, gid: u32) -> Attr {
-    Attr { uid, gid, mode: 0o100000 | mode }
+    Attr {
+        uid,
+        gid,
+        mode: 0o100000 | mode,
+    }
 }
 fn dir(mode: u32, uid: u32, gid: u32) -> Attr {
-    Attr { uid, gid, mode: 0o040000 | mode }
+    Attr {
+        uid,
+        gid,
+        mode: 0o040000 | mode,
+    }
 }
 
 /// A tree at `/model`:
@@ -60,7 +68,11 @@ fn fixture(caller: Option<Caller>) -> Fixture {
     let d = tempfile::tempdir().unwrap();
     let store = Store::open(&d.path().join("state")).unwrap();
     let mut ix = Index::new();
-    let root = ix.insert(ROOT_ID, b"model", EntryFlags::EMPTY.with_dir(true).with_root_dir(true));
+    let root = ix.insert(
+        ROOT_ID,
+        b"model",
+        EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+    );
     let public = ix.insert(root, b"public", EntryFlags::EMPTY.with_dir(true));
     let private = ix.insert(root, b"private", EntryFlags::EMPTY.with_dir(true));
     let readable = ix.insert(public, b"readable.txt", EntryFlags::EMPTY);
@@ -73,7 +85,12 @@ fn fixture(caller: Option<Caller>) -> Fixture {
     let mut r = Root::new(0, model_root());
     r.caps.writable = true;
     let shared = Shared::new(ix, vec![r]);
-    let applier = Applier::new(shared.clone(), store, Arc::new(ModelFs::new()), SyncRegistry::new());
+    let applier = Applier::new(
+        shared.clone(),
+        store,
+        Arc::new(ModelFs::new()),
+        SyncRegistry::new(),
+    );
     drop(applier);
 
     // Populate ownership directly — this suite is about the filter, not the crawl.
@@ -95,7 +112,11 @@ fn fixture(caller: Option<Caller>) -> Fixture {
         control: None,
         caller,
     };
-    Fixture { ctx, _d: d, _shared: shared }
+    Fixture {
+        ctx,
+        _d: d,
+        _shared: shared,
+    }
 }
 
 fn hits(ctx: &ServerCtx, req: &Request) -> Vec<String> {
@@ -129,8 +150,14 @@ fn root_sees_everything() {
 fn stranger_sees_only_the_world_readable_subtree() {
     let f = fixture(Some(Caller::new(1000, 1000)));
     let got = hits(&f.ctx, &Request::query("", 0, false, false));
-    assert!(got.iter().any(|p| p.ends_with("/public/readable.txt")), "got {got:?}");
-    assert!(!got.iter().any(|p| p.contains("private")), "0700 dir must hide its whole subtree; got {got:?}");
+    assert!(
+        got.iter().any(|p| p.ends_with("/public/readable.txt")),
+        "got {got:?}"
+    );
+    assert!(
+        !got.iter().any(|p| p.contains("private")),
+        "0700 dir must hide its whole subtree; got {got:?}"
+    );
     assert_eq!(got.len(), 3, "public + its two files; got {got:?}");
 }
 
@@ -140,7 +167,10 @@ fn a_readable_file_inside_a_private_dir_stays_hidden() {
     // file's own mode is 0644, so a naive per-entry filter would show it.
     let f = fixture(Some(Caller::new(1000, 1000)));
     let got = hits(&f.ctx, &Request::query("world-readable", 0, false, false));
-    assert!(got.is_empty(), "a 0644 file under a 0700 dir is not readable; got {got:?}");
+    assert!(
+        got.is_empty(),
+        "a 0644 file under a 0700 dir is not readable; got {got:?}"
+    );
 }
 
 #[test]
@@ -149,7 +179,10 @@ fn count_respects_the_caller_not_root() {
     // caller cannot open — a smaller leak than a path, but a leak.
     let f = fixture(Some(Caller::new(1000, 1000)));
     assert_eq!(counted(&f.ctx, &Request::query("", 0, false, true)), 3);
-    assert_eq!(counted(&f.ctx, &Request::query("secret", 0, false, true)), 0);
+    assert_eq!(
+        counted(&f.ctx, &Request::query("secret", 0, false, true)),
+        0
+    );
     let root = fixture(Some(Caller::new(0, 0)));
     assert_eq!(counted(&root.ctx, &Request::query("", 0, false, true)), 6);
 }
@@ -176,7 +209,10 @@ fn fuzzy_path_is_filtered_too() {
         max_distance: Some(1),
     };
     let got = hits(&f.ctx, &req);
-    assert!(got.is_empty(), "fuzzy must be filtered like everything else; got {got:?}");
+    assert!(
+        got.is_empty(),
+        "fuzzy must be filtered like everything else; got {got:?}"
+    );
 }
 
 #[test]
@@ -200,7 +236,10 @@ fn expression_path_is_filtered_too() {
     };
     let got = hits(&f.ctx, &req);
     assert!(!got.iter().any(|p| p.contains("private")), "got {got:?}");
-    assert!(got.iter().any(|p| p.ends_with("/public/readable.txt")), "got {got:?}");
+    assert!(
+        got.iter().any(|p| p.ends_with("/public/readable.txt")),
+        "got {got:?}"
+    );
 }
 
 #[test]
@@ -234,7 +273,10 @@ fn group_membership_is_honoured_in_the_filter() {
     let mut c = Caller::new(5001, 9999);
     c.groups = &[77];
     assert!(own.visible_to(1, &c), "supplementary group");
-    assert!(!own.visible_to(1, &Caller::new(5001, 9999)), "no group ⇒ no read");
+    assert!(
+        !own.visible_to(1, &Caller::new(5001, 9999)),
+        "no group ⇒ no read"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -249,9 +291,9 @@ fn group_membership_is_honoured_in_the_filter() {
 /// a restart or any rescan, correct files were hidden.
 #[test]
 fn a_file_found_by_rescan_is_still_visible() {
-    use std::sync::Arc;
     use findex::applier::{Applier, RealFs};
     use findex::event::RescanCause;
+    use std::sync::Arc;
 
     let root = std::path::PathBuf::from("/tmp/findex-rescan-ownership");
     let _ = std::fs::remove_dir_all(&root);
@@ -277,7 +319,9 @@ fn a_file_found_by_rescan_is_still_visible() {
 
     // A file that appears on disk and is found by a rescan, never by an event.
     std::fs::write(root.join("rescanned.txt"), b"y").unwrap();
-    applier.pending_mut().enqueue_rescan(rid, RescanCause::Manual);
+    applier
+        .pending_mut()
+        .enqueue_rescan(rid, RescanCause::Manual);
     applier.drain();
 
     let ctx = ServerCtx {
@@ -292,7 +336,10 @@ fn a_file_found_by_rescan_is_still_visible() {
         got.iter().any(|p| p.ends_with("/rescanned.txt")),
         "a rescan-discovered world-readable file must be visible; got {got:?}"
     );
-    assert!(got.iter().any(|p| p.ends_with("/crawled.txt")), "got {got:?}");
+    assert!(
+        got.iter().any(|p| p.ends_with("/crawled.txt")),
+        "got {got:?}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -305,8 +352,8 @@ fn a_file_found_by_rescan_is_still_visible() {
 /// entry's flags for an existing id, and must refresh its attributes too.
 #[test]
 fn re_upsert_refreshes_ownership() {
-    use std::sync::Arc;
     use findex::applier::{Applier, RealFs};
+    use std::sync::Arc;
 
     let root = std::path::PathBuf::from("/tmp/findex-refresh-ownership");
     let _ = std::fs::remove_dir_all(&root);
@@ -337,10 +384,16 @@ fn re_upsert_refreshes_ownership() {
     // While it is 0600, a stranger must not see it.
     let id = {
         let ix = shared.index.read().unwrap();
-        let found = ix.iter_live().find(|(_, e)| !e.flags().is_root_dir()).map(|(id, _)| id);
+        let found = ix
+            .iter_live()
+            .find(|(_, e)| !e.flags().is_root_dir())
+            .map(|(id, _)| id);
         found.unwrap()
     };
-    assert!(!shared.ownership.read().unwrap().visible_to(id, &caller), "0600 must be hidden");
+    assert!(
+        !shared.ownership.read().unwrap().visible_to(id, &caller),
+        "0600 must be hidden"
+    );
 
     // The file is replaced, this time world-readable, under the same name. A
     // watcher reports this as an upsert for an id we already have.
@@ -369,8 +422,8 @@ fn re_upsert_refreshes_ownership() {
 /// shift, in whichever direction their neighbours' modes imply.
 #[test]
 fn ownership_survives_compaction() {
-    use std::sync::Arc;
     use findex::applier::{Applier, RealFs};
+    use std::sync::Arc;
 
     let root = std::path::PathBuf::from("/tmp/findex-compact-ownership");
     let _ = std::fs::remove_dir_all(&root);
@@ -382,9 +435,21 @@ fn ownership_survives_compaction() {
     // One world-readable and one owner-only file, at different ids.
     std::fs::write(root.join("open.txt"), b"x").unwrap();
     std::fs::write(root.join("shut.txt"), b"y").unwrap();
-    std::fs::set_permissions(root.join("open.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
-    std::fs::set_permissions(root.join("shut.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
-    std::fs::set_permissions(root.join("early.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(
+        root.join("open.txt"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        root.join("shut.txt"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        root.join("early.txt"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
     let early = root.join("early.txt");
 
     let d = tempfile::tempdir().unwrap();
@@ -441,7 +506,10 @@ fn ownership_survives_compaction() {
     // actually shift their ids. Without a tombstone ahead of them, renaming is a
     // no-op and the test proves nothing.
     std::fs::remove_file(&early).unwrap();
-    applier.push(findex::event::FsEvent::remove(findex::event::DirKey::new(rid), b"early.txt".to_vec()));
+    applier.push(findex::event::FsEvent::remove(
+        findex::event::DirKey::new(rid),
+        b"early.txt".to_vec(),
+    ));
     applier.drain();
 
     let compacted = applier.compact_now();
@@ -486,15 +554,19 @@ fn ownership_survives_compaction() {
 /// empty list is worse than one that refuses to start.
 #[test]
 fn ownership_is_backfilled_after_a_restart() {
-    use std::sync::Arc;
     use findex::applier::{Applier, RealFs};
+    use std::sync::Arc;
 
     let root = std::path::PathBuf::from("/tmp/findex-restart-ownership");
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("visible.txt"), b"x").unwrap();
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(root.join("visible.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(
+        root.join("visible.txt"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
 
     let d = tempfile::tempdir().unwrap();
     let store = findex::persist::Store::open(&d.path().join("state")).unwrap();
@@ -519,7 +591,9 @@ fn ownership_is_backfilled_after_a_restart() {
     // requirement anyway, since it must refresh *survivors*, not just new files.)
     *shared.ownership.write().unwrap() = findex::ownership::Ownership::new();
     applier.rebuild_dir_cache(); // as a fresh Daemon::start would
-    applier.pending_mut().enqueue_rescan(rid, findex::event::RescanCause::Manual);
+    applier
+        .pending_mut()
+        .enqueue_rescan(rid, findex::event::RescanCause::Manual);
     applier.drain();
 
     let ctx = ServerCtx {
@@ -550,8 +624,8 @@ fn ownership_is_backfilled_after_a_restart() {
 /// whether the crawl descends into directories it already knows about.
 #[test]
 fn a_restart_walks_into_already_known_directories() {
-    use std::sync::Arc;
     use findex::applier::{Applier, RealFs};
+    use std::sync::Arc;
 
     let root = std::path::PathBuf::from("/tmp/findex-restart-descent");
     let _ = std::fs::remove_dir_all(&root);
@@ -560,7 +634,11 @@ fn a_restart_walks_into_already_known_directories() {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::set_permissions(root.join("sub"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::set_permissions(root.join("sub/deep.txt"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(
+        root.join("sub/deep.txt"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
 
     let d = tempfile::tempdir().unwrap();
     let store = findex::persist::Store::open(&d.path().join("state")).unwrap();

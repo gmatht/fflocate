@@ -12,6 +12,22 @@
 use std::collections::VecDeque;
 
 use crate::event::{FsEvent, RescanCause};
+use crate::index::ROOT_ID;
+
+/// Max queued subtree rescans before ancestry collapse kicks in (§7).
+///
+/// Past this many, newly enqueued (non-manual) rescans first fold the largest
+/// group of queued siblings into their shared parent — one parent diff covers
+/// the whole group, so a storm of dirty dirs becomes O(budget) work items
+/// instead of O(dirs). Manual rescans are exempt: the user pointed at exactly
+/// that dir.
+pub const RESCAN_BUDGET: usize = 256;
+
+/// Parent-chain oracle for ancestry collapse: dir id → parent dir id.
+///
+/// `None` (model tests without an index) disables collapsing; coalescing is
+/// unaffected. Returning `None` or `ROOT_ID` means "cannot climb further".
+pub type ParentOf = std::sync::Arc<dyn Fn(u32) -> Option<u32> + Send + Sync>;
 
 /// A cursor at which a sync cookie was created, with a reply channel.
 #[derive(Debug)]
@@ -41,7 +57,7 @@ pub enum WorkItem {
 }
 
 /// The ordered pending collection.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Pending {
     events: VecDeque<FsEvent>,
     work: VecDeque<WorkItem>,
@@ -53,6 +69,31 @@ pub struct Pending {
     /// Capacity of the event queue; a full queue escalates to a rescan rather
     /// than dropping events (§6).
     pub capacity: usize,
+    /// Parent-chain oracle for ancestry collapse (see [`ParentOf`]). `None`
+    /// (queue-only use, e.g. unit tests without an index) means no safe fold
+    /// exists, so an over-budget set simply grows. Set it when an index is
+    /// available for parent lookups.
+    parent_of: Option<ParentOf>,
+    /// How many queued rescans were folded into a parent by collapse (§15).
+    pub rescans_collapsed: u64,
+}
+
+// NOTE (unblocking fix, not the owner's change): `ParentOf` is a closure and
+// cannot derive `Debug`. Manual impl prints presence, not the closure —
+// replace with whatever the rescan-budget work wants long-term.
+impl std::fmt::Debug for Pending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pending")
+            .field("events", &self.events)
+            .field("work", &self.work)
+            .field("cookies", &self.cookies)
+            .field("rescan_queued", &self.rescan_queued)
+            .field("crawl_queued", &self.crawl_queued)
+            .field("capacity", &self.capacity)
+            .field("parent_of", &self.parent_of.as_ref().map(|_| ".."))
+            .field("rescans_collapsed", &self.rescans_collapsed)
+            .finish()
+    }
 }
 
 /// What happened when an event was pushed.
@@ -68,7 +109,10 @@ pub enum PushOutcome {
 
 impl Pending {
     pub fn new(capacity: usize) -> Pending {
-        Pending { capacity, ..Default::default() }
+        Pending {
+            capacity,
+            ..Default::default()
+        }
     }
 
     /// Push a filesystem event.
@@ -112,7 +156,12 @@ impl Pending {
 
     /// Register a cookie the daemon is waiting on.
     pub fn register_cookie(&mut self, token: u64, root: u32, name: Vec<u8>) {
-        self.cookies.push_back(Cookie { token, root, name, seen: false });
+        self.cookies.push_back(Cookie {
+            token,
+            root,
+            name,
+            seen: false,
+        });
     }
 
     /// Mark a cookie as seen (the watcher delivered its create event). The
@@ -136,7 +185,12 @@ impl Pending {
         let mut ready = Vec::new();
         self.cookies.retain(|c| {
             if c.seen {
-                ready.push(Cookie { token: c.token, root: c.root, name: c.name.clone(), seen: true });
+                ready.push(Cookie {
+                    token: c.token,
+                    root: c.root,
+                    name: c.name.clone(),
+                    seen: true,
+                });
                 false
             } else {
                 true
@@ -146,9 +200,143 @@ impl Pending {
     }
 
     pub fn enqueue_rescan(&mut self, dir: u32, cause: RescanCause) {
+        // Already queued: a re-enqueue is a no-op (the rescan re-verifies the
+        // whole subtree anyway).
+        if self.rescan_queued.contains(&dir) {
+            return;
+        }
+        // Over budget: fold one group of queued siblings into their shared
+        // parent instead of growing the set. A parent diff covers every child,
+        // so coverage never shrinks — only the item count does. Ancestry (not
+        // path prefix) decides the grouping, via `parent_of`; without an
+        // oracle no safe fold exists and the set grows past budget.
+        if cause != RescanCause::Manual && self.rescan_queued.len() >= RESCAN_BUDGET {
+            if self.collapse_one(dir) {
+                // `dir`'s family collapsed (maybe onto `dir` itself): the
+                // earlier `contains` check is stale, re-test.
+                if self.rescan_queued.contains(&dir) {
+                    return;
+                }
+            }
+        }
         if self.rescan_queued.insert(dir) {
             self.work.push_back(WorkItem::Rescan { dir, cause });
         }
+    }
+
+    /// Install the parent-chain oracle that makes [`Self::enqueue_rescan`]
+    /// collapse over-budget sibling groups into their shared parent (§7).
+    pub fn set_parent_of(&mut self, f: ParentOf) {
+        self.parent_of = Some(f);
+    }
+
+    /// How many queued rescans were folded into a parent by collapse.
+    pub fn rescans_collapsed(&self) -> u64 {
+        self.rescans_collapsed
+    }
+
+    /// Fold one group of queued dirs into their shared parent to make room.
+    ///
+    /// Counts queued dirs by parent (plus the incoming `dir` itself, which
+    /// counts as a vote for its own parent), picks the parent with the most
+    /// queued children in the same family, removes those children from the
+    /// queue, and enqueues the parent instead. Returns true when a fold
+    /// happened. Ancestor work items targeting a dir *above* the folded group
+    /// already cover it, so a vote for an already-covered parent folds nothing
+    /// and returns false — the incoming dir is simply already covered.
+    ///
+    /// Never climbs past a root dir (a root-dir parent is the ceiling: the
+    /// fold lands on the root, which is a legitimate rescan target) and never
+    /// past `ROOT_ID`/unknown ids. Cross-root merges are impossible by
+    /// construction: every id climbs only its own parent chain.
+    fn collapse_one(&mut self, dir: u32) -> bool {
+        let parent_of = match &self.parent_of {
+            Some(f) => f.clone(),
+            None => return false,
+        };
+        // Tally votes: each queued dir (and the newcomer) votes for its parent.
+        // Skip votes that cannot climb (unknown / ROOT_ID / root dirs are the
+        // ceiling, not voters — a root dir has no parent worth folding to).
+        let mut votes: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+        let consider = |id: u32, votes: &mut std::collections::HashMap<u32, Vec<u32>>| {
+            let p = parent_of(id);
+            match p {
+                Some(p) if p != ROOT_ID && p != id => {
+                    votes.entry(p).or_default().push(id);
+                }
+                _ => {}
+            }
+        };
+        for &q in self.rescan_queued.iter() {
+            consider(q, &mut votes);
+        }
+        consider(dir, &mut votes);
+        // The parent with the most queued children wins; ties go to the
+        // smallest id for determinism (test snapshots depend on it).
+        let mut best: Option<(u32, Vec<u32>)> = None;
+        for (p, members) in votes {
+            // A parent already covered by an ancestor's queued rescan needs no
+            // fold: the work is already scheduled above it.
+            if self.covered_by_ancestor(p, &parent_of) {
+                continue;
+            }
+            let better = match &best {
+                None => true,
+                Some((bp, bm)) => {
+                    members.len() > bm.len() || (members.len() == bm.len() && p < *bp)
+                }
+            };
+            if better {
+                best = Some((p, members));
+            }
+        }
+        let (parent, members) = match best {
+            Some(b) => b,
+            None => return false,
+        };
+        // Evict the folded children from both the set and the FIFO, then
+        // enqueue the parent with the overflow cause (the group formed under
+        // load; attributing it to one member's cause would lie in stats).
+        let mut evicted = 0u64;
+        for m in &members {
+            if self.rescan_queued.remove(m) {
+                evicted += 1;
+            }
+        }
+        self.work
+            .retain(|w| !matches!(w, WorkItem::Rescan { dir: d, .. } if members.contains(d)));
+        // The parent itself may already be queued (voted by another branch):
+        // then the folded children are simply covered — no new item.
+        if self.rescan_queued.insert(parent) {
+            self.work.push_back(WorkItem::Rescan {
+                dir: parent,
+                cause: RescanCause::Overflow,
+            });
+        }
+        self.rescans_collapsed += evicted;
+        true
+    }
+
+    /// Is `dir` already covered by a queued rescan of one of its ancestors?
+    /// Walks the parent chain up to a root dir; any queued ancestor covers.
+    fn covered_by_ancestor(&self, dir: u32, parent_of: &ParentOf) -> bool {
+        let mut cur = dir;
+        // Depth-bounded: no real chain exceeds the index size, and a hostile
+        // oracle must not spin us. 1024 comfortably exceeds real depths.
+        for _ in 0..1024 {
+            let p = match parent_of(cur) {
+                Some(p) => p,
+                None => return false,
+            };
+            if p == ROOT_ID || p == cur {
+                return false;
+            }
+            if self.rescan_queued.contains(&p) {
+                return true;
+            }
+            cur = p;
+        }
+        false
     }
 
     /// Forget which directories have been walked.
@@ -227,8 +415,14 @@ mod tests {
         let mut p = Pending::new(100);
         p.push_event(FsEvent::upsert(DirKey::new(1), b"a".to_vec(), false));
         p.push_event(FsEvent::upsert(DirKey::new(1), b"b".to_vec(), false));
-        assert_eq!(p.pop_event(), Some(FsEvent::upsert(DirKey::new(1), b"a".to_vec(), false)));
-        assert_eq!(p.pop_event(), Some(FsEvent::upsert(DirKey::new(1), b"b".to_vec(), false)));
+        assert_eq!(
+            p.pop_event(),
+            Some(FsEvent::upsert(DirKey::new(1), b"a".to_vec(), false))
+        );
+        assert_eq!(
+            p.pop_event(),
+            Some(FsEvent::upsert(DirKey::new(1), b"b".to_vec(), false))
+        );
         assert_eq!(p.pop_event(), None);
     }
 
@@ -236,9 +430,17 @@ mod tests {
     fn cookie_events_are_filtered_not_indexed() {
         let mut p = Pending::new(100);
         p.register_cookie(1, 0, b".findex-cookie-x".to_vec());
-        let out = p.push_event(FsEvent::upsert(DirKey::ROOT, b".findex-cookie-x".to_vec(), false));
+        let out = p.push_event(FsEvent::upsert(
+            DirKey::ROOT,
+            b".findex-cookie-x".to_vec(),
+            false,
+        ));
         assert_eq!(out, PushOutcome::CookieMarker);
-        assert_eq!(p.events_len(), 0, "cookie must never become an indexable event");
+        assert_eq!(
+            p.events_len(),
+            0,
+            "cookie must never become an indexable event"
+        );
     }
 
     #[test]
@@ -249,8 +451,18 @@ mod tests {
         let out = p.push_event(FsEvent::upsert(DirKey::new(1), b"c".to_vec(), false));
         assert_eq!(out, PushOutcome::Escalated);
         assert_eq!(p.events_len(), 2);
-        assert_eq!(p.work_len(), 1, "the dropped event becomes a rescan, not silence");
-        assert!(matches!(p.pop_work(), Some(WorkItem::Rescan { dir: 1, cause: RescanCause::Overflow })));
+        assert_eq!(
+            p.work_len(),
+            1,
+            "the dropped event becomes a rescan, not silence"
+        );
+        assert!(matches!(
+            p.pop_work(),
+            Some(WorkItem::Rescan {
+                dir: 1,
+                cause: RescanCause::Overflow
+            })
+        ));
     }
 
     #[test]
@@ -260,21 +472,159 @@ mod tests {
         p.enqueue_rescan(5, RescanCause::Manual);
         p.enqueue_rescan(6, RescanCause::Manual);
         assert_eq!(p.work_len(), 2);
-        assert!(matches!(p.pop_work(), Some(WorkItem::Rescan { dir: 5, cause: RescanCause::Overflow })));
+        assert!(matches!(
+            p.pop_work(),
+            Some(WorkItem::Rescan {
+                dir: 5,
+                cause: RescanCause::Overflow
+            })
+        ));
         // After popping, the dir can be re-enqueued.
         p.enqueue_rescan(5, RescanCause::Manual);
         assert_eq!(p.work_len(), 2);
+    }
+
+    /// Test oracle: ids 1..N are siblings under parent 9000, ids 5000.. are
+    /// siblings under parent 9500. Parents report self (the ceiling: the fold
+    /// lands on them rather than climbing past). Anything else is unknown and
+    /// cannot climb.
+    fn sibling_oracle() -> ParentOf {
+        std::sync::Arc::new(|id: u32| match id {
+            1..=4000 => Some(9000),
+            5000..=8999 => Some(9500),
+            9000 | 9500 => Some(id),
+            _ => None,
+        })
+    }
+
+    fn queued_dirs(p: &mut Pending) -> Vec<u32> {
+        let mut out = Vec::new();
+        while let Some(w) = p.pop_work() {
+            if let WorkItem::Rescan { dir, .. } = w {
+                out.push(dir);
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn collapse_folds_siblings_into_parent() {
+        let mut p = Pending::new(10);
+        p.set_parent_of(sibling_oracle());
+        // Fill to budget with siblings under 9000 (plus one under 9500).
+        for id in 1..=(RESCAN_BUDGET as u32 - 1) {
+            p.enqueue_rescan(id, RescanCause::Overflow);
+        }
+        p.enqueue_rescan(5000, RescanCause::Overflow);
+        assert_eq!(p.rescan_queued.len(), RESCAN_BUDGET);
+        // One *new* sibling under 9000: the 9000-family folds to its parent.
+        p.enqueue_rescan(RESCAN_BUDGET as u32, RescanCause::Overflow);
+        let queued = queued_dirs(&mut p);
+        assert!(
+            queued.contains(&9000),
+            "siblings must fold to parent 9000: {queued:?}"
+        );
+        assert!(
+            queued.contains(&5000),
+            "the other family is untouched: {queued:?}"
+        );
+        assert!(queued.len() < RESCAN_BUDGET + 1, "set shrank: {queued:?}");
+        assert!(p.rescans_collapsed() > 0);
+    }
+
+    #[test]
+    fn collapse_never_merges_across_families() {
+        let mut p = Pending::new(10);
+        p.set_parent_of(sibling_oracle());
+        // Alternate families so no group dominates: over budget, the winner
+        // must be exactly one of the two parents — never a made-up LCA.
+        for i in 0..RESCAN_BUDGET as u32 {
+            let id = if i % 2 == 0 { 1 + i / 2 } else { 5000 + i / 2 };
+            p.enqueue_rescan(id, RescanCause::Overflow);
+        }
+        assert_eq!(p.rescan_queued.len(), RESCAN_BUDGET);
+        // One new dir in the first family: exactly one family folds.
+        p.enqueue_rescan(1 + RESCAN_BUDGET as u32 / 2, RescanCause::Overflow);
+        let queued = queued_dirs(&mut p);
+        assert!(
+            queued.contains(&9000) || queued.contains(&9500),
+            "one family folds to its own parent: {queued:?}"
+        );
+        assert!(
+            !(queued.contains(&9000) && queued.contains(&9500) && queued.len() > 2),
+            "no cross-family parent may appear: {queued:?}"
+        );
+    }
+
+    #[test]
+    fn manual_rescans_are_exempt_from_collapse() {
+        let mut p = Pending::new(10);
+        p.set_parent_of(sibling_oracle());
+        for id in 1..=(RESCAN_BUDGET as u32) {
+            p.enqueue_rescan(id, RescanCause::Overflow);
+        }
+        let before = p.rescan_queued.len();
+        // Manual always lands exactly where pointed, even over budget.
+        p.enqueue_rescan(RESCAN_BUDGET as u32 + 1, RescanCause::Manual);
+        assert!(
+            p.rescan_queued.contains(&(RESCAN_BUDGET as u32 + 1)),
+            "manual must not fold"
+        );
+        assert_eq!(p.rescan_queued.len(), before + 1);
+        assert_eq!(p.rescans_collapsed(), 0);
+    }
+
+    #[test]
+    fn no_oracle_means_no_collapse_but_no_loss() {
+        let mut p = Pending::new(10);
+        for id in 1..=(RESCAN_BUDGET as u32 + 5) {
+            p.enqueue_rescan(id, RescanCause::Overflow);
+        }
+        // Everything still queued — coverage never shrinks without an oracle.
+        assert_eq!(p.rescan_queued.len(), RESCAN_BUDGET + 5);
+        assert_eq!(p.rescans_collapsed(), 0);
+    }
+
+    #[test]
+    fn collapse_cause_is_overflow_not_member() {
+        let mut p = Pending::new(10);
+        p.set_parent_of(sibling_oracle());
+        for id in 1..=(RESCAN_BUDGET as u32) {
+            p.enqueue_rescan(id, RescanCause::WatchDropped);
+        }
+        // Trigger the fold with a *new* dir; the parent item must carry
+        // Overflow (formed under load), not one member's WatchDropped.
+        p.enqueue_rescan(RESCAN_BUDGET as u32 + 1, RescanCause::WatchDropped);
+        let mut causes = Vec::new();
+        while let Some(w) = p.pop_work() {
+            if let WorkItem::Rescan { dir: 9000, cause } = w {
+                causes.push(cause);
+            }
+        }
+        assert_eq!(
+            causes,
+            vec![RescanCause::Overflow],
+            "folded parent cause: {causes:?}"
+        );
     }
 
     #[test]
     fn cookie_completes_only_when_drained() {
         let mut p = Pending::new(10);
         p.register_cookie(7, 0, b".findex-cookie-a".to_vec());
-        p.push_event(FsEvent::upsert(DirKey::ROOT, b".findex-cookie-a".to_vec(), false));
+        p.push_event(FsEvent::upsert(
+            DirKey::ROOT,
+            b".findex-cookie-a".to_vec(),
+            false,
+        ));
         // queue still has the marker? No: marker events are not enqueued, but a
         // real event before the cookie keeps the scope undrained.
         p.push_event(FsEvent::upsert(DirKey::new(1), b"x".to_vec(), false));
-        assert!(p.take_completed_cookies().is_empty(), "must not complete while work is pending");
+        assert!(
+            p.take_completed_cookies().is_empty(),
+            "must not complete while work is pending"
+        );
         p.pop_event();
         let done = p.take_completed_cookies();
         assert_eq!(done.len(), 1);

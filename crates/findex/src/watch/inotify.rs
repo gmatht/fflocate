@@ -50,7 +50,11 @@ mod masks {
 }
 use masks::*;
 
-/// Events we ask for. Content-write events are deliberately absent.
+/// Events we ask for. Content-write events are deliberately absent — with one
+/// exception: `IN_ATTRIB` (metadata changed: `chmod`/`chown`/`touch`). It
+/// carries no namespace change, so the applier translates it into a
+/// flag-only refresh (`FsEvent::RefreshExec`), never an insert. `IN_MODIFY`
+/// and friends stay unsubscribed: content writes generate zero index work.
 const MASK: u32 = IN_CREATE
     | IN_DELETE
     | IN_MOVED_FROM
@@ -59,7 +63,8 @@ const MASK: u32 = IN_CREATE
     | IN_MOVE_SELF
     | IN_UNMOUNT
     | IN_IGNORED
-    | IN_Q_OVERFLOW;
+    | IN_Q_OVERFLOW
+    | IN_ATTRIB;
 
 /// Kernel's `struct inotify_event` header is 16 bytes; the name follows,
 /// NUL-terminated and padded to a multiple of 4.
@@ -159,9 +164,8 @@ impl InotifyBackend {
         let mut out = Vec::new();
         let mut off = 0usize;
         while off + EVENT_HEADER <= buf.len() {
-            let ev: InotifyEvent = unsafe {
-                std::ptr::read_unaligned(buf[off..].as_ptr() as *const InotifyEvent)
-            };
+            let ev: InotifyEvent =
+                unsafe { std::ptr::read_unaligned(buf[off..].as_ptr() as *const InotifyEvent) };
             let name_len = ev.len as usize;
             let name_start = off + EVENT_HEADER;
             let name_end = (name_start + name_len).min(buf.len());
@@ -187,12 +191,16 @@ impl InotifyBackend {
             }
             if ev.mask & IN_UNMOUNT != 0 {
                 if let Some(dir) = self.dir_of_wd(ev.wd) {
-                    out.push(FsEvent::RootGone { dir: DirKey::new(dir) });
+                    out.push(FsEvent::RootGone {
+                        dir: DirKey::new(dir),
+                    });
                 }
                 continue;
             }
 
-            let Some(dir) = self.dir_of_wd(ev.wd) else { continue };
+            let Some(dir) = self.dir_of_wd(ev.wd) else {
+                continue;
+            };
 
             if ev.mask & IN_MOVED_FROM != 0 {
                 // Remember; a MOVED_TO with the same cookie completes the pair.
@@ -220,14 +228,29 @@ impl InotifyBackend {
                 out.push(FsEvent::upsert(DirKey::new(dir), name, is_dir));
                 continue;
             }
-            // Everything else (ACCESS/MODIFY/OPEN/CLOSE/ATTRIB) is ignored:
+            // A metadata change (`chmod`/`chown`/`touch`): the name is
+            // untouched, so this never creates an entry — it asks the applier
+            // to re-read the exec bit in place. (A bare `IN_ATTRIB` on the
+            // watched directory itself carries an empty name: nothing to
+            // refresh.)
+            if ev.mask & IN_ATTRIB != 0 {
+                if !name.is_empty() {
+                    out.push(FsEvent::refresh_exec(DirKey::new(dir), name));
+                }
+                continue;
+            }
+            // Everything else (ACCESS/MODIFY/OPEN/CLOSE) is ignored:
             // content writes generate zero index work.
         }
         out
     }
 
     fn readable(&mut self, timeout: Duration) -> bool {
-        let mut pfd = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
         let n = unsafe { libc::poll(&mut pfd, 1, ms) };
         n > 0 && (pfd.revents & libc::POLLIN) != 0
@@ -237,9 +260,8 @@ impl InotifyBackend {
         let mut all = Vec::new();
         let mut buf = vec![0u8; 64 * 1024];
         loop {
-            let n = unsafe {
-                libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
-            };
+            let n =
+                unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n < 0 {
                 let e = io::Error::last_os_error();
                 match e.raw_os_error() {
@@ -267,7 +289,11 @@ impl Drop for InotifyBackend {
 
 impl WatchBackend for InotifyBackend {
     fn caps(&self) -> BackendCaps {
-        BackendCaps { per_dir_watch: true, whole_mount: false, atomic_rename: false }
+        BackendCaps {
+            per_dir_watch: true,
+            whole_mount: false,
+            atomic_rename: false,
+        }
     }
 
     fn add_root(&mut self, root: &Root) -> io::Result<()> {
@@ -338,7 +364,10 @@ mod tests {
         let (mut b, _wd) = backend_with_watches();
         let buf = encode_event(1, IN_CREATE, 0, b"new.rs");
         let evs = b.parse_buffer(&buf);
-        assert_eq!(evs, vec![FsEvent::upsert(DirKey::new(100), b"new.rs".to_vec(), false)]);
+        assert_eq!(
+            evs,
+            vec![FsEvent::upsert(DirKey::new(100), b"new.rs".to_vec(), false)]
+        );
     }
 
     #[test]
@@ -346,16 +375,41 @@ mod tests {
         let (mut b, _wd) = backend_with_watches();
         let buf = encode_event(1, IN_CREATE | IN_ISDIR, 0, b"sub");
         let evs = b.parse_buffer(&buf);
-        assert_eq!(evs, vec![FsEvent::upsert(DirKey::new(100), b"sub".to_vec(), true)]);
+        assert_eq!(
+            evs,
+            vec![FsEvent::upsert(DirKey::new(100), b"sub".to_vec(), true)]
+        );
     }
 
     #[test]
     fn content_writes_are_ignored() {
         let (mut b, _wd) = backend_with_watches();
-        for mask in [IN_MODIFY, IN_CLOSE_WRITE, IN_OPEN, IN_ACCESS, IN_ATTRIB] {
+        for mask in [IN_MODIFY, IN_CLOSE_WRITE, IN_OPEN, IN_ACCESS] {
             let buf = encode_event(1, mask, 0, b"file");
-            assert!(b.parse_buffer(&buf).is_empty(), "mask {mask:#x} should be ignored");
+            assert!(
+                b.parse_buffer(&buf).is_empty(),
+                "mask {mask:#x} should be ignored"
+            );
         }
+    }
+
+    #[test]
+    fn attrib_becomes_an_exec_refresh_not_an_upsert() {
+        // A metadata change must never create entries or touch the namespace:
+        // it re-reads the exec bit in place.
+        let (mut b, _wd) = backend_with_watches();
+        let buf = encode_event(1, IN_ATTRIB, 0, b"script.sh");
+        assert_eq!(
+            b.parse_buffer(&buf),
+            vec![FsEvent::refresh_exec(
+                DirKey::new(100),
+                b"script.sh".to_vec()
+            )]
+        );
+        // ...and a bare ATTRIB on the watched dir itself (empty name) is
+        // dropped, not fanned out.
+        let buf = encode_event(1, IN_ATTRIB, 0, b"");
+        assert!(b.parse_buffer(&buf).is_empty());
     }
 
     #[test]
@@ -364,7 +418,13 @@ mod tests {
         let buf = encode_event(-1, IN_Q_OVERFLOW, 0, b"");
         let evs = b.parse_buffer(&buf);
         assert_eq!(evs.len(), 1);
-        assert!(matches!(evs[0], FsEvent::RescanSubtree { cause: RescanCause::Overflow, .. }));
+        assert!(matches!(
+            evs[0],
+            FsEvent::RescanSubtree {
+                cause: RescanCause::Overflow,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -372,8 +432,17 @@ mod tests {
         let (mut b, _wd) = backend_with_watches();
         let buf = encode_event(1, IN_IGNORED, 0, b"");
         let evs = b.parse_buffer(&buf);
-        assert!(matches!(evs[0], FsEvent::RescanSubtree { cause: RescanCause::WatchDropped, .. }));
-        assert!(b.dir_of_wd(1).is_none(), "wd ids get reused; the mapping must go");
+        assert!(matches!(
+            evs[0],
+            FsEvent::RescanSubtree {
+                cause: RescanCause::WatchDropped,
+                ..
+            }
+        ));
+        assert!(
+            b.dir_of_wd(1).is_none(),
+            "wd ids get reused; the mapping must go"
+        );
     }
 
     #[test]
@@ -400,7 +469,12 @@ mod tests {
         let (mut b, _wd) = backend_with_watches();
         let buf = encode_event(1, IN_UNMOUNT, 0, b"");
         let evs = b.parse_buffer(&buf);
-        assert_eq!(evs, vec![FsEvent::RootGone { dir: DirKey::new(100) }]);
+        assert_eq!(
+            evs,
+            vec![FsEvent::RootGone {
+                dir: DirKey::new(100)
+            }]
+        );
     }
 
     #[test]
@@ -420,12 +494,16 @@ mod tests {
         let mut got = Vec::new();
         for _ in 0..50 {
             got.extend(b.poll(Duration::from_millis(20)).unwrap());
-            if got.iter().any(|e| matches!(e, FsEvent::Upsert { name, .. } if name == b"hello.txt")) {
+            if got
+                .iter()
+                .any(|e| matches!(e, FsEvent::Upsert { name, .. } if name == b"hello.txt"))
+            {
                 break;
             }
         }
         assert!(
-            got.iter().any(|e| matches!(e, FsEvent::Upsert { name, .. } if name == b"hello.txt")),
+            got.iter()
+                .any(|e| matches!(e, FsEvent::Upsert { name, .. } if name == b"hello.txt")),
             "expected a create event, got {got:?}"
         );
     }

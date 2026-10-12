@@ -83,6 +83,12 @@ pub enum FsEvent {
     },
     /// A name disappeared.
     Remove { parent: DirKey, name: Vec<u8> },
+    /// A name's metadata changed (`chmod`, not create/delete/rename). The
+    /// namespace is untouched — only the exec bit is re-read — so this never
+    /// creates entries and never emits journal records: it corrects the flag
+    /// in place. (A refresh for a name that is not indexed is a silent no-op,
+    /// exactly like an upsert for an unknown parent.)
+    RefreshExec { parent: DirKey, name: Vec<u8> },
     /// Re-enumerate the whole subtree rooted at `dir` and diff against the
     /// index (§7). Never a silent drop.
     RescanSubtree { dir: DirKey, cause: RescanCause },
@@ -95,10 +101,23 @@ pub enum FsEvent {
 
 impl FsEvent {
     pub fn upsert(parent: DirKey, name: impl Into<Vec<u8>>, is_dir: bool) -> FsEvent {
-        FsEvent::Upsert { parent, name: name.into(), is_dir }
+        FsEvent::Upsert {
+            parent,
+            name: name.into(),
+            is_dir,
+        }
     }
     pub fn remove(parent: DirKey, name: impl Into<Vec<u8>>) -> FsEvent {
-        FsEvent::Remove { parent, name: name.into() }
+        FsEvent::Remove {
+            parent,
+            name: name.into(),
+        }
+    }
+    pub fn refresh_exec(parent: DirKey, name: impl Into<Vec<u8>>) -> FsEvent {
+        FsEvent::RefreshExec {
+            parent,
+            name: name.into(),
+        }
     }
     pub fn rescan(dir: DirKey, cause: RescanCause) -> FsEvent {
         FsEvent::RescanSubtree { dir, cause }
@@ -107,7 +126,9 @@ impl FsEvent {
     /// The dir this event is *about*, for coalescing and root attribution.
     pub fn target_dir(&self) -> Option<DirKey> {
         match self {
-            FsEvent::Upsert { parent, .. } | FsEvent::Remove { parent, .. } => Some(*parent),
+            FsEvent::Upsert { parent, .. }
+            | FsEvent::Remove { parent, .. }
+            | FsEvent::RefreshExec { parent, .. } => Some(*parent),
             FsEvent::RescanSubtree { dir, .. } => Some(*dir),
             FsEvent::RootGone { .. } => None,
         }
@@ -117,7 +138,12 @@ impl FsEvent {
     /// cookies must never be indexed nor shown to subscribers (§8, §16).
     pub fn is_cookie_event(&self) -> bool {
         match self {
-            FsEvent::Upsert { name, .. } | FsEvent::Remove { name, .. } => crate::util::is_cookie(name),
+            FsEvent::Upsert { name, .. } | FsEvent::Remove { name, .. } => {
+                crate::util::is_cookie(name)
+            }
+            // A metadata refresh never creates entries; a cookie has no exec
+            // bit to refresh, but routing one here must still be harmless.
+            FsEvent::RefreshExec { name, .. } => crate::util::is_cookie(name),
             _ => false,
         }
     }

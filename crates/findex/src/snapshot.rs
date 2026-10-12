@@ -156,7 +156,8 @@ pub fn peek_version(path: &Path) -> io::Result<Option<u32>> {
     let mut f = File::open(path)?;
     let mut hdr = [0u8; 8];
     use std::io::Read;
-    f.read_exact(&mut hdr).map_err(|_| corrupt("snapshot header unreadable"))?;
+    f.read_exact(&mut hdr)
+        .map_err(|_| corrupt("snapshot header unreadable"))?;
     if &hdr[0..4] != MAGIC {
         return Err(corrupt("bad magic"));
     }
@@ -220,7 +221,12 @@ pub fn decode(bytes: &[u8]) -> io::Result<(Index, Vec<Root>)> {
         let name_len = r.u16()?;
         let parent = r.u32()?;
         let flags = r.u8()?;
-        entries.push(Entry { name_off, name_len, parent, flags });
+        entries.push(Entry {
+            name_off,
+            name_len,
+            parent,
+            flags,
+        });
     }
     if r.remaining() != 0 {
         return Err(corrupt("trailing bytes in snapshot body"));
@@ -280,7 +286,11 @@ pub fn load_mmap(path: &Path) -> io::Result<LoadedSnapshot> {
     // hold the mapping privately; no writer mutates a live mapping.
     let map = unsafe { memmap2::MmapOptions::new().map_copy_read_only(&f)? };
     let (index, roots) = decode(&map)?;
-    Ok(LoadedSnapshot { index, roots, backing: SnapshotBacking::Mapped(map) })
+    Ok(LoadedSnapshot {
+        index,
+        roots,
+        backing: SnapshotBacking::Mapped(map),
+    })
 }
 
 /// Load a snapshot into an owned buffer (no mmap); handy in tests.
@@ -289,7 +299,11 @@ pub fn load_owned(path: &Path) -> io::Result<LoadedSnapshot> {
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
     let (index, roots) = decode(&buf)?;
-    Ok(LoadedSnapshot { index, roots, backing: SnapshotBacking::Owned(buf) })
+    Ok(LoadedSnapshot {
+        index,
+        roots,
+        backing: SnapshotBacking::Owned(buf),
+    })
 }
 
 struct Cursor<'a> {
@@ -334,10 +348,13 @@ mod tests {
     use super::*;
     use crate::index::EntryFlags;
 
-
     fn sample() -> (Index, Vec<Root>) {
         let mut ix = Index::new();
-        let r = ix.insert(ROOT_ID, b"proj", EntryFlags::EMPTY.with_dir(true).with_root_dir(true));
+        let r = ix.insert(
+            ROOT_ID,
+            b"proj",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
         let s = ix.insert(r, b"src", EntryFlags::EMPTY.with_dir(true));
         ix.insert(s, b"main.rs", EntryFlags::EMPTY);
         ix.insert(r, b"README.md", EntryFlags::EMPTY);

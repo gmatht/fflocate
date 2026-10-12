@@ -101,7 +101,11 @@ fn fs_uuid_for(dev_path: &Path, by_uuid: &Path) -> Option<String> {
         let uuid = ent.file_name().to_string_lossy().into_owned();
         let target = std::fs::read_link(ent.path()).ok()?;
         // Link targets are usually relative (`../../sda2`).
-        let resolved = if target.is_absolute() { target } else { by_uuid.join(target) };
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            by_uuid.join(target)
+        };
         if std::fs::canonicalize(resolved).ok().as_ref() == Some(&want) {
             return Some(uuid);
         }
@@ -153,7 +157,11 @@ fn parent_disk(dev: &str) -> Option<String> {
 fn probe_linux(path: &Path) -> Option<DriveId> {
     let mounts = crate::mount::read_mountinfo();
     let m = crate::mount::mount_for(&mounts, path)?;
-    volume_drive_id(&m.source, Path::new("/dev/disk/by-uuid"), Path::new("/sys/block"))
+    volume_drive_id(
+        &m.source,
+        Path::new("/dev/disk/by-uuid"),
+        Path::new("/sys/block"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -176,8 +184,7 @@ fn probe_windows(path: &Path) -> Option<DriveId> {
     // The volume root for any path on it (`C:\x` → `C:\`).
     let mount = wide(path.as_os_str());
     let mut root = [0u16; 261];
-    let ok =
-        unsafe { GetVolumePathNameW(mount.as_ptr(), root.as_mut_ptr(), root.len() as u32) };
+    let ok = unsafe { GetVolumePathNameW(mount.as_ptr(), root.as_mut_ptr(), root.len() as u32) };
     if ok == FALSE {
         return None;
     }
@@ -188,10 +195,18 @@ fn probe_windows(path: &Path) -> Option<DriveId> {
         GetVolumeNameForVolumeMountPointW(root.as_ptr(), guid.as_mut_ptr(), guid.len() as u32)
     } != FALSE
     {
-        let s: String =
-            String::from_utf16_lossy(&guid).trim_end_matches('\0').to_string();
-        let s = s.trim_start_matches(r"\\?\").trim_end_matches('\\').to_string();
-        if s.is_empty() { None } else { Some(s) }
+        let s: String = String::from_utf16_lossy(&guid)
+            .trim_end_matches('\0')
+            .to_string();
+        let s = s
+            .trim_start_matches(r"\\?\")
+            .trim_end_matches('\\')
+            .to_string();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
     } else {
         None
     };
@@ -274,7 +289,9 @@ fn probe_windows(path: &Path) -> Option<DriveId> {
             .position(|&b| b == 0)
             .map(|i| off + i)
             .unwrap_or(desc.len());
-        let s = String::from_utf8_lossy(&desc[off..end]).trim().to_uppercase();
+        let s = String::from_utf8_lossy(&desc[off..end])
+            .trim()
+            .to_uppercase();
         if s.is_empty() {
             None
         } else {
@@ -282,7 +299,10 @@ fn probe_windows(path: &Path) -> Option<DriveId> {
         }
     })();
 
-    let id = DriveId { disk_serial, volume_uuid };
+    let id = DriveId {
+        disk_serial,
+        volume_uuid,
+    };
     if id.is_empty() {
         None
     } else {
@@ -296,12 +316,24 @@ mod tests {
 
     #[test]
     fn matches_needs_one_agreeing_identifier() {
-        let a = DriveId { disk_serial: Some("ABC".into()), volume_uuid: Some("111".into()) };
-        let b = DriveId { disk_serial: Some("abc".into()), volume_uuid: Some("222".into()) };
+        let a = DriveId {
+            disk_serial: Some("ABC".into()),
+            volume_uuid: Some("111".into()),
+        };
+        let b = DriveId {
+            disk_serial: Some("abc".into()),
+            volume_uuid: Some("222".into()),
+        };
         assert!(a.matches(&b), "serial agrees (case-insensitive)");
-        let c = DriveId { disk_serial: Some("ZZZ".into()), volume_uuid: Some("111".into()) };
+        let c = DriveId {
+            disk_serial: Some("ZZZ".into()),
+            volume_uuid: Some("111".into()),
+        };
         assert!(a.matches(&c), "uuid agrees");
-        let d = DriveId { disk_serial: Some("ZZZ".into()), volume_uuid: Some("222".into()) };
+        let d = DriveId {
+            disk_serial: Some("ZZZ".into()),
+            volume_uuid: Some("222".into()),
+        };
         assert!(!a.matches(&d), "nothing agrees");
         let e = DriveId::default();
         assert!(!a.matches(&e) && !e.matches(&a), "empty never matches");
@@ -364,6 +396,10 @@ mod tests {
         std::fs::create_dir_all(&empty).unwrap();
         assert_eq!(volume_drive_id("tmpfs", &empty, &empty), None);
         assert_eq!(volume_drive_id("overlay", &empty, &empty), None);
-        assert_eq!(volume_drive_id("/dev/sda1", &empty, &empty), None, "nothing backing it");
+        assert_eq!(
+            volume_drive_id("/dev/sda1", &empty, &empty),
+            None,
+            "nothing backing it"
+        );
     }
 }

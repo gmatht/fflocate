@@ -82,7 +82,10 @@ impl DaemonProc {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn findexd");
-        let p = DaemonProc { child, socket: socket.to_path_buf() };
+        let p = DaemonProc {
+            child,
+            socket: socket.to_path_buf(),
+        };
         p.wait_ready(Duration::from_secs(10));
         p
     }
@@ -150,7 +153,9 @@ fn truth(root: &Path) -> std::collections::BTreeSet<String> {
     let mut out = std::collections::BTreeSet::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for ent in rd.flatten() {
             let p = ent.path();
             out.insert(canon(&p));
@@ -221,8 +226,10 @@ fn kill9_mid_write_then_restart_is_consistent_and_converges() {
     // The journal must exist and be a *decodeable prefix*: never a wedge. The
     // restart below proves the daemon tolerates a torn tail (§9).
     let state2 = state.clone();
-    assert!(state2.join("journal.log").exists() || state2.join("snapshot.fnx").exists(),
-        "the store must have left a journal or a snapshot behind");
+    assert!(
+        state2.join("journal.log").exists() || state2.join("snapshot.fnx").exists(),
+        "the store must have left a journal or a snapshot behind"
+    );
 
     // Phase 2: restart on the same state dir. This must not panic or hang, and
     // must converge to filesystem truth after a rescan (§7).
@@ -234,7 +241,10 @@ fn kill9_mid_write_then_restart_is_consistent_and_converges() {
         if code == 0 && out.contains("entries") {
             break;
         }
-        assert!(Instant::now() < deadline, "daemon never came back up after kill -9");
+        assert!(
+            Instant::now() < deadline,
+            "daemon never came back up after kill -9"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 
@@ -245,7 +255,10 @@ fn kill9_mid_write_then_restart_is_consistent_and_converges() {
         std::thread::sleep(Duration::from_millis(100));
         let got = {
             let (out, _) = ff(&fxbin, &socket, &["-l", "0", ""]);
-            out.lines().filter(|l| !l.is_empty()).map(|s| s.to_string()).collect::<std::collections::BTreeSet<_>>()
+            out.lines()
+                .filter(|l| !l.is_empty())
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
         };
         let want = truth(&root);
         if got == want {
@@ -292,10 +305,16 @@ fn torn_journal_tail_after_crash_recovers_without_wedging() {
     }
     let journal = state.join("journal.log");
     let size = std::fs::metadata(&journal).map(|m| m.len()).unwrap_or(0);
-    assert!(size > 32, "expected a non-trivial journal, got {size} bytes");
+    assert!(
+        size > 32,
+        "expected a non-trivial journal, got {size} bytes"
+    );
 
     // Chop mid-record.
-    let f = std::fs::OpenOptions::new().write(true).open(&journal).unwrap();
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&journal)
+        .unwrap();
     f.set_len(size - 37).unwrap();
     drop(f);
 
@@ -311,7 +330,10 @@ fn torn_journal_tail_after_crash_recovers_without_wedging() {
                 }
             }
         }
-        assert!(Instant::now() < deadline, "torn tail was not reported as corrupt");
+        assert!(
+            Instant::now() < deadline,
+            "torn tail was not reported as corrupt"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -319,12 +341,18 @@ fn torn_journal_tail_after_crash_recovers_without_wedging() {
         indexed(&fxbin, &socket, &root);
         std::thread::sleep(Duration::from_millis(100));
         let (out, _) = ff(&fxbin, &socket, &["-l", "0", ""]);
-        let got: std::collections::BTreeSet<String> =
-            out.lines().filter(|l| !l.is_empty()).map(|s| s.to_string()).collect();
+        let got: std::collections::BTreeSet<String> = out
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|s| s.to_string())
+            .collect();
         if got == truth(&root) {
             break;
         }
-        assert!(Instant::now() < deadline, "did not converge after a torn journal");
+        assert!(
+            Instant::now() < deadline,
+            "did not converge after a torn journal"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     daemon.kill9();
@@ -365,7 +393,10 @@ fn kill9_repeatedly_never_wedges_the_store() {
         if code == 0 && out.contains("entries") {
             break;
         }
-        assert!(Instant::now() < deadline, "store wedged after repeated kill -9");
+        assert!(
+            Instant::now() < deadline,
+            "store wedged after repeated kill -9"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -373,12 +404,18 @@ fn kill9_repeatedly_never_wedges_the_store() {
         indexed(&fxbin, &socket, &root);
         std::thread::sleep(Duration::from_millis(100));
         let (out, _) = ff(&fxbin, &socket, &["-l", "0", ""]);
-        let got: std::collections::BTreeSet<String> =
-            out.lines().filter(|l| !l.is_empty()).map(|s| s.to_string()).collect();
+        let got: std::collections::BTreeSet<String> = out
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|s| s.to_string())
+            .collect();
         if got == truth(&root) {
             break;
         }
-        assert!(Instant::now() < deadline, "did not converge after repeated crashes");
+        assert!(
+            Instant::now() < deadline,
+            "did not converge after repeated crashes"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     daemon.kill9();

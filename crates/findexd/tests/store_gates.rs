@@ -91,9 +91,14 @@ fn newer_snapshot_refuses_before_any_mutation() {
     std::fs::write(Store::snapshot_path(&state), &bytes).unwrap();
 
     let cfg = test_config(d.path(), root, true); // flag must not save it
-    let Err(err) = Daemon::build(cfg) else { panic!("expected refusal") };
+    let Err(err) = Daemon::build(cfg) else {
+        panic!("expected refusal")
+    };
     let err = err.to_string();
-    assert!(err.contains("newer"), "version gate must refuse, got: {err}");
+    assert!(
+        err.contains("newer"),
+        "version gate must refuse, got: {err}"
+    );
 }
 
 #[test]
@@ -105,15 +110,23 @@ fn foreign_store_refuses_without_the_flag() {
     let mut s = stamp(other_os(), false);
     s.drives.insert(
         root.to_string_lossy().into_owned(),
-        RecordedRoot { drive: None, owner_os: Some(other_os().into()) },
+        RecordedRoot {
+            drive: None,
+            owner_os: Some(other_os().into()),
+        },
     );
     Store::write_stamp(&state, &s).unwrap();
 
     let cfg = test_config(d.path(), root, false);
-    let Err(err) = Daemon::build(cfg) else { panic!("expected refusal") };
+    let Err(err) = Daemon::build(cfg) else {
+        panic!("expected refusal")
+    };
     let err = err.to_string();
     assert!(err.contains("foreign"), "must refuse, got: {err}");
-    assert!(err.contains("--shared-store"), "must point at the flag, got: {err}");
+    assert!(
+        err.contains("--shared-store"),
+        "must point at the flag, got: {err}"
+    );
 }
 
 #[test]
@@ -157,9 +170,14 @@ fn foreign_store_opens_with_flag_and_handoffs() {
     );
     drop(roots);
     let ctx = daemon.server_ctx();
-    let out = findex::server::handle_request(&ctx, &findex::proto::Request::query("a.txt", 0, false, false));
+    let out = findex::server::handle_request(
+        &ctx,
+        &findex::proto::Request::query("a.txt", 0, false, false),
+    );
     assert!(
-        out.iter().any(|r| matches!(r, findex::proto::Response::Hit { path, .. } if path.ends_with("a.txt"))),
+        out.iter().any(
+            |r| matches!(r, findex::proto::Response::Hit { path, .. } if path.ends_with("a.txt"))
+        ),
         "handoff rescan must index the tree"
     );
     // ... and the stamp now names this OS the writer.

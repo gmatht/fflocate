@@ -64,7 +64,10 @@ pub struct HandleKey {
 
 impl HandleKey {
     pub fn of(h: &HandleId) -> HandleKey {
-        HandleKey { handle_type: h.handle_type, handle: h.handle.clone() }
+        HandleKey {
+            handle_type: h.handle_type,
+            handle: h.handle.clone(),
+        }
     }
 
     /// The key for a fanotify-decoded [`crate::watch::fanotify::Fid`] identity.
@@ -72,14 +75,20 @@ impl HandleKey {
     /// syscalls that produce handles.
     #[cfg(target_os = "linux")]
     pub fn of_identity(fid: &crate::watch::fanotify::Fid) -> HandleKey {
-        HandleKey { handle_type: fid.handle_type, handle: fid.handle.clone() }
+        HandleKey {
+            handle_type: fid.handle_type,
+            handle: fid.handle.clone(),
+        }
     }
 
     /// As [`HandleKey::of_identity`], for the name-less identity a caller passes
     /// to `learn_fid`.
     #[cfg(target_os = "linux")]
     pub fn of_fid_identity(fid: &crate::watch::fanotify::FidIdentity) -> HandleKey {
-        HandleKey { handle_type: fid.handle_type, handle: fid.handle.clone() }
+        HandleKey {
+            handle_type: fid.handle_type,
+            handle: fid.handle.clone(),
+        }
     }
 }
 
@@ -104,14 +113,18 @@ impl FidMap {
 
     pub fn resolve(&self, handle_type: i32, handle: &[u8]) -> Option<u32> {
         self.by_handle
-            .get(&HandleKey { handle_type, handle: handle.to_vec() })
+            .get(&HandleKey {
+                handle_type,
+                handle: handle.to_vec(),
+            })
             .copied()
     }
 
     /// Forget every mapping for `dir_id` (root removed / remounted).
     pub fn forget_dir(&mut self, dir_id: u32) {
         self.by_handle.retain(|_, v| *v != dir_id);
-        self.root_handles.retain(|k| self.by_handle.get(k).copied() != Some(dir_id));
+        self.root_handles
+            .retain(|k| self.by_handle.get(k).copied() != Some(dir_id));
     }
 
     pub fn len(&self) -> usize {
@@ -160,7 +173,10 @@ impl FidMap {
                     // It looked like ours (a root subtree) but we have no handle
                     // for it: the map is stale. Rescan; do not drop.
                     self.escalated += 1;
-                    vec![FsEvent::rescan(DirKey::new(root), RescanCause::WatchDropped)]
+                    vec![FsEvent::rescan(
+                        DirKey::new(root),
+                        RescanCause::WatchDropped,
+                    )]
                 } else {
                     self.ignored_foreign += 1;
                     Vec::new()
@@ -195,6 +211,10 @@ pub fn namespace_event(mask: u64, parent: DirKey, name: &[u8], is_dir: bool) -> 
     if mask & (FAN_CREATE | FAN_MOVE_SELF) != 0 {
         return vec![FsEvent::upsert(parent, name.to_vec(), is_dir)];
     }
+    // A metadata change never touches the namespace: flag-only refresh.
+    if mask & FAN_ATTRIB != 0 {
+        return vec![FsEvent::refresh_exec(parent, name.to_vec())];
+    }
     Vec::new()
 }
 
@@ -203,7 +223,11 @@ mod tests {
     use super::*;
 
     fn h(bytes: &[u8]) -> HandleId {
-        HandleId { mount_id: 1, handle_type: 1, handle: bytes.to_vec() }
+        HandleId {
+            mount_id: 1,
+            handle_type: 1,
+            handle: bytes.to_vec(),
+        }
     }
 
     #[test]
@@ -245,7 +269,10 @@ mod tests {
         // it would be a silent desync, so it becomes work.
         let mut m = FidMap::new();
         let evs = m.translate(1, b"stale", FAN_CREATE, b"x", false, |_| Some(42));
-        assert_eq!(evs, vec![FsEvent::rescan(DirKey::new(42), RescanCause::WatchDropped)]);
+        assert_eq!(
+            evs,
+            vec![FsEvent::rescan(DirKey::new(42), RescanCause::WatchDropped)]
+        );
         assert_eq!(m.escalated, 1);
     }
 
@@ -256,7 +283,10 @@ mod tests {
         let mut m = FidMap::new();
         m.learn(&h(b"dir"), 5);
         let evs = m.translate(1, b"dir", FAN_CREATE, b"new.rs", false, |_| None);
-        assert_eq!(evs, vec![FsEvent::upsert(DirKey::new(5), b"new.rs".to_vec(), false)]);
+        assert_eq!(
+            evs,
+            vec![FsEvent::upsert(DirKey::new(5), b"new.rs".to_vec(), false)]
+        );
         assert_eq!(m.resolved, 1);
     }
 
@@ -280,6 +310,11 @@ mod tests {
         assert_eq!(
             namespace_event(FAN_MOVED_FROM, d, b"a", false),
             vec![FsEvent::remove(d, b"a".to_vec())]
+        );
+        assert_eq!(
+            namespace_event(FAN_ATTRIB, d, b"a", false),
+            vec![FsEvent::refresh_exec(d, b"a".to_vec())],
+            "ATTRIB refreshes the exec bit, never the namespace"
         );
         // A mask we do not handle (e.g. a bare ONDIR with no op) yields nothing.
         assert!(namespace_event(0, d, b"a", false).is_empty());

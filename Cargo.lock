@@ -18,21 +18,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "arc-swap"
-version = "1.9.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
-dependencies = [
- "rustversion",
-]
-
-[[package]]
-name = "autocfg"
-version = "1.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
-
-[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -109,6 +94,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
+name = "embed-manifest"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba92c8f4591bf29f89716b45e5f5f56577adbb81426e5620c6e994da7c88bb7a"
+
+[[package]]
 name = "endian-type"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -157,9 +148,7 @@ dependencies = [
 name = "ff"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "findex",
- "libc",
  "regex",
  "serde_json",
  "tempfile",
@@ -169,8 +158,11 @@ dependencies = [
 name = "ff-gui"
 version = "0.1.0"
 dependencies = [
+ "embed-manifest",
  "findex",
- "rustxwidgets",
+ "gtk_dynamic_loader",
+ "libc",
+ "rswidgets",
  "serde_json",
  "tempfile",
 ]
@@ -180,9 +172,7 @@ name = "findex"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
- "arc-swap",
  "crossbeam-channel",
- "crossbeam-utils",
  "libc",
  "memchr",
  "memmap2",
@@ -198,11 +188,9 @@ name = "findexd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arc-swap",
  "crossbeam-channel",
  "findex",
  "libc",
- "serde",
  "serde_json",
  "tempfile",
 ]
@@ -428,8 +416,6 @@ dependencies = [
  "bitflags 1.3.2",
  "lazy_static",
  "newline-converter",
- "plotters",
- "plotters-backend",
  "stretch",
  "winapi",
  "winapi-build",
@@ -496,15 +482,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "num-traits"
-version = "0.2.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
-dependencies = [
- "autocfg",
-]
-
-[[package]]
 name = "num_enum"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -537,24 +514,6 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
-
-[[package]]
-name = "plotters"
-version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5aeb6f403d7a4911efb1e33402027fc44f29b5bf6def3effcc22d7bb75f2b747"
-dependencies = [
- "num-traits",
- "plotters-backend",
- "wasm-bindgen",
- "web-sys",
-]
-
-[[package]]
-name = "plotters-backend"
-version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df42e13c12958a16b3f7f4386b9ab1f3e7933914ecea48da7139435263a4172a"
 
 [[package]]
 name = "proc-macro-crate"
@@ -635,6 +594,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "rswidgets"
+version = "0.1.0"
+dependencies = [
+ "gtk_dynamic_loader",
+ "jni",
+ "js-sys",
+ "libc",
+ "libloading 0.8.9",
+ "native-windows-gui",
+ "ndk",
+ "ndk-context",
+ "once_cell",
+ "rustyline",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "unicode-width 0.2.2",
+ "wasm-bindgen",
+ "web-sys",
+ "winapi",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -654,26 +636,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
-name = "rustxwidgets"
-version = "0.1.0"
-dependencies = [
- "gtk_dynamic_loader",
- "jni",
- "js-sys",
- "libc",
- "libloading 0.8.9",
- "native-windows-gui",
- "ndk",
- "ndk-context",
- "once_cell",
- "rustyline",
- "thiserror",
- "wasm-bindgen",
- "web-sys",
- "winapi",
-]
-
-[[package]]
 name = "rustyline"
 version = "14.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -690,7 +652,7 @@ dependencies = [
  "nix",
  "radix_trie",
  "unicode-segmentation",
- "unicode-width",
+ "unicode-width 0.1.14",
  "utf8parse",
  "windows-sys 0.52.0",
 ]
@@ -871,6 +833,12 @@ name = "unicode-width"
 version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
+
+[[package]]
+name = "unicode-width"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "utf8parse"

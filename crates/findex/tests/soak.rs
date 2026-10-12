@@ -73,7 +73,9 @@ fn truth(root: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for ent in rd.flatten() {
             let p = ent.path();
             out.insert(canon(&p));
@@ -115,7 +117,12 @@ fn soak_thousands_of_ops_zero_drift() {
     r.caps.writable = true;
     let shared = Shared::new(ix, vec![r]);
     // A small journal-compaction threshold so the soak also exercises compaction.
-    let mut applier = Applier::new(shared.clone(), store, Arc::new(findex::applier::RealFs), SyncRegistry::new());
+    let mut applier = Applier::new(
+        shared.clone(),
+        store,
+        Arc::new(findex::applier::RealFs),
+        SyncRegistry::new(),
+    );
     applier.compaction_threshold = 1_500;
     applier.rebuild_dir_cache();
     applier.pending_mut().enqueue_crawl(root_id);
@@ -136,7 +143,9 @@ fn soak_thousands_of_ops_zero_drift() {
                 break;
             }
         }
-        applier.pending_mut().enqueue_rescan(root_id, RescanCause::Manual);
+        applier
+            .pending_mut()
+            .enqueue_rescan(root_id, RescanCause::Manual);
         for _ in 0..8 {
             applier.drain();
             if applier.pending().is_drained() {
@@ -182,7 +191,11 @@ fn soak_thousands_of_ops_zero_drift() {
                 if std::fs::rename(&p, &np).is_ok() {
                     let did = dir_id(&applier, &parent);
                     applier.push(FsEvent::remove(DirKey::new(did), old.as_bytes().to_vec()));
-                    applier.push(FsEvent::upsert(DirKey::new(did), name.as_bytes().to_vec(), false));
+                    applier.push(FsEvent::upsert(
+                        DirKey::new(did),
+                        name.as_bytes().to_vec(),
+                        false,
+                    ));
                     files[i] = np;
                 }
             }
@@ -225,7 +238,8 @@ fn soak_thousands_of_ops_zero_drift() {
             let got = index_paths(&shared, &root);
             let want = truth(&root);
             assert_eq!(
-                got, want,
+                got,
+                want,
                 "DRIFT after {} ops\n  missing: {:?}\n  extra: {:?}",
                 step + 1,
                 want.difference(&got).take(8).collect::<Vec<_>>(),
@@ -255,7 +269,8 @@ fn soak_thousands_of_ops_zero_drift() {
     let got = index_paths(&shared, &root);
     let want = truth(&root);
     assert_eq!(
-        got, want,
+        got,
+        want,
         "final drift\n  missing: {:?}\n  extra: {:?}",
         want.difference(&got).take(8).collect::<Vec<_>>(),
         got.difference(&want).take(8).collect::<Vec<_>>()

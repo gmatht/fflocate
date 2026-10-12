@@ -11,7 +11,11 @@ use std::time::{Duration, Instant};
 
 fn bin_dir() -> Option<PathBuf> {
     let d = std::env::var("FINDEX_BIN_DIR").ok().map(PathBuf::from)?;
-    (d.join(format!("findexd{}", std::env::consts::EXE_SUFFIX)).exists() && d.join(format!("ff{}", std::env::consts::EXE_SUFFIX)).exists()).then_some(d)
+    (d.join(format!("findexd{}", std::env::consts::EXE_SUFFIX))
+        .exists()
+        && d.join(format!("ff{}", std::env::consts::EXE_SUFFIX))
+            .exists())
+    .then_some(d)
 }
 
 fn backend_arg() -> &'static str {
@@ -63,7 +67,6 @@ fn canon(p: &std::path::Path) -> String {
     }
 }
 
-
 /// Spawn a daemon over `root`, and symlink `ff` to `locate` in a fresh dir.
 /// Returns (daemon child, socket, locate path).
 fn setup(root: &Path, tag: &str) -> (std::process::Child, PathBuf, PathBuf) {
@@ -99,13 +102,21 @@ fn setup(root: &Path, tag: &str) -> (std::process::Child, PathBuf, PathBuf) {
     #[cfg(unix)]
     let locate = {
         let l = linkdir.join("locate");
-        std::os::unix::fs::symlink(bindir.join(format!("ff{}", std::env::consts::EXE_SUFFIX)), &l).unwrap();
+        std::os::unix::fs::symlink(
+            bindir.join(format!("ff{}", std::env::consts::EXE_SUFFIX)),
+            &l,
+        )
+        .unwrap();
         l
     };
     #[cfg(windows)]
     let locate = {
         let l = linkdir.join("locate.exe");
-        std::fs::copy(bindir.join(format!("ff{}", std::env::consts::EXE_SUFFIX)), &l).unwrap();
+        std::fs::copy(
+            bindir.join(format!("ff{}", std::env::consts::EXE_SUFFIX)),
+            &l,
+        )
+        .unwrap();
         l
     };
     (child, socket, locate)
@@ -136,7 +147,10 @@ fn locate(locate_bin: &Path, socket: &Path, fxbin: &Path, args: &[&str]) -> (Str
 }
 
 fn lines(s: &str) -> Vec<String> {
-    s.lines().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect()
+    s.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect()
 }
 
 fn fixture_tree() -> (tempfile::TempDir, PathBuf) {

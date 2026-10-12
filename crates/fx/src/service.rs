@@ -17,7 +17,9 @@ pub fn run(args: &[String]) -> Result<std::process::ExitCode, CliError> {
             println!("{}", systemd_unit());
             Ok(std::process::ExitCode::SUCCESS)
         }
-        other => Err(CliError::Usage(format!("unknown service subcommand: {other}"))),
+        other => Err(CliError::Usage(format!(
+            "unknown service subcommand: {other}"
+        ))),
     }
 }
 
@@ -47,14 +49,18 @@ fn install() -> Result<std::process::ExitCode, CliError> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        Err(CliError::Usage("service install is only implemented for Linux and macOS".into()))
+        Err(CliError::Usage(
+            "service install is only implemented for Linux and macOS".into(),
+        ))
     }
 }
 
 // Only used by the Linux/macOS install paths.
 #[cfg_attr(windows, allow(dead_code))]
 fn home() -> PathBuf {
-    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/"))
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/"))
 }
 
 /// XDG config home, used only by the Linux systemd-unit path.

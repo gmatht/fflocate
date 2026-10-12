@@ -51,9 +51,34 @@ impl Rng {
 /// Name fragments drawn from a small alphabet so trigram collisions are common
 /// (a large alphabet would make everything trivially disjoint).
 const WORDS: &[&str] = &[
-    "main", "lib", "mod", "test", "util", "index", "query", "server", "src", "rs",
-    "md", "toml", "foo", "bar", "baz", "notes", "README", "main_test", "core", "net",
-    "abc", "xyz", "aaaa", "zz", "a", "Q", "UPPER", "MixedCase",
+    "main",
+    "lib",
+    "mod",
+    "test",
+    "util",
+    "index",
+    "query",
+    "server",
+    "src",
+    "rs",
+    "md",
+    "toml",
+    "foo",
+    "bar",
+    "baz",
+    "notes",
+    "README",
+    "main_test",
+    "core",
+    "net",
+    "abc",
+    "xyz",
+    "aaaa",
+    "zz",
+    "a",
+    "Q",
+    "UPPER",
+    "MixedCase",
 ];
 
 const EXTS: &[&str] = &["rs", "md", "toml", "txt", "c", "h", "o", "so"];
@@ -222,7 +247,9 @@ fn accelerator_actually_prunes_for_selective_queries() {
 
     let q = Query::compile("main").unwrap();
     let plan = q.trigram_plan();
-    let cands = tg.candidates(&plan).expect("`main` yields a trigram constraint");
+    let cands = tg
+        .candidates(&plan)
+        .expect("`main` yields a trigram constraint");
     assert!(
         (cands.len() as u64) < ix.live_count(),
         "expected the trigram filter to prune: {} candidates of {} live entries",
@@ -234,7 +261,11 @@ fn accelerator_actually_prunes_for_selective_queries() {
     let plain = query::execute(&ix, &rp, &q, 0, false);
     let cand_set: std::collections::HashSet<u32> = cands.into_iter().collect();
     for h in &plain.hits {
-        assert!(cand_set.contains(&h.id), "accelerator dropped a real hit id {}", h.id);
+        assert!(
+            cand_set.contains(&h.id),
+            "accelerator dropped a real hit id {}",
+            h.id
+        );
     }
 }
 

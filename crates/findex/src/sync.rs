@@ -49,11 +49,25 @@ impl SyncRegistry {
 
     /// Register a cookie the daemon will wait on. Returns the receiver the
     /// caller blocks on.
-    pub fn expect(&self, token: u64, root: u32, name: Vec<u8>, path: Option<PathBuf>) -> Receiver<()> {
+    pub fn expect(
+        &self,
+        token: u64,
+        root: u32,
+        name: Vec<u8>,
+        path: Option<PathBuf>,
+    ) -> Receiver<()> {
         let (tx, rx) = bounded(1);
         let mut g = self.inner.lock().unwrap();
         g.by_name.insert((root, name.clone()), token);
-        g.by_token.insert(token, PendingCookie { root, name, path, tx });
+        g.by_token.insert(
+            token,
+            PendingCookie {
+                root,
+                name,
+                path,
+                tx,
+            },
+        );
         rx
     }
 
@@ -108,7 +122,9 @@ pub fn cookie_name(token: u64) -> Vec<u8> {
 /// Create the cookie file in `root_dir`. Returns the full path.
 pub fn create_cookie(root_dir: &Path, token: u64) -> std::io::Result<PathBuf> {
     let name = cookie_name(token);
-    let path = root_dir.join(std::ffi::OsString::from(String::from_utf8_lossy(&name).into_owned()));
+    let path = root_dir.join(std::ffi::OsString::from(
+        String::from_utf8_lossy(&name).into_owned(),
+    ));
     // Write a little content so the create is unambiguous even on lazy mounts.
     std::fs::write(&path, b"")?;
     Ok(path)

@@ -15,7 +15,10 @@ pub struct ChangeLog {
 
 impl ChangeLog {
     pub fn new(cap: usize) -> Self {
-        ChangeLog { ring: std::collections::VecDeque::with_capacity(cap), cap: cap.max(1) }
+        ChangeLog {
+            ring: std::collections::VecDeque::with_capacity(cap),
+            cap: cap.max(1),
+        }
     }
     pub fn push(&mut self, c: crate::cursor::Cursor) {
         if self.ring.len() == self.cap {
@@ -61,6 +64,10 @@ pub struct Health {
     pub watch_limit_hits: u64,
     /// Mount changes detected by the watchdog (§16 mount churn).
     pub mount_events: u64,
+    /// Queued subtree rescans folded into a shared parent by ancestry
+    /// collapse (§7): the set stays bounded under storm load while coverage
+    /// never shrinks.
+    pub rescans_collapsed: u64,
     pub dropped_events: u64,
     pub escalated_events: u64,
     pub last_compaction_ms: u64,
@@ -86,6 +93,7 @@ impl Health {
             "watch_failures": self.watch_failures,
             "watch_limit_hits": self.watch_limit_hits,
             "mount_events": self.mount_events,
+            "rescans_collapsed": self.rescans_collapsed,
             "dropped_events": self.dropped_events,
             "escalated_events": self.escalated_events,
             "last_compaction_ms": self.last_compaction_ms,
@@ -110,7 +118,10 @@ mod tests {
         assert_eq!(cl.len(), 4);
         // entries 3..=6 retained
         let got = cl.since(Cursor::new(1, 2));
-        assert_eq!(got.iter().map(|c| c.lsn).collect::<Vec<_>>(), vec![3, 4, 5, 6]);
+        assert_eq!(
+            got.iter().map(|c| c.lsn).collect::<Vec<_>>(),
+            vec![3, 4, 5, 6]
+        );
         let got = cl.since(Cursor::new(1, 5));
         assert_eq!(got.iter().map(|c| c.lsn).collect::<Vec<_>>(), vec![6]);
     }

@@ -11,7 +11,11 @@ use std::time::{Duration, Instant};
 
 fn bin_dir() -> Option<PathBuf> {
     let d = std::env::var("FINDEX_BIN_DIR").ok().map(PathBuf::from)?;
-    (d.join(format!("findexd{}", std::env::consts::EXE_SUFFIX)).exists() && d.join(format!("ff{}", std::env::consts::EXE_SUFFIX)).exists()).then_some(d)
+    (d.join(format!("findexd{}", std::env::consts::EXE_SUFFIX))
+        .exists()
+        && d.join(format!("ff{}", std::env::consts::EXE_SUFFIX))
+            .exists())
+    .then_some(d)
 }
 
 /// Watch backend for the spawned daemon (see fault_crash.rs). These tests
@@ -27,7 +31,6 @@ fn backend_arg() -> &'static str {
         "fake"
     }
 }
-
 
 /// Isolated IPC endpoint for this test. Unix socket file everywhere except
 /// Windows, where it is loopback TCP text (no unix sockets). The port is
@@ -64,7 +67,10 @@ impl DaemonProc {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn findexd");
-        let p = DaemonProc { child, socket: socket.to_path_buf() };
+        let p = DaemonProc {
+            child,
+            socket: socket.to_path_buf(),
+        };
         let deadline = Instant::now() + Duration::from_secs(10);
         while !p.socket.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
@@ -113,17 +119,25 @@ fn ff(fxbin: &Path, socket: &Path, args: &[&str]) -> (String, i32) {
         .env("FINDEX_SOCKET", socket)
         .output()
         .expect("run ff");
-    (String::from_utf8_lossy(&out.stdout).into_owned(), out.status.code().unwrap_or(-1))
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
 }
 
 fn stats_json(fxbin: &Path, socket: &Path) -> Option<serde_json::Value> {
     let (o, c) = ff(fxbin, socket, &["stats", "--json", "--roots"]);
-    (c == 0 || !o.is_empty()).then(|| serde_json::from_str(&o).ok()).flatten()
+    (c == 0 || !o.is_empty())
+        .then(|| serde_json::from_str(&o).ok())
+        .flatten()
 }
 
 fn paths_under(fxbin: &Path, socket: &Path) -> std::collections::BTreeSet<String> {
     let (o, _) = ff(fxbin, socket, &["-l", "0", ""]);
-    o.lines().filter(|l| !l.is_empty()).map(|s| s.to_string()).collect()
+    o.lines()
+        .filter(|l| !l.is_empty())
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Wait until the daemon is serving.
@@ -199,12 +213,21 @@ fn mount_umount_during_crawl_degrades_and_recovers() {
         eprintln!("skipping (bind mount unavailable): mount/umount during crawl");
         return;
     }
-    assert!(Command::new("mount").args(["--bind"]).arg(&backing).arg(&root).status().unwrap().success());
+    assert!(Command::new("mount")
+        .args(["--bind"])
+        .arg(&backing)
+        .arg(&root)
+        .status()
+        .unwrap()
+        .success());
 
     let state = d.path().join("state");
     let socket = test_socket(d.path());
     let mut daemon = DaemonProc::spawn(&findexd, &socket, &state, &root);
-    assert!(wait_serving(&fxbin, &socket, Duration::from_secs(10)), "daemon never served");
+    assert!(
+        wait_serving(&fxbin, &socket, Duration::from_secs(10)),
+        "daemon never served"
+    );
 
     // Crawl should see the mounted content.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -213,7 +236,10 @@ fn mount_umount_during_crawl_degrades_and_recovers() {
         if p.iter().any(|x| x.ends_with("mounted.rs")) {
             break;
         }
-        assert!(Instant::now() < deadline, "crawl never indexed the mount: {p:?}");
+        assert!(
+            Instant::now() < deadline,
+            "crawl never indexed the mount: {p:?}"
+        );
         std::thread::sleep(Duration::from_millis(80));
     }
 
@@ -222,22 +248,36 @@ fn mount_umount_during_crawl_degrades_and_recovers() {
     // The mount point still exists, so this is a "different fs is mounted now"
     // event: the daemon rescans with cause=mount_event — loudly, visible in
     // stats, never silent.
-    assert!(Command::new("umount").arg(&root).status().unwrap().success());
+    assert!(Command::new("umount")
+        .arg(&root)
+        .status()
+        .unwrap()
+        .success());
 
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(s) = stats_json(&fxbin, &socket) {
             if s.get("mount_events").and_then(|v| v.as_u64()).unwrap_or(0) > 0 {
-                let roots = s.get("roots").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let roots = s
+                    .get("roots")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
                 let cause = roots
                     .iter()
                     .filter_map(|r| r.get("last_rescan_cause").and_then(|v| v.as_str()))
                     .any(|c| c == "mount_event");
-                assert!(cause, "a mount change must be logged with cause=mount_event: {s}");
+                assert!(
+                    cause,
+                    "a mount change must be logged with cause=mount_event: {s}"
+                );
                 break;
             }
         }
-        assert!(Instant::now() < deadline, "unmount was never noticed (no mount_event)");
+        assert!(
+            Instant::now() < deadline,
+            "unmount was never noticed (no mount_event)"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
 
@@ -249,12 +289,21 @@ fn mount_umount_during_crawl_degrades_and_recovers() {
         if !p.iter().any(|x| x.ends_with("mounted.rs")) {
             break;
         }
-        assert!(Instant::now() < deadline, "the unmounted content must be reconciled away: {p:?}");
+        assert!(
+            Instant::now() < deadline,
+            "the unmounted content must be reconciled away: {p:?}"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
 
     // Remount the same backing store: the daemon must recover and re-index it.
-    assert!(Command::new("mount").args(["--bind"]).arg(&backing).arg(&root).status().unwrap().success());
+    assert!(Command::new("mount")
+        .args(["--bind"])
+        .arg(&backing)
+        .arg(&root)
+        .status()
+        .unwrap()
+        .success());
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         std::thread::sleep(Duration::from_millis(200));
@@ -264,7 +313,10 @@ fn mount_umount_during_crawl_degrades_and_recovers() {
         if p.iter().any(|x| x.ends_with("mounted.rs")) {
             break;
         }
-        assert!(Instant::now() < deadline, "remount was never recovered: {p:?}");
+        assert!(
+            Instant::now() < deadline,
+            "remount was never recovered: {p:?}"
+        );
     }
     let _ = Command::new("umount").arg(&root).status();
     daemon.stop_and_wait();
@@ -299,7 +351,11 @@ fn root_vanishing_degrades_loudly() {
     loop {
         if let Some(s) = stats_json(&fxbin, &socket) {
             if s.get("mount_events").and_then(|v| v.as_u64()).unwrap_or(0) > 0 {
-                let roots = s.get("roots").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let roots = s
+                    .get("roots")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
                 let reason = roots
                     .iter()
                     .find_map(|r| r.get("state").and_then(|v| v.as_str()))
@@ -312,7 +368,10 @@ fn root_vanishing_degrades_loudly() {
                 return;
             }
         }
-        assert!(Instant::now() < deadline, "a vanished root was never noticed");
+        assert!(
+            Instant::now() < deadline,
+            "a vanished root was never noticed"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -368,20 +427,36 @@ fn watch_limit_exhaustion_degrades_loudly_without_panic() {
     let state = d.path().join("state");
     let socket = test_socket(d.path());
     let daemon = DaemonProc::spawn(&findexd, &socket, &state, &root);
-    assert!(wait_serving(&fxbin, &socket, Duration::from_secs(10)), "daemon never served");
+    assert!(
+        wait_serving(&fxbin, &socket, Duration::from_secs(10)),
+        "daemon never served"
+    );
 
     // The daemon must not panic or hang. Eventually it should report watch
     // failures and mark the root degraded — loudly, not silently.
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(s) = stats_json(&fxbin, &socket) {
-            let wf = s.get("watch_failures").and_then(|v| v.as_u64()).unwrap_or(0);
-            let wl = s.get("watch_limit_hits").and_then(|v| v.as_u64()).unwrap_or(0);
+            let wf = s
+                .get("watch_failures")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let wl = s
+                .get("watch_limit_hits")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             if wf > 0 || wl > 0 {
                 // Verify the root is reported degraded in `stats --roots`.
-                let roots = s.get("roots").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let roots = s
+                    .get("roots")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
                 let degraded = roots.iter().any(|r| {
-                    r.get("state").and_then(|v| v.as_str()).unwrap_or("").starts_with("degraded")
+                    r.get("state")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .starts_with("degraded")
                 });
                 assert!(
                     degraded,

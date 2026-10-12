@@ -16,7 +16,11 @@ use std::time::{Duration, Instant};
 
 fn bin_dir() -> Option<PathBuf> {
     let d = std::env::var("FINDEX_BIN_DIR").ok().map(PathBuf::from)?;
-(d.join(format!("findexd{}", std::env::consts::EXE_SUFFIX)).exists() && d.join(format!("ff{}", std::env::consts::EXE_SUFFIX)).exists()).then_some(d)
+    (d.join(format!("findexd{}", std::env::consts::EXE_SUFFIX))
+        .exists()
+        && d.join(format!("ff{}", std::env::consts::EXE_SUFFIX))
+            .exists())
+    .then_some(d)
 }
 
 fn backend_arg() -> &'static str {
@@ -68,9 +72,6 @@ fn canon(p: &std::path::Path) -> String {
     }
 }
 
-
-
-
 fn spawn(findexd: &Path, socket: &Path, state: &Path, root: &Path) -> Child {
     let child = Command::new(findexd)
         .arg("--socket")
@@ -115,7 +116,10 @@ fn ff(fxbin: &Path, socket: &Path, args: &[&str]) -> (String, i32) {
 
 fn listing(fxbin: &Path, socket: &Path) -> std::collections::BTreeSet<String> {
     let (out, _) = ff(fxbin, socket, &["-l", "0", ""]);
-    out.lines().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect()
+    out.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect()
 }
 
 fn settle(fxbin: &Path, socket: &Path) {
@@ -210,11 +214,7 @@ fn update_unknown_root_is_an_error() {
     assert_eq!(code, 2, "unknown root must be an error, got:\n{out}");
 
     // Scoped update of the real root succeeds.
-    let (out, code) = ff(
-        &fxbin,
-        &socket,
-        &["update", &root.to_string_lossy()],
-    );
+    let (out, code) = ff(&fxbin, &socket, &["update", &root.to_string_lossy()]);
     assert_eq!(code, 0, "scoped update output:\n{out}");
     assert!(out.contains("ok"), "per-root status expected:\n{out}");
 

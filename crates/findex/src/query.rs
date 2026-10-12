@@ -40,6 +40,12 @@ enum Term {
     Path { needle: Vec<u8>, case: bool },
     /// `regex:...` — full regex over the name.
     Regex { re: Box<Regex> },
+    /// `type:dir` — entry is a directory (`-type:dir` = files only).
+    IsDir,
+    /// `type:exec` — entry has any execute bit set (`find -perm /111`).
+    /// Reads the `IS_EXEC` flag, so it never stats: the crawl, the event
+    /// path, the rescan diff and the ATTRIB refresh keep it current.
+    IsExec,
     /// `-foo` — negation: entry must NOT match.
     Not(Box<Term>),
 }
@@ -166,7 +172,10 @@ pub struct Query {
 
 impl std::fmt::Debug for Query {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Query").field("raw", &self.raw).field("terms", &self.terms).finish()
+        f.debug_struct("Query")
+            .field("raw", &self.raw)
+            .field("terms", &self.terms)
+            .finish()
     }
 }
 
@@ -233,14 +242,21 @@ impl Query {
             }
         };
         let is_empty = terms.is_empty();
-        Ok(Query { terms, literals, literal_case, ac, is_empty, raw: raw.to_string() })
+        Ok(Query {
+            terms,
+            literals,
+            literal_case,
+            ac,
+            is_empty,
+            raw: raw.to_string(),
+        })
     }
 
-    /// Does a candidate entry (by name, with its materialized path lazily
-    /// supplied) pass every term? `path` is only computed when a `path:` term
-    /// exists; `path_provider` is called at most once.
+    /// Does a candidate entry (by name and kind, with its materialized path
+    /// lazily supplied) pass every term? `path` is only computed when a
+    /// `path:` term exists; `path_provider` is called at most once.
     #[allow(clippy::redundant_closure)] // closure needed: FnMut cannot be moved into FnOnce
-    pub fn matches<F>(&self, name: &[u8], mut path_provider: F) -> bool
+    pub fn matches<F>(&self, name: &[u8], is_dir: bool, is_exec: bool, mut path_provider: F) -> bool
     where
         F: FnMut() -> Option<Vec<u8>>,
     {
@@ -258,7 +274,16 @@ impl Query {
                     }
                 }
                 Term::Regex { re } => re.is_match(name),
-                Term::Not(inner) => !self.match_inner(inner, name, &mut path_cache, &mut path_provider),
+                Term::IsDir => is_dir,
+                Term::IsExec => is_exec,
+                Term::Not(inner) => !self.match_inner(
+                    inner,
+                    name,
+                    is_dir,
+                    is_exec,
+                    &mut path_cache,
+                    &mut path_provider,
+                ),
             };
             if !ok {
                 return false;
@@ -272,6 +297,8 @@ impl Query {
         &self,
         t: &Term,
         name: &[u8],
+        is_dir: bool,
+        is_exec: bool,
         path_cache: &mut Option<Option<Vec<u8>>>,
         path_provider: &mut F,
     ) -> bool
@@ -290,7 +317,11 @@ impl Query {
                 }
             }
             Term::Regex { re } => re.is_match(name),
-            Term::Not(inner) => !self.match_inner(inner, name, path_cache, path_provider),
+            Term::IsDir => is_dir,
+            Term::IsExec => is_exec,
+            Term::Not(inner) => {
+                !self.match_inner(inner, name, is_dir, is_exec, path_cache, path_provider)
+            }
         }
     }
 
@@ -410,7 +441,13 @@ impl Query {
     ///
     /// Fuzzy search runs this alongside the edit-distance scoring so a term
     /// never gets to be both.
-    pub fn matches_exact_terms<F>(&self, name: &[u8], mut path_provider: F) -> bool
+    pub fn matches_exact_terms<F>(
+        &self,
+        name: &[u8],
+        is_dir: bool,
+        is_exec: bool,
+        mut path_provider: F,
+    ) -> bool
     where
         F: FnMut() -> Option<Vec<u8>>,
     {
@@ -435,7 +472,16 @@ impl Query {
                     }
                 }
                 Term::Regex { re } => re.is_match(name),
-                Term::Not(inner) => !self.match_inner(inner, name, &mut path_cache, &mut path_provider),
+                Term::IsDir => is_dir,
+                Term::IsExec => is_exec,
+                Term::Not(inner) => !self.match_inner(
+                    inner,
+                    name,
+                    is_dir,
+                    is_exec,
+                    &mut path_cache,
+                    &mut path_provider,
+                ),
             };
             if !ok {
                 return false;
@@ -460,7 +506,8 @@ fn parse_terms(raw: &str) -> Result<Vec<Term>, String> {
             break;
         }
         let mut negate = false;
-        if bytes[i] == b'-' && i + 1 < bytes.len() && !(bytes[i + 1] as char).is_ascii_whitespace() {
+        if bytes[i] == b'-' && i + 1 < bytes.len() && !(bytes[i + 1] as char).is_ascii_whitespace()
+        {
             negate = true;
             i += 1;
         }
@@ -485,7 +532,11 @@ fn parse_terms(raw: &str) -> Result<Vec<Term>, String> {
             }
         }
         let term = compile_token(&tok, quoted)?;
-        out.push(if negate { Term::Not(Box::new(term)) } else { term });
+        out.push(if negate {
+            Term::Not(Box::new(term))
+        } else {
+            term
+        });
     }
     Ok(out)
 }
@@ -495,28 +546,57 @@ fn compile_token(tok: &[u8], quoted: bool) -> Result<Term, String> {
     if !quoted {
         if let Some(rest) = strip_prefix_ci(tok, b"ext:") {
             let case = has_upper(rest);
-            return Ok(Term::Ext { ext: rest.to_vec(), case });
+            return Ok(Term::Ext {
+                ext: rest.to_vec(),
+                case,
+            });
         }
         if let Some(rest) = strip_prefix_ci(tok, b"path:") {
             let case = has_upper(rest);
-            return Ok(Term::Path { needle: rest.to_vec(), case });
+            return Ok(Term::Path {
+                needle: rest.to_vec(),
+                case,
+            });
         }
         if let Some(rest) = strip_prefix_ci(tok, b"case:") {
             // Force case-sensitive substring of the name.
-            return Ok(Term::Substr { needle: rest.to_vec(), case: true });
+            return Ok(Term::Substr {
+                needle: rest.to_vec(),
+                case: true,
+            });
         }
         if let Some(rest) = strip_prefix_ci(tok, b"regex:") {
             let re = Regex::new(std::str::from_utf8(rest).map_err(|_| "regex must be UTF-8")?)
                 .map_err(|e| format!("bad regex: {e}"))?;
             return Ok(Term::Regex { re: Box::new(re) });
         }
+        if let Some(rest) = strip_prefix_ci(tok, b"type:") {
+            // Directories only (`-type:dir` inverts to files), or executables
+            // (`-type:exec` inverts to non-executables). Anything else is a
+            // usage error, not a silent substring.
+            if rest.eq_ignore_ascii_case(b"dir") {
+                return Ok(Term::IsDir);
+            }
+            if rest.eq_ignore_ascii_case(b"file") {
+                return Ok(Term::Not(Box::new(Term::IsDir)));
+            }
+            if rest.eq_ignore_ascii_case(b"exec") {
+                return Ok(Term::IsExec);
+            }
+            return Err("type: want dir, file, or exec".into());
+        }
     }
     if !quoted && (tok.contains(&b'*') || tok.contains(&b'?')) {
         let case = has_upper(tok);
-        return Ok(Term::Glob { pattern: GlobPattern::parse(tok, case) });
+        return Ok(Term::Glob {
+            pattern: GlobPattern::parse(tok, case),
+        });
     }
     let case = has_upper(tok);
-    Ok(Term::Substr { needle: tok.to_vec(), case })
+    Ok(Term::Substr {
+        needle: tok.to_vec(),
+        case,
+    })
 }
 
 fn strip_prefix_ci<'a>(tok: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
@@ -536,11 +616,14 @@ fn has_upper(tok: &[u8]) -> bool {
 /// Mark a term (and any negated term inside it) as case-sensitive.
 fn force_term_case(t: &mut Term) {
     match t {
-        Term::Substr { case, .. } | Term::Ext { case, .. } | Term::Path { case, .. } => *case = true,
+        Term::Substr { case, .. } | Term::Ext { case, .. } | Term::Path { case, .. } => {
+            *case = true
+        }
         Term::Glob { pattern } => pattern.case = true,
         Term::Not(inner) => force_term_case(inner),
-        // A regex carries its own flags: nothing to force.
-        Term::Regex { .. } => {}
+        // A regex carries its own flags, and a kind test has no case:
+        // nothing to force.
+        Term::Regex { .. } | Term::IsDir | Term::IsExec => {}
     }
 }
 
@@ -553,8 +636,14 @@ fn contains(hay: &[u8], needle: &[u8], case: bool) -> bool {
     } else {
         // ASCII-case-insensitive substring: lowercase a copy of the haystack.
         let lower: Vec<u8> = hay.iter().map(|c| c.to_ascii_lowercase()).collect();
-        memchr::memmem::find(&lower, &needle.iter().map(|c| c.to_ascii_lowercase()).collect::<Vec<_>>())
-            .is_some()
+        memchr::memmem::find(
+            &lower,
+            &needle
+                .iter()
+                .map(|c| c.to_ascii_lowercase())
+                .collect::<Vec<_>>(),
+        )
+        .is_some()
     }
 }
 
@@ -601,7 +690,13 @@ pub struct Hit {
 /// entry point uses none, so it behaves exactly like the plain scan). Without
 /// the feature it is a straight linear scan. Either way the results are
 /// identical.
-pub fn execute(index: &Index, root_paths: &[(u32, Vec<u8>)], q: &Query, limit: usize, count_only: bool) -> Results {
+pub fn execute(
+    index: &Index,
+    root_paths: &[(u32, Vec<u8>)],
+    q: &Query,
+    limit: usize,
+    count_only: bool,
+) -> Results {
     #[cfg(feature = "trigram")]
     {
         execute_with_trigram(index, root_paths, q, limit, count_only, None)
@@ -640,20 +735,35 @@ pub fn execute_with_trigram(
     };
     if let Some(c) = &candidates {
         if c.is_empty() {
-            return Results { hits: Vec::new(), total: 0 };
+            return Results {
+                hits: Vec::new(),
+                total: 0,
+            };
         }
     }
     match candidates {
         // Accelerated: ids are ascending, so result order matches the linear
         // scan exactly.
         Some(ids) => {
-            let mut results = Results { hits: Vec::new(), total: 0 };
+            let mut results = Results {
+                hits: Vec::new(),
+                total: 0,
+            };
             let mut buf: Vec<u8> = Vec::with_capacity(256);
             for id in ids {
                 // Guard the (impossible in practice) case of an id past the end
                 // after a shrink; the scan body also rechecks liveness.
                 if (id as usize) < index.len() {
-                    consider(index, root_paths, q, limit, count_only, id, &mut results, &mut buf);
+                    consider(
+                        index,
+                        root_paths,
+                        q,
+                        limit,
+                        count_only,
+                        id,
+                        &mut results,
+                        &mut buf,
+                    );
                 }
             }
             results
@@ -714,11 +824,14 @@ pub fn execute_fuzzy(
             let mut acc: Option<Vec<u32>> = None;
             let mut all_constrained = true;
             for n in &needles {
-                let constrained = crate::trigram::TrigramIndex::literal_trigrams(n, false).and_then(|tris| {
-                    let need =
-                        crate::trigram::TrigramIndex::required_shared_after_edits(tris.len(), max_distance);
-                    tg.candidates_sharing_at_least(&tris, need)
-                });
+                let constrained = crate::trigram::TrigramIndex::literal_trigrams(n, false)
+                    .and_then(|tris| {
+                        let need = crate::trigram::TrigramIndex::required_shared_after_edits(
+                            tris.len(),
+                            max_distance,
+                        );
+                        tg.candidates_sharing_at_least(&tris, need)
+                    });
                 match constrained {
                     Some(ids) => {
                         acc = Some(match acc {
@@ -756,15 +869,24 @@ pub fn execute_fuzzy(
         let name = index.name(id);
         // Exact terms still apply in full.
         let root_id = index.root_of(id);
-        let root_path = root_id
-            .and_then(|r| root_paths.iter().find(|(rid, _)| *rid == r).map(|(_, p)| p.clone()));
+        let root_path = root_id.and_then(|r| {
+            root_paths
+                .iter()
+                .find(|(rid, _)| *rid == r)
+                .map(|(_, p)| p.clone())
+        });
         // Unattributable entries (foreign roots excluded upstream) are
         // skipped before matching, as in the plain scan (§15).
         let root_path = match root_path {
             Some(rp) => rp,
             None => return,
         };
-        if !q.matches_exact_terms(name, || index.path_of(id, &root_path)) {
+        if !q.matches_exact_terms(
+            name,
+            entry.flags().is_dir(),
+            entry.flags().is_exec(),
+            || index.path_of(id, &root_path),
+        ) {
             return;
         }
         // Approximate terms: every needle must be within budget; sum the costs.
@@ -802,7 +924,11 @@ pub fn execute_fuzzy(
     }
 
     // Deterministic ranking: by score, then by path (bytes), then id.
-    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.cmp(&b.2)));
+    scored.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
     let hits = scored
         .into_iter()
         .take(if limit == 0 { usize::MAX } else { limit })
@@ -820,10 +946,22 @@ fn execute_scan(
     limit: usize,
     count_only: bool,
 ) -> Results {
-    let mut results = Results { hits: Vec::new(), total: 0 };
+    let mut results = Results {
+        hits: Vec::new(),
+        total: 0,
+    };
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     for (id, _) in index.iter_live() {
-        consider(index, root_paths, q, limit, count_only, id, &mut results, &mut buf);
+        consider(
+            index,
+            root_paths,
+            q,
+            limit,
+            count_only,
+            id,
+            &mut results,
+            &mut buf,
+        );
     }
     results
 }
@@ -859,7 +997,12 @@ fn consider(
         }
     }
     let root_id = index.root_of(id);
-    let root_path = root_id.and_then(|r| root_paths.iter().find(|(rid, _)| *rid == r).map(|(_, p)| p.clone()));
+    let root_path = root_id.and_then(|r| {
+        root_paths
+            .iter()
+            .find(|(rid, _)| *rid == r)
+            .map(|(_, p)| p.clone())
+    });
     // No root in the table (foreign roots excluded upstream, or orphans):
     // unattributable. A bare basename is not a valid path, and counting it
     // would leak foreign files into totals (§15) — skip before matching.
@@ -867,7 +1010,12 @@ fn consider(
         Some(rp) => rp,
         None => return,
     };
-    let matched = q.matches(name, || index.path_of(id, &root_path));
+    let matched = q.matches(
+        name,
+        entry.flags().is_dir(),
+        entry.flags().is_exec(),
+        || index.path_of(id, &root_path),
+    );
     if !matched {
         return;
     }
@@ -910,7 +1058,10 @@ pub fn execute_expr(
 ) -> Results {
     use crate::expr::MatchCtx;
 
-    let mut results = Results { hits: Vec::new(), total: 0 };
+    let mut results = Results {
+        hits: Vec::new(),
+        total: 0,
+    };
     let mut buf: Vec<u8> = Vec::with_capacity(256);
 
     // The anchor path we materialize against is `root_path/rel_root`; the
@@ -919,14 +1070,18 @@ pub fn execute_expr(
         if entry.flags().is_root_dir() {
             continue;
         }
-        let Some(root_id) = index.root_of(id) else { continue };
+        let Some(root_id) = index.root_of(id) else {
+            continue;
+        };
         let Some((_, root_path)) = root_paths.iter().find(|(rid, _)| *rid == root_id) else {
             continue;
         };
 
         // Absolute path of the candidate under its root.
         buf.clear();
-        let Some(abs) = index.path_of(id, root_path) else { continue };
+        let Some(abs) = index.path_of(id, root_path) else {
+            continue;
+        };
 
         // Anchor = root_path + '/' + rel_root.
         let mut anchor: Vec<u8> = root_path.clone();
@@ -939,9 +1094,7 @@ pub fn execute_expr(
         // Must be under the anchor.
         let rel = if anchor.is_empty() {
             abs.as_slice()
-        } else if abs.len() > anchor.len()
-            && abs.starts_with(&anchor)
-            && abs[anchor.len()] == b'/'
+        } else if abs.len() > anchor.len() && abs.starts_with(&anchor) && abs[anchor.len()] == b'/'
         {
             &abs[anchor.len() + 1..]
         } else {
@@ -953,6 +1106,7 @@ pub fn execute_expr(
             rel_path: rel,
             is_dir: entry.flags().is_dir(),
             is_symlink: entry.flags().is_symlink(),
+            is_exec: entry.flags().is_exec(),
             // v1 does not carry sizes or timestamps; `size`/`empty`/`since`
             // terms see `None`.
             size: None,
@@ -973,7 +1127,11 @@ pub fn execute_expr(
         }
         // Report the path exactly as `abs` (root-anchored), matching the string
         // query path's behaviour.
-        results.hits.push(Hit { id, path: abs, score: 0 });
+        results.hits.push(Hit {
+            id,
+            path: abs,
+            score: 0,
+        });
     }
     results
 }
@@ -987,7 +1145,11 @@ mod tests {
 
     fn tree() -> (Index, Vec<(u32, Vec<u8>)>) {
         let mut ix = Index::new();
-        let r = ix.insert(ROOT_ID, b"proj", EntryFlags::EMPTY.with_dir(true).with_root_dir(true));
+        let r = ix.insert(
+            ROOT_ID,
+            b"proj",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
         let src = ix.insert(r, b"src", EntryFlags::EMPTY.with_dir(true));
         ix.insert(src, b"main.rs", EntryFlags::EMPTY);
         ix.insert(src, b"lib.rs", EntryFlags::EMPTY);
@@ -1032,7 +1194,10 @@ mod tests {
     }
 
     fn paths(res: &Results) -> Vec<String> {
-        res.hits.iter().map(|h| String::from_utf8_lossy(&h.path).into_owned()).collect()
+        res.hits
+            .iter()
+            .map(|h| String::from_utf8_lossy(&h.path).into_owned())
+            .collect()
     }
 
     #[test]
@@ -1083,6 +1248,41 @@ mod tests {
     }
 
     #[test]
+    fn type_modifier() {
+        let (ix, rp) = tree();
+        let q = Query::compile("type:dir").unwrap();
+        let res = execute(&ix, &rp, &q, 0, false);
+        assert_eq!(res.total, 1);
+        assert_eq!(paths(&res), vec!["/home/me/proj/src".to_string()]);
+        // Explicit `file` and negation both select the four files.
+        for raw in ["type:file", "-type:dir"] {
+            let q = Query::compile(raw).unwrap();
+            let res = execute(&ix, &rp, &q, 0, false);
+            assert_eq!(res.total, 4, "{raw}");
+        }
+        // Composes with other terms.
+        let q = Query::compile("type:dir src").unwrap();
+        let res = execute(&ix, &rp, &q, 0, false);
+        assert_eq!(paths(&res), vec!["/home/me/proj/src".to_string()]);
+        // Anything else is a usage error, not a silent substring.
+        assert!(Query::compile("type:x").is_err());
+        assert!(Query::compile("type:").is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "trigram")]
+    fn type_dir_survives_the_fuzzy_path() {
+        // The fuzzy engine evaluates exact terms separately: `type:dir`
+        // must filter there too, not just in the plain scan.
+        let (ix, rp) = tree();
+        let tg = TrigramIndex::build(&ix);
+        let q = Query::compile("type:dir").unwrap();
+        let res = execute_fuzzy(&ix, &rp, &q, 1, 0, false, Some(&tg));
+        assert_eq!(res.total, 1);
+        assert_eq!(res.hits[0].path, b"/home/me/proj/src".to_vec());
+    }
+
+    #[test]
     fn glob_wildcards() {
         let (ix, rp) = tree();
         let q = Query::compile("*.rs").unwrap();
@@ -1108,7 +1308,10 @@ mod tests {
         assert_eq!(execute(&ix, &rp, &q, 0, false).total, 1);
         let q = Query::compile("rs -main").unwrap();
         assert_eq!(execute(&ix, &rp, &q, 0, false).total, 1);
-        assert_eq!(paths(&execute(&ix, &rp, &q, 0, false))[0], "/home/me/proj/src/lib.rs");
+        assert_eq!(
+            paths(&execute(&ix, &rp, &q, 0, false))[0],
+            "/home/me/proj/src/lib.rs"
+        );
     }
 
     #[test]
@@ -1305,6 +1508,10 @@ mod tests {
             .iter()
             .map(|n| String::from_utf8_lossy(n).into_owned())
             .collect();
-        assert_eq!(needles, vec!["main.js".to_string()], "only the plain lowercase substring");
+        assert_eq!(
+            needles,
+            vec!["main.js".to_string()],
+            "only the plain lowercase substring"
+        );
     }
 }

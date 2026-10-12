@@ -69,7 +69,11 @@ pub struct Caller {
 
 impl Caller {
     pub fn new(uid: u32, gid: u32) -> Caller {
-        Caller { uid, gid, groups: &[] }
+        Caller {
+            uid,
+            gid,
+            groups: &[],
+        }
     }
 
     /// uid 0 may read everything; the system index exists to serve everyone else.
@@ -126,7 +130,9 @@ impl Ownership {
         for (old, attr) in self.attrs.drain() {
             // Slot 0 is the virtual root and is never a real entry; ids past the
             // end did not survive.
-            let Some(&new) = old_to_new.get(old as usize) else { continue };
+            let Some(&new) = old_to_new.get(old as usize) else {
+                continue;
+            };
             if new == 0 {
                 continue; // tombstoned: no slot in the compacted index
             }
@@ -188,10 +194,18 @@ mod tests {
     use super::*;
 
     fn file(mode: u32, uid: u32, gid: u32) -> Attr {
-        Attr { uid, gid, mode: 0o100000 | mode }
+        Attr {
+            uid,
+            gid,
+            mode: 0o100000 | mode,
+        }
     }
     fn dir(mode: u32, uid: u32, gid: u32) -> Attr {
-        Attr { uid, gid, mode: 0o040000 | mode }
+        Attr {
+            uid,
+            gid,
+            mode: 0o040000 | mode,
+        }
     }
 
     #[test]
@@ -199,7 +213,10 @@ mod tests {
         let mut o = Ownership::new();
         o.set(7, file(0o600, 1000, 1000));
         assert!(o.visible_to(7, &Caller::new(1000, 1000)));
-        assert!(!o.visible_to(7, &Caller::new(1001, 1001)), "0600 is owner-only");
+        assert!(
+            !o.visible_to(7, &Caller::new(1001, 1001)),
+            "0600 is owner-only"
+        );
     }
 
     #[test]
@@ -211,7 +228,10 @@ mod tests {
         let mut c = Caller::new(5555, 999);
         c.groups = &[2000];
         assert!(o.visible_to(7, &c), "supplementary group");
-        assert!(!o.visible_to(7, &Caller::new(5555, 999)), "no group, no access");
+        assert!(
+            !o.visible_to(7, &Caller::new(5555, 999)),
+            "no group, no access"
+        );
     }
 
     #[test]
@@ -220,7 +240,10 @@ mod tests {
         o.set(7, file(0o644, 1000, 1000));
         assert!(o.visible_to(7, &Caller::new(4242, 4242)), "world-readable");
         o.set(8, file(0o600, 1000, 1000));
-        assert!(!o.visible_to(8, &Caller::new(4242, 4242)), "not world-readable");
+        assert!(
+            !o.visible_to(8, &Caller::new(4242, 4242)),
+            "not world-readable"
+        );
     }
 
     #[test]
@@ -238,7 +261,10 @@ mod tests {
     #[test]
     fn root_sees_everything_including_unknown_ids() {
         let o = Ownership::new();
-        assert!(o.visible_to(999, &Caller::new(0, 0)), "root may read anything");
+        assert!(
+            o.visible_to(999, &Caller::new(0, 0)),
+            "root may read anything"
+        );
     }
 
     #[test]

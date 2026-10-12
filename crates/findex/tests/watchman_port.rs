@@ -67,7 +67,13 @@ fn fixture() -> Fx {
     applier.pending_mut().enqueue_crawl(root_id);
     applier.drain();
     applier.drain();
-    Fx { applier, shared, _dir: d, root, root_id }
+    Fx {
+        applier,
+        shared,
+        _dir: d,
+        root,
+        root_id,
+    }
 }
 
 impl Fx {
@@ -173,7 +179,11 @@ fn dir_move_nonatomic_recreate_converges() {
     std::fs::create_dir_all(f.root.join("dir")).unwrap();
     std::fs::write(f.root.join("dir/a"), b"a").unwrap();
     f.settle();
-    assert_eq!(f.paths(), f.set(&["dir", "dir/a"]), "recreate must converge");
+    assert_eq!(
+        f.paths(),
+        f.set(&["dir", "dir/a"]),
+        "recreate must converge"
+    );
 }
 
 #[test]
@@ -238,7 +248,9 @@ fn root_gone_drops_subtree() {
     f.settle();
     assert_eq!(f.paths(), f.set(&["top"]));
 
-    f.applier.push(FsEvent::RootGone { dir: DirKey::new(f.root_id) });
+    f.applier.push(FsEvent::RootGone {
+        dir: DirKey::new(f.root_id),
+    });
     f.drain();
     assert!(f.paths().is_empty(), "RootGone must drop the whole subtree");
 }
@@ -259,7 +271,10 @@ fn cookie_files_are_never_indexed() {
 
     let paths = f.paths();
     assert!(paths.contains("real.txt"));
-    assert!(!paths.iter().any(|p| p.contains("cookie")), "cookies must never be indexed: {paths:?}");
+    assert!(
+        !paths.iter().any(|p| p.contains("cookie")),
+        "cookies must never be indexed: {paths:?}"
+    );
 }
 
 #[test]
@@ -268,9 +283,13 @@ fn cookie_event_marker_is_not_a_hit() {
     // indexed.
     let mut f = fixture();
     let name = findex::sync::cookie_name(4242);
-    f.applier.push(FsEvent::upsert(DirKey::new(f.root_id), name.clone(), false));
+    f.applier
+        .push(FsEvent::upsert(DirKey::new(f.root_id), name.clone(), false));
     f.drain();
-    assert!(f.paths().is_empty(), "a cookie upsert must not create an entry");
+    assert!(
+        f.paths().is_empty(),
+        "a cookie upsert must not create an entry"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -300,32 +319,55 @@ fn cursor_advances_and_since_reports_changes() {
     // without the generation bump a rescan would cause.
     std::fs::write(f.root.join("one"), b"x").unwrap();
     let name = b"one".to_vec();
-    f.applier.push(FsEvent::upsert(DirKey::new(f.root_id), name, false));
+    f.applier
+        .push(FsEvent::upsert(DirKey::new(f.root_id), name, false));
     f.drain();
     assert!(f.paths().contains("one"));
 
     // The cursor advanced.
     let after = f.shared.cursor();
     assert!(after.lsn > before.lsn, "the clock must move on change");
-    assert_eq!(after.gen, before.gen, "a plain event must not bump the generation");
+    assert_eq!(
+        after.gen, before.gen,
+        "a plain event must not bump the generation"
+    );
 
     // A stale-generation cursor reports fresh (Watchman's is_fresh_instance).
     let stale = format!("c:{}:{}", after.gen.wrapping_sub(1), 0);
-    let out = handle_request(&ctx, &findex::proto::Request::Since { cursor: stale, q: String::new() });
+    let out = handle_request(
+        &ctx,
+        &findex::proto::Request::Since {
+            cursor: stale,
+            q: String::new(),
+        },
+    );
     match out.first() {
-        Some(findex::proto::Response::Meta { fresh, .. }) => assert!(*fresh, "stale gen must be fresh"),
+        Some(findex::proto::Response::Meta { fresh, .. }) => {
+            assert!(*fresh, "stale gen must be fresh")
+        }
         other => panic!("expected meta, got {other:?}"),
     }
 
     // A current cursor is not fresh, and reports the change log tail.
     let current = format!("c:{}:{}", before.gen, before.lsn);
-    let out = handle_request(&ctx, &findex::proto::Request::Since { cursor: current, q: String::new() });
+    let out = handle_request(
+        &ctx,
+        &findex::proto::Request::Since {
+            cursor: current,
+            q: String::new(),
+        },
+    );
     match out.first() {
-        Some(findex::proto::Response::Meta { fresh, .. }) => assert!(!*fresh, "a live cursor is not fresh"),
+        Some(findex::proto::Response::Meta { fresh, .. }) => {
+            assert!(!*fresh, "a live cursor is not fresh")
+        }
         other => panic!("expected meta, got {other:?}"),
     }
     // The reply always ends with a `done` carrying the current cursor.
-    assert!(matches!(out.last(), Some(findex::proto::Response::Done { .. })));
+    assert!(matches!(
+        out.last(),
+        Some(findex::proto::Response::Done { .. })
+    ));
 }
 
 #[test]
@@ -351,7 +393,10 @@ fn since_reports_fresh_on_generation_bump() {
 
     let out = handle_request(
         &ctx,
-        &findex::proto::Request::Since { cursor: c.to_string_repr(), q: String::new() },
+        &findex::proto::Request::Since {
+            cursor: c.to_string_repr(),
+            q: String::new(),
+        },
     );
     match out.first() {
         Some(findex::proto::Response::Meta { fresh, .. }) => {

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::drive::DriveId;
 use crate::index::Index;
-use crate::journal::{Journal, ReplayOutcome, Record};
+use crate::journal::{Journal, Record, ReplayOutcome};
 use crate::roots::Root;
 use crate::snapshot;
 
@@ -102,7 +102,9 @@ pub fn check_gate(
             stamp.last_writer_os, current_os
         ));
     }
-    OpenGate::Open { handoff: stamp.last_writer_os != current_os }
+    OpenGate::Open {
+        handoff: stamp.last_writer_os != current_os,
+    }
 }
 
 /// The persistent store: a directory containing one snapshot and one journal.
@@ -163,7 +165,10 @@ impl Store {
     pub fn open(dir: &Path) -> io::Result<Store> {
         std::fs::create_dir_all(dir)?;
         let journal = Journal::open(&Self::journal_path(dir))?;
-        Ok(Store { dir: dir.to_path_buf(), journal })
+        Ok(Store {
+            dir: dir.to_path_buf(),
+            journal,
+        })
     }
 
     /// Load the snapshot if present. Returns `None` when there is none.
@@ -232,13 +237,22 @@ impl Store {
 pub fn apply_record(index: &mut Index, rec: &Record) {
     use crate::index::EntryFlags;
     match rec {
-        Record::Add { id, parent, name, flags } => {
+        Record::Add {
+            id,
+            parent,
+            name,
+            flags,
+        } => {
             index.apply_add(*id, *parent, name, EntryFlags(*flags));
         }
         Record::Del { id } => {
             index.remove(*id);
         }
-        Record::Move { id, new_parent, new_name } => {
+        Record::Move {
+            id,
+            new_parent,
+            new_name,
+        } => {
             index.move_entry(*id, *new_parent, Some(new_name));
         }
         Record::Fence | Record::Mark { .. } => {}
@@ -256,10 +270,28 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut store = Store::open(d.path()).unwrap();
         let mut ix = Index::new();
-        let r = ix.insert(ROOT_ID, b"p", EntryFlags::EMPTY.with_dir(true).with_root_dir(true));
-        store.append(&Record::Add { id: r, parent: ROOT_ID, name: b"p".to_vec(), flags: EntryFlags::EMPTY.with_dir(true).with_root_dir(true).0 }).unwrap();
+        let r = ix.insert(
+            ROOT_ID,
+            b"p",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        store
+            .append(&Record::Add {
+                id: r,
+                parent: ROOT_ID,
+                name: b"p".to_vec(),
+                flags: EntryFlags::EMPTY.with_dir(true).with_root_dir(true).0,
+            })
+            .unwrap();
         let f = ix.insert(r, b"a", EntryFlags::EMPTY);
-        store.append(&Record::Add { id: f, parent: r, name: b"a".to_vec(), flags: 0 }).unwrap();
+        store
+            .append(&Record::Add {
+                id: f,
+                parent: r,
+                name: b"a".to_vec(),
+                flags: 0,
+            })
+            .unwrap();
         ix.set_last_lsn(store.journal.count());
         let roots = vec![];
         store.compact(&ix, &roots).unwrap();
@@ -269,7 +301,9 @@ mod tests {
         let mut store2 = Store::open(d.path()).unwrap();
         let mut snap = store2.load_snapshot().unwrap().unwrap();
         assert_eq!(snap.index.entry_count(), ix.entry_count());
-        let out = store2.replay(&mut snap.index, |_, _rec: &crate::journal::Record| {}).unwrap();
+        let out = store2
+            .replay(&mut snap.index, |_, _rec: &crate::journal::Record| {})
+            .unwrap();
         assert_eq!(out.replayed, 0);
     }
 
@@ -278,12 +312,23 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut store = Store::open(d.path()).unwrap();
         let mut ix = Index::new();
-        let r = ix.insert(ROOT_ID, b"p", EntryFlags::EMPTY.with_dir(true).with_root_dir(true));
+        let r = ix.insert(
+            ROOT_ID,
+            b"p",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
         ix.set_last_lsn(store.journal.count());
         store.compact(&ix, &[]).unwrap();
         // Two tail records: add then del, at known ids.
         let a = ix.insert(r, b"a", EntryFlags::EMPTY);
-        store.append(&Record::Add { id: a, parent: r, name: b"a".to_vec(), flags: 0 }).unwrap();
+        store
+            .append(&Record::Add {
+                id: a,
+                parent: r,
+                name: b"a".to_vec(),
+                flags: 0,
+            })
+            .unwrap();
         store.append(&Record::Del { id: a }).unwrap();
 
         let mut store2 = Store::open(d.path()).unwrap();
@@ -295,7 +340,9 @@ mod tests {
         let mut store3 = Store::open(d.path()).unwrap();
         let mut snap3 = store3.load_snapshot().unwrap().unwrap().index;
         let mut applied = Vec::new();
-        store3.replay(&mut snap3, |lsn, rec| applied.push((lsn, rec.clone()))).unwrap();
+        store3
+            .replay(&mut snap3, |lsn, rec| applied.push((lsn, rec.clone())))
+            .unwrap();
         for (_, rec) in &applied {
             apply_record(&mut snap3, rec);
         }
@@ -340,11 +387,20 @@ mod tests {
     fn gate_matrix() {
         use OpenGate::*;
         // Fresh store: open, no handoff.
-        assert_eq!(check_gate(None, None, "linux", false), Open { handoff: false });
+        assert_eq!(
+            check_gate(None, None, "linux", false),
+            Open { handoff: false }
+        );
         // Same OS, with or without the flag: open, no handoff.
         let s = stamp("linux", false);
-        assert_eq!(check_gate(Some(&s), Some(2), "linux", false), Open { handoff: false });
-        assert_eq!(check_gate(Some(&s), Some(2), "linux", true), Open { handoff: false });
+        assert_eq!(
+            check_gate(Some(&s), Some(2), "linux", false),
+            Open { handoff: false }
+        );
+        assert_eq!(
+            check_gate(Some(&s), Some(2), "linux", true),
+            Open { handoff: false }
+        );
         // Foreign without the flag: refuse.
         let s = stamp("windows", false);
         assert!(
@@ -369,13 +425,20 @@ mod tests {
             "newer snapshot version must refuse even unstamped"
         );
         // Older snapshots keep the legacy recrawl path (no refusal).
-        assert_eq!(check_gate(None, Some(1), "linux", false), Open { handoff: false });
+        assert_eq!(
+            check_gate(None, Some(1), "linux", false),
+            Open { handoff: false }
+        );
     }
 
     #[test]
     fn peek_snapshot_version_behaves() {
         let d = tempfile::tempdir().unwrap();
-        assert_eq!(Store::peek_snapshot_version(d.path()).unwrap(), None, "no file");
+        assert_eq!(
+            Store::peek_snapshot_version(d.path()).unwrap(),
+            None,
+            "no file"
+        );
         // A real snapshot reports its version.
         let ix = Index::new();
         let roots = vec![];
@@ -393,11 +456,24 @@ mod tests {
     #[test]
     fn apply_record_is_idempotent() {
         let mut ix = Index::new();
-        let r = ix.insert(ROOT_ID, b"p", EntryFlags::EMPTY.with_dir(true).with_root_dir(true));
-        let rec = Record::Add { id: r, parent: ROOT_ID, name: b"p".to_vec(), flags: EntryFlags::EMPTY.with_dir(true).with_root_dir(true).0 };
+        let r = ix.insert(
+            ROOT_ID,
+            b"p",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        let rec = Record::Add {
+            id: r,
+            parent: ROOT_ID,
+            name: b"p".to_vec(),
+            flags: EntryFlags::EMPTY.with_dir(true).with_root_dir(true).0,
+        };
         apply_record(&mut ix, &rec);
         let before = ix.live_count();
         apply_record(&mut ix, &rec);
-        assert_eq!(ix.live_count(), before, "replaying an add twice must not duplicate");
+        assert_eq!(
+            ix.live_count(),
+            before,
+            "replaying an add twice must not duplicate"
+        );
     }
 }

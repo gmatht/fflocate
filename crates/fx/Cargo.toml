@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "ff: command-line client for the findex daemon."
+# `cargo run` with no `--bin` runs the CLI: it is the primary interface, and
+# the only binary that makes sense without arguments or a display.
+default-run = "ff"
 
 [[bin]]
 name = "ff"
@@ -18,10 +21,7 @@ trigram = ["findex/trigram"]
 [dependencies]
 findex.workspace = true
 serde_json.workspace = true
-anyhow.workspace = true
-libc.workspace = true
 regex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-libc.workspace = true

@@ -11,6 +11,7 @@ it is a status note.
 | §3 Index data model | done | `crates/findex/src/index.rs`, `roots.rs` |
 | §4 Per-mount probing | done | `crates/findex/src/mount.rs` (`fanotify_available`, `handle_of_path`) |
 | §4/§6 **exclusions** | done | `crates/findex/src/excludes.rs`, `applier.rs`; tests `tests/excludes.rs` |
+| §4 **native-filesystem defaults + mount-aware crawl** | done | `mount.rs` (`NATIVE_FSTYPES`, `default_root_candidates`), `roots.rs` (path-qualified entry names), `applier.rs` (mountpoint set, `may_descend`), `daemon.rs` (covered-root pruning), `config.rs` (`default_roots`); tests `tests/mount_boundary.rs` |
 | §3/§15 **system daemon** | done | `crates/findex/src/ownership.rs`, `server.rs` (`finish_query`), `crates/findexd/src/net.rs` (`bind_system`, `peer_credentials`); tests `tests/system_access.rs`, `tests/system_live.rs` |
 | §5 Initial crawl | done | `crates/findex/src/crawl.rs`, `applier.rs` (`crawl_dir`) |
 | §6 Watcher backends | inotify + **fanotify-FID** + fake | `crates/findex/src/watch/{mod,inotify,fanotify,fake}.rs`, `watch/fidmap.rs`; tests `tests/fanotify_live.rs` |
@@ -43,7 +44,7 @@ All of the following were exercised against real binaries and a real temp tree:
   the queue drained).
 * Cookie files are cleaned up on completion and on timeout (no leaks).
 
-`cargo test` runs 313 tests, all green, including a 120-step random
+`cargo test` runs 377 tests, all green, including a 120-step random
 differential test against a from-scratch filesystem walk.
 
 Zero-hit `ff` string queries with an uppercase letter get a case-folded
@@ -226,6 +227,70 @@ refuses, foreign refuses, foreign+flag handoffs end to end), and server
 foreign-exclusion tests. Legacy (unstamped) stores adopt unchanged; the
 never-compacted foreign store is the one documented unprotected case.
 
+### Native-filesystem defaults: one database, one root per filesystem (§4)
+
+On Linux the daemon now indexes every readable native filesystem by default
+(`ext4`, `btrfs`, `xfs`, `f2fs`, …) instead of just `$HOME`; unreadable mounts
+are skipped loudly at startup, and when discovery yields nothing usable
+(containers) the historical `$HOME` root applies. `$FINDEX_ROOT` and `--root`
+still win outright, and every other platform keeps `$HOME`.
+
+Deliberately **not** a database per filesystem: the index already stores paths
+relative to the root mountpoint (`materialize_into(id, root_path)` — only the
+small per-query root table is absolute), so per-filesystem stores would buy no
+identity while breaking global cursors, single-writer ordering, and
+cross-filesystem queries. What per-filesystem indexing actually needed was:
+
+* **Default discovery** (`mount::default_root_candidates`): native fstypes
+  from mountinfo, nested mounts included, duplicates collapsed, sorted.
+* **A mount-aware crawl** (`may_descend` in `crawl_dir`/`diff_subtree`): never
+  descend into a mount point that is not itself a root, from a mountinfo set
+  refreshed on the mount-watchdog tick (zero syscalls on the hot path). The
+  mountpoint directory itself is still recorded; a nested mount is covered by
+  its own root, and a non-root mount (NFS, pseudo-FS, removable media) never
+  leaks in through a parent — which also finally enforces §4's "network FS
+  unless opted in" (the fstype exclusion helper existed but was never wired
+  into any path). A rescan additionally drops legacy content lingering beneath
+  a boundary, healing pre-boundary stores.
+* **Root identity by path** (`roots::root_entry_name`): entries are named by
+  full path, so same-basename roots (`/data`, `/mnt/data`) cannot collide —
+  this fixes old deviation #5 with no format change and no migration. Stores
+  written before qualification resolve through a basename fallback, and the
+  daemon adopts (never duplicates) a legacy entry.
+* **`/` as a root**: the materializer already special-cased a `/` root path;
+  only the entry name was missing.
+* **Covered-root pruning at open** (`daemon::covered_root_paths`): a stored
+  root on the same device strictly below a configured root (yesterday's `$HOME`
+  under today's `/home`) is dropped with its subtree, or everything would index
+  twice. Only provable coverage prunes — unknown device ids never count.
+* **Compaction remaps the root table**: `compact_now` previously remapped the
+  ownership sidecar but left `root_dir_ids` pointing at whatever moved into
+  the old slots — every watch/crawl/rescan/drop mistargeted after a
+  compaction. Covered by a unit test that fails with the remap removed.
+
+Two honest edges, stated plainly: a filesystem remounted at a *different path*
+is treated as a new root (recrawl) with the old record degrading loudly — the
+storage is already mount-relative, but identity-following adoption is future
+work. And the default backend stays inotify: per-filesystem roots make
+fanotify-FID (one mark per filesystem) the natural `--backend auto` pick where
+privileged, but the default is unchanged.
+
+### GUI menubar (`crates/ff-gui`)
+
+File/Search/View/Help, built through the portable `new_menu` /
+`new_simple_action` / `register_action` / `new_menubar` API so every backend
+gets it. Every item reuses a handler something else already owns (search
+trigger, option widgets, row actions, daemon client); toggles flip their
+widgets rather than carrying checkmarks the toolkit cannot render; no
+accelerators (the toolkit exposes none). Contents live as testable data
+(`menubar_model`: every action exactly once). New client surface this needed:
+`DaemonClient::rescan` / `root_paths` (Refresh Index) plus pure
+`rescan_request` / `parse_root_paths` constructors. Verified headless: unit
+tests plus driving the zork REPL over piped stdin (model renders, Quit
+terminates the process). On zork, menu-item selection now dispatches the
+item's registered action by name (bare or `app.`-prefixed, as on NWG);
+previously only parent-menu callbacks fired.
+
 ### `locate` drop-in (`crates/fx/src/locate.rs`)
 
 Invoking the `ff` binary as `locate` (argv\[0\], e.g. a symlink) speaks GNU
@@ -312,16 +377,11 @@ These are deliberate and small; each is noted so the design stays honest.
    converts. A non-UTF-8 directory name is still indexed correctly, but a rescan
    of its subtree may not find it on disk.
 
-5. **`root_dir_id` matches a root by the basename of its path.** Roots are
-   inserted into the index as entries whose name is the final path component.
-   Two roots with the same basename would collide. Fine for v1; a root-id field
-   on the entry would fix it.
-
-6. **FSEvents is not implemented** (v1.5 in the design). fanotify-FID *is* now
+5. **FSEvents is not implemented** (v1.5 in the design). fanotify-FID *is* now
    implemented and live-verified (§6); the `WatchBackend` trait and `BackendCaps`
    are what let it slot in without touching the applier.
 
-7. **The system daemon's ownership sidecar can be stale, by design.** It is
+6. **The system daemon's ownership sidecar can be stale, by design.** It is
    captured at crawl time and refreshed on rescan; a `chown`/`chmod` between
    rescans is not seen, because fanotify's namespace mask does not report metadata
    changes and adding `FAN_ATTRIB` would make every `touch` an event for no
@@ -330,7 +390,7 @@ These are deliberate and small; each is noted so the design stays honest.
    they have gained). This is a deliberate trade, recorded here rather than
    discovered later.
 
-8. **Ownership costs an `lstat` per entry, and only the system daemon pays it.**
+7. **Ownership costs an `lstat` per entry, and only the system daemon pays it.**
    `Applier::track_ownership` is off unless `--system`. A personal index crawls
    with no stats at all, which is why the sidecar is not simply part of the
    normal path.
@@ -355,6 +415,7 @@ These are deliberate and small; each is noted so the design stays honest.
   watch-limit exhaustion produced no degradation and no counter. Now the watcher
   thread reports failures to the applier, which marks the root degraded and bumps
   `watch_failures`/`watch_limit_hits` — loudly stale, not silently wrong.
+fails at exactly that watchdog).
 
 ## Reproducing the checks
 

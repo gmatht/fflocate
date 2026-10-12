@@ -29,8 +29,8 @@ use findex::mount::{fanotify_available, handle_of_path};
 use findex::persist::Store;
 use findex::roots::Root;
 use findex::sync::SyncRegistry;
-use findex::watch::{FanotifyBackend, WatchBackend};
 use findex::watch::fidmap::FidMap;
+use findex::watch::{FanotifyBackend, WatchBackend};
 
 /// Removes the tmpfs on drop even if the test panics.
 struct TmpfsGuard(PathBuf);
@@ -101,7 +101,10 @@ fn harness(tag: &str) -> Option<Harness> {
     // The root entry's name is the path's basename — that is how `root_dir_id`
     // finds it, and it is what the daemon does. Getting this wrong leaves the
     // path cache un-primed and nothing is crawled.
-    let basename = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let basename = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let root_id = ix.insert(
         ROOT_ID,
         basename.as_bytes(),
@@ -130,7 +133,9 @@ fn harness(tag: &str) -> Option<Harness> {
         },
         root_id,
     );
-    backend.add_root(shared.roots.read().unwrap().first().unwrap()).ok()?;
+    backend
+        .add_root(shared.roots.read().unwrap().first().unwrap())
+        .ok()?;
 
     Some(Harness {
         applier,
@@ -178,7 +183,9 @@ impl Harness {
 
 #[test]
 fn fanotify_events_converge_the_index() {
-    let Some(mut h) = harness("converge") else { return };
+    let Some(mut h) = harness("converge") else {
+        return;
+    };
     // Seed the index with the (empty) root's real contents, then watch.
     h.applier.pending_mut().enqueue_crawl(h.root_id);
     h.applier.drain();
@@ -193,7 +200,10 @@ fn fanotify_events_converge_the_index() {
     // Run the shell in a thread so we can pump events *while* it works.
     let root = h.root.clone();
     let worker = std::thread::spawn(move || {
-        let _ = std::process::Command::new("sh").arg("-c").arg(&script).status();
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .status();
         let _ = root;
     });
     h.pump(2600);
@@ -204,7 +214,10 @@ fn fanotify_events_converge_the_index() {
     // The sequence was mkdir → create a.rs → rename to b.rs → delete b.rs, so
     // the *final* state is just the directory. Asserting every intermediate
     // state would be asserting on timing, not on convergence.
-    assert!(paths.iter().any(|p| p.ends_with("/sub")), "mkdir must be indexed; got {paths:?}");
+    assert!(
+        paths.iter().any(|p| p.ends_with("/sub")),
+        "mkdir must be indexed; got {paths:?}"
+    );
     assert!(
         !paths.iter().any(|p| p.ends_with("/sub/a.rs")),
         "a.rs was renamed away and must be gone; got {paths:?}"
@@ -215,7 +228,10 @@ fn fanotify_events_converge_the_index() {
     );
     // And the resolver never had to guess — every event, including the ones
     // inside the directory created *after* we started watching, resolved.
-    assert_eq!(h.backend.unresolved_events, 0, "every event's parent handle was learned");
+    assert_eq!(
+        h.backend.unresolved_events, 0,
+        "every event's parent handle was learned"
+    );
 }
 
 #[test]
@@ -223,7 +239,9 @@ fn fanotify_index_survives_a_rescan_after_events() {
     // Events give a *live* view; a rescan must agree with it. If the two
     // disagree, one of them is lying, and the whole "diffs over replacements"
     // contract (§7) rests on them agreeing.
-    let Some(mut h) = harness("rescan") else { return };
+    let Some(mut h) = harness("rescan") else {
+        return;
+    };
     h.applier.pending_mut().enqueue_crawl(h.root_id);
     h.applier.drain();
 
@@ -243,12 +261,20 @@ fn fanotify_index_survives_a_rescan_after_events() {
     h.pump(300);
 
     let after_events = h.index_paths();
-    assert!(after_events.iter().any(|p| p.ends_with("/one.txt")), "got {after_events:?}");
-    assert!(after_events.iter().any(|p| p.ends_with("/two.txt")), "got {after_events:?}");
+    assert!(
+        after_events.iter().any(|p| p.ends_with("/one.txt")),
+        "got {after_events:?}"
+    );
+    assert!(
+        after_events.iter().any(|p| p.ends_with("/two.txt")),
+        "got {after_events:?}"
+    );
 
     // A full rescan must converge to the same set (not replace it with something
     // else, and not lose the files the events added).
-    h.applier.pending_mut().enqueue_rescan(h.root_id, RescanCause::Manual);
+    h.applier
+        .pending_mut()
+        .enqueue_rescan(h.root_id, RescanCause::Manual);
     h.applier.drain();
     let after_rescan = h.index_paths();
     assert_eq!(after_events, after_rescan, "events and a rescan must agree");
@@ -258,13 +284,19 @@ fn fanotify_index_survives_a_rescan_after_events() {
 fn fanotify_ignores_events_outside_the_root() {
     // A whole-mount watch reports the whole mount. An event whose parent handle
     // we never learned must be dropped, not attributed to a root we do know.
-    let Some(mut h) = harness("foreign") else { return };
+    let Some(mut h) = harness("foreign") else {
+        return;
+    };
     h.applier.drain();
 
     // Fabricate an event with an unknown parent id: the resolver cannot have a
     // mapping for it, so nothing may be indexed.
     let before = h.index_paths();
-    h.applier.push(FsEvent::upsert(findex::event::DirKey::new(9999), b"stranger.rs".to_vec(), false));
+    h.applier.push(FsEvent::upsert(
+        findex::event::DirKey::new(9999),
+        b"stranger.rs".to_vec(),
+        false,
+    ));
     h.applier.drain();
     let after = h.index_paths();
     assert_eq!(before, after, "an unknown parent must not create entries");

@@ -39,7 +39,9 @@ pub fn runtime_dir() -> PathBuf {
 pub fn state_dir() -> PathBuf {
     if let Ok(d) = std::env::var("XDG_STATE_HOME") {
         if !d.is_empty() {
-            return PathBuf::from(d).join("findex").join(FORMAT_VERSION.to_string());
+            return PathBuf::from(d)
+                .join("findex")
+                .join(FORMAT_VERSION.to_string());
         }
     }
     #[cfg(windows)]
@@ -47,7 +49,9 @@ pub fn state_dir() -> PathBuf {
         for var in ["LOCALAPPDATA", "APPDATA"] {
             if let Ok(d) = std::env::var(var) {
                 if !d.is_empty() {
-                    return PathBuf::from(d).join("findex").join(FORMAT_VERSION.to_string());
+                    return PathBuf::from(d)
+                        .join("findex")
+                        .join(FORMAT_VERSION.to_string());
                 }
             }
         }
@@ -60,7 +64,9 @@ pub fn state_dir() -> PathBuf {
     #[cfg(windows)]
     {
         // Last resort: temp dir (Git-Bash/MSYS set HOME, so this is rare).
-        std::env::temp_dir().join("findex").join(FORMAT_VERSION.to_string())
+        std::env::temp_dir()
+            .join("findex")
+            .join(FORMAT_VERSION.to_string())
     }
     #[cfg(not(windows))]
     {
@@ -114,14 +120,16 @@ mod tests {
         let p = socket_path();
         #[cfg(not(windows))]
         {
-            assert!(!p.starts_with("/tmp"), "socket must not live in /tmp: {p:?}");
+            assert!(
+                !p.starts_with("/tmp"),
+                "socket must not live in /tmp: {p:?}"
+            );
             assert!(p.ends_with("findex.sock"));
         }
         // On Windows the "socket path" is loopback TCP text, never a file.
         #[cfg(windows)]
         {
-            let addr: std::net::SocketAddr =
-                p.to_str().expect("utf-8").parse().expect("addr text");
+            let addr: std::net::SocketAddr = p.to_str().expect("utf-8").parse().expect("addr text");
             assert!(addr.ip().is_loopback(), "loopback only: {addr}");
         }
     }

@@ -24,7 +24,7 @@ mod service;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use client::{Client, CliError};
+use client::{CliError, Client};
 
 const USAGE: &str = "\
 ff — search the findex index
@@ -141,7 +141,10 @@ fn run() -> Result<ExitCode, CliError> {
             return c.stats(args.roots, args.json);
         }
         Some("rescan") => {
-            let root = args.query.first().ok_or_else(|| CliError::Usage("rescan needs a ROOT".into()))?;
+            let root = args
+                .query
+                .first()
+                .ok_or_else(|| CliError::Usage("rescan needs a ROOT".into()))?;
             let mut c = Client::connect(args.socket.as_deref())?;
             return c.rescan(root);
         }
@@ -226,14 +229,23 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<Args, CliError> {
             "-s" | "--sync" => a.sync = true,
             "--gui" => a.gui = true,
             "-l" | "--limit" => {
-                let v = it.next().ok_or_else(|| CliError::Usage("--limit needs a number".into()))?;
-                a.limit = v.parse().map_err(|_| CliError::Usage(format!("bad limit: {v}")))?;
+                let v = it
+                    .next()
+                    .ok_or_else(|| CliError::Usage("--limit needs a number".into()))?;
+                a.limit = v
+                    .parse()
+                    .map_err(|_| CliError::Usage(format!("bad limit: {v}")))?;
             }
             "--since" => {
-                a.since = Some(it.next().ok_or_else(|| CliError::Usage("--since needs a cursor".into()))?);
+                a.since = Some(
+                    it.next()
+                        .ok_or_else(|| CliError::Usage("--since needs a cursor".into()))?,
+                );
             }
             "--timeout" => {
-                let v = it.next().ok_or_else(|| CliError::Usage("--timeout needs seconds".into()))?;
+                let v = it
+                    .next()
+                    .ok_or_else(|| CliError::Usage("--timeout needs seconds".into()))?;
                 let secs: u64 = v
                     .parse()
                     .map_err(|_| CliError::Usage(format!("bad timeout: {v}")))?;
@@ -242,21 +254,28 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<Args, CliError> {
             "--roots" => a.roots = true,
             "-f" | "--fuzzy" => a.fuzzy = true,
             "--distance" => {
-                let v = it.next().ok_or_else(|| CliError::Usage("--distance needs a number".into()))?;
+                let v = it
+                    .next()
+                    .ok_or_else(|| CliError::Usage("--distance needs a number".into()))?;
                 let d: u32 = v
                     .parse()
                     .map_err(|_| CliError::Usage(format!("bad distance: {v}")))?;
                 a.distance = Some(d);
             }
             "--expr" => {
-                let v = it.next().ok_or_else(|| CliError::Usage("--expr needs JSON".into()))?;
+                let v = it
+                    .next()
+                    .ok_or_else(|| CliError::Usage("--expr needs JSON".into()))?;
                 a.expr = Some(
                     serde_json::from_str(&v)
                         .map_err(|e| CliError::Usage(format!("bad --expr JSON: {e}")))?,
                 );
             }
             "--socket" => {
-                a.socket = Some(it.next().ok_or_else(|| CliError::Usage("--socket needs a path".into()))?);
+                a.socket = Some(
+                    it.next()
+                        .ok_or_else(|| CliError::Usage("--socket needs a path".into()))?,
+                );
             }
             "--" => {
                 a.query.extend(it);
@@ -342,7 +361,10 @@ fn launch_gui() -> Result<ExitCode, CliError> {
         use std::os::unix::process::CommandExt;
         // `exec` only returns on failure.
         let err = std::process::Command::new(&exe).exec();
-        Err(CliError::Io(format!("cannot exec {}: {err}", exe.display())))
+        Err(CliError::Io(format!(
+            "cannot exec {}: {err}",
+            exe.display()
+        )))
     }
     #[cfg(not(unix))]
     {
@@ -368,7 +390,11 @@ mod tests {
     fn gui_flag_is_a_flag_not_a_query_term() {
         let a = parse(&["--gui"]);
         assert!(a.gui);
-        assert!(a.query.is_empty(), "--gui must not leak into the query: {:?}", a.query);
+        assert!(
+            a.query.is_empty(),
+            "--gui must not leak into the query: {:?}",
+            a.query
+        );
     }
 
     #[test]
@@ -409,9 +435,15 @@ mod tests {
 
     #[test]
     fn subcommands() {
-        assert_eq!(parse(&["stats", "--roots"]).command.as_deref(), Some("stats"));
+        assert_eq!(
+            parse(&["stats", "--roots"]).command.as_deref(),
+            Some("stats")
+        );
         assert!(parse(&["stats", "--roots"]).roots);
-        assert_eq!(parse(&["rescan", "/data"]).command.as_deref(), Some("rescan"));
+        assert_eq!(
+            parse(&["rescan", "/data"]).command.as_deref(),
+            Some("rescan")
+        );
         assert_eq!(parse(&["rescan", "/data"]).query, vec!["/data"]);
     }
 

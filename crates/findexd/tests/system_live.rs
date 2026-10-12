@@ -78,11 +78,17 @@ fn make_tree(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::set_permissions(dir.join("public"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::set_permissions(dir.join("public/readable.txt"), std::fs::Permissions::from_mode(0o644))
-        .unwrap();
+    std::fs::set_permissions(
+        dir.join("public/readable.txt"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
     std::fs::set_permissions(dir.join("private"), std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::set_permissions(dir.join("private/secret.txt"), std::fs::Permissions::from_mode(0o600))
-        .unwrap();
+    std::fs::set_permissions(
+        dir.join("private/secret.txt"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
 }
 
 /// Build a server context whose ownership table came from crawling `root`.
@@ -137,14 +143,23 @@ fn a_privileged_index_filters_for_an_unprivileged_caller() {
     // Crawled as root, answered as uid 1000 (a stranger to these files).
     let (ctx, _d) = system_ctx(&root, Some(ownership::Caller::new(1000, 1000)));
     let got = hits(&ctx, &Request::query("", 0, false, false));
-    assert!(got.iter().any(|p| p.ends_with("/public/readable.txt")), "got {got:?}");
-    assert!(!got.iter().any(|p| p.contains("private")), "0700 subtree leaked; got {got:?}");
+    assert!(
+        got.iter().any(|p| p.ends_with("/public/readable.txt")),
+        "got {got:?}"
+    );
+    assert!(
+        !got.iter().any(|p| p.contains("private")),
+        "0700 subtree leaked; got {got:?}"
+    );
     assert!(!got.iter().any(|p| p.contains("secret")), "got {got:?}");
 
     // And the same index answers root in full.
     let (root_ctx, _d2) = system_ctx(&root, Some(ownership::Caller::new(0, 0)));
     let all = hits(&root_ctx, &Request::query("", 0, false, false));
-    assert!(all.iter().any(|p| p.ends_with("/private/secret.txt")), "root must see it; got {all:?}");
+    assert!(
+        all.iter().any(|p| p.ends_with("/private/secret.txt")),
+        "root must see it; got {all:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -162,7 +177,13 @@ fn peer_credentials_are_read_from_the_kernel_not_the_request() {
     }
     if user_ids(USER).is_none() {
         let _ = Command::new("useradd")
-            .args(["--system", "--no-create-home", "--shell", "/usr/sbin/nologin", USER])
+            .args([
+                "--system",
+                "--no-create-home",
+                "--shell",
+                "/usr/sbin/nologin",
+                USER,
+            ])
             .status();
     }
     let Some((uid, gid)) = user_ids(USER) else {
@@ -192,8 +213,8 @@ fn peer_credentials_are_read_from_the_kernel_not_the_request() {
         .env("FINDEX_TEST_SOCK", &sock2)
         .spawn();
     let _ = child; // the `setpriv sleep` does not connect; we connect as root.
-    // Connect as root (the socket is ours) — enough to prove SO_PEERCRED reports
-    // *a* real identity, and that it is this process's.
+                   // Connect as root (the socket is ours) — enough to prove SO_PEERCRED reports
+                   // *a* real identity, and that it is this process's.
     let _client = std::os::unix::net::UnixStream::connect(&sock).unwrap();
     let cred = handle.join().unwrap();
     assert_eq!(cred.uid, 0, "the peer is this process, uid 0");

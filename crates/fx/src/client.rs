@@ -2,11 +2,12 @@
 //! protocol, and format results.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use findex::config_paths::{socket_path_from_env, state_dir_from_env};
+use findex::config_paths::socket_path_from_env;
 use findex::proto::{Request, Response};
+use findex::spawn::spawn_daemon;
 use findex::transport::{self, Stream};
 
 #[derive(Debug)]
@@ -56,15 +57,28 @@ impl Client {
         // Try once, then spawn and retry.
         match transport::connect(&socket) {
             Ok(stream) => Ok(Client { stream, socket }),
-            Err(_) => {
-                spawn_daemon(&socket)?;
+            Err(first) => {
+                // Connection-refused against a lock held by a LIVE daemon is
+                // the deaf-daemon signature (§15): a process holds the pidfile
+                // but serves nothing — spawning another daemon can never help
+                // (the child just exits "already running") and waiting 30 s
+                // for a listener that will never appear only hides the cause.
+                // Fail fast and loud instead; anything else spawns as before.
+                if first.kind() == std::io::ErrorKind::ConnectionRefused {
+                    let pidfile = findex::spawn::pidfile_for_socket(&socket);
+                    if findex::spawn::daemon_lock_held(&pidfile) {
+                        return Err(CliError::Io(findex::spawn::deaf_daemon_message(
+                            &socket, &pidfile,
+                        )));
+                    }
+                }
+                spawn_daemon(&socket).map_err(|e| CliError::Io(e.to_string()))?;
                 // Wait for the socket to come up. The daemon performs its
                 // initial mount probes and starts its threads before binding,
                 // which on a slow or network-backed filesystem can take a
                 // while; a daemon that is still *starting* must not be
                 // mistaken for one that is absent.
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(30);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                 let mut last_err = None;
                 loop {
                     match transport::connect(&socket) {
@@ -91,16 +105,22 @@ impl Client {
     fn send(&mut self, req: &Request) -> Result<Vec<Response>, CliError> {
         let line = serde_json::to_string(req).map_err(|e| CliError::Protocol(e.to_string()))?;
         writeln!(self.stream, "{line}").map_err(|e| CliError::Io(e.to_string()))?;
-        self.stream.flush().map_err(|e| CliError::Io(e.to_string()))?;
+        self.stream
+            .flush()
+            .map_err(|e| CliError::Io(e.to_string()))?;
         let mut out = Vec::new();
-        let reader = BufReader::new(self.stream.try_clone().map_err(|e| CliError::Io(e.to_string()))?);
+        let reader = BufReader::new(
+            self.stream
+                .try_clone()
+                .map_err(|e| CliError::Io(e.to_string()))?,
+        );
         for line in reader.lines() {
             let line = line.map_err(|e| CliError::Io(e.to_string()))?;
             if line.trim().is_empty() {
                 continue;
             }
-            let r: Response =
-                serde_json::from_str(&line).map_err(|e| CliError::Protocol(format!("{e}: {line}")))?;
+            let r: Response = serde_json::from_str(&line)
+                .map_err(|e| CliError::Protocol(format!("{e}: {line}")))?;
             let terminal = matches!(
                 r,
                 Response::Done { .. }
@@ -124,7 +144,15 @@ impl Client {
     /// full query object; the JSON is sent as the query and the string `q` is
     /// ignored (§10, expr).
     pub fn query(&mut self, q: &str, opts: QueryOpts) -> Result<ExitCode, CliError> {
-        let QueryOpts { limit, json, count, zero, expr, fuzzy, distance } = opts;
+        let QueryOpts {
+            limit,
+            json,
+            count,
+            zero,
+            expr,
+            fuzzy,
+            distance,
+        } = opts;
         let is_string_query = expr.is_none();
         let req = match expr {
             Some(v) => {
@@ -150,7 +178,8 @@ impl Client {
                     glob_noescape: get("glob_noescape").and_then(|v| v.as_bool()),
                     suffix: get("suffix"),
                     path: get("path"),
-                    relative_root: get("relative_root").and_then(|v| v.as_str().map(|s| s.to_string())),
+                    relative_root: get("relative_root")
+                        .and_then(|v| v.as_str().map(|s| s.to_string())),
                     case_sensitive: get("case_sensitive").and_then(|v| v.as_bool()),
                     // Fuzzy applies to the string query language, not to
                     // expression trees (§10).
@@ -160,7 +189,12 @@ impl Client {
             }
             None => {
                 let mut r = Request::query(q, limit, json, count);
-                if let Request::Query { fuzzy: f, max_distance: d, .. } = &mut r {
+                if let Request::Query {
+                    fuzzy: f,
+                    max_distance: d,
+                    ..
+                } = &mut r
+                {
                     *f = fuzzy;
                     *d = distance;
                 }
@@ -173,12 +207,18 @@ impl Client {
         let mut stdout = std::io::stdout().lock();
         for r in &resp {
             match r {
-                Response::Meta { stale_roots, catching_up, .. } => {
+                Response::Meta {
+                    stale_roots,
+                    catching_up,
+                    ..
+                } => {
                     if !stale_roots.is_empty() {
                         eprintln!("ff: warning: stale roots: {}", stale_roots.join(", "));
                     }
                     if catching_up == &Some(true) {
-                        eprintln!("ff: warning: daemon is still catching up; results may be incomplete");
+                        eprintln!(
+                            "ff: warning: daemon is still catching up; results may be incomplete"
+                        );
                     }
                 }
                 Response::Hit { path, id } => {
@@ -222,7 +262,9 @@ impl Client {
     /// untouched. This is a *suggestion*; for ranked edit-distance matching on
     /// stdout use `--fuzzy` (§10).
     fn suggest_alternate(&mut self, q: &str) {
-        let Some(folded) = folded_query(q) else { return };
+        let Some(folded) = folded_query(q) else {
+            return;
+        };
         let req = Request::query(&folded, 5, false, false);
         let Ok(resp) = self.send(&req) else { return };
         let mut hits = Vec::new();
@@ -274,7 +316,11 @@ impl Client {
         let mut total = 0u64;
         for r in &resp {
             match r {
-                Response::Meta { stale_roots, catching_up, .. } => {
+                Response::Meta {
+                    stale_roots,
+                    catching_up,
+                    ..
+                } => {
                     if o.quiet {
                         continue;
                     }
@@ -319,7 +365,11 @@ impl Client {
         }
         // Server-side count arrives in `done`; otherwise the fetched (and
         // possibly existence-filtered) hits tell the story.
-        let matched = if o.count && !o.existing { total } else { paths.len() as u64 };
+        let matched = if o.count && !o.existing {
+            total
+        } else {
+            paths.len() as u64
+        };
         if matched == 0 {
             return Ok(ExitCode::from(1));
         }
@@ -375,7 +425,11 @@ impl Client {
         let mut survivors: Vec<String> = Vec::new();
         for r in &resp {
             match r {
-                Response::Meta { stale_roots, catching_up, .. } => {
+                Response::Meta {
+                    stale_roots,
+                    catching_up,
+                    ..
+                } => {
                     if !stale_roots.is_empty() {
                         eprintln!("find: warning: stale roots: {}", stale_roots.join(", "));
                     }
@@ -413,8 +467,12 @@ impl Client {
             }
             if !plan.meta.is_empty() {
                 let p = std::path::Path::new(path);
-                let Some(m) = crate::find::lstat(p, now) else { continue };
-                let is_empty_dir = std::fs::read_dir(p).map(|mut d| d.next().is_none()).unwrap_or(false);
+                let Some(m) = crate::find::lstat(p, now) else {
+                    continue;
+                };
+                let is_empty_dir = std::fs::read_dir(p)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(false);
                 if !crate::find::meta_matches(&plan.meta, &m, is_empty_dir, now) {
                     continue;
                 }
@@ -443,7 +501,10 @@ impl Client {
         &mut self,
         timeout_ms: u64,
     ) -> Result<std::collections::BTreeMap<String, String>, CliError> {
-        let resp = self.send(&Request::Sync { timeout_ms, roots: None })?;
+        let resp = self.send(&Request::Sync {
+            timeout_ms,
+            roots: None,
+        })?;
         for r in resp {
             if let Response::Synced { roots } = r {
                 return Ok(roots);
@@ -477,7 +538,9 @@ impl Client {
     /// Ask for a rescan of one root. Fire-and-forget: pair with a sync, which
     /// cannot complete until the rescan drains (pending ordering, §7–§8).
     pub fn rescan_root(&mut self, root: &str) -> Result<(), CliError> {
-        let resp = self.send(&Request::Rescan { root: root.to_string() })?;
+        let resp = self.send(&Request::Rescan {
+            root: root.to_string(),
+        })?;
         for r in resp {
             if let Response::Rescanning { .. } = r {
                 return Ok(());
@@ -528,17 +591,26 @@ impl Client {
     }
 
     pub fn since(&mut self, cursor: &str, q: &str) -> Result<ExitCode, CliError> {
-        let resp = self.send(&Request::Since { cursor: cursor.to_string(), q: q.to_string() })?;
+        let resp = self.send(&Request::Since {
+            cursor: cursor.to_string(),
+            q: q.to_string(),
+        })?;
         let mut n = 0usize;
         for r in &resp {
             match r {
-                Response::Meta { fresh, gen, lsn, .. } => {
+                Response::Meta {
+                    fresh, gen, lsn, ..
+                } => {
                     if *fresh {
                         // Generation mismatch → a full listing stands in.
                         println!("# fresh: true (cursor stale) gen={gen} lsn={lsn}");
                     }
                 }
-                Response::Event { cursor, action, path } => {
+                Response::Event {
+                    cursor,
+                    action,
+                    path,
+                } => {
                     n += 1;
                     if path.is_empty() {
                         println!("{cursor} {action}");
@@ -571,7 +643,9 @@ impl Client {
     }
 
     pub fn rescan(&mut self, root: &str) -> Result<ExitCode, CliError> {
-        let resp = self.send(&Request::Rescan { root: root.to_string() })?;
+        let resp = self.send(&Request::Rescan {
+            root: root.to_string(),
+        })?;
         for r in resp {
             match r {
                 Response::Rescanning { root } => println!("rescanning {root}"),
@@ -583,10 +657,15 @@ impl Client {
     }
 
     pub fn watch(&mut self, q: &str) -> Result<ExitCode, CliError> {
-        let resp = self.send(&Request::Subscribe { name: Some("ff-watch".into()), cursor: None })?;
+        let resp = self.send(&Request::Subscribe {
+            name: Some("ff-watch".into()),
+            cursor: None,
+        })?;
         for r in resp {
             match r {
-                Response::Meta { gen, lsn, .. } => eprintln!("# watching from c:{gen}:{lsn} q={q:?}"),
+                Response::Meta { gen, lsn, .. } => {
+                    eprintln!("# watching from c:{gen}:{lsn} q={q:?}")
+                }
                 Response::Event { path, action, .. } => println!("{action} {path}"),
                 Response::Done { .. } => {}
                 Response::Error { message } => return Err(CliError::Protocol(message)),
@@ -595,7 +674,6 @@ impl Client {
         }
         Ok(ExitCode::SUCCESS)
     }
-
 }
 
 /// Lowercased re-query for "did you mean", or `None` when folding changes
@@ -644,7 +722,10 @@ fn depth_of(path: &str, bases: &[String], _all: &[String]) -> u32 {
             .max_by_key(|b| b.len())
             .unwrap_or("")
     };
-    let rest = path.strip_prefix(base).unwrap_or(path).trim_start_matches('/');
+    let rest = path
+        .strip_prefix(base)
+        .unwrap_or(path)
+        .trim_start_matches('/');
     rest.split('/').filter(|c| !c.is_empty()).count() as u32
 }
 
@@ -685,7 +766,9 @@ fn expand_printf(fmt: &str, path: &str) -> String {
                 ),
                 Some('P') => outout.push_str(path.trim_start_matches('/')),
                 Some('s') => {
-                    let sz = std::fs::symlink_metadata(path).map(|m| m.len()).unwrap_or(0);
+                    let sz = std::fs::symlink_metadata(path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
                     outout.push_str(&sz.to_string());
                 }
                 Some('%') => outout.push('%'),
@@ -722,6 +805,7 @@ fn print_stats(stats: &serde_json::Value) {
     p!("journal_corrupt");
     p!("catching_up");
     p!("queue_depth");
+    p!("rescans_collapsed");
     p!("dropped_events");
     p!("escalated_events");
     if let Some(roots) = stats.get("roots").and_then(|r| r.as_array()) {
@@ -730,7 +814,10 @@ fn print_stats(stats: &serde_json::Value) {
             let path = r.get("path").and_then(|v| v.as_str()).unwrap_or("?");
             let state = r.get("state").and_then(|v| v.as_str()).unwrap_or("?");
             let recrawl = r.get("recrawl_count").and_then(|v| v.as_u64()).unwrap_or(0);
-            let cause = r.get("last_rescan_cause").and_then(|v| v.as_str()).unwrap_or("-");
+            let cause = r
+                .get("last_rescan_cause")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
             let fstype = r
                 .get("caps")
                 .and_then(|c| c.get("fstype"))
@@ -748,120 +835,6 @@ fn print_stats(stats: &serde_json::Value) {
     }
 }
 
-/// Spawn `findexd` detached, inheriting our socket/state overrides.
-fn spawn_daemon(socket: &Path) -> Result<(), CliError> {
-    let exe = daemon_binary_path()?;
-    let state = state_dir_from_env();
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("--socket").arg(socket);
-    cmd.arg("--state-dir").arg(&state);
-    // Pick a backend this platform actually has. The daemon's own default is
-    // inotify, which is Linux-only: spawning it on macOS/Windows would make the
-    // child exit immediately ("backend `inotify` is Linux-only") and leave a
-    // stale socket behind, so `ff` would fail to connect with ECONNREFUSED.
-    cmd.arg("--backend").arg(default_backend_for_platform());
-    // Forward the roots to index. Without this the daemon falls back to its own
-    // default ($HOME), which makes auto-spawn crawl the entire home directory
-    // and can take far longer than the connect window — the daemon is healthy
-    // but `ff` reports "connection refused". `FINDEX_ROOT` is the same
-    // separator-delimited override the daemon understands.
-    if let Some(roots) = roots_from_env() {
-        if let Ok(joined) = std::env::join_paths(roots) {
-            cmd.env("FINDEX_ROOT", joined);
-        }
-    }
-    // Detach: redirect stdio so the child does not hold the terminal.
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
-    let child = cmd
-        .spawn()
-        .map_err(|e| CliError::Io(format!("cannot spawn {}: {e}", exe.display())))?;
-    let _ = child.id();
-    Ok(())
-}
-
-/// The watcher backend to ask for when auto-spawning.
-///
-/// inotify exists only on Linux; elsewhere the kernel watcher is not ported yet
-/// (FSEvents/FSEvents is v1.5), so the daemon runs with the fake backend, which
-/// still crawls, serves queries and reconciles on demand — it just does not get
-/// live events. `$FINDEX_BACKEND` overrides.
-fn default_backend_for_platform() -> &'static str {
-    if let Ok(b) = std::env::var("FINDEX_BACKEND") {
-        if b == "inotify" || b == "fake" {
-            // Leak is fine: a single short-lived string for a process that is
-            // about to exec a child.
-            return Box::leak(b.into_boxed_str());
-        }
-    }
-    if cfg!(target_os = "linux") {
-        "inotify"
-    } else {
-        "fake"
-    }
-}
-
-/// The roots the daemon should index, from `$FINDEX_ROOT` if the user set it.
-/// `None` means "let the daemon decide" ($HOME).
-fn roots_from_env() -> Option<Vec<PathBuf>> {
-    let v = std::env::var_os("FINDEX_ROOT")?;
-    if v.is_empty() {
-        return None;
-    }
-    Some(std::env::split_paths(&v).collect())
-}
-
-/// Locate the `findexd` binary.
-///
-/// Search order: `$FINDEXD_BIN`, then the directory of `argv[0]` (the invoked
-/// path — a symlink is deliberately *not* resolved, so a `ff` symlinked into
-/// `~/bin` finds a `findexd` placed beside it), then the directory of
-/// `current_exe()` (which on Linux resolves the symlink target), then `$PATH`.
-fn daemon_binary_path() -> Result<PathBuf, CliError> {
-    if let Ok(p) = std::env::var("FINDEXD_BIN") {
-        return Ok(PathBuf::from(p));
-    }
-
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    // The invoked path as given (may be a symlink). `current_exe()` resolves
-    // symlinks on Linux, so this is the only way to see the symlink's own dir.
-    if let Some(arg0) = std::env::args_os().next() {
-        let p = Path::new(&arg0);
-        if let Some(dir) = p.parent() {
-            if !dir.as_os_str().is_empty() {
-                dirs.push(dir.to_path_buf());
-            }
-        }
-        // A bare `ff` (no slash) has no parent of its own; it is found via PATH.
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            dirs.push(dir.to_path_buf());
-        }
-    }
-    for dir in dirs {
-        let cand = dir.join("findexd");
-        if cand.exists() {
-            return Ok(cand);
-        }
-    }
-    for dir in std::env::var("PATH").unwrap_or_default().split(':') {
-        if dir.is_empty() {
-            continue;
-        }
-        let cand = PathBuf::from(dir).join("findexd");
-        if cand.exists() {
-            return Ok(cand);
-        }
-    }
-    Err(CliError::Io(
-        "findexd not found: looked next to ff, next to the invoked path, and on \
-         PATH (set FINDEXD_BIN to override)"
-            .into(),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -874,35 +847,5 @@ mod tests {
         assert_eq!(folded_query("readme"), None);
         assert_eq!(folded_query(""), None);
         assert_eq!(folded_query("123-_.rs"), None);
-    }
-
-    /// `ff` symlinked into a bin dir must find a `findexd` placed *beside the
-    /// symlink* — `current_exe()` resolves the symlink on Linux, so the
-    /// invoked path has to be searched as well.
-    #[test]
-    fn finds_findexd_beside_the_invoked_symlink() {
-        let d = tempfile::tempdir().unwrap();
-        let real = d.path().join("real");
-        let bin = d.path().join("bin");
-        std::fs::create_dir_all(&real).unwrap();
-        std::fs::create_dir_all(&bin).unwrap();
-
-        // A stand-in `findexd` that exists; the code only checks `.exists()`.
-        std::fs::write(bin.join("findexd"), b"stub").unwrap();
-
-        // Sanity: with PATH cleared and no FINDEXD_BIN, the search must find the
-        // one in `bin/`. We cannot set argv[0] for the test process, so this
-        // pins the `$PATH` leg and the directory-probing logic that the symlink
-        // fix relies on.
-        std::env::remove_var("FINDEXD_BIN");
-        let saved = std::env::var("PATH").ok();
-        std::env::set_var("PATH", bin.as_os_str());
-        let found = daemon_binary_path();
-        match saved {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
-        }
-        let found = found.expect("findexd must be found on PATH");
-        assert_eq!(found, bin.join("findexd"));
     }
 }

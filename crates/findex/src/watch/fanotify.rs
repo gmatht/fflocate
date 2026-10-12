@@ -77,6 +77,9 @@ pub mod masks {
     pub const FAN_MOVED_TO: u64 = 0x0000_0080;
     pub const FAN_CREATE: u64 = 0x0000_0100;
     pub const FAN_DELETE: u64 = 0x0000_0200;
+    /// Metadata changed (`chmod`/`chown`/`touch`): 0x4, same value as inotify's
+    /// `IN_ATTRIB` (both mirror the kernel's `FS_ATTRIB`).
+    pub const FAN_ATTRIB: u64 = 0x0000_0004;
     pub const FAN_MOVE_SELF: u64 = 0x0000_0800;
     pub const FAN_DELETE_SELF: u64 = 0x0000_0400;
     pub const FAN_Q_OVERFLOW: u64 = 0x0000_4000;
@@ -99,13 +102,17 @@ pub mod masks {
 }
 use masks::*;
 
-/// Events we ask for. Content writes are deliberately absent (§1).
+/// Events we ask for. Content writes are deliberately absent (§1) — with one
+/// exception: `FAN_ATTRIB` (metadata changed). Like inotify's `IN_ATTRIB`, it
+/// carries no namespace change and becomes a flag-only refresh, never an
+/// insert.
 const MASK: u64 = FAN_CREATE
     | FAN_DELETE
     | FAN_MOVED_FROM
     | FAN_MOVED_TO
     | FAN_DELETE_SELF
     | FAN_MOVE_SELF
+    | FAN_ATTRIB
     | FAN_ONDIR
     | FAN_EVENT_ON_CHILD;
 
@@ -168,7 +175,11 @@ pub struct FidIdentity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DecodedEvent {
     /// A namespace op: the parent directory's DFID plus the entry name.
-    Namespace { mask: u64, parent: Fid, name: Vec<u8> },
+    Namespace {
+        mask: u64,
+        parent: Fid,
+        name: Vec<u8>,
+    },
     /// The queue overflowed; rescan the whole root.
     Overflow,
     /// An event carrying no DFID_NAME we can use.
@@ -216,9 +227,18 @@ pub fn parse_fid_record(buf: &[u8]) -> Option<(Fid, usize)> {
         i32::from_ne_bytes([rec[8], rec[9], rec[10], rec[11]]),
     ];
     let hb_off = INFO_HEADER_LEN + FSID_LEN;
-    let handle_bytes = u32::from_ne_bytes([rec[hb_off], rec[hb_off + 1], rec[hb_off + 2], rec[hb_off + 3]]);
-    let handle_type =
-        i32::from_ne_bytes([rec[hb_off + 4], rec[hb_off + 5], rec[hb_off + 6], rec[hb_off + 7]]);
+    let handle_bytes = u32::from_ne_bytes([
+        rec[hb_off],
+        rec[hb_off + 1],
+        rec[hb_off + 2],
+        rec[hb_off + 3],
+    ]);
+    let handle_type = i32::from_ne_bytes([
+        rec[hb_off + 4],
+        rec[hb_off + 5],
+        rec[hb_off + 6],
+        rec[hb_off + 7],
+    ]);
     let hbytes = handle_bytes as usize;
     let handle_start = hb_off + FILE_HANDLE_LEN;
     let handle_end = handle_start.saturating_add(hbytes);
@@ -240,7 +260,14 @@ pub fn parse_fid_record(buf: &[u8]) -> Option<(Fid, usize)> {
     };
 
     Some((
-        Fid { handle_bytes, handle_type, handle, fsid, name, has_name },
+        Fid {
+            handle_bytes,
+            handle_type,
+            handle,
+            fsid,
+            name,
+            has_name,
+        },
         info_len,
     ))
 }
@@ -261,7 +288,11 @@ pub fn parse_event(mask: u64, body: &[u8]) -> Vec<DecodedEvent> {
         }
         if let Some((fid, used)) = parse_fid_record(&body[off..off + info_len]) {
             if fid.has_name {
-                return vec![DecodedEvent::Namespace { mask, parent: fid.clone(), name: fid.name }];
+                return vec![DecodedEvent::Namespace {
+                    mask,
+                    parent: fid.clone(),
+                    name: fid.name,
+                }];
             }
             let _ = used;
         }
@@ -308,7 +339,12 @@ impl FanotifyBackend {
     /// support it — the caller then falls back to inotify (§4 probe).
     pub fn new() -> io::Result<FanotifyBackend> {
         let flags = FAN_CLASS_NOTIF | FAN_REPORT_DFID_NAME | FAN_CLOEXEC | FAN_NONBLOCK;
-        let fd = unsafe { libc::fanotify_init(flags as libc::c_uint, (libc::O_RDONLY | libc::O_LARGEFILE) as libc::c_uint) };
+        let fd = unsafe {
+            libc::fanotify_init(
+                flags as libc::c_uint,
+                (libc::O_RDONLY | libc::O_LARGEFILE) as libc::c_uint,
+            )
+        };
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -329,7 +365,8 @@ impl FanotifyBackend {
     /// Tell the backend which index directory a file handle names. The resolver
     /// builds this from the crawl.
     pub fn learn_fid(&mut self, fid: FidIdentity, dir_id: u32) {
-        self.dir_of_fid.insert(HandleKey::of_fid_identity(&fid), dir_id);
+        self.dir_of_fid
+            .insert(HandleKey::of_fid_identity(&fid), dir_id);
     }
 
     /// Forget everything learned about a subtree's fids (used when a root is
@@ -388,7 +425,11 @@ impl FanotifyBackend {
                 .collect(),
             DecodedEvent::Ignored => Vec::new(),
             DecodedEvent::Namespace { mask, parent, name } => {
-                let Some(dir) = self.dir_of_fid.get(&HandleKey::of_identity(&parent)).copied() else {
+                let Some(dir) = self
+                    .dir_of_fid
+                    .get(&HandleKey::of_identity(&parent))
+                    .copied()
+                else {
                     self.unresolved_events += 1;
                     return Vec::new();
                 };
@@ -401,7 +442,9 @@ impl FanotifyBackend {
                     return Vec::new();
                 }
                 if mask & FAN_MOVED_TO != 0 {
-                    if let Some((from_dir, from_name)) = self.pending_move.remove(&HandleKey::of_identity(&parent)) {
+                    if let Some((from_dir, from_name)) =
+                        self.pending_move.remove(&HandleKey::of_identity(&parent))
+                    {
                         return vec![
                             FsEvent::remove(DirKey::new(from_dir), from_name),
                             FsEvent::upsert(DirKey::new(dir), name, is_dir),
@@ -414,6 +457,13 @@ impl FanotifyBackend {
                 }
                 if mask & (FAN_CREATE | FAN_MOVE_SELF) != 0 {
                     return vec![FsEvent::upsert(DirKey::new(dir), name, is_dir)];
+                }
+                // A metadata change: re-read the exec bit in place, never an
+                // insert. (An ATTRIB on a directory itself still names a
+                // child — fanotify reports per-name — so no empty-name guard
+                // is needed here as in the inotify path.)
+                if mask & FAN_ATTRIB != 0 {
+                    return vec![FsEvent::refresh_exec(DirKey::new(dir), name)];
                 }
                 Vec::new()
             }
@@ -444,7 +494,11 @@ impl FanotifyBackend {
     }
 
     fn readable(&mut self, timeout: Duration) -> bool {
-        let mut pfd = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
         let n = unsafe { libc::poll(&mut pfd, 1, ms) };
         n > 0 && (pfd.revents & libc::POLLIN) != 0
@@ -454,7 +508,8 @@ impl FanotifyBackend {
         let mut all = Vec::new();
         let mut buf = vec![0u8; 64 * 1024];
         loop {
-            let n = unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            let n =
+                unsafe { libc::read(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if n < 0 {
                 let e = io::Error::last_os_error();
                 match e.raw_os_error() {
@@ -483,7 +538,11 @@ impl Drop for FanotifyBackend {
 impl WatchBackend for FanotifyBackend {
     fn caps(&self) -> BackendCaps {
         // Whole-mount, no per-dir watches, and atomic rename halves.
-        BackendCaps { per_dir_watch: false, whole_mount: true, atomic_rename: true }
+        BackendCaps {
+            per_dir_watch: false,
+            whole_mount: true,
+            atomic_rename: true,
+        }
     }
 
     fn add_root(&mut self, root: &Root) -> io::Result<()> {
@@ -537,7 +596,12 @@ impl WatchBackend for FanotifyBackend {
 // ---------------------------------------------------------------------------
 
 /// Build a `FAN_EVENT_INFO_TYPE_DFID_NAME` record for `dir` + `name`.
-pub fn encode_dfid_name_record(fsid: [i32; 2], handle_type: i32, handle: &[u8], name: &[u8]) -> Vec<u8> {
+pub fn encode_dfid_name_record(
+    fsid: [i32; 2],
+    handle_type: i32,
+    handle: &[u8],
+    name: &[u8],
+) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&fsid[0].to_ne_bytes());
     payload.extend_from_slice(&fsid[1].to_ne_bytes());
@@ -580,7 +644,12 @@ mod tests {
     use super::*;
 
     fn fid(h: &[u8]) -> FidIdentity {
-        FidIdentity { fsid: [7, 9], handle_bytes: h.len() as u32, handle_type: 1, handle: h.to_vec() }
+        FidIdentity {
+            fsid: [7, 9],
+            handle_bytes: h.len() as u32,
+            handle_type: 1,
+            handle: h.to_vec(),
+        }
     }
 
     fn backend_with_dir(fidbytes: &[u8], dir: u32) -> FanotifyBackend {
@@ -614,7 +683,10 @@ mod tests {
     #[test]
     fn short_or_malformed_records_are_rejected_not_panicked() {
         assert!(parse_fid_record(&[]).is_none());
-        assert!(parse_fid_record(&[2, 0, 4, 0]).is_none(), "header only, no fid body");
+        assert!(
+            parse_fid_record(&[2, 0, 4, 0]).is_none(),
+            "header only, no fid body"
+        );
         // info_len larger than the buffer
         assert!(parse_fid_record(&[2, 0, 0xff, 0xff, 0, 0, 0, 0]).is_none());
     }
@@ -622,9 +694,15 @@ mod tests {
     #[test]
     fn create_becomes_upsert_against_the_learning_map() {
         let mut b = backend_with_dir(&[1, 2, 3], 100);
-        let ev = encode_event(FAN_CREATE, &[encode_dfid_name_record([7, 9], 1, &[1, 2, 3], b"new.rs")]);
+        let ev = encode_event(
+            FAN_CREATE,
+            &[encode_dfid_name_record([7, 9], 1, &[1, 2, 3], b"new.rs")],
+        );
         let out = b.parse_and_translate(&ev);
-        assert_eq!(out, vec![FsEvent::upsert(DirKey::new(100), b"new.rs".to_vec(), false)]);
+        assert_eq!(
+            out,
+            vec![FsEvent::upsert(DirKey::new(100), b"new.rs".to_vec(), false)]
+        );
     }
 
     #[test]
@@ -635,25 +713,43 @@ mod tests {
             &[encode_dfid_name_record([7, 9], 1, &[1, 2, 3], b"sub")],
         );
         let out = b.parse_and_translate(&ev);
-        assert_eq!(out, vec![FsEvent::upsert(DirKey::new(100), b"sub".to_vec(), true)]);
+        assert_eq!(
+            out,
+            vec![FsEvent::upsert(DirKey::new(100), b"sub".to_vec(), true)]
+        );
     }
 
     #[test]
     fn delete_becomes_remove() {
         let mut b = backend_with_dir(&[1, 2, 3], 100);
-        let ev = encode_event(FAN_DELETE, &[encode_dfid_name_record([7, 9], 1, &[1, 2, 3], b"gone.rs")]);
+        let ev = encode_event(
+            FAN_DELETE,
+            &[encode_dfid_name_record([7, 9], 1, &[1, 2, 3], b"gone.rs")],
+        );
         let out = b.parse_and_translate(&ev);
-        assert_eq!(out, vec![FsEvent::remove(DirKey::new(100), b"gone.rs".to_vec())]);
+        assert_eq!(
+            out,
+            vec![FsEvent::remove(DirKey::new(100), b"gone.rs".to_vec())]
+        );
     }
 
     #[test]
     fn rename_pair_becomes_remove_then_upsert() {
         let mut b = backend_with_dir(&[1, 2, 3], 100);
         // MOVED_FROM: the moved object (name "a") leaves dir 100.
-        let from = encode_event(FAN_MOVED_FROM, &[encode_dfid_name_record([7, 9], 1, &[1, 2, 3], b"a")]);
-        assert!(b.parse_and_translate(&from).is_empty(), "half a rename emits nothing yet");
+        let from = encode_event(
+            FAN_MOVED_FROM,
+            &[encode_dfid_name_record([7, 9], 1, &[1, 2, 3], b"a")],
+        );
+        assert!(
+            b.parse_and_translate(&from).is_empty(),
+            "half a rename emits nothing yet"
+        );
         // MOVED_TO: the same object arrives as "b".
-        let to = encode_event(FAN_MOVED_TO, &[encode_dfid_name_record([7, 9], 1, &[1, 2, 3], b"b")]);
+        let to = encode_event(
+            FAN_MOVED_TO,
+            &[encode_dfid_name_record([7, 9], 1, &[1, 2, 3], b"b")],
+        );
         let out = b.parse_and_translate(&to);
         assert_eq!(
             out,
@@ -667,9 +763,19 @@ mod tests {
     #[test]
     fn moved_to_without_a_partner_is_a_bare_upsert() {
         let mut b = backend_with_dir(&[1, 2, 3], 100);
-        let to = encode_event(FAN_MOVED_TO, &[encode_dfid_name_record([7, 9], 1, &[1, 2, 3], b"incoming")]);
+        let to = encode_event(
+            FAN_MOVED_TO,
+            &[encode_dfid_name_record([7, 9], 1, &[1, 2, 3], b"incoming")],
+        );
         let out = b.parse_and_translate(&to);
-        assert_eq!(out, vec![FsEvent::upsert(DirKey::new(100), b"incoming".to_vec(), false)]);
+        assert_eq!(
+            out,
+            vec![FsEvent::upsert(
+                DirKey::new(100),
+                b"incoming".to_vec(),
+                false
+            )]
+        );
     }
 
     #[test]
@@ -677,7 +783,10 @@ mod tests {
         // The whole-mount watch sees other trees; an unknown parent must not be
         // attributed to a root we do know.
         let mut b = backend_with_dir(&[1, 2, 3], 100);
-        let ev = encode_event(FAN_CREATE, &[encode_dfid_name_record([7, 9], 1, &[9, 9, 9], b"other.rs")]);
+        let ev = encode_event(
+            FAN_CREATE,
+            &[encode_dfid_name_record([7, 9], 1, &[9, 9, 9], b"other.rs")],
+        );
         let out = b.parse_and_translate(&ev);
         assert!(out.is_empty(), "unknown DFID resolves to nothing");
         assert_eq!(b.unresolved_events, 1, "…but it is counted, never silent");
@@ -689,7 +798,13 @@ mod tests {
         let ev = encode_event(FAN_Q_OVERFLOW, &[]);
         let out = b.parse_and_translate(&ev);
         assert_eq!(out.len(), 1);
-        assert!(matches!(out[0], FsEvent::RescanSubtree { cause: crate::event::RescanCause::Overflow, .. }));
+        assert!(matches!(
+            out[0],
+            FsEvent::RescanSubtree {
+                cause: crate::event::RescanCause::Overflow,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -697,12 +812,19 @@ mod tests {
         // These are hand-defined because libc lacks them. A wrong value is not a
         // cosmetic bug: FAN_REPORT_NAME=0x200 instead of 0x800 silently yields
         // name-less DFID records and every event is lost. Pin them.
-        assert_eq!(FAN_REPORT_DFID_NAME, 0xC00, "FAN_REPORT_DIR_FID|FAN_REPORT_NAME");
+        assert_eq!(
+            FAN_REPORT_DFID_NAME, 0xC00,
+            "FAN_REPORT_DIR_FID|FAN_REPORT_NAME"
+        );
         assert_eq!(FAN_REPORT_FID, 0x200);
         assert_eq!(FAN_MARK_FILESYSTEM, 0x100);
         assert_eq!(FAN_MARK_ADD, 0x1);
         assert_eq!(FAN_CREATE, 0x100);
         assert_eq!(FAN_DELETE, 0x200);
+        assert_eq!(
+            FAN_ATTRIB, 0x4,
+            "FAN_ATTRIB mirrors FS_ATTRIB, like IN_ATTRIB"
+        );
         assert_eq!(FAN_MOVED_FROM, 0x40);
         assert_eq!(FAN_MOVED_TO, 0x80);
         assert_eq!(FAN_ONDIR, 0x4000_0000);
@@ -713,7 +835,8 @@ mod tests {
     }
 
     #[test]
-    fn caps_say_whole_mount_and_atomic_rename() {        // The applier keys exclusion filtering off this: a whole-mount backend
+    fn caps_say_whole_mount_and_atomic_rename() {
+        // The applier keys exclusion filtering off this: a whole-mount backend
         // cannot decline a subtree at watch time.
         let b = FanotifyBackend::new().unwrap();
         let c = b.caps();
@@ -767,7 +890,10 @@ mod tests {
             return;
         }
         let cleanup = || {
-            let _ = std::process::Command::new("umount").arg(dir).stderr(std::process::Stdio::null()).status();
+            let _ = std::process::Command::new("umount")
+                .arg(dir)
+                .stderr(std::process::Stdio::null())
+                .status();
             let _ = std::fs::remove_dir_all(dir);
         };
 
@@ -799,21 +925,45 @@ mod tests {
             "sleep 0.4; echo a > {d}/a.txt; sleep 0.4; mv {d}/a.txt {d}/b.txt; sleep 0.4; rm -f {d}/b.txt",
             d = dir.display()
         );
-        std::process::Command::new("sh").arg("-c").arg(script).status().unwrap();
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .status()
+            .unwrap();
 
         let mut got = Vec::new();
         for _ in 0..40 {
             got.extend(b.poll(Duration::from_millis(50)).unwrap());
         }
-        let saw_create = got.iter().any(|e| matches!(e, FsEvent::Upsert { name, .. } if name == b"a.txt"));
-        let saw_rename = got.iter().any(|e| matches!(e, FsEvent::Remove { name, .. } if name == b"a.txt"))
-            && got.iter().any(|e| matches!(e, FsEvent::Upsert { name, .. } if name == b"b.txt"));
-        let saw_delete = got.iter().any(|e| matches!(e, FsEvent::Remove { name, .. } if name == b"b.txt"));
+        let saw_create = got
+            .iter()
+            .any(|e| matches!(e, FsEvent::Upsert { name, .. } if name == b"a.txt"));
+        let saw_rename = got
+            .iter()
+            .any(|e| matches!(e, FsEvent::Remove { name, .. } if name == b"a.txt"))
+            && got
+                .iter()
+                .any(|e| matches!(e, FsEvent::Upsert { name, .. } if name == b"b.txt"));
+        let saw_delete = got
+            .iter()
+            .any(|e| matches!(e, FsEvent::Remove { name, .. } if name == b"b.txt"));
 
         cleanup();
-        assert!(saw_create, "expected the kernel's create event to decode; got {got:?}");
-        assert!(saw_rename, "expected an atomic rename pair to decode; got {got:?}");
-        assert!(saw_delete, "expected the kernel's delete event to decode; got {got:?}");
-        assert_eq!(b.unresolved_events, 0, "every event's parent handle was learned");
+        assert!(
+            saw_create,
+            "expected the kernel's create event to decode; got {got:?}"
+        );
+        assert!(
+            saw_rename,
+            "expected an atomic rename pair to decode; got {got:?}"
+        );
+        assert!(
+            saw_delete,
+            "expected the kernel's delete event to decode; got {got:?}"
+        );
+        assert_eq!(
+            b.unresolved_events, 0,
+            "every event's parent handle was learned"
+        );
     }
 }

@@ -96,6 +96,7 @@ impl FakeBackend {
     pub fn new(handle: FakeHandle) -> Self {
         FakeBackend { handle }
     }
+
 }
 
 /// Scan `(dir id, path)` pairs for sync-cookie files and emit create events
@@ -110,7 +111,9 @@ impl FakeBackend {
 fn scan_cookie_events(watched: &[(u32, std::path::PathBuf)]) -> Vec<FsEvent> {
     let mut out = Vec::new();
     for (id, path) in watched {
-        let Ok(rd) = std::fs::read_dir(path) else { continue };
+        let Ok(rd) = std::fs::read_dir(path) else {
+            continue;
+        };
         for ent in rd.flatten() {
             let name = crate::applier::os_str_bytes(&ent.file_name());
             if crate::util::is_cookie(&name) {
@@ -127,7 +130,11 @@ fn scan_cookie_events(watched: &[(u32, std::path::PathBuf)]) -> Vec<FsEvent> {
 
 impl WatchBackend for FakeBackend {
     fn caps(&self) -> BackendCaps {
-        BackendCaps { per_dir_watch: true, whole_mount: false, atomic_rename: true }
+        BackendCaps {
+            per_dir_watch: true,
+            whole_mount: false,
+            atomic_rename: true,
+        }
     }
 
     fn add_root(&mut self, root: &Root) -> std::io::Result<()> {
@@ -198,7 +205,13 @@ mod tests {
         h.inject_overflow([1, 2]);
         let evs = b.poll(Duration::ZERO).unwrap();
         assert_eq!(evs.len(), 2);
-        assert!(evs.iter().all(|e| matches!(e, FsEvent::RescanSubtree { cause: crate::event::RescanCause::Overflow, .. })));
+        assert!(evs.iter().all(|e| matches!(
+            e,
+            FsEvent::RescanSubtree {
+                cause: crate::event::RescanCause::Overflow,
+                ..
+            }
+        )));
         assert_eq!(h.inner.lock().unwrap().overflows, 1);
     }
 

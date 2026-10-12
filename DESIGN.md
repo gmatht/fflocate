@@ -128,6 +128,10 @@ At root-add (and on mount events), classify the mount from `/proc/self/mountinfo
 
 Exclusions: pseudo-FS (`proc`, `sysfs`, `devtmpfs`, `cgroup*`, `tracefs`, `overlay`), network FS unless opted in, user config excludes. Per-location watch enable/disable mirrors FSearch's monitor toggle.
 
+Default roots (Linux): every readable native filesystem (`ext4`, `btrfs`, `xfs`, `f2fs`, …) gets its own root, so the whole machine is indexed with each filesystem exactly once; unreadable mounts are skipped loudly, and when discovery yields nothing usable (containers) the historical `$HOME` root applies. This is deliberately **one database with one root per filesystem**, not a database per filesystem: the index already stores paths relative to the root mountpoint (only the per-query root table is absolute), so per-filesystem stores would buy no identity while breaking global cursors, single-writer ordering, and cross-filesystem queries. Root entries are named by full path (basename-qualified stores resolve via a legacy fallback), so same-basename roots cannot collide.
+
+Mount-aware crawl: enumeration never descends into a mount point that is not itself a root (a mountinfo set, refreshed on the mount-watchdog tick — zero syscalls on the hot path). The mountpoint directory itself is still recorded; a nested mount is covered by its own root, and a non-root mount (network, pseudo-FS, removable media) is never indexed through a parent. Stored roots a configured root covers (same device, strictly above) are pruned at open, so yesterday's `$HOME` root does not double-index under today's `/home`.
+
 Surface everything via `ff stats --roots` — a mis-probed mount should be visible, not mysterious.
 
 ---
@@ -263,7 +267,7 @@ Unchanged from v1, briefly: linear scan over the in-memory name arena — this i
 
 The contract is that this is a **filter, never an authority**: every candidate still goes through the full `Query::matches` path, so the accelerator can change only the time taken, never the answer. Two consequences are load-bearing:
 
-- Ids are stable across rescans (§3), so posting lists stay meaningful; the cache is keyed on `(generation, entry_count)`, so any addition or generation bump rebuilds it. A *deletion* leaves postings naming tombstoned ids — safe, because the accelerated path checks liveness and the matcher decides.
+- Ids are stable across rescans (§3), so posting lists stay meaningful; the cache is keyed on **generation only** and kept current incrementally — every `Add`/`Del`/`Move` record funnels through `Applier::emit`, which indexes or prunes the affected name's trigrams under the same index lock. Additions therefore never invalidate the cache; only a generation bump (whole-root rescan / compaction, which may remap ids) rebuilds it. A *deletion* leaves postings naming tombstoned ids unless pruned — safe either way, because the accelerated path checks liveness and the matcher decides. Measured live on a churning 737 k-entry index: 23 s/query before (full rebuild every query), ~0.3 s after in a debug build.
 - `path:` terms are not accelerated (the index stores no path strings, §3), and literals shorter than three bytes give no trigram. Both fall through to the linear scan for their part of the query.
 
 `crates/findex/tests/trigram_differential.rs` pins the contract against random trees and a corpus spanning every query shape; `crates/findex/examples/trigram_bench.rs` measures it. At 1 M entries the postings cost ~45 MiB against ~13 MiB of name bytes (a name averaging ~13 bytes yields ~11.6 trigrams), so the accelerator roughly quadruples name-side memory and queries run 6–60× faster — a good trade at 10 M+ files, which is why the design gates it at that scale. `path:`-heavy queries see no benefit.

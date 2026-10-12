@@ -88,12 +88,23 @@ fn fixture() -> Fixture {
     let mut r = Root::new(0, root.clone());
     r.caps.writable = true;
     let shared = Shared::new(ix, vec![r]);
-    let mut applier = Applier::new(shared.clone(), store, Arc::new(findex::applier::RealFs), SyncRegistry::new());
+    let mut applier = Applier::new(
+        shared.clone(),
+        store,
+        Arc::new(findex::applier::RealFs),
+        SyncRegistry::new(),
+    );
     applier.rebuild_dir_cache();
     applier.pending_mut().enqueue_crawl(root_id);
     applier.drain();
     applier.drain();
-    Fixture { applier, shared, _dir: d, root, root_id }
+    Fixture {
+        applier,
+        shared,
+        _dir: d,
+        root,
+        root_id,
+    }
 }
 
 impl Fixture {
@@ -148,7 +159,9 @@ fn truth(root: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for ent in rd.flatten() {
             let p = ent.path();
             out.insert(canon(&p));
@@ -242,15 +255,19 @@ fn differential_with_live_event_notifications() {
             let p = files.remove(0);
             let n = p.file_name().unwrap().to_string_lossy().to_string();
             std::fs::remove_file(&p).unwrap();
-            fx.applier
-                .push(FsEvent::remove(DirKey::new(fx.root_id), n.as_bytes().to_vec()));
+            fx.applier.push(FsEvent::remove(
+                DirKey::new(fx.root_id),
+                n.as_bytes().to_vec(),
+            ));
         }
 
         fx.applier.drain();
         let _ = rng.below(10);
     }
     // Final reconcile.
-    fx.applier.pending_mut().enqueue_rescan(fx.root_id, RescanCause::Manual);
+    fx.applier
+        .pending_mut()
+        .enqueue_rescan(fx.root_id, RescanCause::Manual);
     fx.applier.drain();
 
     assert_eq!(fx.indexed(), truth(&fx.root));
@@ -264,8 +281,10 @@ fn fault_injection_overflow_then_rescan_converges() {
         std::fs::write(fx.root.join(format!("real{i}.txt")), b"x").unwrap();
     }
     // Now simulate an overflow: the index is told nothing, but a rescan runs.
-    fx.applier
-        .push(FsEvent::rescan(DirKey::new(fx.root_id), RescanCause::Overflow));
+    fx.applier.push(FsEvent::rescan(
+        DirKey::new(fx.root_id),
+        RescanCause::Overflow,
+    ));
     fx.applier.drain();
     assert_eq!(fx.indexed(), truth(&fx.root));
 }
@@ -274,29 +293,39 @@ fn fault_injection_overflow_then_rescan_converges() {
 fn fault_injection_unpaired_move_degrades_to_remove_then_rescan_heals() {
     let mut fx = fixture();
     std::fs::write(fx.root.join("moveme.txt"), b"x").unwrap();
-    fx.applier
-        .push(FsEvent::rescan(DirKey::new(fx.root_id), RescanCause::Manual));
+    fx.applier.push(FsEvent::rescan(
+        DirKey::new(fx.root_id),
+        RescanCause::Manual,
+    ));
     fx.applier.drain();
     assert!(fx.indexed().iter().any(|p| p.ends_with("moveme.txt")));
 
     // The backend lost the MOVED_TO half: it only reports a remove.
-    fx.applier
-        .push(FsEvent::remove(DirKey::new(fx.root_id), b"moveme.txt".to_vec()));
+    fx.applier.push(FsEvent::remove(
+        DirKey::new(fx.root_id),
+        b"moveme.txt".to_vec(),
+    ));
     // In reality the file was renamed:
     std::fs::rename(fx.root.join("moveme.txt"), fx.root.join("renamed.txt")).unwrap();
     fx.applier.drain();
     // The index now believes the old name is gone (correct) but lacks the new
     // one; a rescan must heal. Backoff may defer it briefly, so retry until the
     // window opens (bounded) — a deferred rescan is never lost.
-    fx.applier
-        .push(FsEvent::rescan(DirKey::new(fx.root_id), RescanCause::WatchDropped));
+    fx.applier.push(FsEvent::rescan(
+        DirKey::new(fx.root_id),
+        RescanCause::WatchDropped,
+    ));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         fx.applier.drain();
         if fx.indexed() == truth(&fx.root) {
             break;
         }
-        assert!(Instant::now() < deadline, "deferred rescan never ran: {:?}", fx.indexed());
+        assert!(
+            Instant::now() < deadline,
+            "deferred rescan never ran: {:?}",
+            fx.indexed()
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(fx.indexed(), truth(&fx.root));
@@ -308,8 +337,10 @@ fn backoff_limits_rescan_rate_under_an_event_storm() {
     let mut fx = fixture();
     // Force many rescans in quick succession; the backoff must defer most.
     for _ in 0..50 {
-        fx.applier
-            .push(FsEvent::rescan(DirKey::new(fx.root_id), RescanCause::Overflow));
+        fx.applier.push(FsEvent::rescan(
+            DirKey::new(fx.root_id),
+            RescanCause::Overflow,
+        ));
         fx.applier.drain();
     }
     let h = fx.shared.health.read().unwrap();
@@ -331,8 +362,10 @@ fn manual_rescan_bypasses_backoff() {
     let mut fx = fixture();
     let before = fx.shared.roots.read().unwrap()[0].recrawl_count;
     for _ in 0..3 {
-        fx.applier
-            .push(FsEvent::rescan(DirKey::new(fx.root_id), RescanCause::Manual));
+        fx.applier.push(FsEvent::rescan(
+            DirKey::new(fx.root_id),
+            RescanCause::Manual,
+        ));
         fx.applier.drain();
     }
     let after = fx.shared.roots.read().unwrap()[0].recrawl_count;

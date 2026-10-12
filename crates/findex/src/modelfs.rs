@@ -17,6 +17,10 @@ use crate::applier::{DirItem, FsView, StatInfo};
 pub enum Node {
     Dir(BTreeMap<Vec<u8>, Node>),
     File,
+    /// A file with an execute bit set (`find -perm /111`): the model's
+    /// analogue of a `chmod +x`'d file, so crawl-diff tests can assert the
+    /// `IS_EXEC` flag converges.
+    ExecFile,
     Symlink,
 }
 
@@ -26,6 +30,9 @@ impl Node {
     }
     pub fn is_symlink(&self) -> bool {
         matches!(self, Node::Symlink)
+    }
+    pub fn is_exec(&self) -> bool {
+        matches!(self, Node::ExecFile)
     }
 
     /// Build a directory node whose children are all plain files.
@@ -46,7 +53,9 @@ pub struct ModelFs {
 
 impl ModelFs {
     pub fn new() -> ModelFs {
-        ModelFs { inner: Arc::new(Mutex::new(BTreeMap::new())) }
+        ModelFs {
+            inner: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 
     pub fn with(entries: impl IntoIterator<Item = (&'static str, Node)>) -> ModelFs {
@@ -96,6 +105,12 @@ fn walk(out: &mut BTreeMap<String, bool>, prefix: &str, name: &[u8], node: &Node
         Node::File => {
             out.insert(path, false);
         }
+        // An executable file flattens exactly like a plain one: `flatten`
+        // answers "what is where", and the exec bit is asserted separately
+        // through the index flags.
+        Node::ExecFile => {
+            out.insert(path, false);
+        }
         Node::Symlink => {
             out.insert(path, false);
         }
@@ -122,6 +137,7 @@ impl FsView for ModelFs {
                     name: n.clone(),
                     is_dir: node.is_dir(),
                     is_symlink: node.is_symlink(),
+                    is_exec: node.is_exec(),
                 })
                 .collect());
         }
@@ -139,6 +155,7 @@ impl FsView for ModelFs {
                 name: n.clone(),
                 is_dir: node.is_dir(),
                 is_symlink: node.is_symlink(),
+                is_exec: node.is_exec(),
             })
             .collect())
     }

@@ -48,11 +48,20 @@ impl OpKind {
 pub enum Record {
     /// Insert/upsert a child under a parent. `name` is raw bytes (never UTF-8
     /// coerced). `id` is the id the applier assigned.
-    Add { id: u32, parent: u32, name: Vec<u8>, flags: u8 },
+    Add {
+        id: u32,
+        parent: u32,
+        name: Vec<u8>,
+        flags: u8,
+    },
     /// Tombstone an entry by id.
     Del { id: u32 },
     /// Move/rename an entry: new parent, new name.
-    Move { id: u32, new_parent: u32, new_name: Vec<u8> },
+    Move {
+        id: u32,
+        new_parent: u32,
+        new_name: Vec<u8>,
+    },
     /// A fence marker; carries no payload. Used to bound replay when a
     /// snapshot was written concurrently.
     Fence,
@@ -74,7 +83,12 @@ impl Record {
     fn encode_payload(&self) -> Vec<u8> {
         let mut p = Vec::new();
         match self {
-            Record::Add { id, parent, name, flags } => {
+            Record::Add {
+                id,
+                parent,
+                name,
+                flags,
+            } => {
                 p.extend_from_slice(&id.to_le_bytes());
                 p.extend_from_slice(&parent.to_le_bytes());
                 p.push(*flags);
@@ -82,7 +96,11 @@ impl Record {
                 p.extend_from_slice(name);
             }
             Record::Del { id } => p.extend_from_slice(&id.to_le_bytes()),
-            Record::Move { id, new_parent, new_name } => {
+            Record::Move {
+                id,
+                new_parent,
+                new_name,
+            } => {
                 p.extend_from_slice(&id.to_le_bytes());
                 p.extend_from_slice(&new_parent.to_le_bytes());
                 p.extend_from_slice(&(new_name.len() as u32).to_le_bytes());
@@ -103,7 +121,12 @@ impl Record {
                 let flags = r.u8()?;
                 let nlen = r.u32()? as usize;
                 let name = r.bytes(nlen)?;
-                Record::Add { id, parent, name: name.to_vec(), flags }
+                Record::Add {
+                    id,
+                    parent,
+                    name: name.to_vec(),
+                    flags,
+                }
             }
             OpKind::Del => Record::Del { id: r.u32()? },
             OpKind::Move => {
@@ -111,7 +134,11 @@ impl Record {
                 let new_parent = r.u32()?;
                 let nlen = r.u32()? as usize;
                 let new_name = r.bytes(nlen)?;
-                Record::Move { id, new_parent, new_name: new_name.to_vec() }
+                Record::Move {
+                    id,
+                    new_parent,
+                    new_name: new_name.to_vec(),
+                }
             }
             OpKind::Fence => Record::Fence,
             OpKind::Mark => Record::Mark { tag: r.u64()? },
@@ -173,7 +200,12 @@ impl Journal {
             .create(true)
             .truncate(false)
             .open(path)?;
-        let mut j = Journal { path: path.to_path_buf(), file, count: 0, fenced: false };
+        let mut j = Journal {
+            path: path.to_path_buf(),
+            file,
+            count: 0,
+            fenced: false,
+        };
         j.rescan_len()?;
         Ok(j)
     }
@@ -186,7 +218,12 @@ impl Journal {
             .create(true)
             .truncate(true)
             .open(path)?;
-        Ok(Journal { path: path.to_path_buf(), file, count: 0, fenced: false })
+        Ok(Journal {
+            path: path.to_path_buf(),
+            file,
+            count: 0,
+            fenced: false,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -262,15 +299,23 @@ impl Journal {
             if crc32(payload) != crc {
                 break; // torn/corrupt record: stop, don't try to resync
             }
-            let Some(kind) = OpKind::from_u8(op) else { break };
-            let Some(rec) = Record::decode_payload(kind, payload) else { break };
+            let Some(kind) = OpKind::from_u8(op) else {
+                break;
+            };
+            let Some(rec) = Record::decode_payload(kind, payload) else {
+                break;
+            };
             lsn += 1;
             f(lsn, rec);
             off = pend;
         }
         self.count = lsn;
         let corrupt_tail = off != cap;
-        Ok(ReplayOutcome { replayed: lsn, bytes_ok: off as u64, corrupt_tail })
+        Ok(ReplayOutcome {
+            replayed: lsn,
+            bytes_ok: off as u64,
+            corrupt_tail,
+        })
     }
 
     /// Truncate the journal to zero records. Used after a snapshot is swapped
@@ -339,12 +384,23 @@ mod tests {
         let p = d.path().join("journal.log");
         let mut j = Journal::create(&p).unwrap();
         assert_eq!(
-            j.append(&Record::Add { id: 5, parent: 1, name: b"a.rs".to_vec(), flags: 0 }).unwrap(),
+            j.append(&Record::Add {
+                id: 5,
+                parent: 1,
+                name: b"a.rs".to_vec(),
+                flags: 0
+            })
+            .unwrap(),
             1
         );
         assert_eq!(j.append(&Record::Del { id: 5 }).unwrap(), 2);
         assert_eq!(
-            j.append(&Record::Move { id: 6, new_parent: 2, new_name: b"b".to_vec() }).unwrap(),
+            j.append(&Record::Move {
+                id: 6,
+                new_parent: 2,
+                new_name: b"b".to_vec()
+            })
+            .unwrap(),
             3
         );
         assert_eq!(j.append(&Record::Fence).unwrap(), 4);
@@ -382,7 +438,10 @@ mod tests {
         let mut j = Journal::open(&p).unwrap();
         let mut seen = Vec::new();
         let out = j.replay(|_, r| seen.push(r)).unwrap();
-        assert!(out.corrupt_tail, "torn tail must be reported, not silently dropped");
+        assert!(
+            out.corrupt_tail,
+            "torn tail must be reported, not silently dropped"
+        );
         assert_eq!(seen, vec![Record::Del { id: 1 }]);
         assert_eq!(out.replayed, 1);
     }
@@ -433,7 +492,13 @@ mod tests {
         let p = d.path().join("j.log");
         let name = vec![0xff, 0xfe, b'a'];
         let mut j = Journal::create(&p).unwrap();
-        j.append(&Record::Add { id: 3, parent: 1, name: name.clone(), flags: 0 }).unwrap();
+        j.append(&Record::Add {
+            id: 3,
+            parent: 1,
+            name: name.clone(),
+            flags: 0,
+        })
+        .unwrap();
         j.sync().unwrap();
         let mut j2 = Journal::open(&p).unwrap();
         let mut got = None;

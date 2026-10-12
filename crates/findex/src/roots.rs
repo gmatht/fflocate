@@ -34,7 +34,9 @@ pub enum RootState {
     Ok,
     /// Queries keep answering from what is known; every response meta lists
     /// stale roots. Loudly stale beats silently wrong.
-    Degraded { reason: String },
+    Degraded {
+        reason: String,
+    },
     Rescanning,
 }
 
@@ -180,12 +182,39 @@ impl Root {
     }
 }
 
-/// The index-entry name for a root path: its final component, except a
-/// Windows drive root (`D:/`, whose `file_name` is `None`) takes its drive
-/// letter so it gets a stable entry instead of falling back to `ROOT_ID`
-/// (which queries skip — drive roots were silently unqueryable). `/` keeps
-/// the historical `None` (indexing `/` itself remains unsupported).
-pub fn root_entry_name(path: &std::path::Path) -> Option<Vec<u8>> {
+/// The index-entry name for a root path: the full normalized path itself
+/// (separators canonicalized, one trailing slash stripped, `/` kept).
+///
+/// One database holds many filesystems (§4), so roots are identified by path,
+/// not by basename: two roots sharing a final component (`/data` and
+/// `/mnt/data`) must not collide (formerly STATUS deviation #5, fixed by path
+/// qualification). The name never
+/// surfaces in results — materialization prefixes the runtime root path and
+/// excludes the entry's own name — so its only job is identity, and the full
+/// path is the identity that cannot collide (configured roots are deduplicated
+/// by path at merge).
+///
+/// Legacy stores used the bare basename; `root_dir_id` falls back to that
+/// (see `legacy_root_entry_name`) when the path-qualified name misses, so old
+/// stores keep working with no migration and no recrawl — and the daemon only
+/// inserts a path-qualified entry when *neither* resolves, so no duplicate
+/// root entry is ever created.
+pub fn root_entry_name(path: &std::path::Path) -> Vec<u8> {
+    let s = crate::util::normalize_separators(path)
+        .to_string_lossy()
+        .into_owned();
+    let t = if s.len() > 1 {
+        s.trim_end_matches('/').to_string()
+    } else {
+        s
+    };
+    t.into_bytes()
+}
+
+/// The pre-path-qualification entry name (basename, or the drive letter for a
+/// Windows drive root): the fallback `root_dir_id` consults for stores
+/// written before path qualification.
+pub fn legacy_root_entry_name(path: &std::path::Path) -> Option<Vec<u8>> {
     if let Some(base) = path.file_name() {
         #[cfg(unix)]
         {
@@ -240,7 +269,10 @@ mod tests {
     fn state_labels() {
         assert_eq!(RootState::Ok.label(), "ok");
         assert_eq!(
-            RootState::Degraded { reason: "overflow".into() }.label(),
+            RootState::Degraded {
+                reason: "overflow".into()
+            }
+            .label(),
             "degraded(overflow)"
         );
     }
@@ -257,15 +289,45 @@ mod tests {
 
     #[test]
     fn root_entry_names() {
+        // Path-qualified: no two distinct roots can share a name.
         assert_eq!(
             root_entry_name(std::path::Path::new("/mnt/data")),
+            b"/mnt/data".to_vec()
+        );
+        assert_eq!(
+            root_entry_name(std::path::Path::new("/data")),
+            b"/data".to_vec()
+        );
+        assert_ne!(
+            root_entry_name(std::path::Path::new("/data")),
+            root_entry_name(std::path::Path::new("/mnt/data")),
+            "same basename must not collide"
+        );
+        // `/` is a usable root name now (indexing `/` is supported).
+        assert_eq!(root_entry_name(std::path::Path::new("/")), b"/".to_vec());
+        // A trailing slash spells the same entry.
+        assert_eq!(
+            root_entry_name(std::path::Path::new("/mnt/data/")),
+            b"/mnt/data".to_vec()
+        );
+        // Drive-letter roots keep a stable entry. On Linux `D:/` already has
+        // a `file_name`; on Windows only the fallback produces it — either
+        // way the separator-normalized, slash-stripped path is `D:`.
+        assert_eq!(root_entry_name(std::path::Path::new("D:/")), b"D:".to_vec());
+        assert_eq!(root_entry_name(std::path::Path::new("D:")), b"D:".to_vec());
+    }
+
+    #[test]
+    fn legacy_root_entry_names() {
+        // The pre-qualification rule, kept as the resolution fallback.
+        assert_eq!(
+            legacy_root_entry_name(std::path::Path::new("/mnt/data")),
             Some(b"data".to_vec())
         );
-        assert_eq!(root_entry_name(std::path::Path::new("/")), None, "indexing / stays unsupported");
-        // Drive-letter roots get a stable entry instead of ROOT_ID. On Linux
-        // `D:/` already has a `file_name`; on Windows only the fallback
-        // produces it — either way the name is `D:`.
-        assert_eq!(root_entry_name(std::path::Path::new("D:/")), Some(b"D:".to_vec()));
-        assert_eq!(root_entry_name(std::path::Path::new("D:")), Some(b"D:".to_vec()));
+        assert_eq!(legacy_root_entry_name(std::path::Path::new("/")), None);
+        assert_eq!(
+            legacy_root_entry_name(std::path::Path::new("D:/")),
+            Some(b"D:".to_vec())
+        );
     }
 }

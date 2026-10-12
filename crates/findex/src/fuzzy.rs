@@ -68,9 +68,7 @@ fn levenshtein_lower(a: &[u8], b: &[u8], k: u32) -> Option<u32> {
         let mut row_min = cur[0];
         for j in 1..=m {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            let v = (prev[j - 1] + cost)
-                .min(prev[j] + 1)
-                .min(cur[j - 1] + 1);
+            let v = (prev[j - 1] + cost).min(prev[j] + 1).min(cur[j - 1] + 1);
             cur[j] = v;
             row_min = row_min.min(v);
         }
@@ -127,9 +125,7 @@ pub fn substring_lower(hay: &[u8], needle: &[u8], k: u32) -> Option<u32> {
         let mut row_min = cur[0];
         for j in 1..=n {
             let cost = if needle[i - 1] == hay[j - 1] { 0 } else { 1 };
-            let v = (prev[j - 1] + cost)
-                .min(prev[j] + 1)
-                .min(cur[j - 1] + 1);
+            let v = (prev[j - 1] + cost).min(prev[j] + 1).min(cur[j - 1] + 1);
             cur[j] = v;
             row_min = row_min.min(v);
         }
@@ -153,7 +149,11 @@ mod tests {
     #[test]
     fn exact_distance_zero() {
         assert_eq!(levenshtein_within(b"main.rs", b"main.rs", 0), Some(0));
-        assert_eq!(levenshtein_within(b"MAIN.RS", b"main.rs", 0), Some(0), "case-insensitive");
+        assert_eq!(
+            levenshtein_within(b"MAIN.RS", b"main.rs", 0),
+            Some(0),
+            "case-insensitive"
+        );
     }
 
     #[test]
@@ -227,7 +227,10 @@ mod tests {
     #[test]
     fn prefix_suffix_trim_does_not_change_result() {
         // A long shared prefix must not fool the trimmed DP.
-        assert_eq!(levenshtein_within(b"aaaaaaaaaab", b"aaaaaaaaaac", 1), Some(1));
+        assert_eq!(
+            levenshtein_within(b"aaaaaaaaaab", b"aaaaaaaaaac", 1),
+            Some(1)
+        );
         assert_eq!(levenshtein_within(b"aaaaaaaaaab", b"aaaaaaaaaac", 0), None);
     }
 }

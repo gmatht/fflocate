@@ -21,11 +21,18 @@ use findex::persist::Store;
 use findex::roots::Root;
 use findex::sync::SyncRegistry;
 
-fn harness_with(excludes: Excludes, model: ModelFs) -> (Applier, Arc<Shared>, tempfile::TempDir, u32) {
+fn harness_with(
+    excludes: Excludes,
+    model: ModelFs,
+) -> (Applier, Arc<Shared>, tempfile::TempDir, u32) {
     let d = tempfile::tempdir().unwrap();
     let store = Store::open(&d.path().join("state")).unwrap();
     let mut ix = Index::new();
-    let root = ix.insert(ROOT_ID, b"model", EntryFlags::EMPTY.with_dir(true).with_root_dir(true));
+    let root = ix.insert(
+        ROOT_ID,
+        b"model",
+        EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+    );
     let mut r = Root::new(0, model_root());
     r.caps.writable = true;
     let shared = Shared::new(ix, vec![r]);
@@ -63,13 +70,22 @@ fn crawl_skips_an_excluded_subtree() {
 
     let paths = index_paths(&shared);
     assert!(paths.contains(&"/model/src".to_string()), "got {paths:?}");
-    assert!(paths.contains(&"/model/src/main.rs".to_string()), "got {paths:?}");
-    assert!(paths.contains(&"/model/README.md".to_string()), "got {paths:?}");
+    assert!(
+        paths.contains(&"/model/src/main.rs".to_string()),
+        "got {paths:?}"
+    );
+    assert!(
+        paths.contains(&"/model/README.md".to_string()),
+        "got {paths:?}"
+    );
     assert!(
         !paths.iter().any(|p| p.contains("node_modules")),
         "an excluded dir and its whole subtree must not be indexed; got {paths:?}"
     );
-    assert!(applier.excluded_names > 0, "the exclusion must be counted, not silent");
+    assert!(
+        applier.excluded_names > 0,
+        "the exclusion must be counted, not silent"
+    );
 }
 
 #[test]
@@ -82,15 +98,28 @@ fn whole_mount_events_cannot_reintroduce_an_excluded_dir() {
     applier.drain();
     // The event names the root dir as parent; a whole-mount watch would deliver
     // exactly this for `mkdir node_modules`.
-    applier.push(FsEvent::upsert(DirKey::new(1), b"node_modules".to_vec(), true));
+    applier.push(FsEvent::upsert(
+        DirKey::new(1),
+        b"node_modules".to_vec(),
+        true,
+    ));
     // And an unrelated create that must still work.
     applier.push(FsEvent::upsert(DirKey::new(1), b"keep.rs".to_vec(), false));
     applier.drain();
 
     let paths = index_paths(&shared);
-    assert!(!paths.iter().any(|p| p.contains("node_modules")), "got {paths:?}");
-    assert!(paths.contains(&"/model/keep.rs".to_string()), "unrelated creates still work; got {paths:?}");
-    assert!(applier.excluded_names > 0, "the refused dir must be counted");
+    assert!(
+        !paths.iter().any(|p| p.contains("node_modules")),
+        "got {paths:?}"
+    );
+    assert!(
+        paths.contains(&"/model/keep.rs".to_string()),
+        "unrelated creates still work; got {paths:?}"
+    );
+    assert!(
+        applier.excluded_names > 0,
+        "the refused dir must be counted"
+    );
 }
 
 #[test]

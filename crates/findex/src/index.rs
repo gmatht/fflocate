@@ -5,9 +5,18 @@
 //!     name_off: u32,      // offset into names arena
 //!     name_len: u16,
 //!     parent: u32,        // ROOT = 0
-//!     flags: u8,          // IS_DIR | IS_SYMLINK | TOMBSTONE
+//!     flags: u8,          // IS_DIR | IS_SYMLINK | TOMBSTONE | IS_EXEC
 //! }
 //! ```
+//!
+//! `IS_EXEC` means "any execute bit set" (`find -perm /111`), deliberately
+//! *not* effective access for the querying user: the system daemon serves many
+//! users from one index, and per-user executability needs the full
+//! `mode+uid+gid` (the ownership sidecar already carries that). Directories
+//! are never marked executable even when their `x` (traverse) bit is set —
+//! `type:exec` answers "is this file executable", and a directory is not a
+//! file. Symlinks `lstat` as `0777`, so the bit must be decided from the
+//! target's mode, not the link's.
 //!
 //! No path strings are stored. Paths are materialized by walking the parent
 //! chain on demand, which makes directory renames O(1). Deletions are
@@ -31,6 +40,9 @@ pub mod flags {
     /// matched by a bare `parent == ROOT_ID` walk, since a root is referenced by
     /// its own id).
     pub const IS_ROOT_DIR: u8 = 0b0000_1000;
+    /// Any execute bit set (`mode & 0o111 != 0`, decided from `stat` so
+    /// symlinks report their target's mode). Never set on directories.
+    pub const IS_EXEC: u8 = 0b0001_0000;
 }
 
 /// Bit flags stored compactly in an [`Entry`].
@@ -52,8 +64,15 @@ impl EntryFlags {
     pub fn is_root_dir(self) -> bool {
         self.0 & flags::IS_ROOT_DIR != 0
     }
+    pub fn is_exec(self) -> bool {
+        self.0 & flags::IS_EXEC != 0
+    }
     pub fn with_dir(mut self, v: bool) -> Self {
         self.set(flags::IS_DIR, v);
+        self
+    }
+    pub fn with_exec(mut self, v: bool) -> Self {
+        self.set(flags::IS_EXEC, v);
         self
     }
     pub fn with_symlink(mut self, v: bool) -> Self {
@@ -321,7 +340,12 @@ impl Index {
             while self.entries.len() <= id as usize {
                 let pad_id = self.entries.len() as u32;
                 let _ = pad_id;
-                self.entries.push(Entry { name_off: 0, name_len: 0, parent: ROOT_ID, flags: flags::TOMBSTONE });
+                self.entries.push(Entry {
+                    name_off: 0,
+                    name_len: 0,
+                    parent: ROOT_ID,
+                    flags: flags::TOMBSTONE,
+                });
                 self.alive.push(false);
             }
         }
@@ -444,7 +468,8 @@ impl Index {
     /// Convenience wrapper allocating a `Vec`.
     pub fn path_of(&self, id: u32, root_path: &[u8]) -> Option<Vec<u8>> {
         let mut buf = Vec::new();
-        self.materialize_into(id, root_path, &mut buf).map(|s| s.to_vec())
+        self.materialize_into(id, root_path, &mut buf)
+            .map(|s| s.to_vec())
     }
 
     // ------------------------------------------------------------- compaction
@@ -603,7 +628,10 @@ mod tests {
         let sub = ix.insert(root, b"src", dir());
         let f = ix.insert(sub, b"main.rs", file());
         // The root dir's own name is not repeated: `root_path` already names it.
-        assert_eq!(ix.path_of(f, b"/home/me/proj"), Some(b"/home/me/proj/src/main.rs".to_vec()));
+        assert_eq!(
+            ix.path_of(f, b"/home/me/proj"),
+            Some(b"/home/me/proj/src/main.rs".to_vec())
+        );
         // root at "/"
         assert_eq!(ix.path_of(f, b"/"), Some(b"/src/main.rs".to_vec()));
     }
@@ -616,7 +644,10 @@ mod tests {
         let f = ix.insert(sub, b"x.txt", file());
         assert!(ix.path_of(f, b"/p").is_some());
         ix.remove(sub);
-        assert!(ix.path_of(f, b"/p").is_none(), "results under a deleted dir are dropped");
+        assert!(
+            ix.path_of(f, b"/p").is_none(),
+            "results under a deleted dir are dropped"
+        );
     }
 
     #[test]
@@ -646,9 +677,12 @@ mod tests {
         assert_eq!(c.live_count(), before_live);
         assert_eq!(c.entry_count(), before_live as usize + 1);
         assert_eq!(c.entries.len(), 5); // slot0 + root + 3 live files
-        // parent links intact for every live entry
+                                        // parent links intact for every live entry
         for id in 1..c.entries.len() as u32 {
-            assert!(c.chain_ok(id), "entry {id} lost its root chain after compaction");
+            assert!(
+                c.chain_ok(id),
+                "entry {id} lost its root chain after compaction"
+            );
         }
         // ids are remapped but reachability and names survive
         let f1 = c.lookup(1, b"f1").expect("f1 survived");
