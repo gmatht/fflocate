@@ -203,3 +203,58 @@ fn socket_roundtrip_serves_a_query() {
         .any(|r| matches!(r, Response::Hit { path, .. } if path.ends_with("hello.rs"))));
     daemon.stop();
 }
+
+#[test]
+fn large_replayed_tail_compacts_away_on_boot() {
+    // §9 startup compaction: a tail past the threshold is folded into a
+    // fresh snapshot during build, so the *next* boot replays ~nothing —
+    // and post-compact writes land on the reset epoch (LSN 1..) instead of
+    // being skipped by the `lsn > last_lsn` replay filter.
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("tree");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), b"x").unwrap();
+
+    let mut cfg = test_config(d.path(), root.clone());
+    cfg.compaction_threshold = 2;
+
+    {
+        let mut daemon = Daemon::build(cfg.clone()).unwrap();
+        // Build-time: the crawl tail (≥ threshold) was folded into a fresh
+        // snapshot — journal truncated, epoch reset, before serving.
+        assert_eq!(
+            daemon.shared.index.read().unwrap().last_lsn(),
+            0,
+            "startup compaction must reset the epoch"
+        );
+        assert_eq!(daemon.shared.snapshot_lsn(), 0);
+        assert_eq!(
+            daemon.applier_mut().store().journal.count(),
+            0,
+            "journal must be truncated after startup compaction"
+        );
+        daemon.start().unwrap();
+        settle(&mut daemon, 2000);
+        daemon.stop();
+    }
+
+    // A post-compact write, then a second boot: it must survive, and the
+    // second boot must have (almost) nothing to replay.
+    std::fs::write(root.join("b.txt"), b"y").unwrap();
+    {
+        let mut daemon = Daemon::build(cfg.clone()).unwrap();
+        daemon.start().unwrap();
+        settle(&mut daemon, 2000);
+        let (has_a, has_b) = {
+            let ix = daemon.shared.index.read().unwrap();
+            let rid = ix.root_dirs()[0];
+            (
+                ix.lookup(rid, b"a.txt").is_some(),
+                ix.lookup(rid, b"b.txt").is_some(),
+            )
+        };
+        assert!(has_a, "a.txt must survive the compacted snapshot");
+        assert!(has_b, "b.txt (post-compact crawl) must survive the second boot");
+        daemon.stop();
+    }
+}

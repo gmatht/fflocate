@@ -1480,7 +1480,12 @@ impl Applier {
         let new_gen = self.shared.generation() + 1;
         let mut compacted = compacted;
         compacted.set_generation(new_gen);
-        compacted.set_last_lsn(self.shared.snapshot_lsn());
+        // §9 LSN epoch reset: the journal is truncated below, so its clock
+        // restarts at 0. Carrying the old high-water into the new snapshot
+        // would make next boot's `lsn > last_lsn` replay skip filter out
+        // every post-compact write (silent loss). The generation bump above
+        // already invalidates pre-compact `c:gen:lsn` cursors.
+        compacted.set_last_lsn(0);
         {
             let mut ix = self.shared.index.write().unwrap();
             *ix = compacted;
@@ -1503,6 +1508,9 @@ impl Applier {
             }
         }
         self.shared.generation.store(new_gen, Ordering::Release);
+        // Epoch reset, continued: the shared clock restarts with the journal.
+        // (The index copy above already carries last_lsn 0 for the snapshot.)
+        self.shared.lsn.store(0, Ordering::Release);
         let (snap_index, snap_roots) = {
             let ix = self.shared.index.read().unwrap();
             (ix.clone(), roots_snapshot)
@@ -1573,6 +1581,74 @@ mod tests {
         ix.insert(b, b"y", EntryFlags::EMPTY);
         let d = descendants(&ix, r);
         assert_eq!(d.len(), 4);
+    }
+
+    #[test]
+    fn compaction_resets_the_lsn_epoch() {
+        use crate::modelfs::{model_root, ModelFs, Node};
+        use crate::persist::Store;
+        use crate::roots::Root;
+        use crate::sync::SyncRegistry;
+        use std::sync::Arc;
+
+        // The epoch reset is what makes a truncated journal safe to reopen:
+        // snapshot, shared clock, and journal all restart at 0, so next
+        // boot's `lsn > last_lsn` replay skip cannot discard post-compact
+        // writes.
+        let model = ModelFs::with([("a.rs", Node::File)]);
+        let dir = tempfile::tempdir().unwrap();
+        let statedir = dir.path().join("state");
+        let store = Store::open(&statedir).unwrap();
+        let mut ix = Index::new();
+        let r0 = ix.insert(
+            ROOT_ID,
+            b"/model",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        ix.set_last_lsn(41);
+        let shared = Shared::new(ix, vec![Root::new(0, model_root())]);
+        shared.lsn.store(41, Ordering::Release);
+        let mut a = Applier::new(
+            shared.clone(),
+            store,
+            Arc::new(model.clone()),
+            SyncRegistry::new(),
+        );
+        a.rebuild_dir_cache();
+        a.pending_mut().enqueue_crawl(r0);
+        a.drain();
+        assert!(a.compact_now());
+        assert_eq!(shared.index.read().unwrap().last_lsn(), 0);
+        assert_eq!(shared.snapshot_lsn(), 0);
+        assert_eq!(a.store().journal.count(), 0);
+
+        // A post-compact write gets LSN 1 and survives a reopen+replay.
+        a.pending_mut().enqueue_crawl(r0);
+        a.drain();
+        model.put(b"b.rs", Node::File);
+        a.pending_mut()
+            .enqueue_rescan(r0, crate::event::RescanCause::Manual);
+        a.drain();
+        assert_eq!(shared.snapshot_lsn(), 1, "first post-epoch write is LSN 1");
+        drop(a);
+
+        let mut store2 = Store::open(&statedir).unwrap();
+        let snap = store2.load_snapshot().unwrap().unwrap();
+        assert_eq!(snap.index.last_lsn(), 0, "snapshot carries the reset epoch");
+        let mut ix2 = snap.index;
+        let mut applied = Vec::new();
+        let out = store2
+            .replay(&mut ix2, |lsn, rec| applied.push((lsn, rec.clone())))
+            .unwrap();
+        assert_eq!(out.replayed, 1, "the post-compact write must not be skipped");
+        for (_, rec) in &applied {
+            crate::persist::apply_record(&mut ix2, rec);
+        }
+        let r0b = crate::applier::root_dir_id(&ix2, &Root::new(0, model_root()));
+        assert!(
+            ix2.lookup(r0b, b"b.rs").is_some(),
+            "b.rs must survive a restart after the epoch reset"
+        );
     }
 
     #[test]

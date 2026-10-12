@@ -415,6 +415,37 @@ These are deliberate and small; each is noted so the design stays honest.
   watch-limit exhaustion produced no degradation and no counter. Now the watcher
   thread reports failures to the applier, which marks the root degraded and bumps
   `watch_failures`/`watch_limit_hits` — loudly stale, not silently wrong.
+* **Startup compaction + LSN epoch reset.** A journal tail replayed at boot never
+  counted toward `records_since_compaction` (it bypasses `emit`), so a large
+  inherited tail — 672k records / 26 MB in the live incident — replayed on
+  *every* boot. `Daemon::build` now folds a clean tail past the threshold into a
+  fresh snapshot once. This exposed a latent correctness bug: `compact_now`
+  wrote the old LSN high-water into the new snapshot while `Journal::truncate`
+  reset the journal clock to 0, so next boot's `lsn > last_lsn` replay skip
+  would have silently discarded every post-compact write. Compaction now resets
+  the epoch across snapshot, shared clock, and journal together (the generation
+  bump already invalidates old `c:gen:lsn` cursors).
+* **Watcher↔applier ABBA deadlock (root-caused from a live wedge).** Both
+  threads parked forever in futex waits — stacks recovered from the wedged
+  process via `/proc/PID/mem` + `addr2line` against `/proc/PID/exe`: main in
+  `tick → watch_dir → watch_tx.send` (watch channel, cap 4096), the watcher in
+  `tx.send` of event batches (cap 1000). Each side's blocking send is the
+  other's consume step: one long applier work item (a full-root
+  `diff_subtree` — `DRAIN_TIME_BUDGET` paces *between* items, not within one)
+  starves the event-channel drain; a live event flood (two concurrent build
+  sessions on indexed roots) fills it; the parked watcher stops servicing watch
+  requests; the applier's flush — one request per surviving directory after a
+  full-tree pass, far more than 4096 — blocks in `watch_dir` and main never
+  returns to the top of its tick. A later SIGTERM then made the accept loop drop
+  the listener while the wedged applier never cleaned the socket or pidfile:
+  clients saw ECONNREFUSED (111) against a held pidfile — the "deaf daemon".
+  Fixed in the watcher: event batches are sent with a 50 ms deadline, watch
+  requests are serviced between retries, and the stop flag is re-checked on
+  every retry; watch-failure reports are `try_send` (dropped loudly to the
+  daemon log when saturated) so they cannot re-create the cycle. Neither events
+  nor watch requests are ever dropped, and shutdown stays prompt. Pinned by
+  `watcher_services_watch_requests_while_events_back_up` (30 s watchdog — the
+  plain blocking-send variant hangs at exactly that watchdog).
 fails at exactly that watchdog).
 
 ## Reproducing the checks

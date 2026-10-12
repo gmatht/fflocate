@@ -254,7 +254,7 @@ store.meta:    JSON sidecar: format version, creating/writing OS, resolved
 
 - **Load = mmap** (MAP_PRIVATE, < 50 ms at millions of entries); tombstone flips are COW. Replay journal tail on startup. Torn/corrupt tail: per-record CRC bounds the damage — keep serving, log it, enqueue `RescanSubtree(cause=journal_corrupt)`.
 - **Cursors**: opaque `c:<gen>:<lsn>`. A cursor is valid only while `gen` matches; generation bumps (full-root rescan, compaction) invalidate all cursors by design — consumers resync from a full listing rather than apply deltas of uncertain provenance. This is Watchman's `is_fresh_instance` contract, expressed in our protocol.
-- **Compaction**: build fresh snapshot off-thread, `arc_swap` it in, truncate journal, bump generation.
+- **Compaction**: build fresh snapshot off-thread, `arc_swap` it in, truncate journal, bump generation. Truncation resets the LSN epoch (snapshot, shared clock, and journal all restart at 0) — otherwise the next boot's `lsn > last_lsn` replay skip would discard every post-compact write. A tail past the threshold at startup is compacted during build, so it replays once, never every boot.
 - Startup: load → replay → serve immediately (meta marks catching-up state) → background rescan only if the journal was unusable.
 
 ---
@@ -340,6 +340,15 @@ Still boring, deliberately:
 - Applier owns the pending collection and is the **single writer** behind a `RwLock`; queries take the read lock for the whole scan (~10–50 ms worst case). Writer stalls are absorbed by the bounded channel. Epoch/arc-swap schemes stay on the shelf until profiling demands them.
 - Watcher, crawler/rescanner, compactor are separate threads.
 - Sync ops wait on a oneshot registered per cookie; timeout is enforced by the applier's clock, so a stuck sync can't wedge a client thread.
+- **Channel discipline (watcher ↔ applier):** the two bounded channels between
+  them (event batches up, watch requests down) form a cycle — each side's
+  blocking send is the other's consume step. Neither side may block
+  indefinitely on its send: the watcher sends event batches with a deadline and
+  services watch requests between retries (see `Daemon::start`); the applier's
+  `watch_dir` send is thereby bounded and always returns to the top of its tick
+  to drain events. A plain blocking send on either side parks both threads
+  forever — observed live as a wedged daemon whose socket then outlives its
+  listener (`ECONNREFUSED` against a held pidfile).
 
 ---
 

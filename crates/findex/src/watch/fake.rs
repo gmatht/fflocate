@@ -97,6 +97,12 @@ impl FakeBackend {
         FakeBackend { handle }
     }
 
+    /// The shared injection handle. Tests (and only tests) use this to feed
+    /// events into a daemon whose backend was constructed internally, by
+    /// downcasting `Box<dyn WatchBackend>` back to the concrete fake.
+    pub fn handle(&self) -> FakeHandle {
+        self.handle.clone()
+    }
 }
 
 /// Scan `(dir id, path)` pairs for sync-cookie files and emit create events

@@ -61,7 +61,10 @@ pub struct BackendCaps {
 
 /// The backend interface. `poll` returns a globally ordered batch; an empty
 /// Vec with a timeout means "nothing happened", not "the stream ended".
-pub trait WatchBackend: Send {
+/// `Any` enables downcasting `Box<dyn WatchBackend>` back to a concrete
+/// backend — used by tests to reach the fake backend's injection handle
+/// inside a daemon whose backend was constructed internally (`make_backend`).
+pub trait WatchBackend: Send + std::any::Any {
     fn caps(&self) -> BackendCaps;
     /// Start watching `root`. Idempotent.
     fn add_root(&mut self, root: &Root) -> std::io::Result<()>;

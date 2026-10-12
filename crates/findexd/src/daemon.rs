@@ -15,6 +15,14 @@
 //! meta until the initial crawl lands (§9/§15). Watch first, then enumerate
 //! (§5): watches are installed on every directory before it is crawled.
 //!
+//! Channel discipline: the watcher and the applier exchange work through two
+//! bounded channels (events up, watch requests down). Neither side may block
+//! indefinitely on its send, because each side's send is the other's consume
+//! step — one parked producer wedges both threads forever. The watcher sends
+//! event batches with a deadline and services watch requests between retries
+//! (see the loop in `start`); the applier's `watch_dir` send is thereby
+//! bounded, and always returns to the top of its tick to drain events.
+//!
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -303,15 +311,6 @@ impl Daemon {
             root.drive = findex::drive::probe_drive(&root.path);
         }
 
-        // A drive that changed under a known path (swapped removable media,
-        // or the other OS's view of a shared drive) must be re-reconciled:
-        // entries proved against the old drive are suspect.
-        let drive_changed = drive_changed_rids(
-            &stamp.as_ref().map(|s| s.drives.clone()).unwrap_or_default(),
-            &roots,
-            &index,
-        );
-
         // Replay the journal tail. `replay` reports the records; we apply them
         // to the index ourselves (the same `apply_record` the applier uses).
         let mut tail: Vec<Record> = Vec::new();
@@ -326,6 +325,32 @@ impl Daemon {
             index.bump_generation();
         }
 
+        // §9 startup compaction: the replayed tail never counted toward
+        // compaction (it bypassed the applier's `emit` counter), so a large
+        // inherited tail would replay on every boot. Fold it into a fresh
+        // snapshot here — one slow boot buys back every future boot — while
+        // the state is still local (index + roots + store), before any ids
+        // escape into `Shared`, the applier, or the pending queue (compaction
+        // renumbers ids). Skipped when the tail is suspect (corrupt → rescan
+        // first) or a handoff queued rescans (compact after they drain via
+        // the normal `maybe_compact` path).
+        if replay.replayed >= config.compaction_threshold
+            && !replay.corrupt_tail
+            && !handoff
+        {
+            let (compacted, _) = index.compacted();
+            let mut compacted = compacted;
+            compacted.set_generation(compacted.generation() + 1);
+            // LSN epoch reset (see `Applier::compact_now`): the journal is
+            // truncated below, so the snapshot and the clock both restart at
+            // 0 — otherwise next boot's `lsn > last_lsn` skip would filter
+            // out every post-compact write. The generation bump already
+            // invalidates pre-compact `c:gen:lsn` cursors.
+            compacted.set_last_lsn(0);
+            index = compacted;
+            store.compact(&index, &roots)?;
+        }
+
         let shared = Shared::new(index, roots);
         {
             let mut h = shared.health.write().unwrap();
@@ -336,6 +361,7 @@ impl Daemon {
         let sync = SyncRegistry::new();
         let fs: Arc<dyn FsView> = Arc::new(RealFs);
         let mut applier = Applier::new(shared.clone(), store, fs, sync.clone());
+        applier.compaction_threshold = config.compaction_threshold;
         // §4/§6: exclusions must be installed before the initial crawl, so an
         // excluded subtree is never enumerated (and, for a whole-mount backend
         // that cannot decline the watch, never inserted either).
@@ -349,8 +375,14 @@ impl Daemon {
 
         // Reconcile queued at open: swapped drives re-verified, and on a
         // cross-OS handoff every local root is re-reconciled unconditionally
-        // (a crawl only adds; deletions need the diff).
-        for rid in drive_changed {
+        // (a crawl only adds; deletions need the diff). Computed here, after
+        // the startup compaction above: compaction renumbers ids, so rids
+        // resolved earlier would mistarget the rescans.
+        for rid in drive_changed_rids(
+            &stamp.as_ref().map(|s| s.drives.clone()).unwrap_or_default(),
+            &shared.roots.read().unwrap(),
+            &shared.index.read().unwrap(),
+        ) {
             applier
                 .pending_mut()
                 .enqueue_rescan(rid, RescanCause::MountEvent);
@@ -522,48 +554,106 @@ impl Daemon {
         let watch_rx = self.watch_rx.take().expect("watch_rx taken twice");
         let fail_tx = self.watch_fail_tx.clone();
         self.watcher_thread = Some(std::thread::spawn(move || {
+            // Install every pending watch request, reporting failures. This is
+            // the watcher's consume step for the watch channel, and it is
+            // called from every wait below — that is what breaks the
+            // channel cycle (see the loop comment).
+            let install_pending = |backend: &SharedBackend| -> bool {
+                let mut busy = false;
+                while let Ok((id, path)) = watch_rx.try_recv() {
+                    busy = true;
+                    let mut b = backend.lock().unwrap();
+                    if let Err(e) = b.watch_dir(id, &path) {
+                        // A failure is *never* silent (§7, §15): it is
+                        // reported so the applier can degrade the root
+                        // loudly. But the report itself must never block:
+                        // the applier drains `watch_fail_rx` only at the top
+                        // of its tick, so a blocking send on a saturated
+                        // report channel would park the watcher, stop the
+                        // watch-request servicing, and re-create the exact
+                        // deadlock this loop exists to prevent. Saturated =
+                        // drop loudly to the daemon log; the first 1024
+                        // reports have already degraded every root in
+                        // trouble.
+                        let f = WatchFailure { dir: id, reason: e.to_string() };
+                        if fail_tx.try_send(f).is_err() {
+                            eprintln!(
+                                "findexd: watch failure report dropped (report channel saturated): dir {id}: {e}"
+                            );
+                        }
+                    }
+                }
+                busy
+            };
+
             {
                 let mut b = backend.lock().unwrap();
                 for r in &roots_snapshot {
                     let _ = b.add_root(r);
                 }
             }
+            // The watcher never blocks indefinitely on `tx.send`.
+            //
+            // Both channels here are bounded, and each thread's blocking
+            // send is exactly the other's consume step — a textbook ABBA
+            // cycle, observed live on a 1.4M-entry index (both threads
+            // futex-parked forever, stacks recovered from /proc):
+            //
+            //   applier:  one long work item (a full-root `diff_subtree`;
+            //             DRAIN_TIME_BUDGET paces *between* items, not
+            //             within one) goes minutes without draining
+            //             `incoming_rx`; a live event flood fills the
+            //             1000-batch event channel and the watcher parks in
+            //             its send — and while parked stops servicing watch
+            //             requests. The applier then finishes its item
+            //             holding one watch request per surviving directory
+            //             (far more than the 4096-channel after a
+            //             full-tree pass) and blocks in `watch_dir`'s
+            //             `watch_tx.send` — never returning to the top of
+            //             its tick to drain `incoming_rx`. Neither thread
+            //             ever reaches its consume step again.
+            //
+            // The cycle breaks here, in the watcher: every event-batch send
+            // carries a deadline, watch requests are serviced between
+            // retries, and the stop flag is re-checked on every retry. The
+            // applier's `watch_dir` send is therefore parked for at most
+            // ~one retry interval, always returns to the top of its tick,
+            // and always drains `incoming_rx`. Neither events nor watch
+            // requests are ever dropped; shutdown stays prompt.
             while !stop.load(Ordering::Relaxed) {
-                // Service pending watch additions (non-blocking). A failure is
-                // *never* silent: it is reported so the applier can degrade the
-                // root loudly (§7, §15).
-                let mut busy = false;
-                while let Ok((id, path)) = watch_rx.try_recv() {
-                    busy = true;
-                    let mut b = backend.lock().unwrap();
-                    if let Err(e) = b.watch_dir(id, &path) {
-                        let _ = fail_tx.send(WatchFailure {
-                            dir: id,
-                            reason: e.to_string(),
-                        });
-                    }
-                }
+                let mut busy = install_pending(&backend);
                 let evs = {
                     let mut b = backend.lock().unwrap();
                     b.poll(Duration::from_millis(50)).unwrap_or_default()
                 };
-                let has_events = !evs.is_empty();
-                if has_events && tx.send(evs).is_err() {
-                    break;
-                }
-                busy |= has_events;
-                // Drain watch requests again promptly so a new dir is watched
-                // before its contents change.
-                while let Ok((id, path)) = watch_rx.try_recv() {
+                if !evs.is_empty() {
                     busy = true;
-                    let mut b = backend.lock().unwrap();
-                    if let Err(e) = b.watch_dir(id, &path) {
-                        let _ = fail_tx.send(WatchFailure {
-                            dir: id,
-                            reason: e.to_string(),
-                        });
+                    let mut batch = Some(evs);
+                    while let Some(evs) = batch {
+                        if stop.load(Ordering::Relaxed) {
+                            // Shutdown: drop the in-flight batch. Events not
+                            // yet applied are lost on shutdown by
+                            // construction today (the applier stops ticking
+                            // first); §7 rescans heal the gap.
+                            break;
+                        }
+                        busy |= install_pending(&backend);
+                        match tx.send_timeout(evs, Duration::from_millis(50)) {
+                            Ok(()) => batch = None,
+                            Err(crossbeam_channel::SendTimeoutError::Timeout(evs)) => {
+                                batch = Some(evs);
+                            }
+                            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                                // The applier side is gone: the daemon is
+                                // stopping. Nothing further to deliver.
+                                return;
+                            }
+                        }
                     }
                 }
+                // Drain watch requests again promptly so a new dir is watched
+                // before its contents change.
+                busy |= install_pending(&backend);
                 // Kernel backends block in `poll` for up to the timeout, but
                 // the fake backend drains a queue and returns instantly — so
                 // on platforms without a kernel watcher (macOS/Windows) this
@@ -929,5 +1019,125 @@ mod tests {
             covered_root_paths(&slashed, &cfg_slashed),
             vec!["/home/me".to_string()]
         );
+    }
+
+    /// Regression for the watcher<->applier channel deadlock (see the watcher
+    /// loop in `start`): with the event channel saturated *and* events still
+    /// flowing, the applier must still be able to flush more watch requests
+    /// than the watch channel holds -- i.e. the watcher must keep servicing
+    /// watch requests while its event send is parked. Before the fix the
+    /// watcher blocked in a plain `send` here, the applier blocked in
+    /// `watch_dir`'s send, and neither thread ever reached its consume step
+    /// again (observed live: both threads in futex waits, index frozen).
+    ///
+    /// The scenario runs on a worker thread with a watchdog: a hang here is
+    /// the deadlock, and the watchdog turns it into a test failure instead.
+    #[test]
+    fn watcher_services_watch_requests_while_events_back_up() {
+        use crate::config::{BackendChoice, Config};
+        use findex::watch::fake::FakeBackend;
+
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg = Config {
+            socket_path: d.path().join("findex.sock"),
+            pidfile: d.path().join("findex.pid"),
+            state_dir: d.path().join("state"),
+            roots: vec![root.clone()],
+            backend: BackendChoice::Fake,
+            compaction_threshold: 1_000_000,
+            sync_timeout_ms: 500,
+            excludes: findex::excludes::Excludes::new(),
+            system: false,
+            system_group: 0,
+            shared_store: false,
+        };
+        let mut daemon = Daemon::build(cfg).unwrap();
+        daemon.start().unwrap();
+
+        // The fake backend's injection handle: upcast the boxed trait object
+        // to `dyn Any` and downcast back to the concrete fake, so the test
+        // can keep events flowing through a backend the daemon built
+        // internally.
+        let handle = {
+            let b = daemon.backend.lock().unwrap();
+            let backend: &dyn WatchBackend = b.as_ref();
+            let any: &dyn std::any::Any = backend;
+            any.downcast_ref::<FakeBackend>()
+                .expect("test config asks for the fake backend")
+                .handle()
+        };
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let injecting = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let injector_handle = handle.clone();
+        let injector_flag = injecting.clone();
+        // Keep events flowing for the whole scenario, like a live filesystem
+        // under load: every watcher poll must find a non-empty queue, so the
+        // parked-send condition persists (one static batch is not enough —
+        // the fake backend drains its queue in a single poll, and the
+        // watcher's pre-poll servicing would let the flush slip through).
+        let injector = std::thread::spawn(move || {
+            let mut i = 0u32;
+            while injector_flag.load(Ordering::Relaxed) {
+                injector_handle.inject(findex::event::FsEvent::upsert(
+                    findex::event::DirKey::new(900_000 + (i % 64)),
+                    format!("filler_{i}").into_bytes(),
+                    false,
+                ));
+                i += 1;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let scenario = std::thread::spawn(move || {
+            // 1. Saturate the event channel, as a long applier work item
+            //    would (nothing drains it until the tick at the end). The
+            //    loop's exit on `Full` is the saturation guarantee — the
+            //    exact count is not asserted, because the watcher may have
+            //    delivered batches of its own in the meantime.
+            let mut filled = 0usize;
+            loop {
+                match daemon.incoming_tx.try_send(Vec::new()) {
+                    Ok(()) => filled += 1,
+                    Err(crossbeam_channel::TrySendError::Full(_)) => break,
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        panic!("event channel disconnected before saturation")
+                    }
+                }
+            }
+
+            // 1b. Let the watcher reach its parked state: with the channel
+            //     full and the injector feeding it, the watcher's next poll
+            //     cycle finds a non-empty batch and parks in its event send.
+            //     Without this wait the entire scenario can race past
+            //     before the watcher wakes from its 50 ms idle sleep, and
+            //     the parked-send condition never forms.
+            std::thread::sleep(Duration::from_millis(250));
+
+            // 2. Flush more watch requests than the watch channel's capacity.
+            //    With the fix these complete (the watcher services between
+            //    send retries); without it, this blocks forever at request
+            //    #4097 — the watcher is parked sending events into the
+            //    saturated channel and never reaches its servicing pass.
+            for i in 0..6000u32 {
+                daemon.watch_dir(i + 1, &root);
+            }
+
+            // 3. The tick must return: it drains the event channel at its
+            //    top, which unparks the watcher.
+            daemon.tick();
+            let _ = done_tx.send(filled);
+        });
+
+        let filled = done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("watcher-applier deadlock: the watch flush never completed");
+        assert!(filled > 0, "the fill loop should have delivered batches: {filled}");
+        injecting.store(false, Ordering::Relaxed);
+        injector.join().unwrap();
+        // The scenario thread owns the daemon; on success it drops (and so
+        // stops) it. Join to surface any panic it hit.
+        scenario.join().unwrap();
     }
 }
