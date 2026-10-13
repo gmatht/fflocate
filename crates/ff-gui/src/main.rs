@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────┐
+//! │ File  Search  View  Help                          │
 //! │ [ query box                              ][Search]│
 //! ├──────────────────────────────────────────────────┤
 //! │ /home/me/src/main.rs                              │
@@ -14,24 +15,31 @@
 //! └──────────────────────────────────────────────────┘
 //! ```
 //!
+//! Every menubar item reuses a handler something else already owns (the
+//! search trigger, the option widgets, the row actions, the daemon client),
+//! so the bar cannot drift from the rest of the UI. See `menubar_model` for
+//! the bar's contents as testable data.
+//!
 //! The backend is rustxWidgets' `zork` model, which is headless: the same widget
 //! calls work in a terminal (REPL), over ssh, or against GTK when that backend is
 //! available. The daemon does all the indexing and matching; this only collects
 //! input and renders rows.
 
-use rustxwidgets::prelude::*;
+use rswidgets::prelude::*;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use ff_gui::{
-    effective_query, encode_request, query_is_searchable, render_count, rows_from_paths,
-    DaemonClient, GuiError, PendingRequest, Progress, RowAction, SearchGate,
-    SearchOptions, SearchOutcome, WireResponse, ADVANCED_SYNTAX_HELP, DEFAULT_MAX_DISTANCE,
+    box_change_clears, containing_dir, context_menu_target, effective_query, encode_request,
+    extension_sort_key, render_count, rows_from_paths, search_label, searching_status_line,
+    starting_status_line, step_max_distance, DaemonClient, GuiError, MenuAction, PendingRequest,
+    Progress, RowAction, SearchGate, SearchOptions, SearchOutcome, StartupPoll, StartupProbe,
+    WheelStep, WireResponse, ADVANCED_SYNTAX_HELP, DEFAULT_MAX_DISTANCE,
 };
 
-/// A search's result, plus whether the advanced box's query was the one that ran.
-type SearchResult = Result<(SearchOutcome, bool), GuiError>;
+/// A search's result.
+type SearchResult = Result<SearchOutcome, GuiError>;
 
 /// Applies a result to the widgets. Main-thread only: the widgets are not `Send`.
 type RenderFn = Rc<dyn Fn(SearchResult)>;
@@ -42,10 +50,17 @@ type RenderFn = Rc<dyn Fn(SearchResult)>;
 /// *only* `ff` -- so a stale sibling built with different features (e.g.
 /// `--no-default-features --features zork`) can be launched instead. Naming the
 /// backend makes that mismatch visible rather than mysterious.
-const BACKEND: &str = if cfg!(feature = "gtk") {
-    "gtk"
-} else if cfg!(feature = "zork") {
+const BACKEND: &str = if cfg!(feature = "zork") {
     "zork"
+} else if cfg!(target_os = "macos") {
+    "appkit"
+} else if cfg!(windows) {
+    // The `gtk` cargo feature is on everywhere (it is inert off Linux), so
+    // the feature test below would mislabel a Windows build. The target
+    // decides: on Windows rswidgets always drives the NWG backend.
+    "nwg"
+} else if cfg!(feature = "gtk") {
+    "gtk"
 } else {
     "unknown"
 };
@@ -53,12 +68,37 @@ const BACKEND: &str = if cfg!(feature = "gtk") {
 /// Default window size, big enough for the three columns to be readable.
 const DEFAULT_WINDOW_W: i32 = 1000;
 const DEFAULT_WINDOW_H: i32 = 700;
+/// Width the window maps at on GTK: 1 px narrower than the default. The sortable
+/// headers grow a little in the first frames (sort-arrow space arriving with
+/// the theme), widening the results columns ~38 px past the viewport with no
+/// compensating redistribution — queuing a resize does not help (GTK skips
+/// no-change reallocations) and only a real allocation change or row arrival
+/// redistributes. So the window starts 1 px narrow and steps out to the
+/// default once settled (see below): that step *is* a real allocation change,
+/// and the fixed-sized text columns snap to the viewport exactly. Later
+/// resizes and row changes redistribute by themselves. An imperceptible
+/// difference either way; the default above stays the documented size.
+/// GTK-only: other backends map straight at the default (their headers do not
+/// grow late, and nothing there steps the size back out).
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+const INITIAL_WINDOW_W: i32 = DEFAULT_WINDOW_W - 1;
+/// How long after present the settle step runs. The header growth lands at
+/// ~30 ms here; this has an order of magnitude of margin. A machine slower
+/// than that keeps the bar until its first search or resize (which
+/// redistribute by themselves) — accepted, and documented there.
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+const SETTLE_RESIZE_MS: u32 = 300;
 
 /// How many rows to render at most (the daemon may match millions).
 const MAX_ROWS: usize = 200;
 /// How many hits to ask the daemon for (rows plus a little slack for the
 /// "of N matches" line).
 const FETCH_LIMIT: usize = MAX_ROWS + 1;
+/// How long startup waits for a freshly spawned daemon's socket. The daemon
+/// probes mounts and starts threads before binding, so the socket typically
+/// appears a moment after the child exists; past this the status just says
+/// it is still starting.
+const SPAWN_STARTUP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn main() {
     if let Err(e) = run() {
@@ -73,31 +113,48 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let app = App::init().map_err(|e| GuiError::Backend(e.to_string()))?;
-    let client = DaemonClient::new();
+    let socket_path = DaemonClient::new().socket().to_path_buf();
 
     let win = app.create_window()?;
-    win.set_title("ff-gui — findex search");
-    // Roomy enough that all three columns are visible on launch.
+    win.set_title("fflocate");
+    // Roomy enough that all three columns are visible on launch. On GTK it
+    // starts 1 px narrow (see INITIAL_WINDOW_W) and steps out once settled,
+    // below; elsewhere it maps straight at the default.
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    win.set_default_size(INITIAL_WINDOW_W, DEFAULT_WINDOW_H);
+    #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
     win.set_default_size(DEFAULT_WINDOW_W, DEFAULT_WINDOW_H);
 
     let query_row = app.create_box(Orientation::Horizontal, 2)?;
     let query = app.create_entry()?;
     query.set_text("");
+    // The Basic box is literal-only (quoted before sending): say so, so a
+    // user reaching for ext:/regex: learns where that syntax lives.
+    query.set_placeholder_text("filename — literal, no syntax (ext:/regex: go in Advanced search)");
+    expand_query_entry(&query);
     let search = app.create_button("Search")?;
+    query_row.append(&query);
+    query_row.append(&search);
+    query_row.set_child_hexpand(&query, true);
     let status = app.create_label("type a query and press Search")?;
     // The results are a three-column list: icon, name, path. On GTK this is a
     // real GtkTreeView (so the columns align and the icon column shows a themed
     // icon); the display-free fallbacks render the same three columns as text.
-    // (title, is_icon, sortable): the icon column is not sortable; Name and Path
-    // sort when their headers are clicked.
-    let results = app.create_treeview(&[("", true, false), ("Name", false, true), ("Path", false, true)])?;
+    // (title, is_icon, sortable): every header sorts when clicked — Name and
+    // Path by themselves, the icon column by file extension (see
+    // `extension_sort_key`; a pixbuf has no order of its own).
+    let results = app.create_treeview(&[
+        ("", true, true),
+        ("Name", false, true),
+        ("Path", false, true),
+    ])?;
     // Column index of the full path, which Copy / Open / drag act on.
     const PATH_COLUMN: usize = 2;
 
     // On GTK the tree view needs its own scrolled container to scroll, and that
     // container must expand with the window — otherwise the results stay at
     // their minimum height while the window grows.
-    #[cfg(feature = "gtk")]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     let results_scroll = {
         let sw = results.into_scrolled()?;
         sw.set_vexpand(true);
@@ -112,7 +169,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let advanced = app.create_expander("Advanced search")?;
     let advanced_query = app.create_entry()?;
     advanced_query.set_text("");
-    let advanced_help = app.create_label(ADVANCED_SYNTAX_HELP)?;
+    // The syntax reminder lives inside the field as grey hint text: visible
+    // while the field is empty and unfocused, gone as soon as it holds text
+    // or is selected for typing.
+    advanced_query.set_placeholder_text(ADVANCED_SYNTAX_HELP);
 
     let opt_case = app.create_checkbutton("Case sensitive")?;
     opt_case.set_active(false);
@@ -132,7 +192,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let advanced_box = app.create_box(Orientation::Vertical, 2)?;
     advanced_box.append(&advanced_query);
-    advanced_box.append(&advanced_help);
     advanced_box.append(&opt_case);
     advanced_box.append(&opt_fuzzy);
     advanced_box.append(&distance_row);
@@ -157,6 +216,50 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .ok();
     }
 
+    // Wheel up/down over the max-distance field steps it by one (up
+    // increments, like a spin button) — but only while the field is focused,
+    // so scrolling the window or another control never edits it by accident.
+    // Focus is tracked with the existing focus in/out events (returning 0
+    // lets the default handler run, so the field still actually focuses).
+    {
+        let focused: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        {
+            let focused = focused.clone();
+            opt_distance
+                .connect_focus_in_event(move |_| {
+                    focused.set(true);
+                    0
+                })
+                .ok();
+        }
+        {
+            let focused = focused.clone();
+            opt_distance
+                .connect_focus_out_event(move |_| {
+                    focused.set(false);
+                    0
+                })
+                .ok();
+        }
+        let field = opt_distance.clone();
+        opt_distance
+            .connect_scroll_event(move |dir| {
+                if !focused.get() {
+                    return false;
+                }
+                let step = match dir {
+                    ScrollDirection::Up => WheelStep::Up,
+                    ScrollDirection::Down => WheelStep::Down,
+                    _ => return false,
+                };
+                let current = field.get_text().unwrap_or_default();
+                field.set_text(&step_max_distance(&current, step));
+                // Handled: keep the tick from also scrolling a parent.
+                true
+            })
+            .ok();
+    }
+
     // The rows currently on screen, shared between the Search handler (which
     // fills them) and the right-click handler (which picks one). Also holds the
     // live context menu: GTK does not own a menu popped up this way, so we must
@@ -168,21 +271,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // position of its own.
     let drag_row: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
-    // A live connection check up front: an empty list from an absent daemon and
-    // an empty list from a real "no matches" must not look the same.
-    let initial_status = if client.hello() {
-        match client.stats() {
-            Ok(s) => {
-                let entries = s.get("entries").and_then(|v| v.as_u64()).unwrap_or(0);
-                let backend = s.get("backend").and_then(|v| v.as_str()).unwrap_or("?");
-                format!("connected to findexd at {} ({entries} entries, {backend})", client.socket().display())
-            }
-            Err(e) => format!("{e}"),
-        }
-    } else {
-        format!("no daemon at {} — run `ff` once to spawn one", client.socket().display())
-    };
-    status.set_text(&initial_status);
+    // The daemon check is deferred past first paint: it rides the timer pump
+    // (see `StartupProbe`), so the window appears immediately even when the
+    // daemon is missing and a fresh spawn takes seconds to bind. Until the
+    // probe settles, the status says what is happening rather than claiming a
+    // connection that has not been verified — an empty list from an absent
+    // daemon and an empty list from a real "no matches" must not look the same.
+    // Spawning runs at most once per process: later searches just report an
+    // unreachable daemon.
+    status.set_text("connecting to findexd…");
+    let startup = Rc::new(RefCell::new(StartupProbe::new(
+        socket_path,
+        SPAWN_STARTUP_GRACE,
+        true,
+    )));
 
     // The search. Two halves, deliberately separated:
     //
@@ -193,10 +295,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Search button and the Return key, so the three cannot drift apart. (It also
     // means the expensive half *could* move to a worker thread, but it is 0.00 s
     // against a warm daemon, so it does not: see the note at the as-you-type code.)
-    // Turn the current widgets into the pair (request line, shadowed?). This is the
+    // Turn the current widgets into the request line. This is the
     // *only* part of a search that needs the widgets, so it is the only part that
     // must run on the main thread — the I/O below is stepped from the pump.
-    let build_request: Rc<dyn Fn() -> Result<(String, bool), GuiError>> = {
+    let build_request: Rc<dyn Fn() -> Result<String, GuiError>> = {
         let query = query.clone();
         let advanced_query = advanced_query.clone();
         let opt_case = opt_case.clone();
@@ -206,10 +308,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Rc::new(move || {
             let quick = query.get_text().unwrap_or_default();
             let adv = advanced_query.get_text().unwrap_or_default();
-            let (q, shadowed) = effective_query(&quick, &adv);
+            let q = effective_query(&quick, &adv);
+            let q = q.ok_or_else(|| {
+                GuiError::Protocol(
+                    "that name contains a `\"`, which the Basic box cannot quote — \
+                     type it in the Advanced search box instead"
+                        .to_string(),
+                )
+            })?;
             let opts = gather_options(&opt_case, &opt_fuzzy, &opt_count, &opt_distance);
             let req = DaemonClient::query_request(&q, FETCH_LIMIT, &opts);
-            encode_request(&req).map(|line| (line, shadowed))
+            encode_request(&req)
         })
     };
 
@@ -219,14 +328,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let current = current.clone();
         let opt_count = opt_count.clone();
         Rc::new(move |outcome| match outcome {
-            Ok((outcome, shadowed)) => {
+            Ok(outcome) => {
                 let count_only = opt_count.is_active();
-                let mut line = outcome.status_line_opts(outcome.paths.len().min(MAX_ROWS), count_only);
-                if shadowed {
-                    // Say which query ran: the two boxes disagreeing must not be
-                    // silent.
-                    line.push_str("  [advanced query]");
-                }
+                let line = outcome.status_line_opts(outcome.paths.len().min(MAX_ROWS), count_only);
                 status.set_text(&line);
                 if count_only {
                     // No paths come back: show the number, not an empty list that
@@ -238,8 +342,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ]]);
                     current.borrow_mut().clear();
                 } else {
-                    let shown: Vec<String> =
-                        outcome.paths.iter().take(MAX_ROWS).cloned().collect();
+                    let shown: Vec<String> = outcome.paths.iter().take(MAX_ROWS).cloned().collect();
                     results.set_rows(&rows_to_cells(&shown));
                     // Record only the rows actually shown.
                     *current.borrow_mut() = shown;
@@ -296,21 +399,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // logic, tested in `ff_gui::asyou_type_tests`.
         let gate = Rc::new(RefCell::new(SearchGate::new()));
 
-        // Which issued request was the one whose query came from the *advanced* box,
-        // so the status line can say so when the reply finally lands. Keyed by the
-        // gate's sequence number, because the widgets may have changed by then.
-        let shadowed_by_seq: Rc<RefCell<std::collections::HashMap<u64, bool>>> =
-            Rc::new(RefCell::new(std::collections::HashMap::new()));
-
         const DEBOUNCE_MS: u64 = 150;
         const PUMP_MS: u32 = 30;
 
         let arm = {
             let due_at = due_at.clone();
             move || {
-                *due_at.borrow_mut() = Some(
-                    std::time::Instant::now() + std::time::Duration::from_millis(DEBOUNCE_MS),
-                );
+                *due_at.borrow_mut() =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(DEBOUNCE_MS));
             }
         };
 
@@ -328,89 +424,170 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let gate = gate.clone();
             let render = render.clone();
             let build_request = build_request.clone();
-            // The request currently in flight, if any. Advancing it is what the
-            // pump does: it never blocks, so a slow or wedged daemon leaves the
-            // window fully responsive (the pump simply keeps returning `true`).
-            let pending: Rc<RefCell<Option<(u64, PendingRequest)>>> =
+            let startup = startup.clone();
+            let startup_status = status.clone();
+            let quick_box = query.clone();
+            let adv_box = advanced_query.clone();
+            // The request currently in flight, if any: (gate seq, request,
+            // when it was issued, display label for the status line). Advancing
+            // it is what the pump does: it never blocks, so a slow or wedged
+            // daemon leaves the window fully responsive (the pump simply keeps
+            // returning `true`). While it is out, the status line says
+            // "searching…" with elapsed time (see below) — a cold daemon's
+            // first query can take seconds (crawl + trigram build), and that
+            // must read as progress, not a frozen window.
+            let pending: Rc<RefCell<Option<(u64, PendingRequest, std::time::Instant, String)>>> =
                 Rc::new(RefCell::new(None));
-            App::timeout_add(PUMP_MS, Box::new(move || {
-                // 1. Advance a request in flight. `WouldBlock` is normal, not an
-                //    error: it means "come back next tick", which is exactly what
-                //    keeps the loop live.
-                let mut finished: Option<(u64, Result<Vec<WireResponse>, GuiError>)> = None;
-                if let Some((seq, p)) = pending.borrow_mut().as_mut() {
-                    let seq = *seq;
-                    match p.advance() {
-                        Ok(Progress::Finished) => {
-                            finished = Some((seq, Ok(p.take_records())));
+            App::timeout_add(
+                PUMP_MS,
+                Box::new(move || {
+                    // 0. Settle the deferred startup check first: until it reports
+                    //    Done the status line is provisional ("connecting…"), and
+                    //    searches still work — they just report their own errors.
+                    if !startup.borrow().is_done() {
+                        match startup.borrow_mut().poll() {
+                            StartupPoll::Pending => {}
+                            StartupPoll::Note(line) | StartupPoll::Done(line) => {
+                                startup_status.set_text(&line)
+                            }
                         }
-                        Ok(_) => {}
-                        Err(e) => finished = Some((seq, Err(e))),
                     }
-                }
-                if finished.is_some() {
-                    *pending.borrow_mut() = None;
-                }
-                if let Some((seq, result)) = finished {
-                    let outcome = result
-                        .and_then(|recs| DaemonClient::new().outcome_from_records(&recs))
-                        .map(|o| (o, take_shadowed(&shadowed_by_seq, seq)));
-                    if let Some(outcome) = gate.borrow_mut().finish(seq, outcome) {
-                        render(outcome);
+                    // 1. Advance a request in flight. `WouldBlock` is normal, not an
+                    //    error: it means "come back next tick", which is exactly what
+                    //    keeps the loop live.
+                    let mut finished: Option<(u64, Result<Vec<WireResponse>, GuiError>)> = None;
+                    if let Some((seq, p, _, _)) = pending.borrow_mut().as_mut() {
+                        let seq = *seq;
+                        match p.advance() {
+                            Ok(Progress::Finished) => {
+                                finished = Some((seq, Ok(p.take_records())));
+                            }
+                            Ok(_) => {}
+                            Err(e) => finished = Some((seq, Err(e))),
+                        }
                     }
-                }
-
-                // 2. Start a new request if the debounce has elapsed (or the Search
-                //    button asked for one now) and nothing is in flight. `begin`
-                //    refuses while one is out, so a burst of keystrokes cannot queue
-                //    up round-trips.
-                if pending.borrow().is_some() {
-                    return true;
-                }
-                let immediate = std::mem::replace(&mut *start_now.borrow_mut(), false);
-                if !immediate {
-                    let Some(t) = *due_at.borrow() else { return true };
-                    if std::time::Instant::now() < t {
-                        return true; // still typing
+                    if finished.is_some() {
+                        *pending.borrow_mut() = None;
                     }
-                }
-                let Some(ticket) = gate.borrow_mut().begin() else {
-                    return true;
-                };
-                *due_at.borrow_mut() = None;
-
-                match build_request().and_then(|(line, shadowed)| {
-                    let stream = connect_stream()?;
-                    PendingRequest::start(stream, &line).map(|p| (p, shadowed))
-                }) {
-                    Ok((p, shadowed)) => {
-                        shadowed_by_seq.borrow_mut().insert(ticket.seq, shadowed);
-                        *pending.borrow_mut() = Some((ticket.seq, p));
-                    }
-                    Err(e) => {
-                        // The request never started, so it can never finish: release
-                        // the gate's slot or every later search would be refused.
-                        if let Some(outcome) = gate.borrow_mut().finish(ticket.seq, Err(e)) {
+                    if let Some((seq, result)) = finished {
+                        let outcome =
+                            result.and_then(|recs| DaemonClient::new().outcome_from_records(&recs));
+                        if let Some(outcome) = gate.borrow_mut().finish(seq, outcome) {
                             render(outcome);
                         }
                     }
-                }
-                true // keep ticking for the life of the app
-            }))
+
+                    // 1b. In-flight progress: while a request is out with no reply
+                    //     yet, the status line says what is happening and for how
+                    //     long. Without this a slow first query — cold daemon
+                    //     still crawling, trigram index building on demand — sits
+                    //     on the stale "connected…" line and reads as frozen.
+                    //     `records()` hands back parsed Hits from partial packets,
+                    //     so the count is live when the daemon flushes mid-reply
+                    //     (it currently writes the whole reply at once, so this
+                    //     is usually 0 until the answer lands — honest either
+                    //     way). Updated every tick (~30 ms) so the elapsed time
+                    //     visibly moves; never touches the rows, only the line.
+                    if let Some((_, p, started, label)) = pending.borrow().as_ref() {
+                        let hits = p
+                            .records()
+                            .iter()
+                            .filter(|r| matches!(r, WireResponse::Hit { .. }))
+                            .count();
+                        // Cold-start case: this process spawned the daemon, so
+                        // the wait is startup (crawl + trigram warm), not a
+                        // slow query — name it. Sticky for the process: the
+                        // first queries after a spawn all pay it.
+                        let line = if startup.borrow().was_spawned() {
+                            starting_status_line(
+                                label,
+                                started.elapsed(),
+                                startup.borrow().spawned_elapsed(),
+                                hits,
+                            )
+                        } else {
+                            searching_status_line(label, started.elapsed(), hits, false)
+                        };
+                        startup_status.set_text(&line);
+                    }
+
+                    // 2. Start a new request if the debounce has elapsed (or the Search
+                    //    button asked for one now) and nothing is in flight. `begin`
+                    //    refuses while one is out, so a burst of keystrokes cannot queue
+                    //    up round-trips.
+                    if pending.borrow().is_some() {
+                        return true;
+                    }
+                    let immediate = std::mem::replace(&mut *start_now.borrow_mut(), false);
+                    if !immediate {
+                        let Some(t) = *due_at.borrow() else {
+                            return true;
+                        };
+                        if std::time::Instant::now() < t {
+                            return true; // still typing
+                        }
+                    }
+                    // An explicit Search with no combined query clears the list
+                    // instead of sending an empty query: empty matches
+                    // everything, which would fill the list with entries that
+                    // match neither box.
+                    if box_change_clears(
+                        &quick_box.get_text().unwrap_or_default(),
+                        &adv_box.get_text().unwrap_or_default(),
+                    ) {
+                        *due_at.borrow_mut() = None;
+                        render(Ok(SearchOutcome::default()));
+                        return true;
+                    }
+                    let Some(ticket) = gate.borrow_mut().begin() else {
+                        return true;
+                    };
+                    *due_at.borrow_mut() = None;
+
+                    // The display label is read now (main thread owns the boxes):
+                    // by the time the reply lands the user may have typed on.
+                    let label = search_label(
+                        &quick_box.get_text().unwrap_or_default(),
+                        &adv_box.get_text().unwrap_or_default(),
+                    );
+                    match build_request().and_then(|line| {
+                        let stream = connect_stream()?;
+                        PendingRequest::start(stream, &line)
+                    }) {
+                        Ok(p) => {
+                            *pending.borrow_mut() =
+                                Some((ticket.seq, p, std::time::Instant::now(), label));
+                        }
+                        Err(e) => {
+                            // The request never started, so it can never finish: release
+                            // the gate's slot or every later search would be refused.
+                            if let Some(outcome) = gate.borrow_mut().finish(ticket.seq, Err(e)) {
+                                render(outcome);
+                            }
+                        }
+                    }
+                    true // keep ticking for the life of the app
+                }),
+            )
         };
         let _ = pump;
 
-        // Arm the debounce on every change to either box. An emptied box clears the
-        // list at once rather than waiting, since "show everything again" is the
-        // absence of a query, not a query.
+        // Arm the debounce on every change to either box. Only when the
+        // *combined* query is empty clear the list at once rather than
+        // waiting, since "show everything again" is the absence of a query,
+        // not a query. A box emptied while the other still holds text keeps
+        // searching: the list shows only entries matching both boxes.
         for entry in [&query, &advanced_query] {
             let arm = arm.clone();
-            let e = entry.clone();
             let render = render.clone();
+            let quick_box = query.clone();
+            let adv_box = advanced_query.clone();
             entry
                 .connect_changed(move || {
-                    if !query_is_searchable(&e.get_text().unwrap_or_default()) {
-                        render(Ok((SearchOutcome::default(), false)));
+                    let quick = quick_box.get_text().unwrap_or_default();
+                    let adv = adv_box.get_text().unwrap_or_default();
+                    if box_change_clears(&quick, &adv) {
+                        render(Ok(SearchOutcome::default()));
                         return;
                     }
                     arm();
@@ -438,36 +615,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Warn live when both boxes hold text: the advanced one will run and the
-    // quick one will be ignored. Better to say so as the user types than to
-    // surprise them after pressing Search.
-    {
-        let q1 = query.clone();
-        let a1 = advanced_query.clone();
-        let s1 = status.clone();
-        advanced_query
-            .connect_changed(move || {
-                let quick = q1.get_text().unwrap_or_default();
-                let adv = a1.get_text().unwrap_or_default();
-                if !quick.trim().is_empty() && !adv.trim().is_empty() {
-                    s1.set_text("both boxes have text — Search will run the advanced query");
-                }
-            })
-            .ok();
-        let q2 = query.clone();
-        let a2 = advanced_query.clone();
-        let s2 = status.clone();
-        query
-            .connect_changed(move || {
-                let quick = q2.get_text().unwrap_or_default();
-                let adv = a2.get_text().unwrap_or_default();
-                if !quick.trim().is_empty() && !adv.trim().is_empty() {
-                    s2.set_text("both boxes have text — Search will run the advanced query");
-                }
-            })
-            .ok();
-    }
-
     // Right-click on the results opens a context menu for the row under the
     // cursor. The row is found with GTK's own hit-test (`line_at`), so it stays
     // correct under scrolling and with any font.
@@ -481,13 +628,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let status_for_err = status.clone();
         let drag_row = drag_row.clone();
         if let Err(e) = results.connect_button_press_event(move |button, x, y, event| {
-            // Left-press starts a potential drag: remember the row grabbed.
+            // Buttons arrive normalized (`normalize_press_button`): a
+            // middle-press is already button 1 here, so primary handling
+            // covers it with no special case.
+            // Primary press starts a potential drag: remember the row grabbed.
             // (button-press fires before the drag begins, so this is set by the
             // time `drag-data-get` runs.) The row is the one under the pointer.
             if button == 1 {
                 let row = cb_results.row_at(x, y);
-                let path = row
-                    .and_then(|r| current.borrow().get(r.max(0) as usize).cloned());
+                let path = row.and_then(|r| current.borrow().get(r.max(0) as usize).cloned());
                 *drag_row.borrow_mut() = path;
                 return;
             }
@@ -496,16 +645,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             // Right-click acts on the row under the pointer; a click on blank
             // space below the rows does nothing rather than acting on a
-            // neighbour.
-            let Some(row) = cb_results.row_at(x, y) else {
-                return;
-            };
-            let path = match current.borrow().get(row.max(0) as usize) {
-                Some(p) => p.clone(),
+            // neighbour (see `ff_gui::context_menu_target`).
+            let row = cb_results.row_at(x, y);
+            let path = match context_menu_target(button, row, &current.borrow()) {
+                Some(p) => p,
                 None => return,
             };
             // Show the selection too, so it is obvious which row the menu is for.
-            cb_results.select_row(row);
+            // `path` is `Some`, so `row` held a valid in-bounds row.
+            cb_results.select_row(row.unwrap_or(0));
             let mut menu = match app_handle.new_context_menu() {
                 Ok(m) => m,
                 Err(e) => {
@@ -513,18 +661,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
             };
-            for action in [
-                RowAction::CopyPath,
-                RowAction::Open,
-                RowAction::OpenContainingFolder,
-            ] {
+            // One-shot guard per menu: some hosts deliver the choice twice
+            // (once via the popup return value, once via a command message).
+            // Copy is idempotent but Open/terminal spawns are not — run once
+            // per menu. Per-menu (not global): every new right-click arms a
+            // fresh menu whose items must all fire once.
+            let menu_fired: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+            for action in RowAction::all() {
                 let path = path.clone();
                 let status = status.clone();
                 let results = cb_results.clone();
-                menu.append_item(action.label(), Box::new(move || {
-                    let msg = run_row_action(action, &path, &results);
-                    status.set_text(&msg);
-                }));
+                let menu_fired = menu_fired.clone();
+                menu.append_item(
+                    action.label(),
+                    Box::new(move || {
+                        if *menu_fired.borrow() {
+                            return;
+                        }
+                        *menu_fired.borrow_mut() = true;
+                        let msg = run_row_action(action, &path, &results);
+                        status.set_text(&msg);
+                    }),
+                );
             }
             let widget = cb_results.raw_handle();
             // Anchor the menu to the click: forwarding the real GdkEvent makes
@@ -545,65 +703,363 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Dragging a row out of the window carries it as a file URI *and* as plain
     // text, so it can be dropped on a file manager (which wants the URI) or a
     // terminal/editor (which wants the path). The payload is read lazily at
-    // drop time from the row recorded on left-press.
+    // drop time from the row recorded on left-press. The drag icon shows the
+    // same row's themed icon under the cursor (via `drag-begin`): without it
+    // GTK drags invisibly and there is no indication anything was picked up.
     {
         let results = results.clone();
         let status = status.clone();
         let drag_row = drag_row.clone();
         let cb_results = results.clone();
-        if let Err(e) = results.enable_uri_drag_source(move || {
-            // Prefer the row recorded on left-press; fall back to the widget's
-            // own selection (which is what the drop target sees).
-            let recorded = drag_row.borrow().clone();
-            let path = recorded.or_else(|| cb_results.selected_path(PATH_COLUMN));
-            path.as_deref().map(ff_gui::drag_payload)
-        }) {
+        let icon_row = drag_row.clone();
+        let icon_results = results.clone();
+        if let Err(e) = results.enable_uri_drag_source(
+            move || {
+                // Prefer the row recorded on left-press; fall back to the widget's
+                // own selection (which is what the drop target sees).
+                let recorded = drag_row.borrow().clone();
+                let path = recorded.or_else(|| cb_results.selected_path(PATH_COLUMN));
+                path.as_deref().map(ff_gui::drag_payload)
+            },
+            move || {
+                // The icon for the row being dragged: the same row the payload
+                // carries, mapped back through the icon table so the cursor
+                // shows the file's own glyph (folder, Rust source, image…).
+                // `None` keeps the default cursor rather than a wrong icon.
+                let recorded = icon_row.borrow().clone();
+                let path = recorded.or_else(|| icon_results.selected_path(PATH_COLUMN))?;
+                let row = ff_gui::row_from_path(&path);
+                // `row_from_path` already resolved the fallback the list
+                // itself shows; recompute it the same way so the two agree.
+                let fallback = if row.icon == "folder" {
+                    "folder"
+                } else {
+                    "text-x-generic"
+                };
+                Some((row.icon, fallback.to_string()))
+            },
+        ) {
             // Not fatal: the list still works, only dragging is unavailable.
             status.set_text(&format!("drag and drop unavailable: {e}"));
         }
     }
 
-    query_row.append(&query);
-    query_row.append(&search);
+    // Menubar (File/Search/View/Help). Every item reuses a handler something
+    // else already owns — the search trigger, the checkbox/expander widgets,
+    // the row actions, the daemon client — so the bar cannot drift from the
+    // rest of the UI. Toggle items flip their widgets (which visibly hold the
+    // state) rather than carrying checkmarks the toolkit cannot render. No
+    // accelerators: the toolkit exposes none, so shortcuts wait on toolkit
+    // support.
+    //
+    // One menu item's behaviour, as a closure factory: each box owns its
+    // captures ('static, as `connect_activate` requires), cloned from
+    // `run()` locals whose types stay inferred (adapter vs wrapper split).
+    macro_rules! clone_all {
+        ($($n:ident),*) => { $(let $n = $n.clone();)* };
+    }
+    let menu_item_callback = |action: MenuAction| -> Box<dyn FnMut()> {
+        match action {
+            MenuAction::SearchNow => {
+                let run_search = run_search.clone();
+                Box::new(move || {
+                    if let Ok(mut f) = run_search.try_borrow_mut() {
+                        f();
+                    }
+                })
+            }
+            MenuAction::FocusQuery => {
+                let query = query.clone();
+                Box::new(move || query.grab_focus())
+            }
+            MenuAction::ClearQuery => {
+                let query = query.clone();
+                Box::new(move || query.set_text(""))
+            }
+            MenuAction::ToggleCase => {
+                let w = opt_case.clone();
+                Box::new(move || w.set_active(!w.is_active()))
+            }
+            MenuAction::ToggleFuzzy => {
+                let w = opt_fuzzy.clone();
+                Box::new(move || w.set_active(!w.is_active()))
+            }
+            MenuAction::ToggleCount => {
+                let w = opt_count.clone();
+                Box::new(move || w.set_active(!w.is_active()))
+            }
+            MenuAction::ToggleAdvanced => {
+                let a = advanced.clone();
+                Box::new(move || a.set_expanded(!a.is_expanded()))
+            }
+            MenuAction::FilterAudio
+            | MenuAction::FilterCompressed
+            | MenuAction::FilterExecutable
+            | MenuAction::FilterFolder
+            | MenuAction::FilterPicture
+            | MenuAction::FilterVideo => {
+                // Type-filter presets are full query syntax (regex:/type:), so
+                // they belong in the Advanced box — the Basic box is
+                // literal-only and would quote them into inert text. Visible,
+                // refinable, and as-you-type keeps working, unlike a hidden
+                // filter. The preset ANDs with whatever the Basic box holds:
+                // the list shows only entries matching both.
+                let advanced_query = advanced_query.clone();
+                let run_search = run_search.clone();
+                let preset = action.preset_query().unwrap_or_default();
+                Box::new(move || {
+                    advanced_query.set_text(preset);
+                    if let Ok(mut f) = run_search.try_borrow_mut() {
+                        f();
+                    }
+                })
+            }
+            MenuAction::OpenContainingFolder | MenuAction::CopyPath => {
+                clone_all!(results, status);
+                let row_action = match action {
+                    MenuAction::OpenContainingFolder => RowAction::OpenContainingFolder,
+                    _ => RowAction::CopyPath,
+                };
+                Box::new(move || match results.selected_path(PATH_COLUMN) {
+                    Some(path) => {
+                        let msg = run_row_action(row_action, &path, &results);
+                        status.set_text(&msg);
+                    }
+                    None => status.set_text("no row selected"),
+                })
+            }
+            MenuAction::RefreshIndex => {
+                clone_all!(status);
+                Box::new(move || {
+                    let client = DaemonClient::new();
+                    let roots = match client.root_paths() {
+                        Ok(r) => r,
+                        Err(e) => {
+                            status.set_text(&format!("refresh failed: {e}"));
+                            return;
+                        }
+                    };
+                    let mut failed = 0;
+                    for r in &roots {
+                        if client.rescan(r).is_err() {
+                            failed += 1;
+                        }
+                    }
+                    if failed == 0 {
+                        let n = roots.len();
+                        status.set_text(&format!(
+                            "refresh requested on {} root{}",
+                            n,
+                            if n == 1 { "" } else { "s" }
+                        ));
+                    } else {
+                        status.set_text(&format!("refresh failed on {failed} root(s)"));
+                    }
+                })
+            }
+            MenuAction::ShowSyntax => {
+                clone_all!(app, status);
+                Box::new(move || {
+                    show_dialog(
+                        &app,
+                        "Query syntax",
+                        ADVANCED_SYNTAX_HELP.to_string(),
+                        |m| status.set_text(m),
+                    )
+                })
+            }
+            MenuAction::ShowDaemonStatus => {
+                clone_all!(app, status);
+                Box::new(move || {
+                    let body = match DaemonClient::new().stats() {
+                        Ok(s) => {
+                            let entries = s.get("entries").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let backend = s.get("backend").and_then(|v| v.as_str()).unwrap_or("?");
+                            format!("connected ({entries} entries, {backend})")
+                        }
+                        Err(e) => format!("{e}"),
+                    };
+                    show_dialog(&app, "Daemon status", body, |m| status.set_text(m))
+                })
+            }
+            MenuAction::ShowAbout => {
+                clone_all!(app, status);
+                Box::new(move || {
+                    let socket = DaemonClient::new().socket().to_path_buf();
+                    show_dialog(
+                        &app,
+                        "About ff-gui",
+                        format!(
+                            "ff-gui {}\nbackend: {BACKEND}\ndaemon socket: {}",
+                            env!("CARGO_PKG_VERSION"),
+                            socket.display()
+                        ),
+                        |m| status.set_text(m),
+                    )
+                })
+            }
+            MenuAction::Quit => Box::new(|| {
+                // No unsaved state anywhere (search frontend; the daemon is a
+                // separate process), and the toolkit exposes no main-loop quit,
+                // so exiting is exactly what closing the window does.
+                std::process::exit(0);
+            }),
+        }
+    };
+    let menubar = {
+        let err = |e: rswidgets::Error| GuiError::Backend(e.to_string());
+        // The action group must exist BEFORE any action is registered on it:
+        // `register_action` is a silent no-op until `ensure_action_group` has
+        // run, so registering first dropped every action — leaving each
+        // `app.<name>` item with nothing to resolve to, i.e. greyed out.
+        // (The group is a plain `GSimpleActionGroup`, deliberately not a
+        // `GtkApplication`: the application object resolved `app.<name>` only
+        // on some displays. See `ensure_action_group`.)
+        let group = app.ensure_action_group().map_err(err)?;
+        let mut model = app.new_menu().map_err(err)?;
+        for (menu_label, items) in ff_gui::menubar_model() {
+            let mut sub = app.new_menu().map_err(err)?;
+            for (label, action) in items {
+                let mut cb = menu_item_callback(action);
+                let act = app.new_simple_action(action.action_name()).map_err(err)?;
+                act.connect_activate(move |_| cb()).map_err(err)?;
+                app.register_action(&act).map_err(err)?;
+                sub.append(label, &format!("app.{}", action.action_name()));
+            }
+            model.append_submenu(menu_label, &sub);
+        }
+        let menubar = app.new_menubar(&model, group).map_err(err)?;
+        // The model names actions as `app.<name>`, so the group must be
+        // visible under the name "app" from the menubar's place in the widget
+        // hierarchy — otherwise GTK cannot resolve the items and renders every
+        // one insensitive (greyed out). Insert on the window (the menubar's
+        // eventual ancestor) and on the bar itself (which covers the GTK4
+        // popover path, whose popovers are not window children).
+        // SAFETY: `group` is the live GActionGroup pointer
+        // `ensure_action_group` just returned, valid for the life of the app.
+        unsafe {
+            win.insert_action_group("app", group);
+            menubar.insert_action_group("app", group);
+        }
+        menubar
+    };
 
     let layout = app.create_box(Orientation::Vertical, 1)?;
     layout.set_vexpand(true);
     layout.set_hexpand(true);
+    layout.append(&menubar);
     layout.append(&query_row);
     layout.append(&advanced);
     layout.append(&status);
     // On GTK the tree view lives in its own scrolled container so it scrolls;
     // elsewhere the widget itself is the list.
-    #[cfg(feature = "gtk")]
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     layout.append(&results_scroll);
-    #[cfg(not(feature = "gtk"))]
+    #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
     layout.append(&results);
 
     win.set_child(&layout);
     win.present();
 
+    // The Basic Search box owns the keyboard from the start: the window opens
+    // ready to type, with no click needed. After `present()` — grabbing focus
+    // on an unmapped widget is a silent no-op in GTK, so this must come after.
+    query.grab_focus();
+
+    // The settle step for the results columns (see INITIAL_WINDOW_W): once the
+    // late header growth has landed, step out to the documented width — but
+    // only if the user has not resized meanwhile (a resize of their own
+    // already redistributed, and yanking it back would steal their size).
+    // One-shot; the height is read live so a height-only tweak of theirs is
+    // preserved. Later resizes and row changes redistribute by themselves.
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    {
+        let settle_win = win.clone();
+        let _ = App::timeout_add(
+            SETTLE_RESIZE_MS,
+            Box::new(move || {
+                let (w, h) = settle_win.get_size();
+                if w == INITIAL_WINDOW_W {
+                    settle_win.resize(DEFAULT_WINDOW_W, h);
+                }
+                false
+            }),
+        );
+    }
+
     println!("ff-gui — findex search browser (backend: {BACKEND})");
     println!("Enter a query in the entry, then invoke Search.");
-    app.run().map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    app.run()
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
 /// Perform a context-menu action on `path`, returning the message for the
 /// status line.
 ///
-/// Copy is done in-process through the widget clipboard; Open and
-/// Open-containing-folder spawn `xdg-open`.
+/// Copy is done in-process through the widget clipboard; Open,
+/// Open-containing-folder, Open-with and Open-in-terminal spawn external
+/// helpers (`xdg-open`, `mimeopen -a`, and `x-terminal-emulator` with the
+/// file's directory as its working directory — plus a `-font` workaround
+/// when the alternative target is zutty; see
+/// [`ff_gui::open_in_terminal_command`]).
 fn run_row_action(action: RowAction, path: &str, results: &impl TextViewLike) -> String {
-    let (program, args) = action.command(path);
+    // "Open in terminal" carries host-specific prefix flags: when the
+    // alternatives link resolves to zutty — whose `9x18` default aborts when
+    // `xfonts-base` is not installed — splice `-font <installed monospace>`
+    // in front of `-e` so the emulator starts at all. Every other action
+    // launches exactly what `RowAction::command` says.
+    let (program, args) = if action == RowAction::OpenInTerminal {
+        ff_gui::open_in_terminal_command(path)
+    } else {
+        action.command(path)
+    };
     if program.is_empty() {
-        // Copy: no external command.
-        return match results.clipboard_set_text(path) {
-            Ok(()) => format!("copied {}", short_path(path)),
+        // Clipboard actions need no external command; they differ only in what
+        // they copy.
+        let text = match action {
+            RowAction::CopyFolderPath => containing_dir(path),
+            _ => path.to_string(),
+        };
+        return match results.clipboard_set_text(&text) {
+            Ok(()) => format!("copied {}", short_path(&text)),
             Err(e) => format!("copy failed: {e}"),
         };
     }
     match std::process::Command::new(program).args(&args).spawn() {
         Ok(_) => format!("{} → {}", action.label(), short_path(path)),
         Err(e) => format!("{} failed: {e}", action.label()),
+    }
+}
+
+/// Show a one-label dialog with a Close button. Failures go through `report`
+/// (usually the status line), like every other UI error here. `report` keeps
+/// this helper free of widget types, which differ per backend.
+fn show_dialog(app: &App, title: &str, body: String, report: impl Fn(&str)) {
+    let dlg = match app.new_dialog() {
+        Ok(d) => d,
+        Err(e) => {
+            report(&format!("dialog unavailable: {e}"));
+            return;
+        }
+    };
+    dlg.set_title(title);
+    match app.new_label(&body) {
+        Ok(label) => dlg.append_content_area(&label),
+        Err(e) => {
+            report(&format!("dialog unavailable: {e}"));
+            return;
+        }
+    }
+    dlg.add_button("Close", 0);
+    dlg.present();
+    let closer = dlg.clone();
+    if dlg
+        .connect_response(move |_| {
+            closer.close();
+        })
+        .is_err()
+    {
+        report("dialog close unavailable");
     }
 }
 
@@ -618,11 +1074,11 @@ fn short_path(path: &str) -> String {
 /// The bits of the results widget the action runner needs. A trait so the
 /// logic can be unit-tested with a stub in place of a real `TextView`.
 pub trait TextViewLike {
-    fn clipboard_set_text(&self, text: &str) -> Result<(), rustxwidgets::Error>;
+    fn clipboard_set_text(&self, text: &str) -> Result<(), rswidgets::Error>;
 }
 
 impl TextViewLike for TextView {
-    fn clipboard_set_text(&self, text: &str) -> Result<(), rustxwidgets::Error> {
+    fn clipboard_set_text(&self, text: &str) -> Result<(), rswidgets::Error> {
         TextView::clipboard_set_text(self, text)
     }
 }
@@ -632,15 +1088,6 @@ fn connect_stream() -> Result<findex::transport::Stream, GuiError> {
     let path = DaemonClient::new().socket().to_path_buf();
     findex::transport::connect(&path)
         .map_err(|e| GuiError::Connect(format!("{}: {e}", path.display())))
-}
-
-/// Look up (and forget) whether a finished request's query came from the advanced
-/// box. Forgetting matters: the map would otherwise grow for the life of the app.
-fn take_shadowed(
-    map: &Rc<RefCell<std::collections::HashMap<u64, bool>>>,
-    seq: u64,
-) -> bool {
-    map.borrow_mut().remove(&seq).unwrap_or(false)
 }
 
 /// Read the foldout's controls into a [`SearchOptions`].
@@ -675,50 +1122,71 @@ pub trait Active {
 pub trait TextValue {
     fn get_text(&self) -> Option<String>;
 }
+/// The layout knob row layout needs: the widget takes leftover width. Lets
+/// the row setup be tested without a display.
+pub trait Expandable {
+    fn set_hexpand(&self, expand: bool);
+}
+
+/// The query entry takes all leftover row width: without this the entry keeps
+/// its minimum size and grey space pools to the right of the Search button.
+fn expand_query_entry(entry: &impl Expandable) {
+    entry.set_hexpand(true);
+}
 
 // These target the adapter types the app actually builds. The prelude also
 // re-exports `common` wrappers of the same name, so name the concrete type
 // explicitly — and per backend, since only one adapter exists in a given build.
-#[cfg(feature = "gtk")]
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 mod widget_traits {
-    use super::{Active, TextViewLike, TextValue};
+    use super::{Active, Expandable, TextValue, TextViewLike};
 
-    impl Active for rustxwidgets::backends_gtk_adapter::CheckButton {
+    impl Active for rswidgets::backends_gtk_adapter::CheckButton {
         fn is_active(&self) -> bool {
-            rustxwidgets::backends_gtk_adapter::CheckButton::is_active(self)
+            rswidgets::backends_gtk_adapter::CheckButton::is_active(self)
         }
     }
-    impl TextValue for rustxwidgets::backends_gtk_adapter::Entry {
+    impl TextValue for rswidgets::backends_gtk_adapter::Entry {
         fn get_text(&self) -> Option<String> {
-            rustxwidgets::backends_gtk_adapter::Entry::get_text(self)
+            rswidgets::backends_gtk_adapter::Entry::get_text(self)
         }
     }
-    impl TextViewLike for rustxwidgets::backends_gtk_adapter::TreeView {
-        fn clipboard_set_text(&self, text: &str) -> Result<(), rustxwidgets::Error> {
+    impl Expandable for rswidgets::backends_gtk_adapter::Entry {
+        fn set_hexpand(&self, expand: bool) {
+            rswidgets::backends_gtk_adapter::Entry::set_hexpand(self, expand)
+        }
+    }
+    impl TextViewLike for rswidgets::backends_gtk_adapter::TreeView {
+        fn clipboard_set_text(&self, text: &str) -> Result<(), rswidgets::Error> {
             // The tree view is a widget; the clipboard is process-wide.
-            rustxwidgets::backends_gtk_adapter::clipboard_set_text(text)
+            rswidgets::backends_gtk_adapter::clipboard_set_text(text)
         }
     }
 }
 
 #[cfg(all(feature = "zork", not(feature = "gtk")))]
 mod widget_traits {
-    use super::{Active, TextViewLike, TextValue};
+    use super::{Active, Expandable, TextValue, TextViewLike};
 
-    impl Active for rustxwidgets::backends_zork_adapter::CheckButton {
+    impl Active for rswidgets::backends_zork_adapter::CheckButton {
         fn is_active(&self) -> bool {
-            rustxwidgets::backends_zork_adapter::CheckButton::is_active(self)
+            rswidgets::backends_zork_adapter::CheckButton::is_active(self)
         }
     }
-    impl TextValue for rustxwidgets::backends_zork_adapter::Entry {
+    impl TextValue for rswidgets::backends_zork_adapter::Entry {
         fn get_text(&self) -> Option<String> {
-            rustxwidgets::backends_zork_adapter::Entry::get_text(self)
+            rswidgets::backends_zork_adapter::Entry::get_text(self)
         }
     }
-    impl TextViewLike for rustxwidgets::backends_zork_adapter::TreeView {
-        fn clipboard_set_text(&self, text: &str) -> Result<(), rustxwidgets::Error> {
+    impl Expandable for rswidgets::backends_zork_adapter::Entry {
+        fn set_hexpand(&self, expand: bool) {
+            rswidgets::backends_zork_adapter::Entry::set_hexpand(self, expand)
+        }
+    }
+    impl TextViewLike for rswidgets::backends_zork_adapter::TreeView {
+        fn clipboard_set_text(&self, text: &str) -> Result<(), rswidgets::Error> {
             // The REPL copies with the terminal clipboard escape.
-            rustxwidgets::backends_zork_adapter::clipboard_set_text(text)
+            rswidgets::backends_zork_adapter::clipboard_set_text(text)
         }
     }
 }
@@ -727,30 +1195,79 @@ mod widget_traits {
 // not built on this host, but must compile there.
 #[cfg(all(windows, not(feature = "zork")))]
 mod widget_traits {
-    use super::{Active, TextViewLike, TextValue};
-    impl Active for rustxwidgets::backends_nwg_adapter::CheckButton {
+    use super::{Active, Expandable, TextValue, TextViewLike};
+    impl Active for rswidgets::backends_nwg_adapter::CheckButton {
         fn is_active(&self) -> bool {
-            rustxwidgets::backends_nwg_adapter::CheckButton::is_active(self)
+            rswidgets::backends_nwg_adapter::CheckButton::is_active(self)
         }
     }
-    impl TextValue for rustxwidgets::backends_nwg_adapter::Entry {
+    impl TextValue for rswidgets::backends_nwg_adapter::Entry {
         fn get_text(&self) -> Option<String> {
-            rustxwidgets::backends_nwg_adapter::Entry::get_text(self)
+            rswidgets::backends_nwg_adapter::Entry::get_text(self)
+        }
+    }
+    impl Expandable for rswidgets::backends_nwg_adapter::Entry {
+        fn set_hexpand(&self, expand: bool) {
+            rswidgets::backends_nwg_adapter::Entry::set_hexpand(self, expand)
+        }
+    }
+    impl TextViewLike for rswidgets::backends_nwg_adapter::TreeView {
+        fn clipboard_set_text(&self, text: &str) -> Result<(), rswidgets::Error> {
+            // The list is text-backed; the clipboard is process-wide — and
+            // unsupported on this backend, so Copy reports the failure
+            // through the status line rather than silently doing nothing.
+            rswidgets::backends_nwg_adapter::TreeView::clipboard_set_text(self, text)
         }
     }
 }
 
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
 mod widget_traits {
-    use super::{Active, TextViewLike, TextValue};
-    impl Active for rustxwidgets::backends_wasm_adapter::CheckButton {
+    use super::{Active, Expandable, TextValue, TextViewLike};
+    impl Active for rswidgets::backends_wasm_adapter::CheckButton {
         fn is_active(&self) -> bool {
-            rustxwidgets::backends_wasm_adapter::CheckButton::is_active(self)
+            rswidgets::backends_wasm_adapter::CheckButton::is_active(self)
         }
     }
-    impl TextValue for rustxwidgets::backends_wasm_adapter::Entry {
+    impl TextValue for rswidgets::backends_wasm_adapter::Entry {
         fn get_text(&self) -> Option<String> {
-            rustxwidgets::backends_wasm_adapter::Entry::get_text(self)
+            rswidgets::backends_wasm_adapter::Entry::get_text(self)
+        }
+    }
+    impl Expandable for rswidgets::backends_wasm_adapter::Entry {
+        fn set_hexpand(&self, expand: bool) {
+            rswidgets::backends_wasm_adapter::Entry::set_hexpand(self, expand)
+        }
+    }
+}
+
+// macOS builds the same UI from the AppKit adapter types: checkbox/entry
+// layout traits plus clipboard through the AppKit pasteboard. The results
+// list is the TextView-backed TreeView stub (no click-to-select yet), so
+// there is no TextViewLike arm — Copy/Open act on the selected path where
+// the backend reports one.
+#[cfg(all(target_os = "macos", not(feature = "zork")))]
+mod widget_traits {
+    use super::{Active, Expandable, TextValue, TextViewLike};
+    impl Active for rswidgets::backends_macos_adapter::CheckButton {
+        fn is_active(&self) -> bool {
+            rswidgets::backends_macos_adapter::CheckButton::is_active(self)
+        }
+    }
+    impl TextValue for rswidgets::backends_macos_adapter::Entry {
+        fn get_text(&self) -> Option<String> {
+            rswidgets::backends_macos_adapter::Entry::get_text(self)
+        }
+    }
+    impl Expandable for rswidgets::backends_macos_adapter::Entry {
+        fn set_hexpand(&self, expand: bool) {
+            rswidgets::backends_macos_adapter::Entry::set_hexpand(self, expand)
+        }
+    }
+    impl TextViewLike for rswidgets::backends_macos_adapter::TreeView {
+        fn clipboard_set_text(&self, text: &str) -> Result<(), rswidgets::Error> {
+            // The list is text-backed; the clipboard is process-wide.
+            rswidgets::backends_macos_adapter::clipboard_set_text(text)
         }
     }
 }
@@ -759,16 +1276,27 @@ mod widget_traits {
 /// Build the three-column cells (icon, name, path) for a list of paths.
 ///
 /// The icon is given as a theme name plus a generic fallback, since a minimal
-/// icon theme may not carry the specific name.
+/// icon theme may not carry the specific name. A fourth, hidden value carries
+/// the file extension: on GTK it fills the store's hidden extension column,
+/// which the (otherwise unorderable) icon column sorts by.
 fn rows_to_cells(paths: &[String]) -> Vec<Vec<CellValue>> {
     rows_from_paths(paths)
         .into_iter()
         .map(|r| {
-            let fallback = if r.icon == "folder" { "folder" } else { "text-x-generic" };
+            let fallback = if r.icon == "folder" {
+                "folder"
+            } else {
+                "text-x-generic"
+            };
+            let ext = extension_sort_key(&r.name);
             vec![
-                CellValue::Icon { name: r.icon, fallback: fallback.to_string() },
+                CellValue::Icon {
+                    name: r.icon,
+                    fallback: fallback.to_string(),
+                },
                 CellValue::Text(r.name),
                 CellValue::Text(r.path),
+                CellValue::Text(ext),
             ]
         })
         .collect()
@@ -783,7 +1311,7 @@ mod tests {
     struct FakeView(RefCell<Option<String>>);
 
     impl TextViewLike for FakeView {
-        fn clipboard_set_text(&self, text: &str) -> Result<(), rustxwidgets::Error> {
+        fn clipboard_set_text(&self, text: &str) -> Result<(), rswidgets::Error> {
             *self.0.borrow_mut() = Some(text.to_string());
             Ok(())
         }
@@ -791,11 +1319,36 @@ mod tests {
 
     struct FakeActive(bool);
     impl Active for FakeActive {
-        fn is_active(&self) -> bool { self.0 }
+        fn is_active(&self) -> bool {
+            self.0
+        }
     }
     struct FakeText(String);
     impl TextValue for FakeText {
-        fn get_text(&self) -> Option<String> { Some(self.0.clone()) }
+        fn get_text(&self) -> Option<String> {
+            Some(self.0.clone())
+        }
+    }
+
+    struct FakeExpandable(RefCell<bool>);
+    impl Expandable for FakeExpandable {
+        fn set_hexpand(&self, expand: bool) {
+            *self.0.borrow_mut() = expand;
+        }
+    }
+
+    #[test]
+    fn query_entry_expands_to_fill_the_row() {
+        // Regression test: without the expand flag the entry keeps its minimum
+        // width and vast grey space pools to the right of the Search button.
+        // Real widgets are not observable headless, so a recording fake pins
+        // the layout helper `run()` calls for the query row.
+        let entry = FakeExpandable(RefCell::new(false));
+        expand_query_entry(&entry);
+        assert!(
+            *entry.0.borrow(),
+            "query entry must take leftover row width"
+        );
     }
 
     #[test]
@@ -857,8 +1410,8 @@ mod tests {
     fn copy_reports_a_clipboard_failure() {
         struct Broken;
         impl TextViewLike for Broken {
-            fn clipboard_set_text(&self, _t: &str) -> Result<(), rustxwidgets::Error> {
-                Err(rustxwidgets::Error::Backend("no terminal".into()))
+            fn clipboard_set_text(&self, _t: &str) -> Result<(), rswidgets::Error> {
+                Err(rswidgets::Error::Backend("no terminal".into()))
             }
         }
         let msg = run_row_action(RowAction::CopyPath, "/a/b.rs", &Broken);
@@ -881,7 +1434,8 @@ mod tests {
         assert_eq!(cells.len(), 1);
         let row = &cells[0];
         // Column 0 is the icon (with a sensible generic fallback), 1 the name,
-        // 2 the full path.
+        // 2 the full path, plus a hidden 4th value carrying the extension the
+        // icon column sorts by.
         match &row[0] {
             CellValue::Icon { name, fallback } => {
                 assert_eq!(name, "text-x-rust");
@@ -896,6 +1450,21 @@ mod tests {
         match &row[2] {
             CellValue::Text(t) => assert_eq!(t, "/a/b/main.rs"),
             _ => panic!("column 2 must be the path"),
+        }
+        match &row[3] {
+            CellValue::Text(t) => assert_eq!(t, "rs"),
+            _ => panic!("column 3 must be the extension sort key"),
+        }
+    }
+
+    #[test]
+    fn rows_to_cells_carries_an_empty_extension_for_directories() {
+        // A directory has no extension: its hidden sort key is empty, so
+        // directories group together ahead of any extension.
+        let cells = rows_to_cells(&["/a/src/".to_string()]);
+        match &cells[0][3] {
+            CellValue::Text(t) => assert_eq!(t, ""),
+            _ => panic!("column 3 must be the extension sort key"),
         }
     }
 
