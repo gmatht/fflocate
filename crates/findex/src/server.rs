@@ -145,26 +145,122 @@ fn handle_query(
     case_sensitive: bool,
     t0: Instant,
 ) -> Vec<Response> {
+    let mut out = Vec::new();
+    let _ = handle_query_streaming(ctx, raw, limit, count_only, case_sensitive, t0, &mut |r| {
+        out.push(r);
+        true
+    });
+    out
+}
+
+/// Streaming query: `emit(Meta)` first (elapsed ≈ time-to-first-byte), then
+/// one `emit(Hit)` per found hit as the scan finds it, then `emit(Done)` with
+/// the exact total last. The hits and total are identical to [`handle_query`];
+/// only the timing changes — a client rendering Hits as they arrive fills its
+/// first page in milliseconds while the total is still being counted.
+///
+/// `emit` returns `false` to abort: the first refusal stops the scan and this
+/// returns `false` without emitting `Done` (a partial total would lie). The
+/// daemon's socket emit refuses once the client is gone, so a disconnected
+/// client halts the scan instead of running it to a dead socket.
+///
+/// `emit` runs while the index read lock is held: write+flush promptly.
+///
+/// Public so the daemon transport can stream over the socket; the batched
+/// [`handle_request`] (and its tests) delegate to this and are unchanged.
+pub fn handle_query_streaming(
+    ctx: &ServerCtx,
+    raw: &str,
+    limit: usize,
+    count_only: bool,
+    case_sensitive: bool,
+    t0: Instant,
+    emit: &mut dyn FnMut(Response) -> bool,
+) -> bool {
     let q = match Query::compile_with_case(raw, case_sensitive) {
         Ok(q) => q,
-        Err(e) => return vec![Response::Error { message: e }],
+        Err(e) => {
+            return emit(Response::Error { message: e });
+        }
     };
-    // §17 v2: fetch (build-once, cached by generation) the trigram accelerator
-    // *before* taking the index read lock, so the two locks are never held in a
-    // conflicting order. Only compiled in with the default-on `trigram` feature.
-    // The postings read guard is held for the whole query: `emit` takes the
-    // write guard for one entry's trigrams, so a concurrent insert waits out
-    // the intersection rather than racing it.
+    // Meta goes out BEFORE any scan guard is taken: this is what unblocks the
+    // client's first paint. `elapsed_ms` here is time-to-first-byte; the final
+    // cost lands in the client's own wall clock (and the GUI's `[Ns server]`
+    // suffix).
+    //
+    // The ordering is load-bearing, not cosmetic. `meta_preamble` takes the
+    // index read lock; the scan below holds it for its whole pass. Emitting
+    // Meta while holding the scan guard nests a second read on the same
+    // thread — normally granted, but fatal when the applier's write arrives
+    // in between: std's write-preferring RwLock parks the nested read behind
+    // the pending writer while the writer waits for the outer read, a
+    // self-deadlock with zero CPU, silent stats, and a frozen journal
+    // (proven live via gdb: main in write_contended, every serve thread in
+    // read_contended, no holder, hello alive). Never nest index reads.
+    if !emit(meta_preamble(ctx, false, t0.elapsed())) {
+        return false;
+    }
+    // System mode cannot stream per-hit: `visible_chain` takes the index read
+    // lock per id, which would nest exactly like Meta did. Collect-then-emit
+    // instead (same TOCTOU as the old batched path, which filtered post-scan
+    // too): Meta already went out early, page+total follow together.
+    if let Some(caller) = &ctx.caller {
+        // Batched-equivalent semantics: the old path materialized the first
+        // `limit` matches (all of them under count_only) and counted visible
+        // among those — never a full visible total. Mirror exactly.
+        let collected = collect_query_hits(ctx, &q, limit, count_only);
+        let mut shown = 0u64;
+        if !count_only {
+            for (id, path) in &collected.hits {
+                if !visible_chain(ctx, *id, caller) {
+                    continue;
+                }
+                shown += 1;
+                if !emit(Response::Hit {
+                    path: bytes_to_string(path),
+                    id: *id,
+                }) {
+                    return false;
+                }
+            }
+        } else {
+            shown = collected
+                .hits
+                .iter()
+                .filter(|(id, _)| visible_chain(ctx, *id, caller))
+                .count() as u64;
+        }
+        let cursor = ctx.shared.cursor().to_string_repr();
+        return emit(Response::Done {
+            count: shown,
+            cursor,
+        });
+    }
+    handle_query_streaming_inner(ctx, &q, limit, count_only, emit)
+}
+
+/// Personal-mode scan core: single pass, per-hit emit straight to the caller,
+/// exact total returned. Holds the index read guard for the pass — exactly
+/// like the old batched scan — but performs NO nested lock acquisition while
+/// holding it (see `handle_query_streaming`). `emit` may block on the client
+/// socket; that extends the read hold (as any slow scan does) but cannot
+/// self-deadlock: nothing else is acquired beneath it.
+///
+/// Returns `false` (without emitting `Done`) when the scan aborted mid-pass.
+fn handle_query_streaming_inner(
+    ctx: &ServerCtx,
+    q: &Query,
+    limit: usize,
+    count_only: bool,
+    emit: &mut dyn FnMut(Response) -> bool,
+) -> bool {
+    // §17 v2 lock order: accelerator before index.
     #[cfg(feature = "trigram")]
     let trigram = Some(ctx.shared.trigram_index());
     #[cfg(feature = "trigram")]
     let trigram_guard = trigram.as_ref().map(|t| t.read().unwrap());
     let ix = ctx.shared.index.read().unwrap();
     let roots = ctx.shared.roots.read().unwrap();
-    // Build the (root_dir_id, root_path) table once. Roots recorded by
-    // another OS (dual-boot shared store) are excluded: their entries are
-    // stale here by rule, and serving them would be silently wrong (§15).
-    // Legacy roots without ownership records are always local.
     let mut root_paths: Vec<(u32, Vec<u8>)> = Vec::new();
     for r in roots.iter().filter(|r| r.is_local()) {
         let rid = crate::applier::root_dir_id(&ix, r);
@@ -173,84 +269,110 @@ fn handle_query(
             root_paths.push((rid, std::mem::take(&mut p)));
         }
     }
-    // When we must filter by ownership we cannot use the engine's count-only
-    // fast path: it returns no hits, and a count we cannot inspect is a count we
-    // cannot filter — it would report how many files *exist*, not how many the
-    // caller may see. So in system mode we materialize and count ourselves.
-    let filtering = ctx.caller.is_some();
-    let engine_count_only = count_only && !filtering;
-    let effective_limit = if count_only { 0 } else { limit };
+    // Count-only: the scan counts matches; nothing is emitted but the
+    // already-sent Meta + the Done below. The emit closure would stream hits
+    // — suppress it with a sink. The sink never refuses (nothing to refuse):
+    // only a real socket write can abort a count scan, via `Done` below.
+    let mut emit_hit;
+    let mut sink;
+    let emit_ref: &mut dyn FnMut(query::Hit) -> bool = if count_only {
+        sink = |_: query::Hit| true;
+        &mut sink
+    } else {
+        emit_hit = |hit: query::Hit| {
+            emit(Response::Hit {
+                path: bytes_to_string(&hit.path),
+                id: hit.id,
+            })
+        };
+        &mut emit_hit
+    };
     #[cfg(feature = "trigram")]
-    let res = query::execute_with_trigram(
+    let total = query::execute_with_trigram_emit(
         &ix,
         &root_paths,
-        &q,
-        effective_limit,
-        engine_count_only,
+        q,
+        if count_only { 0 } else { limit },
+        count_only,
         trigram_guard.as_deref(),
+        emit_ref,
     );
     #[cfg(not(feature = "trigram"))]
-    let res = query::execute(&ix, &root_paths, &q, effective_limit, engine_count_only);
+    let total = query::execute_scan_emit(
+        &ix,
+        &root_paths,
+        q,
+        if count_only { 0 } else { limit },
+        count_only,
+        emit_ref,
+    );
+    // `total` counts matches exactly; under `count_only` the sink swallowed
+    // all hits, so only Meta+Done go out. `None` is a mid-scan refusal: no
+    // `Done`, no partial count — the client is gone, and the exact shape of
+    // an unfinished reply is the transport's business (net.rs skips it).
+    let Some(total) = total else { return false };
     let cursor = ctx.shared.cursor().to_string_repr();
-    let elapsed = t0.elapsed();
-    drop(roots);
-    drop(ix);
-
-    finish_query(ctx, res, cursor, elapsed, count_only)
+    emit(Response::Done { count: total, cursor })
 }
 
-/// Turn a [`query::Results`] into the wire responses, applying the caller's
-/// visibility filter when there is a caller to apply it for.
-fn finish_query(
+/// Collected (not streamed) hits for system mode: full materialization under
+/// guards, filtered guard-free by the caller — the old batched semantics with
+/// Meta already sent early. Returns all matching (id, path) pairs plus the
+/// unfiltered total (the caller recounts visible).
+struct CollectedHits {
+    hits: Vec<(u32, Vec<u8>)>,
+}
+
+fn collect_query_hits(
     ctx: &ServerCtx,
-    res: query::Results,
-    cursor: String,
-    elapsed: std::time::Duration,
+    q: &Query,
+    limit: usize,
     count_only: bool,
-) -> Vec<Response> {
-    let mut out = Vec::new();
-    out.push(meta_preamble(ctx, false, elapsed));
-    if count_only {
-        // In system mode the count must reflect what the *caller* may see, not
-        // what root can — otherwise it leaks the existence of files they cannot
-        // open. Counting therefore respects the same filter as listing.
-        let total = match &ctx.caller {
-            Some(caller) => res
-                .hits
-                .iter()
-                .filter(|h| visible_chain(ctx, h.id, caller))
-                .count() as u64,
-            None => res.total,
-        };
-        out.push(Response::Done {
-            count: total,
-            cursor,
-        });
-        return out;
-    }
-    let mut shown = 0u64;
-    for h in &res.hits {
-        if let Some(caller) = &ctx.caller {
-            if !visible_chain(ctx, h.id, caller) {
-                continue;
-            }
+) -> CollectedHits {
+    #[cfg(feature = "trigram")]
+    let trigram = Some(ctx.shared.trigram_index());
+    #[cfg(feature = "trigram")]
+    let trigram_guard = trigram.as_ref().map(|t| t.read().unwrap());
+    let ix = ctx.shared.index.read().unwrap();
+    let roots = ctx.shared.roots.read().unwrap();
+    let mut root_paths: Vec<(u32, Vec<u8>)> = Vec::new();
+    for r in roots.iter().filter(|r| r.is_local()) {
+        let rid = crate::applier::root_dir_id(&ix, r);
+        if rid != crate::index::ROOT_ID {
+            let mut p = r.path.as_os_str().to_string_lossy().as_bytes().to_vec();
+            root_paths.push((rid, std::mem::take(&mut p)));
         }
-        shown += 1;
-        out.push(Response::Hit {
-            path: bytes_to_string(&h.path),
-            id: h.id,
-        });
     }
-    let total = if ctx.caller.is_some() {
-        shown
-    } else {
-        res.total
-    };
-    out.push(Response::Done {
-        count: total,
-        cursor,
-    });
-    out
+    let mut hits: Vec<(u32, Vec<u8>)> = Vec::new();
+    // Mirror the batched engine params: first `limit` matches materialized
+    // (all of them under count_only), caller filters visible guard-free.
+    let collect_limit = if count_only { 0 } else { limit };
+    #[cfg(feature = "trigram")]
+    let _ = query::execute_with_trigram_emit(
+        &ix,
+        &root_paths,
+        q,
+        collect_limit,
+        false,
+        trigram_guard.as_deref(),
+        &mut |hit: query::Hit| {
+            hits.push((hit.id, hit.path));
+            true
+        },
+    );
+    #[cfg(not(feature = "trigram"))]
+    let _ = query::execute_scan_emit(
+        &ix,
+        &root_paths,
+        q,
+        collect_limit,
+        false,
+        &mut |hit: query::Hit| {
+            hits.push((hit.id, hit.path));
+            true
+        },
+    );
+    CollectedHits { hits }
 }
 
 /// May the caller see this entry, *and* traverse every directory on the way to
@@ -312,19 +434,45 @@ fn handle_fuzzy_query(
     count_only: bool,
     t0: Instant,
 ) -> Vec<Response> {
+    let mut out = Vec::new();
+    let _ = handle_fuzzy_streaming(ctx, raw, max_distance, limit, count_only, t0, &mut |r| {
+        out.push(r);
+        true
+    });
+    out
+}
+
+/// Streaming fuzzy query. Meta goes out before the scan; hits follow after
+/// ranking — fuzzy results are ordered by `(score, path)`, and ranking needs
+/// every score, so per-hit streaming during the scan would emit the wrong
+/// order. The win here is Meta-first (unblocks paint) plus flush-as-emitted;
+/// first-page latency still waits on the scan, honestly.
+///
+/// Returns `false` (without emitting `Done`) on the first refused emit.
+pub fn handle_fuzzy_streaming(
+    ctx: &ServerCtx,
+    raw: &str,
+    max_distance: Option<u32>,
+    limit: usize,
+    count_only: bool,
+    t0: Instant,
+    emit: &mut dyn FnMut(Response) -> bool,
+) -> bool {
     #[cfg(not(feature = "trigram"))]
     {
         let _ = (ctx, raw, max_distance, limit, count_only, t0);
-        return vec![Response::Error {
+        return emit(Response::Error {
             message: "fuzzy search requires the `trigram` feature (not built in)".into(),
-        }];
+        });
     }
 
     #[cfg(feature = "trigram")]
     {
         let q = match Query::compile(raw) {
             Ok(q) => q,
-            Err(e) => return vec![Response::Error { message: e }],
+            Err(e) => {
+                return emit(Response::Error { message: e });
+            }
         };
         let k = max_distance.unwrap_or(DEFAULT_FUZZY_DISTANCE);
         // Same lock-order rule as `handle_query`: build the accelerator before
@@ -360,16 +508,69 @@ fn handle_fuzzy_query(
             engine_count_only,
             Some(&trigram_guard),
         );
+        // Meta first (unblocks paint) — but AFTER dropping the scan
+        // guards: `meta_preamble` takes the index read lock, and nesting it
+        // under the held scan guard self-deadlocks against a pending applier
+        // write (std RwLock is write-preferring). Same for the ownership
+        // filter below (`visible_chain` reads the index per id) and the
+        // trigram guard (postings-read held across an index-read inverts the
+        // applier's index-then-postings order). Drop everything first.
         let cursor = ctx.shared.cursor().to_string_repr();
-        let elapsed = t0.elapsed();
         drop(roots);
         drop(ix);
+        drop(trigram_guard);
+        if !emit(meta_preamble(ctx, false, t0.elapsed())) {
+            return false;
+        }
 
         // The same ownership filter as the exact path. Fuzzy results are still
         // results: skipping this here would leak every file the caller cannot read
         // (and it did, before this line existed).
-        finish_query(ctx, res, cursor, elapsed, count_only)
+        emit_filtered_results(ctx, res, cursor, count_only, emit)
     }
+}
+
+/// Shared tail for handlers whose engine returns `Results` wholesale (fuzzy:
+/// ranking needs the full set): emit visible hits in order, then exact Done.
+/// Runs guard-free (see `handle_fuzzy_streaming`): the per-hit ownership
+/// filter reads the index, which must never nest under a scan guard.
+///
+/// Returns `false` (without emitting `Done`) on the first refused emit.
+fn emit_filtered_results(
+    ctx: &ServerCtx,
+    res: query::Results,
+    cursor: String,
+    count_only: bool,
+    emit: &mut dyn FnMut(Response) -> bool,
+) -> bool {
+    if count_only {
+        let total = match &ctx.caller {
+            Some(caller) => res
+                .hits
+                .iter()
+                .filter(|h| visible_chain(ctx, h.id, caller))
+                .count() as u64,
+            None => res.total,
+        };
+        return emit(Response::Done { count: total, cursor });
+    }
+    let mut shown = 0u64;
+    for h in &res.hits {
+        if let Some(caller) = &ctx.caller {
+            if !visible_chain(ctx, h.id, caller) {
+                continue;
+            }
+        }
+        shown += 1;
+        if !emit(Response::Hit {
+            path: bytes_to_string(&h.path),
+            id: h.id,
+        }) {
+            return false;
+        }
+    }
+    let total = if ctx.caller.is_some() { shown } else { res.total };
+    emit(Response::Done { count: total, cursor })
 }
 
 /// The expression-tree query path (§10). Parses the Watchman-style query object
@@ -381,9 +582,30 @@ fn handle_expr_query(
     count_only: bool,
     t0: Instant,
 ) -> Vec<Response> {
+    let mut out = Vec::new();
+    let _ = handle_expr_streaming(ctx, query, limit, count_only, t0, &mut |r| {
+        out.push(r);
+        true
+    });
+    out
+}
+
+/// Streaming expression query: same Meta-first/Hits-as-found/Done-last shape
+/// as [`handle_query_streaming`], driven by `execute_expr_emit`. Returns
+/// `false` (without emitting `Done`) on the first refused emit.
+pub fn handle_expr_streaming(
+    ctx: &ServerCtx,
+    query: &serde_json::Value,
+    limit: usize,
+    count_only: bool,
+    t0: Instant,
+    emit: &mut dyn FnMut(Response) -> bool,
+) -> bool {
     let expr = match crate::expr::parse_query(query) {
         Ok(e) => e,
-        Err(e) => return vec![Response::Error { message: e }],
+        Err(e) => {
+            return emit(Response::Error { message: e });
+        }
     };
     let rel_root = query
         .get("relative_root")
@@ -391,38 +613,111 @@ fn handle_expr_query(
         .map(|s| s.as_bytes().to_vec())
         .unwrap_or_default();
 
-    let ix = ctx.shared.index.read().unwrap();
-    let roots = ctx.shared.roots.read().unwrap();
-    let mut root_paths: Vec<(u32, Vec<u8>)> = Vec::new();
-    // Foreign roots excluded, as in `handle_query` (§15).
-    for r in roots.iter().filter(|r| r.is_local()) {
-        let rid = crate::applier::root_dir_id(&ix, r);
-        if rid != crate::index::ROOT_ID {
-            root_paths.push((
-                rid,
-                r.path.as_os_str().to_string_lossy().as_bytes().to_vec(),
-            ));
+    // Root table in its own scope: acquired AND released before Meta.
+    // Meta takes the index read lock itself; acquiring the scan guards first
+    // and emitting Meta under them nests a second read on this thread — the
+    // exact self-deadlock the plain path documents (it wedged deterministically
+    // under churn: this expr path held the guards first with a stale comment
+    // claiming otherwise). Scope disciplines it: no guard outlives this block.
+    let root_paths: Vec<(u32, Vec<u8>)> = {
+        let ix = ctx.shared.index.read().unwrap();
+        let roots = ctx.shared.roots.read().unwrap();
+        let mut root_paths: Vec<(u32, Vec<u8>)> = Vec::new();
+        // Foreign roots excluded, as in `handle_query` (§15).
+        for r in roots.iter().filter(|r| r.is_local()) {
+            let rid = crate::applier::root_dir_id(&ix, r);
+            if rid != crate::index::ROOT_ID {
+                root_paths.push((
+                    rid,
+                    r.path.as_os_str().to_string_lossy().as_bytes().to_vec(),
+                ));
+            }
         }
+        root_paths
+    };
+    // Meta with NO guards held (never nest index reads — see plain path).
+    if !emit(meta_preamble(ctx, false, t0.elapsed())) {
+        return false;
     }
-    let effective_limit = if count_only { 0 } else { limit };
-    let filtering = ctx.caller.is_some();
-    let engine_count_only = count_only && !filtering;
-    let res = query::execute_expr(
-        &ix,
-        &root_paths,
-        &rel_root,
-        &expr,
-        effective_limit,
-        engine_count_only,
-    );
+    // System mode: collect under guards, filter guard-free (same TOCTOU as
+    // the batched path). Personal mode streams per-hit below.
+    if let Some(caller) = &ctx.caller {
+        // Batched-equivalent params: first `limit` (all under count_only).
+        // Scan guards acquired here, AFTER Meta (never nest).
+        let collect_limit = if count_only { 0 } else { limit };
+        let mut hits: Vec<(u32, Vec<u8>)> = Vec::new();
+        {
+            let ix = ctx.shared.index.read().unwrap();
+            let _ = query::execute_expr_emit(
+                &ix,
+                &root_paths,
+                &rel_root,
+                &expr,
+                collect_limit,
+                false,
+                &mut |hit: query::Hit| {
+                    hits.push((hit.id, hit.path));
+                    true
+                },
+            );
+        }
+        let mut shown = 0u64;
+        if !count_only {
+            for (id, path) in &hits {
+                if !visible_chain(ctx, *id, caller) {
+                    continue;
+                }
+                shown += 1;
+                if !emit(Response::Hit {
+                    path: bytes_to_string(path),
+                    id: *id,
+                }) {
+                    return false;
+                }
+            }
+        } else {
+            shown = hits
+                .iter()
+                .filter(|(id, _)| visible_chain(ctx, *id, caller))
+                .count() as u64;
+        }
+        let cursor = ctx.shared.cursor().to_string_repr();
+        return emit(Response::Done {
+            count: shown,
+            cursor,
+        });
+    }
+    let mut emit_hit;
+    let mut sink;
+    let emit_ref: &mut dyn FnMut(query::Hit) -> bool = if count_only {
+        sink = |_: query::Hit| true;
+        &mut sink
+    } else {
+        emit_hit = |hit: query::Hit| {
+            emit(Response::Hit {
+                path: bytes_to_string(&hit.path),
+                id: hit.id,
+            })
+        };
+        &mut emit_hit
+    };
+    // Scan guards acquired here, AFTER Meta (never nest).
+    let total = {
+        let ix = ctx.shared.index.read().unwrap();
+        query::execute_expr_emit(
+            &ix,
+            &root_paths,
+            &rel_root,
+            &expr,
+            if count_only { 0 } else { limit },
+            count_only,
+            emit_ref,
+        )
+    };
+    // `None` is a mid-scan refusal: no `Done`, no partial count.
+    let Some(total) = total else { return false };
     let cursor = ctx.shared.cursor().to_string_repr();
-    let elapsed = t0.elapsed();
-    drop(roots);
-    drop(ix);
-
-    // The one place results become responses, so the ownership filter cannot be
-    // forgotten by one query path and remembered by another.
-    finish_query(ctx, res, cursor, elapsed, count_only)
+    emit(Response::Done { count: total, cursor })
 }
 
 /// The sync engine (§8). For each writable root we create a cookie, ask the
@@ -904,6 +1199,85 @@ mod tests {
             .unwrap();
         assert_eq!(done, 1);
         assert!(!out.iter().any(|r| matches!(r, Response::Hit { .. })));
+    }
+
+    #[test]
+    fn streaming_abort_skips_done_and_stops_the_scan() {
+        // A refused emit aborts the reply: `false` out, no `Done` after it
+        // (a partial count would lie), and only the records before the
+        // refusal were delivered. This is the server half of the daemon's
+        // dead-client halt — net.rs refuses once the socket is gone.
+        let (ctx, _d, _s) = ctx_with_tree();
+        let mut out = Vec::new();
+        let mut hits_seen = 0usize;
+        let ok = handle_query_streaming(
+            &ctx,
+            "rs",
+            0,
+            false,
+            false,
+            std::time::Instant::now(),
+            &mut |r| {
+                if matches!(r, Response::Hit { .. }) {
+                    hits_seen += 1;
+                    // The tree has exactly one "rs" hit (src/main.rs):
+                    // refuse it, so the scan aborts on its only hit.
+                    return false;
+                }
+                out.push(r);
+                true
+            },
+        );
+        assert!(!ok, "a refused Hit must abort the streaming reply");
+        assert_eq!(hits_seen, 1);
+        assert!(
+            matches!(out.first(), Some(Response::Meta { .. })),
+            "Meta went out before the abort, got {out:?}"
+        );
+        assert!(
+            !out.iter().any(|r| matches!(r, Response::Done { .. })),
+            "no Done after an abort: a partial count would lie, got {out:?}"
+        );
+
+        // Refusing Meta itself aborts before the scan even starts.
+        let mut meta_seen = 0usize;
+        let ok = handle_query_streaming(
+            &ctx,
+            "rs",
+            0,
+            false,
+            false,
+            std::time::Instant::now(),
+            &mut |r| {
+                if matches!(r, Response::Meta { .. }) {
+                    meta_seen += 1;
+                    return false;
+                }
+                panic!("nothing may be emitted after a refused Meta: {r:?}");
+            },
+        );
+        assert!(!ok);
+        assert_eq!(meta_seen, 1);
+
+        // And the expr path aborts the same way.
+        let mut out = Vec::new();
+        let ok = handle_expr_streaming(
+            &ctx,
+            &serde_json::json!({"expression": ["suffix", "rs"]}),
+            0,
+            false,
+            std::time::Instant::now(),
+            &mut |r| {
+                if matches!(r, Response::Hit { .. }) {
+                    return false;
+                }
+                out.push(r);
+                true
+            },
+        );
+        assert!(!ok, "expr streaming must abort on a refused Hit");
+        assert!(matches!(out.first(), Some(Response::Meta { .. })));
+        assert!(!out.iter().any(|r| matches!(r, Response::Done { .. })));
     }
 
     #[test]

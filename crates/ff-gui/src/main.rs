@@ -33,8 +33,9 @@ use std::rc::Rc;
 use ff_gui::{
     box_change_clears, containing_dir, context_menu_target, effective_query, encode_request,
     extension_sort_key, render_count, rows_from_paths, search_label, searching_status_line,
-    starting_status_line, step_max_distance, DaemonClient, GuiError, MenuAction, PendingRequest,
-    Progress, RowAction, SearchGate, SearchOptions, SearchOutcome, StartupPoll, StartupProbe,
+    starting_status_line, step_max_distance, streaming_status_line, DaemonClient, GuiError,
+    MenuAction, PendingRequest, Progress, RowAction, SearchGate, SearchOptions, SearchOutcome,
+    StartupPoll, StartupProbe,
     WheelStep, WireResponse, ADVANCED_SYNTAX_HELP, DEFAULT_MAX_DISTANCE,
 };
 
@@ -428,6 +429,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let startup_status = status.clone();
             let quick_box = query.clone();
             let adv_box = advanced_query.clone();
+            // Partial renders paint rows directly (the `render` closure owns
+            // its clones), so the pump holds its own.
+            let partial_results = results.clone();
+            let partial_current = current.clone();
             // The request currently in flight, if any: (gate seq, request,
             // when it was issued, display label for the status line). Advancing
             // it is what the pump does: it never blocks, so a slow or wedged
@@ -436,8 +441,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // "searching…" with elapsed time (see below) — a cold daemon's
             // first query can take seconds (crawl + trigram build), and that
             // must read as progress, not a frozen window.
-            let pending: Rc<RefCell<Option<(u64, PendingRequest, std::time::Instant, String)>>> =
-                Rc::new(RefCell::new(None));
+            // (gate seq, request, when issued, display label, hits already
+            // painted). `rendered` drives partial renders: each tick paints only
+            // the Hits that arrived since the last paint, so the first page
+            // fills while the daemon is still counting the total.
+            let pending: Rc<
+                RefCell<Option<(u64, PendingRequest, std::time::Instant, String, usize)>>,
+            > = Rc::new(RefCell::new(None));
             App::timeout_add(
                 PUMP_MS,
                 Box::new(move || {
@@ -456,76 +466,153 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     //    error: it means "come back next tick", which is exactly what
                     //    keeps the loop live.
                     let mut finished: Option<(u64, Result<Vec<WireResponse>, GuiError>)> = None;
-                    if let Some((seq, p, _, _)) = pending.borrow_mut().as_mut() {
+                    let mut finished_started: Option<std::time::Instant> = None;
+                    if let Some((seq, p, started, _, _)) = pending.borrow_mut().as_mut() {
                         let seq = *seq;
+                        let started_at = *started;
                         match p.advance() {
                             Ok(Progress::Finished) => {
                                 finished = Some((seq, Ok(p.take_records())));
+                                finished_started = Some(started_at);
                             }
                             Ok(_) => {}
-                            Err(e) => finished = Some((seq, Err(e))),
+                            Err(e) => {
+                                finished = Some((seq, Err(e)));
+                                finished_started = Some(started_at);
+                            }
                         }
                     }
                     if finished.is_some() {
                         *pending.borrow_mut() = None;
                     }
                     if let Some((seq, result)) = finished {
-                        let outcome =
-                            result.and_then(|recs| DaemonClient::new().outcome_from_records(&recs));
+                        // Wall time replaces `Meta.elapsed_ms` for the slow-query
+                        // suffix: Meta now goes out before the scan (elapsed ≈
+                        // time-to-first-byte), so the client's own clock is the
+                        // honest total. Partial rows are already on screen; this
+                        // final render adds the exact total.
+                        let wall = finished_started.map(|t| t.elapsed());
+                        let outcome = result.and_then(|recs| {
+                            DaemonClient::new().outcome_from_records(&recs).map(|mut o| {
+                                if let Some(w) = wall {
+                                    o.elapsed_ms = Some(w.as_secs_f64() * 1000.0);
+                                }
+                                o
+                            })
+                        });
                         if let Some(outcome) = gate.borrow_mut().finish(seq, outcome) {
                             render(outcome);
                         }
                     }
 
-                    // 1b. In-flight progress: while a request is out with no reply
-                    //     yet, the status line says what is happening and for how
-                    //     long. Without this a slow first query — cold daemon
-                    //     still crawling, trigram index building on demand — sits
-                    //     on the stale "connected…" line and reads as frozen.
-                    //     `records()` hands back parsed Hits from partial packets,
-                    //     so the count is live when the daemon flushes mid-reply
-                    //     (it currently writes the whole reply at once, so this
-                    //     is usually 0 until the answer lands — honest either
-                    //     way). Updated every tick (~30 ms) so the elapsed time
-                    //     visibly moves; never touches the rows, only the line.
-                    if let Some((_, p, started, label)) = pending.borrow().as_ref() {
-                        let hits = p
-                            .records()
-                            .iter()
-                            .filter(|r| matches!(r, WireResponse::Hit { .. }))
-                            .count();
-                        // Cold-start case: this process spawned the daemon, so
-                        // the wait is startup (crawl + trigram warm), not a
-                        // slow query — name it. Sticky for the process: the
-                        // first queries after a spawn all pay it.
-                        let line = if startup.borrow().was_spawned() {
-                            starting_status_line(
-                                label,
-                                started.elapsed(),
-                                startup.borrow().spawned_elapsed(),
-                                hits,
-                            )
-                        } else {
-                            searching_status_line(label, started.elapsed(), hits, false)
-                        };
-                        startup_status.set_text(&line);
+                    // 1b. Streaming progress: the daemon flushes Meta+Hits as
+                    //     found, so each tick paints newly arrived Hits and the
+                    //     first page fills while the total is still being
+                    //     counted. Before any Hit arrives the status says what
+                    //     is happening and for how long (a slow first query —
+                    //     cold daemon, trigram build on demand — must read as
+                    //     progress, not a frozen window).
+                    //
+                    //     Gate-checked: a superseded ticket's partials never
+                    //     paint (`is_current`), and `finish` still retires the
+                    //     ticket — partials cannot overwrite a newer answer.
+                    {
+                        let mut pending_ref = pending.borrow_mut();
+                        if let Some((seq, p, started, label, rendered)) = pending_ref.as_mut() {
+                            let seq = *seq;
+                            let started_at = *started;
+                            let hits: Vec<String> = p
+                                .records()
+                                .iter()
+                                .filter_map(|r| match r {
+                                    WireResponse::Hit { path, .. } => Some(path.clone()),
+                                    _ => None,
+                                })
+                                .collect();
+                            if hits.len() > *rendered {
+                                *rendered = hits.len();
+                                let label_owned = label.clone();
+                                let elapsed = started_at.elapsed();
+                                let fresh_hits = hits.clone();
+                                drop(pending_ref);
+                                if gate.borrow().is_current(seq) {
+                                    // Paint only the rows on screen (MAX_ROWS);
+                                    // the status counts every Hit so far.
+                                    let shown: Vec<String> =
+                                        fresh_hits.iter().take(MAX_ROWS).cloned().collect();
+                                    partial_results.set_rows(&rows_to_cells(&shown));
+                                    *partial_current.borrow_mut() = shown;
+                                    if startup.borrow().was_spawned() {
+                                        startup_status.set_text(&starting_status_line(
+                                            &label_owned,
+                                            elapsed,
+                                            startup.borrow().spawned_elapsed(),
+                                            hits.len(),
+                                        ));
+                                    } else {
+                                        startup_status
+                                            .set_text(&streaming_status_line(hits.len(), elapsed));
+                                    }
+                                }
+                            } else if hits.is_empty() {
+                                let label_owned = label.clone();
+                                let elapsed = started_at.elapsed();
+                                let n = hits.len();
+                                drop(pending_ref);
+                                // No Hits yet: the in-flight line with elapsed.
+                                let line = if startup.borrow().was_spawned() {
+                                    starting_status_line(
+                                        &label_owned,
+                                        elapsed,
+                                        startup.borrow().spawned_elapsed(),
+                                        n,
+                                    )
+                                } else {
+                                    searching_status_line(&label_owned, elapsed, n, false)
+                                };
+                                startup_status.set_text(&line);
+                            }
+                        }
                     }
 
                     // 2. Start a new request if the debounce has elapsed (or the Search
-                    //    button asked for one now) and nothing is in flight. `begin`
-                    //    refuses while one is out, so a burst of keystrokes cannot queue
-                    //    up round-trips.
-                    if pending.borrow().is_some() {
-                        return true;
-                    }
+                    //    button asked for one now). A newer keystroke *supersedes*
+                    //    the in-flight scan: drop its socket and retire its
+                    //    ticket, then issue the fresh query on this same tick.
+                    //    Without this a slow short-prefix scan (unaccelerated
+                    //    <3-char literal) head-of-line-blocks the full string
+                    //    behind it. Note the honesty bound: dropping the
+                    //    socket only stops *this client* waiting — the
+                    //    daemon-side scan runs to Done regardless (its writes
+                    //    fail into a closed fd, but nothing cancels the scan
+                    //    itself). The win is client latency, not daemon CPU:
+                    //    the fresh query issues now instead of after the stale
+                    //    4 s scan completes.
                     let immediate = std::mem::replace(&mut *start_now.borrow_mut(), false);
                     if !immediate {
                         let Some(t) = *due_at.borrow() else {
+                            // No keystroke pending. But the user may have hit
+                            // Search while a scan is in flight — `immediate`
+                            // covers that above, so nothing to do here.
+                            if pending.borrow().is_some() {
+                                return true;
+                            }
                             return true;
                         };
                         if std::time::Instant::now() < t {
                             return true; // still typing
                         }
+                    }
+                    if pending.borrow().is_some() {
+                        // Supersede: dropping the PendingRequest closes its
+                        // socket, so this client stops waiting. (The orphaned
+                        // daemon-side scan runs to Done regardless — the win
+                        // is issuing the fresh query now, not saving daemon
+                        // CPU.) `supersede` retires the ticket so stragglers
+                        // cannot paint and frees the gate for the reissue
+                        // below — same tick, no extra latency.
+                        *pending.borrow_mut() = None;
+                        gate.borrow_mut().supersede();
                     }
                     // An explicit Search with no combined query clears the list
                     // instead of sending an empty query: empty matches
@@ -556,7 +643,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }) {
                         Ok(p) => {
                             *pending.borrow_mut() =
-                                Some((ticket.seq, p, std::time::Instant::now(), label));
+                                Some((ticket.seq, p, std::time::Instant::now(), label, 0));
                         }
                         Err(e) => {
                             // The request never started, so it can never finish: release

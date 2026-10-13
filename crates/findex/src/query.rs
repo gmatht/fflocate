@@ -1021,6 +1021,96 @@ fn execute_scan(
     results
 }
 
+/// Streaming form of the scan: `emit` receives each materialized hit as found
+/// (up to `limit`); the returned `total` still counts every match, so the
+/// caller emits the exact `Done` count after the pass. Order is index order,
+/// identical to [`execute_scan`].
+///
+/// `emit` returns `false` to abort: the scan stops at the first refusal and
+/// this returns `None` (a partial `total` would lie in `Done`, so there is
+/// nothing honest to return). The daemon's socket emit refuses once the
+/// client is gone, so a disconnected client halts the scan instead of running
+/// it to a dead socket.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_scan_emit(
+    index: &Index,
+    root_paths: &[(u32, Vec<u8>)],
+    q: &Query,
+    limit: usize,
+    count_only: bool,
+    emit: &mut dyn FnMut(Hit) -> bool,
+) -> Option<u64> {
+    let mut total = 0u64;
+    let mut emitted = 0usize;
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    for (id, _) in index.iter_live() {
+        if !consider_emit(
+            index, root_paths, q, limit, count_only, id, emit, &mut total, &mut emitted,
+            &mut buf,
+        ) {
+            return None;
+        }
+    }
+    Some(total)
+}
+
+/// Streaming form of [`execute_with_trigram`]: candidates are visited in the
+/// same ascending order, hits emitted as found, exact total returned. `None`
+/// trigram (or a plan with no constraint) falls through to the plain
+/// streaming scan, as the batched form does.
+///
+/// Abort semantics are [`execute_scan_emit`]'s: the first refused hit stops
+/// the scan and this returns `None`.
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "trigram")]
+pub fn execute_with_trigram_emit(
+    index: &Index,
+    root_paths: &[(u32, Vec<u8>)],
+    q: &Query,
+    limit: usize,
+    count_only: bool,
+    trigram: Option<&crate::trigram::TrigramIndex>,
+    emit: &mut dyn FnMut(Hit) -> bool,
+) -> Option<u64> {
+    let candidates: Option<Vec<u32>> = match trigram {
+        Some(tg) if tg.is_useful() => tg.candidates(&q.trigram_plan()),
+        _ => None,
+    };
+    if let Some(c) = &candidates {
+        if c.is_empty() {
+            return Some(0);
+        }
+    }
+    let mut total = 0u64;
+    let mut emitted = 0usize;
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    match candidates {
+        Some(ids) => {
+            for id in ids {
+                if (id as usize) < index.len()
+                    && !consider_emit(
+                        index, root_paths, q, limit, count_only, id, emit, &mut total,
+                        &mut emitted, &mut buf,
+                    )
+                {
+                    return None;
+                }
+            }
+        }
+        None => {
+            for (id, _) in index.iter_live() {
+                if !consider_emit(
+                    index, root_paths, q, limit, count_only, id, emit, &mut total,
+                    &mut emitted, &mut buf,
+                ) {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(total)
+}
+
 /// Evaluate one candidate id and fold it into `results`. Shared by the
 /// accelerated path and the linear scan so the two can never drift.
 #[allow(clippy::too_many_arguments)]
@@ -1034,15 +1124,59 @@ fn consider(
     results: &mut Results,
     buf: &mut Vec<u8>,
 ) {
+    // `emitted` is scratch for the streaming cap below; `consider` counts
+    // it but only ever emits into `results.hits`, so it stays in sync.
+    // The infallible push can never refuse, so the abort arm is unreachable.
+    let mut emitted = results.hits.len();
+    let kept = consider_emit(
+        index,
+        root_paths,
+        q,
+        limit,
+        count_only,
+        id,
+        &mut |hit| {
+            results.hits.push(hit);
+            true
+        },
+        &mut results.total,
+        &mut emitted,
+        buf,
+    );
+    debug_assert!(kept, "push-only emit must never refuse");
+}
+
+/// Streaming form of [`consider`]: matched-and-materialized hits are handed to
+/// `emit` as found (up to `limit`), while `total` still counts every match.
+/// The scan order is identical to [`consider`], so a streamed reply carries
+/// exactly the hits the batched reply would — only earlier. Returns `false`
+/// when `emit` refused the hit (the caller stops the scan); every other
+/// path returns `true`, including skips, the count-only sink, and the limit
+/// cap — none of those is an abort. `emit` runs while
+/// the caller holds the index read lock: it must write+flush promptly, never
+/// block on anything but the client socket.
+#[allow(clippy::too_many_arguments)]
+fn consider_emit(
+    index: &Index,
+    root_paths: &[(u32, Vec<u8>)],
+    q: &Query,
+    limit: usize,
+    count_only: bool,
+    id: u32,
+    emit: &mut dyn FnMut(Hit) -> bool,
+    total: &mut u64,
+    emitted: &mut usize,
+    buf: &mut Vec<u8>,
+) -> bool {
     // Liveness is the accelerator's one blind spot: postings built before a
     // deletion still name the dead id. The authoritative scan skips tombstones,
     // so this must too, or a stale posting becomes a phantom hit.
     if !index.is_alive(id) {
-        return;
+        return true;
     }
     let entry = &index.entries[id as usize];
     if entry.flags().is_root_dir() {
-        return;
+        return true;
     }
     let name = index.name(id);
     if q.ac.is_some() {
@@ -1051,7 +1185,7 @@ fn consider(
         // per-entry lowercased copy was pure waste (same ~1 µs/entry cost as
         // `contains`, paid on every entry even when the prefilter rejects).
         if !q.prefilter(name) {
-            return;
+            return true;
         }
     }
     let root_id = index.root_of(id);
@@ -1066,7 +1200,7 @@ fn consider(
     // would leak foreign files into totals (§15) — skip before matching.
     let root_path = match root_path {
         Some(rp) => rp,
-        None => return,
+        None => return true,
     };
     let matched = q.matches(
         name,
@@ -1075,20 +1209,29 @@ fn consider(
         || index.path_of(id, &root_path),
     );
     if !matched {
-        return;
+        return true;
     }
-    results.total += 1;
+    // NOTE: no ownership filter here. `visible_chain` takes the index read
+    // lock, and this runs under the scan's held read guard — nesting it
+    // self-deadlocks against a pending applier write (write-preferring
+    // RwLock). System mode collects, drops guards, and filters guard-free in
+    // the server layer instead (same TOCTOU as the batched path).
+    *total += 1;
     if count_only {
-        return;
+        return true;
     }
-    if limit != 0 && results.hits.len() >= limit {
-        return;
+    // The cap counts materialized hits, not matches: entries that fail
+    // materialization (tombstoned mid-scan, orphaned chains) must not consume
+    // it, exactly as in the batched path.
+    if limit != 0 && *emitted >= limit {
+        return true;
     }
     let path = match index.materialize_into(id, &root_path, buf) {
         Some(_) => buf.clone(),
-        None => return,
+        None => return true,
     };
-    results.hits.push(Hit { id, path, score: 0 });
+    *emitted += 1;
+    emit(Hit { id, path, score: 0 })
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1192,6 +1335,94 @@ pub fn execute_expr(
         });
     }
     results
+}
+
+/// Streaming form of [`execute_expr`]: hits emitted as found (up to `limit`),
+/// exact total returned. Same visit order and same skip rules, so the streamed
+/// hits are exactly the batched reply's hits.
+///
+/// Abort semantics are [`execute_scan_emit`]'s: the first refused hit stops
+/// the scan and this returns `None`.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_expr_emit(
+    index: &Index,
+    root_paths: &[(u32, Vec<u8>)],
+    rel_root: &[u8],
+    expr: &crate::expr::Expr,
+    limit: usize,
+    count_only: bool,
+    emit: &mut dyn FnMut(Hit) -> bool,
+) -> Option<u64> {
+    use crate::expr::MatchCtx;
+
+    let mut total = 0u64;
+    let mut emitted = 0usize;
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+
+    for (id, entry) in index.iter_live() {
+        if entry.flags().is_root_dir() {
+            continue;
+        }
+        let Some(root_id) = index.root_of(id) else {
+            continue;
+        };
+        let Some((_, root_path)) = root_paths.iter().find(|(rid, _)| *rid == root_id) else {
+            continue;
+        };
+
+        buf.clear();
+        let Some(abs) = index.path_of(id, root_path) else {
+            continue;
+        };
+
+        let mut anchor: Vec<u8> = root_path.clone();
+        if !rel_root.is_empty() {
+            if anchor.last() != Some(&b'/') {
+                anchor.push(b'/');
+            }
+            anchor.extend_from_slice(rel_root);
+        }
+        let rel = if anchor.is_empty() {
+            abs.as_slice()
+        } else if abs.len() > anchor.len() && abs.starts_with(&anchor) && abs[anchor.len()] == b'/'
+        {
+            &abs[anchor.len() + 1..]
+        } else {
+            continue;
+        };
+
+        let ctx = MatchCtx {
+            name: index.name(id),
+            rel_path: rel,
+            is_dir: entry.flags().is_dir(),
+            is_symlink: entry.flags().is_symlink(),
+            is_exec: entry.flags().is_exec(),
+            size: None,
+            otime: None,
+            ctime: None,
+            mtime: None,
+            fs_case_insensitive: false,
+        };
+        if !expr.eval(&ctx) {
+            continue;
+        }
+        total += 1;
+        if count_only {
+            continue;
+        }
+        if limit != 0 && emitted >= limit {
+            continue;
+        }
+        emitted += 1;
+        if !emit(Hit {
+            id,
+            path: abs,
+            score: 0,
+        }) {
+            return None;
+        }
+    }
+    Some(total)
 }
 
 #[cfg(test)]
@@ -1473,6 +1704,140 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn streamed_hits_equal_batched_hits() {
+        // Result-identity for the streaming engine: same queries, same limits,
+        // streamed hits must be byte-identical to the batched reply's hits,
+        // and the streamed total must equal the batched total. This pins the
+        // contract the wire change depends on.
+        use crate::index::{EntryFlags, ROOT_ID};
+        let mut ix = Index::new();
+        let r = ix.insert(ROOT_ID, b"root", EntryFlags::EMPTY.with_dir(true).with_root_dir(true));
+        let sub = ix.insert(r, b"src", EntryFlags::EMPTY.with_dir(true));
+        for name in [
+            "main.rs", "lib.rs", "main_test.rs", "README.md", "notes.txt",
+            "MAIN.RS", "m.txt", "e.rs", "eee.md", "nope.py",
+        ] {
+            ix.insert(sub, name.as_bytes(), EntryFlags::EMPTY);
+        }
+        let roots = vec![(r, b"/root".to_vec())];
+        for raw in ["e", "E", "main", "MAIN", "rs", "ext:rs", "ext:md", "zzz", "a e"] {
+            let q = Query::compile(raw).unwrap();
+            for limit in [0usize, 1, 2, 5, 200] {
+                let batched = execute(&ix, &roots, &q, limit, false);
+                let mut streamed_hits = Vec::new();
+                let total = execute_scan_emit(&ix, &roots, &q, limit, false, &mut |h| {
+                    streamed_hits.push(h);
+                    true
+                })
+                .expect("infallible test emit must not abort");
+                assert_eq!(total, batched.total, "total raw={raw:?} limit={limit}");
+                assert_eq!(streamed_hits, batched.hits, "hits raw={raw:?} limit={limit}");
+                // Accelerated form agrees too (same order, same hits).
+                #[cfg(feature = "trigram")]
+                {
+                    let tg = crate::trigram::TrigramIndex::build(&ix);
+                    let mut accel_hits = Vec::new();
+                    let atotal = execute_with_trigram_emit(
+                        &ix,
+                        &roots,
+                        &q,
+                        limit,
+                        false,
+                        Some(&tg),
+                        &mut |h| {
+                            accel_hits.push(h);
+                            true
+                        },
+                    )
+                    .expect("infallible test emit must not abort");
+                    assert_eq!(atotal, batched.total, "accel total raw={raw:?} limit={limit}");
+                    assert_eq!(accel_hits, batched.hits, "accel hits raw={raw:?} limit={limit}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn emit_refusal_aborts_the_scan() {
+        // A `false` from `emit` stops the scan: this returns `None` (a
+        // partial `total` would lie in `Done`), and only the hits before the
+        // refusal were delivered. All three streaming engines share the
+        // contract.
+        use crate::index::{EntryFlags, ROOT_ID};
+        let mut ix = Index::new();
+        let r = ix.insert(ROOT_ID, b"root", EntryFlags::EMPTY.with_dir(true).with_root_dir(true));
+        let sub = ix.insert(r, b"src", EntryFlags::EMPTY.with_dir(true));
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"] {
+            ix.insert(sub, name.as_bytes(), EntryFlags::EMPTY);
+        }
+        let roots = vec![(r, b"/root".to_vec())];
+        let q = Query::compile("txt").unwrap();
+        assert_eq!(execute(&ix, &roots, &q, 0, false).total, 5);
+
+        // Refuse the third hit: two delivered, then `None`.
+        let mut seen = 0usize;
+        let got = execute_scan_emit(&ix, &roots, &q, 0, false, &mut |_| {
+            seen += 1;
+            seen < 3
+        });
+        assert_eq!(got, None, "a refused emit must abort with no total");
+        assert_eq!(seen, 3, "scan stops at the refusal, not at the end");
+
+        // Refuse immediately: nothing delivered, still `None`.
+        let mut seen0 = 0usize;
+        let got0 = execute_scan_emit(&ix, &roots, &q, 0, false, &mut |_| {
+            seen0 += 1;
+            false
+        });
+        assert_eq!(got0, None);
+        assert_eq!(seen0, 1);
+
+        // The accelerated engine aborts the same way.
+        #[cfg(feature = "trigram")]
+        {
+            let tg = crate::trigram::TrigramIndex::build(&ix);
+            let mut aseen = 0usize;
+            let agot = execute_with_trigram_emit(
+                &ix,
+                &roots,
+                &q,
+                0,
+                false,
+                Some(&tg),
+                &mut |_| {
+                    aseen += 1;
+                    aseen < 2
+                },
+            );
+            assert_eq!(agot, None);
+            assert_eq!(aseen, 2, "accelerated scan stops at the refusal too");
+        }
+    }
+
+    #[test]
+    fn expr_emit_refusal_aborts_the_scan() {
+        // Same contract through the expression engine: refuse the second
+        // hit, get `None`, and the scan never visits the rest.
+        use crate::index::{EntryFlags, ROOT_ID};
+        let mut ix = Index::new();
+        let r = ix.insert(ROOT_ID, b"root", EntryFlags::EMPTY.with_dir(true).with_root_dir(true));
+        let sub = ix.insert(r, b"src", EntryFlags::EMPTY.with_dir(true));
+        for name in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+            ix.insert(sub, name.as_bytes(), EntryFlags::EMPTY);
+        }
+        let roots = vec![(r, b"/root".to_vec())];
+        let expr =
+            crate::expr::parse_query(&serde_json::json!({"expression": ["suffix", "rs"]})).unwrap();
+        let mut seen = 0usize;
+        let got = execute_expr_emit(&ix, &roots, b"", &expr, 0, false, &mut |_| {
+            seen += 1;
+            seen < 2
+        });
+        assert_eq!(got, None, "a refused emit must abort with no total");
+        assert_eq!(seen, 2);
     }
 
     #[test]

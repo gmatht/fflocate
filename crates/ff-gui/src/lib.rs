@@ -798,6 +798,20 @@ pub fn searching_status_line(
     s
 }
 
+/// The status line while Hits stream in but `Done` (exact total) has not
+/// landed yet. Hits are real rows on screen; the total is still being counted,
+/// so the line says so — "201 hits… (counting total… 1.2s)" — rather than
+/// claiming a total it does not have. Once `Done` arrives the pump renders the
+/// final [`SearchOutcome::status_line_opts`] line as before.
+pub fn streaming_status_line(hits_shown: usize, elapsed: std::time::Duration) -> String {
+    format!(
+        "{} hit{}… (counting total… {:.1}s)",
+        hits_shown,
+        if hits_shown == 1 { "" } else { "s" },
+        elapsed.as_secs_f64()
+    )
+}
+
 /// A short human label for the query in the two boxes, for the in-flight line.
 ///
 /// Unlike [`effective_query`] this is display-only: no quoting, no `None` —
@@ -2252,6 +2266,18 @@ mod tests {
     }
 
     #[test]
+    fn streaming_line_counts_hits_without_a_total() {
+        assert_eq!(
+            streaming_status_line(1, std::time::Duration::from_millis(300)),
+            "1 hit… (counting total… 0.3s)"
+        );
+        assert_eq!(
+            streaming_status_line(201, std::time::Duration::from_millis(1200)),
+            "201 hits… (counting total… 1.2s)"
+        );
+    }
+
+    #[test]
     fn search_label_combines_and_truncates() {
         assert_eq!(search_label("main", ""), "main");
         assert_eq!(search_label("", "ext:rs"), "ext:rs");
@@ -2343,9 +2369,37 @@ impl SearchGate {
         Some(outcome)
     }
 
+    /// Retire the in-flight request without rendering it, freeing the gate
+    /// for a newer query. The caller drops the old socket alongside this;
+    /// stragglers that beat the close are dropped by `finish` (their seq
+    /// sits beneath the new watermark). Returns the retired seq, or `None`
+    /// when idle.
+    ///
+    /// Honesty bound: this frees the *client*, not the daemon — the orphaned
+    /// server-side scan runs to Done (its writes fail into the closed fd).
+    /// The latency win is issuing the fresh query now instead of after the
+    /// stale scan completes, not saving daemon CPU.
+    pub fn supersede(&mut self) -> Option<u64> {
+        if self.in_flight == 0 {
+            return None;
+        }
+        self.in_flight = 0;
+        let old = self.issued;
+        self.applied = self.applied.max(old);
+        Some(old)
+    }
+
     /// The seq most recently issued, for diagnostics/tests.
     pub fn issued(&self) -> u64 {
         self.issued
+    }
+
+    /// Would a partial update for `seq` still be welcome on screen? True when
+    /// no newer result has been applied — lets streaming renders paint early
+    /// hits without letting a slow old request scribble over a newer answer.
+    /// [`finish`](Self::finish) remains the only thing that retires a ticket.
+    pub fn is_current(&self, seq: u64) -> bool {
+        seq > self.applied
     }
 
     /// Whether a request is outstanding.
@@ -2615,8 +2669,7 @@ mod asyou_type_tests {
     }
 
     #[test]
-    fn a_stale_result_never_overwrites_a_newer_one() {
-        // The ordering hazard: request A takes longer than B. B's answer lands
+    fn a_stale_result_never_overwrites_a_newer_one() {        // The ordering hazard: request A takes longer than B. B's answer lands
         // first; A's must then be dropped, not painted over the top.
         let mut g = SearchGate::new();
         let a = g.begin().unwrap();
@@ -2639,6 +2692,22 @@ mod asyou_type_tests {
     }
 
     #[test]
+    fn stale_partials_are_not_current() {
+        let mut g = SearchGate::new();
+        let a = g.begin().unwrap();
+        assert!(g.is_current(a.seq), "unanswered ticket is current");
+        g.in_flight = 0;
+        let b = g.begin().unwrap();
+        assert!(g.is_current(b.seq));
+        // A newer result applied: older partials must stay off screen.
+        assert!(g.finish(b.seq, "B").is_some());
+        assert!(!g.is_current(a.seq), "superseded partial must not paint");
+        // The applied ticket itself needs no more partials (final render
+        // happened): not current either.
+        assert!(!g.is_current(b.seq), "finished ticket takes no partials");
+    }
+
+    #[test]
     fn sequence_numbers_are_monotonic() {
         let mut g = SearchGate::new();
         let mut last = 0;
@@ -2649,6 +2718,59 @@ mod asyou_type_tests {
             g.finish(r.seq, ());
         }
         assert_eq!(g.issued(), last);
+    }
+
+    #[test]
+    fn supersede_retires_the_in_flight_request_for_immediate_reissue() {
+        // The as-you-type supersede path: a slow short-prefix scan is in
+        // flight, a newer keystroke arrives. Dropping the socket and
+        // retiring the ticket must free the gate on the same tick — the
+        // fresh query issues immediately, and anything from the old ticket
+        // (stragglers that beat the socket close) is dropped, never painted.
+        let mut g = SearchGate::new();
+        let old = g.begin().unwrap();
+        assert!(g.busy());
+        assert_eq!(g.supersede(), Some(old.seq), "retires the live ticket");
+        assert!(!g.busy(), "gate is free on the same tick");
+        let fresh = g.begin().expect("fresh query issues immediately");
+        assert!(fresh.seq > old.seq);
+        assert_eq!(
+            g.finish(old.seq, "STALE"),
+            None,
+            "stragglers from the dropped scan never paint"
+        );
+        assert_eq!(
+            g.finish(fresh.seq, "FRESH"),
+            Some("FRESH"),
+            "the fresh answer renders"
+        );
+    }
+
+    #[test]
+    fn supersede_when_idle_is_a_no_op() {
+        let mut g = SearchGate::new();
+        assert_eq!(g.supersede(), None, "nothing in flight");
+        assert!(!g.busy());
+        // A normal issue/finish cycle still works afterwards.
+        let r = g.begin().unwrap();
+        assert_eq!(g.finish(r.seq, "A"), Some("A"));
+    }
+
+    #[test]
+    fn superseded_partials_are_not_current_but_finish_still_retires() {
+        // Partial renders consult `is_current`; the retired ticket's seq
+        // sits at/beneath the watermark, so its Hits never paint — while
+        // `finish` on it still releases the (already-free) slot harmlessly.
+        let mut g = SearchGate::new();
+        let old = g.begin().unwrap();
+        g.supersede();
+        assert!(!g.is_current(old.seq), "retired partials must not paint");
+        let fresh = g.begin().unwrap();
+        assert!(g.is_current(fresh.seq));
+        // Double-finish of the retired ticket: slot math saturates, newer
+        // answer unaffected.
+        assert_eq!(g.finish(old.seq, "STALE"), None);
+        assert_eq!(g.finish(fresh.seq, "FRESH"), Some("FRESH"));
     }
 }
 
