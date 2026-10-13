@@ -634,17 +634,72 @@ fn contains(hay: &[u8], needle: &[u8], case: bool) -> bool {
     if case {
         memchr::memmem::find(hay, needle).is_some()
     } else {
-        // ASCII-case-insensitive substring: lowercase a copy of the haystack.
-        let lower: Vec<u8> = hay.iter().map(|c| c.to_ascii_lowercase()).collect();
-        memchr::memmem::find(
-            &lower,
-            &needle
-                .iter()
-                .map(|c| c.to_ascii_lowercase())
-                .collect::<Vec<_>>(),
-        )
-        .is_some()
+        contains_ci(hay, needle)
     }
+}
+
+/// ASCII-case-insensitive substring search, allocation-free.
+///
+/// The old code lowercased the whole haystack (and re-lowercased the needle)
+/// into fresh `Vec<u8>`s on *every entry* — ~1.3 µs/entry measured, which is
+/// 5–8 s on a 2 M-entry index for a query like `"e"` whose trigram plan is
+/// empty and which therefore scans everything. This folds on compare instead:
+/// `memchr` skips to the next candidate start byte (either case), then a byte
+/// loop confirms the rest. No allocation on any path; semantics identical
+/// (`to_ascii_lowercase` on both sides, byte-exact).
+/// Allocation-free ASCII case-insensitive substring search (see `contains`).
+/// `#[doc(hidden)]` public only so examples/benches outside the crate can
+/// measure it; the engine uses it through `contains`.
+#[doc(hidden)]
+pub fn contains_ci_pub(hay: &[u8], needle: &[u8]) -> bool {
+    contains_ci(hay, needle)
+}
+
+fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+    debug_assert!(!needle.is_empty());
+    // Single-byte needle: one SIMD pass for both case variants.
+    if needle.len() == 1 {
+        let n = needle[0].to_ascii_lowercase();
+        // Non-ASCII bytes have no case variant; one byte suffices.
+        if !needle[0].is_ascii_alphabetic() {
+            return memchr::memchr(needle[0], hay).is_some();
+        }
+        return memchr::memchr2(n, n.to_ascii_uppercase(), hay).is_some();
+    }
+    let first = needle[0].to_ascii_lowercase();
+    let first_upper = first.to_ascii_uppercase();
+    let mut pos = 0usize;
+    while pos + needle.len() <= hay.len() {
+        // Skip to the next position whose byte matches the first needle byte
+        // in either case. One SIMD pass for both variants (`memchr2`), not
+        // two scans: the skip runs per first-byte occurrence, so its constant
+        // matters most on common letters.
+        let rel = match memchr::memchr2(first, first_upper, &hay[pos..]) {
+            Some(r) => r,
+            None => return false,
+        };
+        pos += rel;
+        // The skip may have landed where the full needle no longer fits
+        // (e.g. a lone trailing byte matching a longer needle): that is a
+        // miss, not a match — the `zip` below would compare zero bytes and
+        // report `true` on an empty confirmation.
+        if pos + needle.len() > hay.len() {
+            return false;
+        }
+        // Confirm the remaining bytes with case folding.
+        let mut ok = true;
+        for (h, n) in hay[pos + 1..].iter().zip(needle[1..].iter()) {
+            if h.to_ascii_lowercase() != n.to_ascii_lowercase() {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return true;
+        }
+        pos += 1;
+    }
+    false
 }
 
 /// `ext:rs` matches a name ending in `.rs` (and, for compatibility with
@@ -991,8 +1046,11 @@ fn consider(
     }
     let name = index.name(id);
     if q.ac.is_some() {
-        let lower: Vec<u8> = name.iter().map(|c| c.to_ascii_lowercase()).collect();
-        if !q.prefilter(&lower) {
+        // The automaton is built with `ascii_case_insensitive(true)`, so it
+        // folds internally: feeding it the raw name is correct, and the old
+        // per-entry lowercased copy was pure waste (same ~1 µs/entry cost as
+        // `contains`, paid on every entry even when the prefilter rejects).
+        if !q.prefilter(name) {
             return;
         }
     }
@@ -1352,6 +1410,78 @@ mod tests {
         assert!(GlobPattern::parse(b"a?c", false).matches(b"abc"));
         assert!(!GlobPattern::parse(b"a?c", false).matches(b"ac"));
         assert!(GlobPattern::parse(b"*.RS", false).matches(b"x.rs"));
+    }
+
+    #[test]
+    fn contains_ci_matches_lowercased_memmem() {
+        // Differential: the allocation-free path must agree byte-for-byte
+        // with the old lowercase-then-memmem semantics, across cases the
+        // optimizer in `contains_ci` treats specially.
+        fn reference(hay: &[u8], needle: &[u8]) -> bool {
+            let lower: Vec<u8> = hay.iter().map(|c| c.to_ascii_lowercase()).collect();
+            let n: Vec<u8> = needle.iter().map(|c| c.to_ascii_lowercase()).collect();
+            memchr::memmem::find(&lower, &n).is_some()
+        }
+        let hays: &[&[u8]] = &[&b""[..],
+            &b"e"[..],
+            &b"E"[..],
+            &b"main.rs"[..],
+            &b"MAIN.RS"[..],
+            &b"mAiN.rS"[..],
+            &b"eeeEEEeee"[..],
+            &b"no match here"[..],
+            &b"a"[..],
+            &b"ab"[..],
+            &b"abc"[..],
+            &b"trailing E"[..],
+            &b"E leading"[..],
+            &b"\xc3\xa9e\xc3\x89"[..],
+            &b"123!@#"[..],
+            &b"EeEeEeEeEeEeEeEeEeEe"[..],
+            &b"longer haystack with e buried at the very end E"[..]];
+        let needles: &[&[u8]] = &[&b"e"[..],
+            &b"E"[..],
+            &b"main"[..],
+            &b"MAIN"[..],
+            &b"mAiN"[..],
+            &b".rs"[..],
+            &b".RS"[..],
+            &b"xyz"[..],
+            &b"a"[..],
+            &b"ab"[..],
+            &b"abc"[..],
+            &b"abcd"[..],
+            &b"\xc3\xa9"[..],
+            &b"\xc3\x89"[..],
+            &b"1"[..],
+            &b"!"[..],
+            &b"EEEE"[..],
+            &b"eEe"[..],
+            &b"end E"[..]];
+        for h in hays {
+            for n in needles {
+                assert_eq!(
+                    super::contains_ci(h, n),
+                    reference(h, n),
+                    "hay={h:?} needle={n:?}"
+                );
+                // And `contains` routes correctly on both case flags.
+                assert_eq!(
+                    super::contains(h, n, false),
+                    reference(h, n),
+                    "contains-ci hay={h:?} needle={n:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn contains_ci_empty_needle_is_handled_by_caller() {
+        // `contains` short-circuits empty needles to true; `contains_ci`
+        // itself takes non-empty (debug-asserted) and must still not panic.
+        assert!(super::contains(b"abc", b"", false));
+        assert!(super::contains(b"", b"", false));
+        assert!(!super::contains(b"", b"e", false));
     }
 
     #[test]
