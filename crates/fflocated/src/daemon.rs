@@ -795,37 +795,53 @@ impl Daemon {
             self.watch_dir(id, &path);
         }
 
-        // Clear `catching_up` once the replay tail has drained, the initial
-        // crawl has caught up, and the queue drains. All three, not just the
-        // queue: the tail is crash-recovery history applied in chunks (a
-        // drained queue with an unapplied tail is still stale), and the
-        // initial crawl's work items only exist after `start` enqueues them.
-        if self.applier.pending_replay_len() == 0 && self.applier.pending().is_drained() {
-            let mut h = self.shared.health.write().unwrap();
-            if h.catching_up {
-                h.catching_up = false;
-            }
-        }
-        self.applier.maybe_compact();
-        // Queue depth counts replay backlog too: a million-record tail
-        // draining in chunks is the opposite of idle, and operators watching
-        // `ff stats` during a restart should see it drain.
-        self.shared.health.write().unwrap().queue_depth =
-            self.applier.pending().depth() as u64 + self.applier.pending_replay_len() as u64;
-        // Lag behind the filesystem: the arrival time of the oldest still-queued
-        // change. Mirrored raw (wall ms) so `Meta.lag_ms` can age it at query
-        // time rather than reporting a stale age; `0` means "caught up".
-        // Journal-replay backlog counts as queued work (it is unapplied change
-        // by definition), so a daemon still replaying its tail reports its
-        // replay start as the oldest thing it owes.
-        let oldest = match (self.applier.pending().oldest_queued_ms(), self.applier.pending_replay_started_ms()) {
+        // Lag behind the filesystem: the arrival time of the oldest
+        // still-unapplied change. Mirrored raw (wall ms) so `Meta.lag_ms` can
+        // age it at query time rather than reporting a stale age; `0` is the
+        // "caught up" sentinel.
+        //
+        // Journal-replay backlog counts as unapplied change by definition, so
+        // a still-draining tail contributes its replay start as a lag floor —
+        // otherwise a replaying daemon would report "caught up" while it was
+        // demonstrably behind.
+        //
+        // This is mirrored BEFORE the `catching_up` clear below, because that
+        // clear is gated on the lag: a daemon whose queues drained and whose
+        // tail finished is the only thing that may claim it is caught up.
+        let oldest = match (
+            self.applier.pending().oldest_queued_ms(),
+            self.applier.pending_replay_started_ms(),
+        ) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
         .unwrap_or(0);
-        self.shared.health.write().unwrap().oldest_queued_at_ms = oldest;
-        self.shared.health.write().unwrap().rescans_collapsed =
-            self.applier.pending().rescans_collapsed();
+        {
+            let mut h = self.shared.health.write().unwrap();
+            h.oldest_queued_at_ms = oldest;
+            h.queue_depth =
+                self.applier.pending().depth() as u64 + self.applier.pending_replay_len() as u64;
+            h.rescans_collapsed = self.applier.pending().rescans_collapsed();
+
+            // Clear `catching_up` once the replay tail has drained, the
+            // initial crawl has caught up, and the queue drains. All three,
+            // not just the queue: the tail is crash-recovery history applied
+            // in chunks (a drained queue with an unapplied tail is still
+            // stale), and the initial crawl's work items only exist after
+            // `start` enqueues them.
+            //
+            // The lag is the arbiter rather than a second opinion: if anything
+            // is still unapplied (`oldest != 0`), the daemon IS behind and must
+            // keep saying so. Reading the same value that `Meta.lag_ms` serves
+            // means the flag and the seconds can never disagree — which is
+            // exactly how a daemon with a 51k-deep backlog used to report
+            // "caught up" the moment its two queues briefly emptied between
+            // drain chunks.
+            if oldest == 0 {
+                h.catching_up = false;
+            }
+        }
+        self.applier.maybe_compact();
         !work_done
     }
 

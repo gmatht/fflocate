@@ -433,6 +433,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // its clones), so the pump holds its own.
             let partial_results = results.clone();
             let partial_current = current.clone();
+            // Last lag the daemon reported, shared across renders: clearing
+            // the query box must not make a behind daemon look caught up
+            // (the stale-roots lesson: loudly stale beats silently wrong).
+            let last_lag: Rc<RefCell<Option<u64>>> = Rc::new(RefCell::new(None));
             // The request currently in flight, if any: (gate seq, request,
             // when it was issued, display label for the status line). Advancing
             // it is what the pump does: it never blocks, so a slow or wedged
@@ -518,6 +522,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(w) = wall {
                                     o.elapsed_ms = Some(w.as_secs_f64() * 1000.0);
                                 }
+                                // Remember this reply's lag so a later
+                                // list-clearing render can still say the
+                                // daemon is behind. `None` (caught up) clears
+                                // the memory — the daemon is the authority on
+                                // its own backlog, and it just said it has none.
+                                *last_lag.borrow_mut() = o.lag_ms;
                                 o
                             })
                         });
@@ -669,7 +679,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &adv_box.get_text().unwrap_or_default(),
                     ) {
                         *due_at.borrow_mut() = None;
-                        render(Ok(SearchOutcome::default()));
+                        // An emptied box shows no results, but the daemon may
+                        // still be behind — say so rather than rendering a
+                        // clean-looking "0 matches" from a stale view.
+                        let remembered = *last_lag.borrow();
+                        render(Ok(SearchOutcome {
+                            catching_up: remembered.is_some(),
+                            lag_ms: remembered,
+                            ..Default::default()
+                        }));
                         return true;
                     }
                     let Some(ticket) = gate.borrow_mut().begin() else {
