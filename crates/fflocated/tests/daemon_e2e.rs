@@ -237,7 +237,13 @@ fn meta_carries_the_daemons_own_phase_over_the_wire() {
     let sock = cfg.socket_path.clone();
     let mut daemon = Daemon::build(cfg).unwrap();
     daemon.start().unwrap();
-    settle(&mut daemon, 2000);
+    // `Daemon::settle` waits for the phase to reach `Idle` (not merely for the
+    // queues to drain): the phase also waits out the index-growth window, so
+    // this is the honest "fully settled" barrier.
+    assert!(
+        daemon.settle(Duration::from_secs(5)),
+        "daemon must settle to idle before asserting its phase"
+    );
 
     // One accept loop serving both round-trips below (a second `net::bind`
     // would be refused while the first listener is up).

@@ -189,6 +189,13 @@ pub struct Daemon {
     watched_dirs: std::collections::HashSet<u32>,
     /// Watch requests from the applier to the watcher thread (new dirs).
     watch_tx: Sender<(u32, PathBuf)>,
+    /// Watch requests that could not be delivered (the watcher busy or gone).
+    /// Retried at the top of every `tick`, so a bounded send never loses a
+    /// watch: the dir stays here until the watcher accepts it. This is the
+    /// retry half of the bounded `watch_dir` send — without it, a dropped
+    /// request would never come back, because the applier's `watch_requested`
+    /// dedupe is set-once (see `Applier::record_watch_request`).
+    watch_retry: std::collections::VecDeque<(u32, PathBuf)>,
     /// Watch failures from the watcher thread back to the applier.
     watch_fail_tx: Sender<WatchFailure>,
     watch_fail_rx: Receiver<WatchFailure>,
@@ -202,13 +209,23 @@ pub struct Daemon {
     /// Shared handle to the accept-loop supervisor (§15 deaf-daemon watchdog).
     /// Installed by `main` after it builds the supervisor — `None` in tests
     /// and harnesses that never serve the socket. When present, the watcher
-    /// ticks it ~20×/s alongside its poll loop, so *either* surviving thread
-    /// (applier via `main`, watcher from here) revives a dead listener.
+    /// ticks it ~20×/s alongside its poll loop. This is a latency
+    /// optimisation, not the guarantee: `main` also runs a dedicated
+    /// watchdog thread that ticks the supervisor unconditionally, so a dead
+    /// listener is revived even when this watcher (and the applier loop) are
+    /// both gone or wedged.
     accept_supervisor: Option<crate::net::SharedSupervisor>,
     /// Last time the mount watchdog ran (ms since epoch).
     last_mount_check_ms: u64,
     /// Kept until `start()` moves it into the watcher thread.
     watch_rx: Option<Receiver<(u32, PathBuf)>>,
+    /// (live entry count, wall ms when it last changed). A crawl that is
+    /// actively discovering entries keeps this moving; a settled index does
+    /// not. This is the honest "am I still indexing" signal, because the
+    /// crawl's queues drain between ticks (one `drain` consumes the whole
+    /// queue and enqueues children while applying them), so queue depth alone
+    /// reads empty mid-crawl.
+    last_entry_change: Option<(u64, u64)>,
 }
 
 impl Daemon {
@@ -474,6 +491,7 @@ impl Daemon {
             backend,
             resolved_backend,
             watched_dirs: std::collections::HashSet::new(),
+            watch_retry: std::collections::VecDeque::new(),
             watch_tx,
             watch_fail_tx,
             watch_fail_rx,
@@ -487,6 +505,7 @@ impl Daemon {
             accept_supervisor: None,
             last_mount_check_ms: 0,
             watch_rx: Some(watch_rx),
+            last_entry_change: None,
         })
     }
 
@@ -730,9 +749,72 @@ impl Daemon {
         Ok(())
     }
 
+    /// Ask the watcher thread to watch `dir`. Never blocks, never loses the
+    /// request.
+    ///
+    /// The watch-request channel is bounded (4096); the watcher thread is its
+    /// consumer. A *blocking* send here is a deaf-daemon trap: when the
+    /// watcher is dead or wedged (a full channel with no drain), the applier
+    /// parks inside `send` forever, never returns to the top of its `tick`,
+    /// and so never drains events, never re-ticks the supervisor — the daemon
+    /// is alive, holds the pidfile, and serves nothing. The event channel in
+    /// the watcher thread was already given a bounded `send_timeout` for
+    /// exactly this reason; this send is the other half of that cycle.
+    ///
+    /// So the send is a single non-blocking `try_send`. If it cannot be
+    /// delivered the request is queued in `watch_retry` and re-attempted at
+    /// the top of every later `tick` — never dropped, never a block. A
+    /// saturated channel is not an error (the watcher is simply behind): it is
+    /// logged at most once per ~10 s so a persistent wedge is diagnosable
+    /// without flooding the log.
     fn watch_dir(&mut self, id: u32, path: &Path) {
         if self.watched_dirs.insert(id) {
-            let _ = self.watch_tx.send((id, path.to_path_buf()));
+            self.try_watch(id, path);
+        }
+    }
+
+    /// One non-blocking delivery attempt for a watch request; on failure,
+    /// queue it for retry. Split from `watch_dir` so the retry flush can reuse
+    /// it without re-running the `watched_dirs` dedupe.
+    fn try_watch(&mut self, id: u32, path: &Path) {
+        match self.watch_tx.try_send((id, path.to_path_buf())) {
+            Ok(()) => {}
+            Err(crossbeam_channel::TrySendError::Full(req))
+            | Err(crossbeam_channel::TrySendError::Disconnected(req)) => {
+                self.watch_retry.push_back(req);
+                static LAST_LOG_MS: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let now = fflocate::applier::now_ms();
+                if now.saturating_sub(LAST_LOG_MS.load(Ordering::Relaxed)) >= 10_000 {
+                    LAST_LOG_MS.store(now, Ordering::Relaxed);
+                    eprintln!(
+                        "fflocated: watch request for dir {id} not delivered \
+                         (watcher busy or gone); queued for retry (further \
+                         occurrences suppressed 10 s)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Re-attempt queued watch requests. Called at the top of every `tick`:
+    /// the applier always returns here, so a request deferred by a bounded
+    /// send is delivered as soon as the watcher has room. Requests still
+    /// undeliverable are pushed back onto the queue (we stop at the first
+    /// failure, so ordering is preserved and a full channel ends the pass).
+    fn flush_watch_retry(&mut self) {
+        while let Some((id, path)) = self.watch_retry.pop_front() {
+            match self.watch_tx.try_send((id, path.clone())) {
+                Ok(()) => {}
+                Err(crossbeam_channel::TrySendError::Full(req))
+                | Err(crossbeam_channel::TrySendError::Disconnected(req)) => {
+                    // Still no room (or no watcher): put it back, front, and
+                    // stop this pass — retrying every other queued request
+                    // would just churn against the same full channel.
+                    self.watch_retry.push_front(req);
+                    return;
+                }
+            }
         }
     }
 
@@ -781,14 +863,42 @@ impl Daemon {
             work_done = true;
         }
 
+        // Re-attempt watch requests a bounded send could not deliver last
+        // tick (the watcher was busy or gone). Done here — not in `watch_dir`
+        // — so it runs on every tick regardless of whether new dirs were just
+        // discovered, and so it can never block: `try_send` returns at once.
+        self.flush_watch_retry();
+
         // Mount watchdog. `IN_UNMOUNT` is not delivered on every platform (it is
         // absent under WSL2), so we detect a mount change portably: compare each
         // root's device id against the probed value. A change means a remount or
         // a different filesystem on the same point → rescan (cause=mount_event).
         work_done |= self.mount_watchdog();
 
+        // Sample the crawl/rescan queues *before* the drain consumes them, so
+        // a tick that finishes the queue still reports the work it did (see
+        // the max-over-window note after `drain`).
+        let crawl_dirs_before_drain = self.applier.pending().crawl_queued_len();
+        let rescans_before_drain = self.applier.pending().rescans_queued_len();
+
         let applied = self.applier.drain();
         work_done |= applied > 0;
+        // Crawl/rescan queue depth is sampled *around* the drain, not after it.
+        // A single `drain` call consumes the whole queue for a small tree (and
+        // a large crawl enqueues children while it applies them), so a
+        // post-drain sample can read empty while the applier is unmistakably
+        // working — which would report `idle` mid-crawl. Taking the max over
+        // the window is the honest "was there work outstanding this tick".
+        let crawl_dirs = self
+            .applier
+            .pending()
+            .crawl_queued_len()
+            .max(crawl_dirs_before_drain);
+        let rescans = self
+            .applier
+            .pending()
+            .rescans_queued_len()
+            .max(rescans_before_drain);
         // Install watches for directories discovered during the crawl. The
         // applier records them via `take_watch_requests`.
         for (id, path) in self.applier.take_watch_requests() {
@@ -829,11 +939,50 @@ impl Daemon {
             // applier is really doing. `crawl_entries` is the live index count:
             // the honest crawl-progress numerator, since a streaming crawl has
             // no known total up front (it *discovers* the tree).
+            //
+            // `crawl_dirs`/`rescans` were sampled around the drain (max over
+            // the window), so a tick that drained the whole queue still counts
+            // as work done rather than reading as idle. The one remaining hole
+            // — a tick that *only* drains and leaves both queues empty while
+            // `catching_up` still holds (the reconcile work is inside the
+            // applier's own pending-replay/queue machinery) — is closed by
+            // folding `catching_up` in: a daemon that says it is behind must
+            // not also say idle.
             let replay = self.applier.pending_replay_len();
-            let crawl_dirs = self.applier.pending().crawl_queued_len();
-            let rescans = self.applier.pending().rescans_queued_len();
-            h.phase = fflocate::health::classify_phase(replay, crawl_dirs, rescans);
-            h.crawl_entries = self.shared.index.read().unwrap().live_count();
+            let mut phase = fflocate::health::classify_phase(replay, crawl_dirs, rescans);
+            // Is the index still growing? This is the signal that survives the
+            // drain: queue depth can read empty mid-crawl (see the max-over-
+            // window note above), but a crawl that is discovering entries
+            // keeps the live count moving. When it has, treat the daemon as
+            // crawling/busy rather than idle — the daemon is unmistakably
+            // working, and "idle" would be a lie (that was the observed bug:
+            // `phase idle` while the index grew by thousands per second).
+            let now = fflocate::applier::now_ms();
+            let entries = self.shared.index.read().unwrap().live_count();
+            // "Growing" = the live count changed within the last second. A
+            // single-tick comparison is too twitchy (one live create would
+            // read as a crawl); a sustained window is the honest crawl signal.
+            match self.last_entry_change {
+                Some((prev, at)) if prev == entries => {}
+                _ => self.last_entry_change = Some((entries, now)),
+            }
+            let growing = self
+                .last_entry_change
+                .map(|(_, at)| now.saturating_sub(at) < 1_000)
+                .unwrap_or(false);
+            if phase == fflocate::health::Phase::Idle && growing {
+                // Entries moved this tick and nothing is queued: a crawl is
+                // mid-drain. Report it as crawling (not merely rescanning) —
+                // `crawl_entries` is meaningful here.
+                phase = fflocate::health::Phase::Crawling;
+            } else if phase == fflocate::health::Phase::Idle && h.catching_up {
+                // Behind but neither queued nor growing *right now*: the
+                // remaining work (replay already excluded above) is a settle
+                // that has not landed. Still not idle.
+                phase = fflocate::health::Phase::Rescanning;
+            }
+            h.phase = phase;
+            h.crawl_entries = entries;
             h.crawl_dirs_pending = crawl_dirs as u64;
             h.rescans_pending = rescans as u64;
 
@@ -851,7 +1000,11 @@ impl Daemon {
             // exactly how a daemon with a 51k-deep backlog used to report
             // "caught up" the moment its two queues briefly emptied between
             // drain chunks.
-            if oldest == 0 {
+            //
+            // `growing` joins the arbiter for the same reason the phase uses
+            // it: a crawl that is actively discovering entries is behind by
+            // definition, even when the queues momentarily read empty.
+            if oldest == 0 && !growing {
                 h.catching_up = false;
             }
         }
@@ -925,17 +1078,26 @@ impl Daemon {
         true
     }
 
-    /// Wait until the pending queue is empty and the initial crawl reports
-    /// caught-up, or `timeout` elapses. Returns true when quiescent.
+    /// Wait until the pending queue is empty, the initial crawl reports
+    /// caught-up, and the phase has settled to `Idle`, or `timeout` elapses.
+    /// Returns true when quiescent.
+    ///
+    /// The phase is part of the condition because `catching_up` alone clears a
+    /// beat before the phase does: the phase also waits for the index to stop
+    /// growing (see `tick`), so a caller that wants "fully settled" must wait
+    /// for both.
     pub fn settle(&mut self, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             self.tick();
+            let h = self.shared.health.read().unwrap();
             if self.applier.pending().is_drained()
-                && !self.shared.health.read().unwrap().catching_up
+                && !h.catching_up
+                && h.phase == fflocate::health::Phase::Idle
             {
                 return true;
             }
+            drop(h);
             if std::time::Instant::now() >= deadline {
                 return false;
             }
@@ -1429,17 +1591,27 @@ mod replay_integration_tests {
         // Before the first tick, Health holds its default (Idle).
         assert_eq!(daemon.shared.health.read().unwrap().phase, Phase::Idle);
 
-        // A tick enqueues/consumes crawl work; with the crawl outstanding the
-        // daemon must call itself Crawling and report its progress.
-        daemon.tick();
-        let h = daemon.shared.health.read().unwrap().clone();
-        // It is either still crawling (dirs pending) or has just drained the
-        // tiny tree (idle) on this one tick — both are honest. Assert the
-        // invariants that must hold either way.
-        match h.phase {
-            Phase::Crawling | Phase::Idle => {}
-            other => panic!("a just-started crawl must read crawling or idle, got {other:?}"),
+        // A tick enqueues/consumes crawl work; while the daemon says it is
+        // catching up, it must never also claim to be idle — that was the bug
+        // this covers (a post-drain sample read empty while the applier was
+        // mid-drain).
+        for _ in 0..50 {
+            daemon.tick();
+            let h = daemon.shared.health.read().unwrap().clone();
+            if h.catching_up {
+                assert_ne!(
+                    h.phase,
+                    Phase::Idle,
+                    "a catching-up daemon must not read idle (crawl_dirs={}, rescans={})",
+                    h.crawl_dirs_pending,
+                    h.rescans_pending
+                );
+            }
+            if h.phase == Phase::Crawling {
+                break;
+            }
         }
+        let h = daemon.shared.health.read().unwrap().clone();
         // `crawl_entries` is the live index count and is always populated.
         assert_eq!(
             h.crawl_entries,
@@ -1457,5 +1629,92 @@ mod replay_integration_tests {
         assert!(!h.catching_up, "caught up must clear the flag");
         assert!(h.crawl_entries >= 3, "root + sub + two files, got {}", h.crawl_entries);
         daemon.stop();
+    }
+
+    /// Regression: `watch_dir`'s send to the watcher is bounded, so a
+    /// saturated watch-request channel (a dead or wedged watcher — the
+    /// deaf-daemon condition) can never park the applier inside `send`, and
+    /// the request is never lost.
+    ///
+    /// Before the fix this was a blocking `watch_tx.send` on a bounded (4096)
+    /// channel: with no consumer the applier blocked forever, never returned
+    /// from `tick`, and the daemon sat alive-but-deaf (pidfile held, no
+    /// listener) — the exact 111-with-a-live-daemon signature. The bounded
+    /// `try_send` must return promptly, queue the request for retry, and
+    /// deliver it as soon as the watcher has room (a later `tick` flushes the
+    /// retry queue).
+    #[test]
+    fn watch_dir_send_is_bounded_when_the_watcher_is_gone() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+        let cfg = test_config(d.path(), root.clone());
+        let mut daemon = Daemon::build(cfg).unwrap();
+
+        // Fill the watch-request channel to capacity: no watcher thread is
+        // draining it (we never `start`ed, so `watch_rx` is still ours and
+        // stays untouched). Every further send must hit the bounded path.
+        let cap = 4096usize;
+        for i in 0..cap {
+            let id = 10_000 + i as u32;
+            daemon
+                .watch_tx
+                .send((id, PathBuf::from(format!("/fake/{i}"))))
+                .expect("filling the channel is the test's own setup");
+        }
+
+        // Now the channel is full. A `watch_dir` call must NOT block.
+        let id = 99_999u32;
+        let start = std::time::Instant::now();
+        daemon.watch_dir(id, Path::new("/fake/overflow"));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "watch_dir must be non-blocking, took {elapsed:?}"
+        );
+
+        // The dir was not delivered, so it must be queued for retry (never
+        // dropped) and still marked (the applier will not re-request it).
+        assert!(
+            daemon.watched_dirs.contains(&id),
+            "a requested dir stays marked even when delivery is deferred"
+        );
+        assert_eq!(
+            daemon.watch_retry.len(),
+            1,
+            "the undelivered request must be queued for retry"
+        );
+
+        // A `tick` with the channel still full retries and re-queues it —
+        // never blocks, never loses it.
+        daemon.tick();
+        assert_eq!(
+            daemon.watch_retry.len(),
+            1,
+            "a still-full channel keeps the request queued"
+        );
+
+        // Make room, then a `tick` must flush the queued request through.
+        for _ in 0..cap {
+            let _ = daemon.watch_rx.as_ref().unwrap().try_recv();
+        }
+        daemon.tick();
+        assert!(
+            daemon.watch_retry.is_empty(),
+            "once the watcher has room the retry must be delivered"
+        );
+        // And the delivered request is the one we were holding.
+        let drained: Vec<_> = {
+            let mut v = Vec::new();
+            while let Ok(req) = daemon.watch_rx.as_ref().unwrap().try_recv() {
+                v.push(req);
+            }
+            v
+        };
+        assert!(
+            drained.iter().any(|(rid, p)| *rid == id && p == Path::new("/fake/overflow")),
+            "the retried request must be delivered as-is, got {drained:?}"
+        );
     }
 }
