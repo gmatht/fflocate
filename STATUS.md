@@ -21,7 +21,7 @@ it is a status note.
 | §10 Query engine | done | `crates/fflocate/src/query.rs` |
 | §10/§17 **v2 trigram accelerator** | done | `crates/fflocate/src/trigram.rs`, `query.rs` (`execute_with_trigram`), `applier.rs` (`Shared::trigram_index`); tests `tests/trigram_differential.rs`; bench `examples/trigram_bench.rs` |
 | §10 **fuzzy search** | done | `crates/fflocate/src/fuzzy.rs`, `query.rs` (`execute_fuzzy`), `proto.rs`/`server.rs`/`fx` (`--fuzzy`, `--distance`) |
-| §11 IPC protocol v2 | done | `crates/fflocate/src/proto.rs`, `server.rs` |
+| §11 IPC protocol v2 (wire v4: daemon `phase` + crawl progress in `Meta`/`stats`) | done | `crates/fflocate/src/proto.rs`, `server.rs`, `health.rs` |
 | §12 CLI | done | `crates/fx/src/{main,client,service}.rs` (binary `ff`; the `fx` name collides with the snap JSON viewer. Crate dir kept as `crates/fx`.) |
 | §13 Concurrency model | done | `crates/fflocate/src/applier.rs`, `crates/fflocated/src/daemon.rs` |
 | §14 Testing | done (§14.1–.5) | `crates/fflocate/tests/*`, `crates/fflocated/tests/*`, `scripts/e2e.sh` |

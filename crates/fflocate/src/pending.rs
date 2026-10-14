@@ -441,6 +441,19 @@ impl Pending {
     pub fn work_len(&self) -> usize {
         self.work.len()
     }
+    /// Directories still queued for enumeration (initial crawl + newly
+    /// discovered dirs). Zero means the crawl has drained its queue. Used by
+    /// the daemon to answer "am I crawling?" — deliberately *not* a count of
+    /// files, because a directory is the unit of crawl work and the set is
+    /// deduped.
+    pub fn crawl_queued_len(&self) -> usize {
+        self.crawl_queued.len()
+    }
+    /// Directories still queued for rescan/diff (re-verification). See
+    /// [`Self::crawl_queued_len`].
+    pub fn rescans_queued_len(&self) -> usize {
+        self.rescan_queued.len()
+    }
     pub fn cookies_len(&self) -> usize {
         self.cookies.len()
     }
@@ -692,6 +705,35 @@ mod tests {
         // pop order is events first, then work
         assert!(p.pop_event().is_some());
         assert!(p.pop_work().is_some());
+    }
+
+    #[test]
+    fn crawl_and_rescan_queue_counts_are_exposed_for_phase_classification() {
+        // The daemon classifies its phase from these counts, so they must
+        // track enqueue/pop exactly — including coalescing (a re-enqueue of a
+        // queued dir is a no-op) and eviction on pop.
+        let mut p = Pending::new(10);
+        assert_eq!(p.crawl_queued_len(), 0);
+        assert_eq!(p.rescans_queued_len(), 0);
+        p.enqueue_crawl(1);
+        p.enqueue_crawl(2);
+        p.enqueue_crawl(2); // coalesced: still two dirs, not three
+        assert_eq!(p.crawl_queued_len(), 2);
+        p.pop_work();
+        assert_eq!(p.crawl_queued_len(), 1, "popping frees the dir");
+        p.enqueue_rescan(7, RescanCause::Manual);
+        p.enqueue_rescan(8, RescanCause::Manual);
+        // One crawl dir (2) is still ahead of the two rescans in the FIFO;
+        // pop it before counting the rescan queue.
+        p.pop_work();
+        assert_eq!(p.crawl_queued_len(), 0, "both crawls popped");
+        assert_eq!(p.rescans_queued_len(), 2);
+        p.pop_work();
+        assert_eq!(p.rescans_queued_len(), 1);
+        // A drained queue reports zero on both.
+        p.pop_work();
+        assert_eq!(p.crawl_queued_len(), 0);
+        assert_eq!(p.rescans_queued_len(), 0);
     }
 
     #[test]

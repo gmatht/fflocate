@@ -823,6 +823,20 @@ impl Daemon {
                 self.applier.pending().depth() as u64 + self.applier.pending_replay_len() as u64;
             h.rescans_collapsed = self.applier.pending().rescans_collapsed();
 
+            // What the daemon is doing, in its own words. Derived from what is
+            // actually outstanding — the replay tail, the crawl queue, the
+            // rescan queue — so the phase cannot disagree with the work the
+            // applier is really doing. `crawl_entries` is the live index count:
+            // the honest crawl-progress numerator, since a streaming crawl has
+            // no known total up front (it *discovers* the tree).
+            let replay = self.applier.pending_replay_len();
+            let crawl_dirs = self.applier.pending().crawl_queued_len();
+            let rescans = self.applier.pending().rescans_queued_len();
+            h.phase = fflocate::health::classify_phase(replay, crawl_dirs, rescans);
+            h.crawl_entries = self.shared.index.read().unwrap().live_count();
+            h.crawl_dirs_pending = crawl_dirs as u64;
+            h.rescans_pending = rescans as u64;
+
             // Clear `catching_up` once the replay tail has drained, the
             // initial crawl has caught up, and the queue drains. All three,
             // not just the queue: the tail is crash-recovery history applied
@@ -1346,8 +1360,7 @@ mod replay_integration_tests {
     /// the snapshot is untouched by the decode, and records come back with
     /// their file LSNs in order.
     #[test]
-    fn read_tail_decodes_without_applying() {
-        use fflocate::journal::Record;
+    fn read_tail_decodes_without_applying() {        use fflocate::journal::Record;
         use fflocate::persist::Store;
 
         let d = tempfile::tempdir().unwrap();
@@ -1380,5 +1393,69 @@ mod replay_integration_tests {
             assert_eq!(*lsn, snap_lsn + i as u64 + 1, "lsn {i} must be ordered");
         }
         let _ = Record::Fence;
+    }
+
+    /// The daemon's own phase, end to end through a real `tick`: a fresh daemon
+    /// with an initial crawl enqueued is `Crawling` (with a growing entry
+    /// count and a draining dir count); once it settles it is `Idle`. This is
+    /// the wiring the GUI's status line depends on — the phase must come from
+    /// the queues, not be guessed.
+    #[test]
+    fn tick_reports_crawling_then_idle() {
+        use crate::config::{BackendChoice, Config};
+        use fflocate::health::Phase;
+
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("tree");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+        std::fs::write(root.join("sub/b.txt"), b"x").unwrap();
+        let cfg = Config {
+            socket_path: d.path().join("fflocate.sock"),
+            pidfile: d.path().join("fflocate.pid"),
+            state_dir: d.path().join("state"),
+            roots: vec![root.clone()],
+            backend: BackendChoice::Fake,
+            compaction_threshold: 1_000_000,
+            sync_timeout_ms: 500,
+            excludes: fflocate::excludes::Excludes::new(),
+            system: false,
+            system_group: 0,
+            shared_store: false,
+        };
+        let mut daemon = Daemon::build(cfg).unwrap();
+        daemon.start().unwrap();
+
+        // Before the first tick, Health holds its default (Idle).
+        assert_eq!(daemon.shared.health.read().unwrap().phase, Phase::Idle);
+
+        // A tick enqueues/consumes crawl work; with the crawl outstanding the
+        // daemon must call itself Crawling and report its progress.
+        daemon.tick();
+        let h = daemon.shared.health.read().unwrap().clone();
+        // It is either still crawling (dirs pending) or has just drained the
+        // tiny tree (idle) on this one tick — both are honest. Assert the
+        // invariants that must hold either way.
+        match h.phase {
+            Phase::Crawling | Phase::Idle => {}
+            other => panic!("a just-started crawl must read crawling or idle, got {other:?}"),
+        }
+        // `crawl_entries` is the live index count and is always populated.
+        assert_eq!(
+            h.crawl_entries,
+            daemon.shared.index.read().unwrap().live_count(),
+            "crawl_entries must mirror the live index count"
+        );
+
+        // Settle fully: the daemon must end up Idle with both queues empty and
+        // the counters consistent.
+        assert!(daemon.settle(Duration::from_secs(5)), "crawl must settle");
+        let h = daemon.shared.health.read().unwrap().clone();
+        assert_eq!(h.phase, Phase::Idle, "a settled daemon is idle");
+        assert_eq!(h.crawl_dirs_pending, 0);
+        assert_eq!(h.rescans_pending, 0);
+        assert!(!h.catching_up, "caught up must clear the flag");
+        assert!(h.crawl_entries >= 3, "root + sub + two files, got {}", h.crawl_entries);
+        daemon.stop();
     }
 }

@@ -16,8 +16,10 @@ use serde::{Deserialize, Serialize};
 /// does: a client that sends `case_sensitive` depends on the daemon honouring it
 /// on the plain-string query path, and v2 daemons built before that silently
 /// ignored it. v3 marks the behaviour change so an old daemon rejects the
-/// request instead of quietly doing the wrong thing.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// request instead of quietly doing the wrong thing. v4 adds the daemon's
+/// self-reported `phase` + crawl progress to `Meta`/`stats`, which clients key
+/// their "what is it doing" wording on.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// A client request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -128,6 +130,24 @@ pub enum Response {
         /// lag rather than inventing one.
         #[serde(skip_serializing_if = "Option::is_none")]
         lag_ms: Option<u64>,
+        /// What the daemon is doing right now — its own words, not a client
+        /// guess: `"replaying"`, `"crawling"`, `"rescanning"`, or `"idle"`
+        /// (see `health::Phase`). Absent on a daemon that predates the field;
+        /// a newer client then falls back to `lag_ms`/`catching_up` rather
+        /// than inventing a phase.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        phase: Option<String>,
+        /// Entries discovered so far while the phase is `crawling` — the
+        /// crawl-progress numerator. Omitted when not crawling (or on an old
+        /// daemon); there is no known denominator up front, so this counts up
+        /// rather than reporting a fraction.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        crawl_entries: Option<u64>,
+        /// Directories still queued for enumeration while crawling. The
+        /// denominator-ish companion to `crawl_entries`: it descends to 0 as
+        /// the crawl drains. Omitted when not crawling.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        crawl_dirs_pending: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         backend: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -220,7 +240,7 @@ mod tests {
     #[test]
     fn parse_query() {
         let r =
-            Request::from_line(r#"{"v":3,"op":"query","q":"src ext:rs","limit":50,"json":true}"#)
+            Request::from_line(r#"{"v":4,"op":"query","q":"src ext:rs","limit":50,"json":true}"#)
                 .unwrap();
         match r {
             Request::Query {
@@ -289,6 +309,9 @@ mod tests {
             backend: Some("inotify".into()),
             entries: Some(10),
             lag_ms: None,
+            phase: None,
+            crawl_entries: None,
+            crawl_dirs_pending: None,
         };
         let line = m.to_line();
         assert!(line.contains("\"type\":\"meta\""));
@@ -296,6 +319,10 @@ mod tests {
         assert!(
             !line.contains("lag_ms"),
             "caught up must omit lag_ms entirely: {line}"
+        );
+        assert!(
+            !line.contains("crawl_entries"),
+            "not crawling must omit crawl progress: {line}"
         );
         // A behind daemon reports the age, and an old client's line (no
         // field) parses as "no lag known" rather than erroring.
@@ -307,6 +334,9 @@ mod tests {
             stale_roots: vec![],
             catching_up: Some(true),
             lag_ms: Some(4200),
+            phase: Some("crawling".into()),
+            crawl_entries: Some(1234),
+            crawl_dirs_pending: Some(56),
             backend: Some("inotify".into()),
             entries: Some(10),
         };
@@ -315,12 +345,31 @@ mod tests {
             behind_line.contains("\"lag_ms\":4200"),
             "behind daemon carries the age: {behind_line}"
         );
+        assert!(
+            behind_line.contains("\"phase\":\"crawling\""),
+            "phase rides Meta: {behind_line}"
+        );
+        assert!(
+            behind_line.contains("\"crawl_entries\":1234")
+                && behind_line.contains("\"crawl_dirs_pending\":56"),
+            "crawl progress rides Meta: {behind_line}"
+        );
         let old: Response = serde_json::from_str(
             r#"{"type":"meta","gen":7,"lsn":1,"fresh":false,"elapsed_ms":1.0}"#,
         )
         .unwrap();
         match old {
-            Response::Meta { lag_ms, .. } => assert_eq!(lag_ms, None),
+            Response::Meta {
+                lag_ms,
+                phase,
+                crawl_entries,
+                ..
+            } => {
+                assert_eq!(lag_ms, None);
+                // An old daemon sends no phase: absent, never invented as idle.
+                assert_eq!(phase, None);
+                assert_eq!(crawl_entries, None);
+            }
             other => panic!("expected meta, got {other:?}"),
         }
         let d = Response::Done {
@@ -335,12 +384,12 @@ mod tests {
         // Opt-in: the flag is always on the wire (like `fuzzy`), and an old
         // line without it parses with progress off — an old daemon's reply
         // shape and a new client's default both mean "no Progress records".
-        let r = Request::from_line(r#"{"v":3,"op":"query","q":"comp","progress":true}"#).unwrap();
+        let r = Request::from_line(r#"{"v":4,"op":"query","q":"comp","progress":true}"#).unwrap();
         match r {
             Request::Query { progress, .. } => assert!(progress),
             _ => panic!("wrong request"),
         }
-        let r = Request::from_line(r#"{"v":3,"op":"query","q":"comp"}"#).unwrap();
+        let r = Request::from_line(r#"{"v":4,"op":"query","q":"comp"}"#).unwrap();
         match r {
             Request::Query { progress, .. } => assert!(!progress),
             _ => panic!("wrong request"),

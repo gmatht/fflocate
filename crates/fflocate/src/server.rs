@@ -126,6 +126,20 @@ fn meta_preamble(ctx: &ServerCtx, fresh: bool, elapsed: Duration) -> Response {
         .map(|r| r.key())
         .collect();
     let catching_up = ctx.shared.health.read().unwrap().catching_up;
+    // The daemon's own phase + crawl progress, read from the mirrored Health
+    // (written on every applier tick — see `Daemon::tick`). Sent on every
+    // Meta so a client can say *what* the daemon is doing, not merely *that*
+    // it is behind. Crawl fields are only meaningful (and only sent) while
+    // crawling; elsewhere they would be noise a client might misread.
+    let (phase, crawl_entries, crawl_dirs_pending) = {
+        let h = ctx.shared.health.read().unwrap();
+        (
+            h.phase.as_str().to_string(),
+            h.crawl_entries,
+            h.crawl_dirs_pending,
+        )
+    };
+    let crawling = phase == crate::health::Phase::Crawling.as_str();
     // Lag = age of the oldest unapplied change. Aged here (not stored aged):
     // the arrival stamp is mirrored once per applier tick, so computing
     // `now - arrival` at reply time keeps the number honest between ticks.
@@ -152,6 +166,9 @@ fn meta_preamble(ctx: &ServerCtx, fresh: bool, elapsed: Duration) -> Response {
         stale_roots: stale,
         catching_up: if catching_up { Some(true) } else { None },
         lag_ms,
+        phase: Some(phase),
+        crawl_entries: crawling.then_some(crawl_entries),
+        crawl_dirs_pending: crawling.then_some(crawl_dirs_pending),
         backend: Some(ctx.backend.clone()),
         entries: Some(ix.live_count()),
     }
@@ -1161,13 +1178,28 @@ fn forward_scan_event(
             if !want {
                 return true;
             }
-            // Always announce the denominator; then gate by wall time.
-            let first = last_progress.is_none();
-            if !first
-                && last_progress
-                    .map(|t| t.elapsed() < PROGRESS_MIN_INTERVAL)
-                    .unwrap_or(false)
-            {
+            // Rate gate, anchored on the *scan start* rather than on the last
+            // send, and never suppressing a completed scan.
+            //
+            // Why not "100 ms since the last record": that form emits the
+            // `(0, total)` announcement, then nothing at all until 100 ms has
+            // elapsed *since that send*. A scan finishing inside the window
+            // therefore reported only "0 of N" — the percentage sat at 0% and
+            // never moved, which is exactly the bug this gate caused on a real
+            // index (a `"comp"` query finishes in ~30 ms).
+            //
+            // Two changes fix it and neither weakens the gate's purpose
+            // (bounding records on a *long* scan):
+            //   * the first record after `PROGRESS_MIN_INTERVAL` of elapsed
+            //     scan time goes out, so a short scan reports its real
+            //     position rather than only its start;
+            //   * a finished pass (`scanned == total`) always goes out, so the
+            //     client sees the scan complete even on a fast query.
+            let done = total > 0 && scanned >= total;
+            let due = last_progress
+                .map(|t| t.elapsed() >= PROGRESS_MIN_INTERVAL)
+                .unwrap_or(true);
+            if !done && !due {
                 return true;
             }
             *last_progress = Some(Instant::now());
@@ -1503,6 +1535,82 @@ mod tests {
         assert!(!ok, "expr streaming must abort on a refused Hit");
         assert!(matches!(out.first(), Some(Response::Meta { .. })));
         assert!(!out.iter().any(|r| matches!(r, Response::Done { .. })));
+    }
+
+    #[test]
+    fn unthrottled_scan_still_reports_moving_progress() {
+        // The GUI's bug, reproduced end to end. On a real index a query like
+        // `"comp"` finishes in ~30 ms; `progress_records_flow_between_meta_and_done`
+        // above only passes because it *sleeps 60 ms per Progress record*,
+        // slowing the scan artificially. Without that crutch the client gets
+        // exactly one record — the `(0, total)` announcement — so the
+        // percentage sits at 0% for the whole scan and never moves. That is
+        // the reported symptom: a percent that never appears.
+        //
+        // A scan that reports only "0 of N" has told the client nothing
+        // about how far along it is.
+        let d = tempfile::tempdir().unwrap();
+        let mut ix = Index::new();
+        let basename = d.path().file_name().unwrap().to_string_lossy().to_string();
+        let rid = ix.insert(
+            ROOT_ID,
+            basename.as_bytes(),
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        let src = ix.insert(rid, b"src", EntryFlags::EMPTY.with_dir(true));
+        for i in 0..9000 {
+            ix.insert(src, format!("file_{i:05}.rs").as_bytes(), EntryFlags::EMPTY);
+        }
+        let mut root = Root::new(0, d.path().to_path_buf());
+        root.caps.writable = true;
+        let shared = Shared::new(ix, vec![root]);
+        let ctx = ServerCtx {
+            shared,
+            sync: SyncRegistry::new(),
+            backend: "fake".into(),
+            control: None,
+            caller: None,
+        };
+        let mut out = Vec::new();
+        // No sleeps anywhere: exactly how the pump drives a real reply.
+        let ok = handle_query_streaming(
+            &ctx,
+            "rs",
+            0,
+            false,
+            false,
+            std::time::Instant::now(),
+            &mut |r| {
+                out.push(r);
+                true
+            },
+            None,
+            true,
+        );
+        assert!(ok);
+        let progress: Vec<(u64, u64)> = out
+            .iter()
+            .filter_map(|r| match r {
+                Response::Progress { scanned, total } => Some((*scanned, *total)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !progress.is_empty(),
+            "an opt-in scan must report progress at all"
+        );
+        // The scan visited 9000+ entries; the client must learn more than
+        // "we had not started". Any final record reporting 0 means the
+        // percentage can never have moved off 0%.
+        let last = *progress.last().expect("checked non-empty");
+        assert!(
+            last.0 > 0,
+            "last progress record is {last:?}: the scan finished but the \
+             client was only ever told 0 of {} — percent can never move. \
+             Got {} record(s): {progress:?}",
+            last.1,
+            progress.len()
+        );
     }
 
     #[test]

@@ -817,6 +817,28 @@ fn print_stats(stats: &serde_json::Value) {
     p!("generation_bumps");
     p!("journal_corrupt");
     p!("catching_up");
+    // What the daemon is actually doing, in its own words. Rendered next to
+    // `catching_up` because the two answer different halves of the same
+    // question: the flag says "it is behind", the phase says *why*.
+    if let Some(phase) = stats.get("phase").and_then(|v| v.as_str()) {
+        let entries = stats.get("crawl_entries").and_then(|v| v.as_u64());
+        let dirs = stats.get("crawl_dirs_pending").and_then(|v| v.as_u64());
+        if phase == "crawling" {
+            // A crawling daemon has progress worth showing: entries found so
+            // far and directories still queued. Absent on an old daemon.
+            let mut line = String::from("crawling");
+            if let Some(e) = entries {
+                line.push_str(&format!(" ({e} entries"));
+                if let Some(d) = dirs {
+                    line.push_str(&format!(", {d} dirs pending"));
+                }
+                line.push(')');
+            }
+            println!("{:<20} {}", "phase", line);
+        } else {
+            println!("{:<20} {}", "phase", phase);
+        }
+    }
     p!("queue_depth");
     // Lag behind the filesystem. The raw field is an arrival timestamp (wall
     // ms), which is unreadable on its own; render the age it implies as well,

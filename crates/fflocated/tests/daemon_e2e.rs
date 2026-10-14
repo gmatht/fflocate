@@ -222,6 +222,72 @@ fn socket_roundtrip_serves_a_query() {
 }
 
 #[test]
+fn meta_carries_the_daemons_own_phase_over_the_wire() {
+    // The point of the protocol change: a client (the GUI) can learn what the
+    // daemon is doing from `Meta`, instead of inventing a cause. Here the
+    // daemon is settled, so the phase is `idle`; the field must still be
+    // present, because the GUI distinguishes "idle" from "an old daemon sent
+    // nothing" (the latter falls back to the catching-up wording).
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path().join("tree");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("hello.rs"), b"x").unwrap();
+
+    let cfg = test_config(d.path(), root);
+    let sock = cfg.socket_path.clone();
+    let mut daemon = Daemon::build(cfg).unwrap();
+    daemon.start().unwrap();
+    settle(&mut daemon, 2000);
+
+    // One accept loop serving both round-trips below (a second `net::bind`
+    // would be refused while the first listener is up).
+    let ctx = std::sync::Arc::new(daemon.server_ctx());
+    let listener = net::bind(&sock).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let accept_stop = stop.clone();
+    std::thread::spawn(move || {
+        while !accept_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let ctx = ctx.clone();
+                    std::thread::spawn(move || net::serve_client(ctx, stream));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // A query's Meta carries the phase.
+    let resp = net::roundtrip(&sock, &Request::query("hello", 0, true, false)).unwrap();
+    match resp.first() {
+        Some(Response::Meta { phase, .. }) => assert_eq!(
+            phase.as_deref(),
+            Some("idle"),
+            "a settled daemon reports its phase on Meta, got {phase:?}"
+        ),
+        other => panic!("expected Meta first, got {other:?}"),
+    }
+
+    // And `stats` carries the same phase plus the crawl counters, for the CLI.
+    let stats = net::roundtrip(&sock, &Request::Stats { roots: false }).unwrap();
+    let stats_val = stats
+        .into_iter()
+        .find_map(|r| match r {
+            Response::Stats { stats } => Some(stats),
+            _ => None,
+        })
+        .expect("expected a Stats record");
+    assert_eq!(stats_val["phase"], "idle");
+    assert!(
+        stats_val["crawl_entries"].is_u64(),
+        "stats must carry crawl_entries: {stats_val}"
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    daemon.stop();
+}
+
+#[test]
 fn progress_opt_in_streams_scan_fraction_over_the_socket() {
     // End-to-end wire pin: a query with `progress: true` yields Meta, then
     // Progress records with monotone `scanned` and a stable `total`, then

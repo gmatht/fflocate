@@ -81,14 +81,32 @@ While a request is in flight the status line says so — `searching for <query>�
 <elapsed>s`, refreshed every 30 ms pump tick, with a live `(N hits so far)` count
 parsed from partial reply packets. The daemon currently writes the whole reply at
 once, so the count is usually 0 until the answer lands; the elapsed time is the
-signal that matters. When this process spawned the daemon the line instead reads
-`starting fflocated… <since-spawn>s (searching for <query>)`, naming the cold start
-(crawl + trigram build) rather than a slow query. A finished search slower than a
-second keeps its server-side cost on the line (`1 matches  [2.3s server]`, from
-`Meta.elapsed_ms`); faster ones stay quiet. The first search against a cold daemon
-is the slow one — measured 300–500 ms `elapsed_ms` on a 2 M-entry live index with
-a churning queue, versus 0.5 ms on a settled one — and now it reads as progress,
-not a frozen window.
+signal that matters.
+
+When the daemon is mid-crawl (or replaying its journal, or re-verifying), the
+line carries **the daemon's own words for it**, read from `Meta` — never a client
+guess. `Meta.phase` (`replaying` / `crawling` / `rescanning` / `idle`) plus, while
+crawling, `crawl_entries` and `crawl_dirs_pending` render as a bracketed suffix:
+
+```
+searching for main… 4.2s  [daemon crawling — 1 234 567 entries, 41 dirs left]
+searching for main… 0.3s                       ← idle, caught up: nothing appended
+```
+
+A finished search slower than a second keeps its server-side cost on the line
+(`1 matches  [2.3s server]`, from `Meta.elapsed_ms`); faster ones stay quiet. The
+first search against a cold daemon is the slow one — measured 300–500 ms
+`elapsed_ms` on a 2 M-entry live index with a churning queue, versus 0.5 ms on a
+settled one — and now it reads as progress, not a frozen window.
+
+> **Why this is not "starting fflocated… _Ns" any more.** That line (until the
+> v4 protocol) printed the *client's* process age since it spawned a daemon. The
+> number counted up forever and was applied to any query that had not produced a
+> Hit yet, so a warm daemon mid-search read as `starting fflocated… 44.0s` — a
+> startup that had finished a minute earlier. The daemon had always known better
+> (`catching_up`, `lag_ms`), and now says so directly (`phase` + crawl counts).
+> An old daemon that sends no `phase` falls back to the `[daemon catching up,
+> Ns behind]` wording; the client never invents a cause.
 
 The query is still not *async*. Async needs a loop you own, and the GTK backend
 runs glib's own `g_main_loop_run` (`vendor/rustxwidgets/src/backends/gtk.rs:33-38`,
@@ -199,8 +217,9 @@ depend on a checkout outside this repository.
   speak XDND — xterm does not (no `XdndAware`), so drops into xterm silently go
   nowhere from any application; Kitty and other XDND-aware terminals work.
 * Results come from the daemon's `query` op; the consistency metadata
-  (`fresh`, `stale_roots`, `catching_up`) is shown in the status line, so a
-  stale view is never presented as an empty one.
+  (`fresh`, `stale_roots`, `catching_up`, and the daemon's own `phase` with crawl
+  progress) is shown in the status line, so a stale view is never presented as an
+  empty one and a slow search names what the daemon is actually doing.
 * `subscribe` (a live push feed) is still a v1.5 preview in the daemon, so the
   GUI re-queries rather than streaming. As-you-type makes that feel live for the
   index's *contents* changing, but it is still a fresh request each time, not a

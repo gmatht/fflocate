@@ -33,7 +33,7 @@ use std::rc::Rc;
 use ff_gui::{
     box_change_clears, containing_dir, context_menu_target, effective_query, encode_request,
     extension_sort_key, render_count, rows_from_paths, scan_percent, search_label, searching_status_line,
-    starting_status_line, step_max_distance, streaming_status_line, DaemonClient, GuiError,
+    step_max_distance, streaming_status_line, DaemonClient, GuiError,
     MenuAction, PendingRequest, Progress, RowAction, SearchGate, SearchOptions, SearchOutcome,
     StartupPoll, StartupProbe,
     WheelStep, WireResponse, ADVANCED_SYNTAX_HELP, DEFAULT_MAX_DISTANCE,
@@ -456,10 +456,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // backwards. Dropped with the ticket on supersede, like
             // `rendered`.
             // ...(gate seq, request, issued, label, rendered, percent
-            // watermark, lag watermark). The lag watermark is the last
-            // `Meta.lag_ms` seen on this reply — the daemon's age for its
-            // oldest unapplied change, which the in-flight line renders as
-            // seconds.
+            // watermark, lag watermark, phase watermark). The phase watermark
+            // is the last `Meta` phase/crawl triple seen on this reply — the
+            // daemon's own "what am I doing", which the in-flight line renders
+            // verbatim instead of the client inventing a cause.
             let pending: Rc<
                 RefCell<
                     Option<(
@@ -469,6 +469,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         String,
                         usize,
                         Option<u8>,
+                        Option<u64>,
+                        Option<fflocate::health::Phase>,
+                        Option<u64>,
                         Option<u64>,
                     )>,
                 >,
@@ -492,7 +495,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     //    keeps the loop live.
                     let mut finished: Option<(u64, Result<Vec<WireResponse>, GuiError>)> = None;
                     let mut finished_started: Option<std::time::Instant> = None;
-                    if let Some((seq, p, started, _, _, _, _)) = pending.borrow_mut().as_mut() {
+                    if let Some((seq, p, started, _, _, _, _, _, _, _)) = pending.borrow_mut().as_mut() {
                         let seq = *seq;
                         let started_at = *started;
                         match p.advance() {
@@ -549,8 +552,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     //     ticket — partials cannot overwrite a newer answer.
                     {
                         let mut pending_ref = pending.borrow_mut();
-                        if let Some((seq, p, started, label, rendered, watermark, lag)) =
-                            pending_ref.as_mut()
+                        if let Some((
+                            seq,
+                            p,
+                            started,
+                            label,
+                            rendered,
+                            watermark,
+                            lag,
+                            phase_wm,
+                            crawl_entries_wm,
+                            crawl_dirs_wm,
+                        )) = pending_ref.as_mut()
                         {
                             let seq = *seq;
                             let started_at = *started;
@@ -574,17 +587,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 // The daemon's lag rides on Meta: keep the
                                 // latest (a reply carries one Meta, and a
                                 // re-issued ticket is a different tuple).
-                                if let WireResponse::Meta { lag_ms, .. } = r {
+                                if let WireResponse::Meta {
+                                    lag_ms,
+                                    phase,
+                                    crawl_entries,
+                                    crawl_dirs_pending,
+                                    ..
+                                } = r
+                                {
                                     if lag_ms.is_some() {
                                         *lag = *lag_ms;
+                                    }
+                                    // The phase is the daemon's own word for
+                                    // what it is doing; keep the latest. An
+                                    // old daemon sends none, so this stays
+                                    // None and the line falls back to lag.
+                                    if let Some(p) = phase
+                                        .as_deref()
+                                        .and_then(fflocate::health::Phase::parse)
+                                    {
+                                        *phase_wm = Some(p);
+                                    }
+                                    if crawl_entries.is_some() {
+                                        *crawl_entries_wm = *crawl_entries;
+                                    }
+                                    if crawl_dirs_pending.is_some() {
+                                        *crawl_dirs_wm = *crawl_dirs_pending;
                                     }
                                 }
                             }
                             let pct = *watermark;
                             let lag_ms = *lag;
+                            let phase = *phase_wm;
+                            let crawl_entries = *crawl_entries_wm;
+                            let crawl_dirs_pending = *crawl_dirs_wm;
                             if hits.len() > *rendered {
                                 *rendered = hits.len();
-                                let label_owned = label.clone();
                                 let elapsed = started_at.elapsed();
                                 let fresh_hits = hits.clone();
                                 drop(pending_ref);
@@ -595,37 +633,37 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         fresh_hits.iter().take(MAX_ROWS).cloned().collect();
                                     partial_results.set_rows(&rows_to_cells(&shown));
                                     *partial_current.borrow_mut() = shown;
-                                    if startup.borrow().was_spawned() {
-                                        startup_status.set_text(&starting_status_line(
-                                            &label_owned,
-                                            elapsed,
-                                            startup.borrow().spawned_elapsed(),
-                                            hits.len(),
-                                        ));
-                                    } else {
-                                        startup_status.set_text(&streaming_status_line(
-                                            hits.len(),
-                                            elapsed,
-                                            pct,
-                                        ));
-                                    }
+                                    // The streaming line: hits are on screen,
+                                    // the total is still being counted. No
+                                    // invented "starting" wording — the daemon's
+                                    // phase, if it has one, speaks for itself.
+                                    let _ = (phase, crawl_entries, crawl_dirs_pending);
+                                    startup_status.set_text(&streaming_status_line(
+                                        hits.len(),
+                                        elapsed,
+                                        pct,
+                                    ));
                                 }
                             } else if hits.is_empty() {
                                 let label_owned = label.clone();
                                 let elapsed = started_at.elapsed();
                                 let n = hits.len();
                                 drop(pending_ref);
-                                // No Hits yet: the in-flight line with elapsed.
-                                let line = if startup.borrow().was_spawned() {
-                                    starting_status_line(
-                                        &label_owned,
-                                        elapsed,
-                                        startup.borrow().spawned_elapsed(),
-                                        n,
-                                    )
-                                } else {
-                                    searching_status_line(&label_owned, elapsed, n, false, pct, lag_ms)
-                                };
+                                // No Hits yet: the in-flight line, carrying the
+                                // daemon's own phase/crawl progress once its
+                                // Meta has landed. No client-side "starting"
+                                // guess, and no process-age number.
+                                let line = searching_status_line(
+                                    &label_owned,
+                                    elapsed,
+                                    n,
+                                    false,
+                                    pct,
+                                    lag_ms,
+                                    phase,
+                                    crawl_entries,
+                                    crawl_dirs_pending,
+                                );
                                 startup_status.set_text(&line);
                             }
                         }
@@ -706,8 +744,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         PendingRequest::start(stream, &line)
                     }) {
                         Ok(p) => {
-                            *pending.borrow_mut() =
-                                Some((ticket.seq, p, std::time::Instant::now(), label, 0, None, None));
+                            *pending.borrow_mut() = Some((
+                                ticket.seq,
+                                p,
+                                std::time::Instant::now(),
+                                label,
+                                0,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                            ));
                         }
                         Err(e) => {
                             // The request never started, so it can never finish: release

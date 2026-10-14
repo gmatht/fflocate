@@ -192,6 +192,9 @@ impl DaemonClient {
         let mut catching_up = false;
         let mut lag_ms: Option<u64> = None;
         let mut elapsed_ms: Option<f64> = None;
+        let mut phase: Option<fflocate::health::Phase> = None;
+        let mut crawl_entries: Option<u64> = None;
+        let mut crawl_dirs_pending: Option<u64> = None;
         for r in resp {
             match r {
                 Response::Meta {
@@ -200,6 +203,9 @@ impl DaemonClient {
                     catching_up: c,
                     lag_ms: l,
                     elapsed_ms: e,
+                    phase: p,
+                    crawl_entries: ce,
+                    crawl_dirs_pending: cdp,
                     ..
                 } => {
                     fresh = *f;
@@ -207,6 +213,13 @@ impl DaemonClient {
                     catching_up = c.unwrap_or(false);
                     lag_ms = *l;
                     elapsed_ms = Some(*e);
+                    // The daemon's own phase, if a new-enough daemon sent one.
+                    // An old daemon omits it: `Phase::parse` of the absent
+                    // value yields `None`, and the GUI then falls back to
+                    // `catching_up`/`lag_ms` rather than inventing a phase.
+                    phase = p.as_deref().and_then(fflocate::health::Phase::parse);
+                    crawl_entries = *ce;
+                    crawl_dirs_pending = *cdp;
                 }
                 Response::Hit { path, .. } => paths.push(path.clone()),
                 Response::Done { count, .. } => total = *count,
@@ -235,6 +248,9 @@ impl DaemonClient {
             catching_up,
             lag_ms,
             elapsed_ms,
+            phase,
+            crawl_entries,
+            crawl_dirs_pending,
         })
     }
 
@@ -353,11 +369,6 @@ pub struct StartupProbe {
     pending: Option<PendingRequest>,
     deadline: std::time::Instant,
     finished: bool,
-    /// When this process spawned the daemon (None if it was already running).
-    /// Lets the in-flight line say "starting daemon…" with elapsed time
-    /// instead of a bare "searching…", so a cold-started daemon reads as
-    /// progress from the first keystroke.
-    spawned_at: Option<std::time::Instant>,
 }
 
 impl StartupProbe {
@@ -370,20 +381,18 @@ impl StartupProbe {
             pending: None,
             deadline: std::time::Instant::now() + grace,
             finished: false,
-            spawned_at: None,
         }
     }
 
     /// True once this process spawned the daemon during this probe run.
-    /// Sticky: stays true after the probe finishes, so the pump can keep
-    /// reporting the cold-start case for the queries that follow.
+    ///
+    /// Used only *within* the probe now (to decide whether the failure wording
+    /// should name a spawn). It deliberately no longer drives the in-flight
+    /// search line: keying that on a sticky "we spawned once" flag was the bug
+    /// that made a warm daemon mid-search read as "starting fflocated… 44.0s".
+    /// The daemon's own `phase` says what it is doing instead.
     pub fn was_spawned(&self) -> bool {
         self.spawned
-    }
-
-    /// How long ago this process spawned the daemon, if it did.
-    pub fn spawned_elapsed(&self) -> Option<std::time::Duration> {
-        self.spawned_at.map(|t| t.elapsed())
     }
 
     /// True once [`poll`](Self::poll) has returned [`StartupPoll::Done`].
@@ -460,7 +469,6 @@ impl StartupProbe {
                         match fflocate::spawn::spawn_daemon(&self.socket) {
                             Ok(()) => {
                                 self.spawned = true;
-                                self.spawned_at = Some(std::time::Instant::now());
                                 // fall through to return the Note below
                             }
                             Err(e) => {
@@ -706,6 +714,15 @@ pub struct SearchOutcome {
     /// build + lock waits, server-side. Shown when slow so a first search
     /// that took seconds explains itself instead of looking instant-but-late.
     pub elapsed_ms: Option<f64>,
+    /// What the daemon said it was doing when it answered — its own word, not
+    /// a client guess (`Meta.phase`, see `fflocate::health::Phase`). `None`
+    /// when the daemon predates the field; callers then fall back to
+    /// `catching_up`/`lag_ms` and never invent a phase.
+    pub phase: Option<fflocate::health::Phase>,
+    /// Entries discovered so far, when `phase == Crawling` (`Meta.crawl_entries`).
+    pub crawl_entries: Option<u64>,
+    /// Directories still queued to enumerate, when `phase == Crawling`.
+    pub crawl_dirs_pending: Option<u64>,
 }
 
 impl SearchOutcome {
@@ -729,7 +746,12 @@ impl SearchOutcome {
         if !self.fresh {
             s.push_str("  [fresh view]");
         }
-        if let Some(suffix) = catching_up_suffix(self.catching_up, self.lag_ms) {
+        // The daemon's own phase ("what is it doing") takes precedence over the
+        // generic catching-up flag: if it told us it is crawling, say that.
+        if let Some(suffix) = phase_suffix(self.phase, self.crawl_entries, self.crawl_dirs_pending)
+        {
+            s.push_str(&suffix);
+        } else if let Some(suffix) = catching_up_suffix(self.catching_up, self.lag_ms) {
             s.push_str(&suffix);
         }
         if !self.stale_roots.is_empty() {
@@ -748,32 +770,63 @@ impl SearchOutcome {
     }
 }
 
-/// The in-flight line when this process just spawned the daemon.
+/// The daemon's self-reported state as a status-line suffix, or `None` when
+/// there is nothing honest to add (idle daemon).
 ///
-/// Same shape as [`searching_status_line`] but names the cause: the daemon is
-/// cold (crawling, warming its trigram index) rather than merely slow. Used
-/// while [`StartupProbe::was_spawned`] is true so the first queries after a
-/// spawn read as startup, not a hang.
-pub fn starting_status_line(
-    query: &str,
-    elapsed: std::time::Duration,
-    daemon_elapsed: Option<std::time::Duration>,
-    hits_so_far: usize,
-) -> String {
-    let show = daemon_elapsed.unwrap_or(elapsed);
-    let mut s = if query.is_empty() {
-        format!("starting fflocated… {:.1}s", show.as_secs_f64())
-    } else {
-        format!("starting fflocated… {:.1}s (searching for {query})", show.as_secs_f64())
-    };
-    if hits_so_far > 0 {
-        s.push_str(&format!(
-            " ({} hit{} so far)",
-            hits_so_far,
-            if hits_so_far == 1 { "" } else { "s" }
-        ));
+/// This replaces the old "starting fflocated… Ns" line. That line's number was
+/// the *client's* process age since it spawned a daemon — it kept climbing for
+/// the life of the GUI and was applied to any query that had not yet produced
+/// a Hit, so a warm daemon mid-search read as "starting fflocated… 44.0s".
+/// The daemon itself already knows better, and now says so: `phase` names what
+/// it is doing (replaying the journal, crawling, re-verifying) and, while
+/// crawling, how far along the discovery is.
+///
+/// Shapes:
+/// * crawling with progress → `[daemon crawling — 1,234,567 entries, 41 dirs left]`
+/// * crawling without progress → `[daemon crawling]`
+/// * replaying → `[daemon replaying journal]`
+/// * re-verifying → `[daemon re-verifying]`
+/// * idle → `None` (a caught-up daemon needs no excuse)
+///
+/// An old daemon sends no `phase`: `None` in, `None` out — the caller then
+/// falls back to [`catching_up_suffix`] and never invents a cause.
+pub fn phase_suffix(
+    phase: Option<fflocate::health::Phase>,
+    crawl_entries: Option<u64>,
+    crawl_dirs_pending: Option<u64>,
+) -> Option<String> {
+    let phase = phase?;
+    match phase {
+        fflocate::health::Phase::Idle => None,
+        fflocate::health::Phase::Crawling => {
+            let mut s = String::from("  [daemon crawling");
+            if let Some(entries) = crawl_entries {
+                s.push_str(&format!(" — {} entries", thousands(entries)));
+                if let Some(dirs) = crawl_dirs_pending {
+                    s.push_str(&format!(", {} dirs left", thousands(dirs)));
+                }
+            }
+            s.push(']');
+            Some(s)
+        }
+        fflocate::health::Phase::Replaying => Some("  [daemon replaying journal]".to_string()),
+        fflocate::health::Phase::Rescanning => Some("  [daemon re-verifying]".to_string()),
     }
-    s
+}
+
+/// Group a count with thin spaces every three digits (`1234567` →
+/// `1 234 567`), so a seven-figure crawl count is readable at a glance rather
+/// than a wall of digits. Pure and total; used only for display.
+pub fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The `[daemon catching up…]` suffix for a status line, in seconds.
@@ -820,14 +873,23 @@ pub fn scan_percent(scanned: u64, total: u64) -> Option<u8> {
 
 /// The status line while a request is in flight (no reply yet).
 ///
-/// The daemon sends nothing until the query engine finishes — `Meta` is
-/// computed after the scan, and the socket is flushed once — so a slow query
-/// (a cold trigram index on first search, a daemon still crawling) looks
-/// identical to a wedged daemon until the reply lands. This line is the honest
-/// signal: the request left, the answer has not come back, and here is how
-/// long that has been true. `hits_so_far` counts `Hit` records parsed from
-/// partial packets (zero until the daemon flushes mid-reply, which it
-/// currently does not — the count is future-proofing, not fiction).
+/// The daemon streams: `Meta` is emitted first, before the scan takes the
+/// index guard, then each `Hit` as it is found (the daemon flushes per
+/// record, so records leave the kernel immediately rather than waiting for
+/// `Done`). A slow query — a cold trigram index on first search, a daemon
+/// still crawling — therefore *is* distinguishable from a wedged daemon
+/// before the scan finishes: `hits_so_far` and `progress` move as it goes.
+/// This line is the honest signal for the gap that remains: the request
+/// left, no `Hit` has arrived yet, and here is how long that has been true.
+/// `hits_so_far` counts `Hit` records parsed from partial packets, so it is
+/// real data from the daemon, not a local guess.
+///
+/// `phase`/`crawl_entries`/`crawl_dirs_pending` are the daemon's own words
+/// about what it is doing, taken from the `Meta` preamble as soon as it lands.
+/// When present they take precedence over the generic `catching_up` suffix: a
+/// daemon that says "crawling — 1.2M entries" has explained itself, and
+/// appending "catching up" on top would be redundant.
+#[allow(clippy::too_many_arguments)]
 pub fn searching_status_line(
     query: &str,
     elapsed: std::time::Duration,
@@ -835,6 +897,9 @@ pub fn searching_status_line(
     catching_up: bool,
     progress: Option<u8>,
     lag_ms: Option<u64>,
+    phase: Option<fflocate::health::Phase>,
+    crawl_entries: Option<u64>,
+    crawl_dirs_pending: Option<u64>,
 ) -> String {
     let mut s = if query.is_empty() {
         format!("searching… {:.1}s", elapsed.as_secs_f64())
@@ -851,7 +916,11 @@ pub fn searching_status_line(
             if hits_so_far == 1 { "" } else { "s" }
         ));
     }
-    if let Some(suffix) = catching_up_suffix(catching_up, lag_ms) {
+    // The daemon's own phase wins over the bare catching-up flag; fall back to
+    // the flag only for a daemon that sends no phase (an older one).
+    if let Some(suffix) = phase_suffix(phase, crawl_entries, crawl_dirs_pending) {
+        s.push_str(&suffix);
+    } else if let Some(suffix) = catching_up_suffix(catching_up, lag_ms) {
         s.push_str(&suffix);
     }
     s
@@ -2259,6 +2328,9 @@ mod tests {
             false,
             None,
             None,
+            None,
+            None,
+            None,
         );
         assert_eq!(s, "searching for main… 1.3s");
     }
@@ -2272,6 +2344,9 @@ mod tests {
             true,
             None,
             None,
+            None,
+            None,
+            None,
         );
         assert!(s.contains("(1 hit so far)"), "{s}");
         assert!(s.contains("[daemon catching up]"), "{s}");
@@ -2280,6 +2355,9 @@ mod tests {
             std::time::Duration::from_millis(300),
             12,
             false,
+            None,
+            None,
+            None,
             None,
             None,
         );
@@ -2294,6 +2372,9 @@ mod tests {
             std::time::Duration::from_millis(200),
             0,
             false,
+            None,
+            None,
+            None,
             None,
             None,
         );
@@ -2338,27 +2419,90 @@ mod tests {
     }
 
     #[test]
-    fn starting_line_names_the_daemon_not_the_query() {
-        let s = starting_status_line(
-            "main",
-            std::time::Duration::from_millis(2100),
-            Some(std::time::Duration::from_millis(3400)),
-            0,
+    fn phase_suffix_names_what_the_daemon_is_doing() {
+        use fflocate::health::Phase;
+        // Crawling with progress: the daemon's own numbers, grouped for
+        // readability.
+        assert_eq!(
+            phase_suffix(Some(Phase::Crawling), Some(1_234_567), Some(41)).as_deref(),
+            Some("  [daemon crawling — 1 234 567 entries, 41 dirs left]")
         );
-        // The daemon age (since spawn), not the query age, is the headline:
-        // the query only just started, the daemon has been cold for longer.
-        assert_eq!(s, "starting fflocated… 3.4s (searching for main)");
+        // Crawling without a count yet: no invented numbers.
+        assert_eq!(
+            phase_suffix(Some(Phase::Crawling), None, None).as_deref(),
+            Some("  [daemon crawling]")
+        );
+        assert_eq!(
+            phase_suffix(Some(Phase::Replaying), None, None).as_deref(),
+            Some("  [daemon replaying journal]")
+        );
+        assert_eq!(
+            phase_suffix(Some(Phase::Rescanning), None, None).as_deref(),
+            Some("  [daemon re-verifying]")
+        );
+        // Idle: nothing to excuse.
+        assert_eq!(phase_suffix(Some(Phase::Idle), None, None), None);
+        // Old daemon: no phase, no invention.
+        assert_eq!(phase_suffix(None, None, None), None);
     }
 
     #[test]
-    fn starting_line_falls_back_to_query_elapsed() {
-        let s = starting_status_line(
-            "",
-            std::time::Duration::from_millis(500),
+    fn thousands_groups_digits_for_readability() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1000), "1 000");
+        assert_eq!(thousands(1_234_567), "1 234 567");
+        assert_eq!(thousands(1_000_000_000), "1 000 000 000");
+    }
+
+    #[test]
+    fn in_flight_line_prefers_the_daemons_phase_over_catching_up() {
+        use fflocate::health::Phase;
+        // A crawling daemon that also flags catching_up: the specific phase
+        // wins, and the bare "catching up" suffix is not appended twice.
+        let s = searching_status_line(
+            "main",
+            std::time::Duration::from_millis(4200),
+            0,
+            true,
             None,
-            2,
+            Some(9000),
+            Some(Phase::Crawling),
+            Some(2_000_000),
+            Some(7),
         );
-        assert_eq!(s, "starting fflocated… 0.5s (2 hits so far)");
+        assert_eq!(
+            s,
+            "searching for main… 4.2s  [daemon crawling — 2 000 000 entries, 7 dirs left]"
+        );
+        assert!(!s.contains("catching up"), "phase must not double up: {s}");
+        // No phase (old daemon): fall back to the catching-up flag.
+        let s = searching_status_line(
+            "main",
+            std::time::Duration::from_millis(4200),
+            0,
+            true,
+            None,
+            Some(9000),
+            None,
+            None,
+            None,
+        );
+        assert!(s.ends_with("[daemon catching up, 9s behind]"), "{s}");
+        // Idle, caught up: nothing appended at all — this is the case that
+        // used to say "starting fflocated… 44.0s".
+        let s = searching_status_line(
+            "main",
+            std::time::Duration::from_millis(300),
+            0,
+            false,
+            None,
+            None,
+            Some(Phase::Idle),
+            None,
+            None,
+        );
+        assert_eq!(s, "searching for main… 0.3s");
     }
 
     #[test]
@@ -2444,6 +2588,9 @@ mod tests {
             true,
             Some(42),
             Some(7300),
+            None,
+            None,
+            None,
         );
         assert_eq!(s, "searching for comp… 1.3s 42%  [daemon catching up, 7s behind]");
     }
@@ -2459,6 +2606,9 @@ mod tests {
                 stale_roots: vec![],
                 catching_up: Some(true),
                 lag_ms: Some(2500),
+                phase: Some("crawling".into()),
+                crawl_entries: Some(900),
+                crawl_dirs_pending: Some(12),
                 backend: None,
                 entries: None,
             },
@@ -2470,6 +2620,42 @@ mod tests {
         let o = DaemonClient::new().outcome_from_records(&recs).unwrap();
         assert_eq!(o.lag_ms, Some(2500));
         assert!(o.catching_up);
+        assert_eq!(o.phase, Some(fflocate::health::Phase::Crawling));
+        assert_eq!(o.crawl_entries, Some(900));
+        assert_eq!(o.crawl_dirs_pending, Some(12));
+        // The daemon's own phase is the headline; lag rides along only when
+        // there is no phase to name (see the fallback test below).
+        assert!(
+            o.status_line(0).contains("[daemon crawling — 900 entries, 12 dirs left]"),
+            "{}",
+            o.status_line(0)
+        );
+
+        // With no phase (an old daemon), the lag suffix is the fallback.
+        let recs_old = vec![
+            Response::Meta {
+                gen: 1,
+                lsn: 2,
+                fresh: true,
+                elapsed_ms: 3.0,
+                stale_roots: vec![],
+                catching_up: Some(true),
+                lag_ms: Some(2500),
+                phase: None,
+                crawl_entries: None,
+                crawl_dirs_pending: None,
+                backend: None,
+                entries: None,
+            },
+            Response::Done {
+                count: 0,
+                cursor: "c:1:2".into(),
+            },
+        ];
+        let o = DaemonClient::new()
+            .outcome_from_records(&recs_old)
+            .unwrap();
+        assert_eq!(o.phase, None);
         assert!(o.status_line(0).contains("2s behind"), "{}", o.status_line(0));
     }
 
@@ -2496,6 +2682,9 @@ mod tests {
             false,
             Some(42),
             None,
+            None,
+            None,
+            None,
         );
         assert_eq!(s, "searching for comp… 1.3s 42%");
         // None keeps the legacy wording byte-for-byte (old daemon,
@@ -2505,6 +2694,9 @@ mod tests {
             std::time::Duration::from_millis(1300),
             0,
             false,
+            None,
+            None,
+            None,
             None,
             None,
         );
@@ -2538,6 +2730,9 @@ mod tests {
                 stale_roots: vec![],
                 catching_up: None,
                 lag_ms: None,
+                phase: None,
+                crawl_entries: None,
+                crawl_dirs_pending: None,
                 backend: None,
                 entries: None,
             },
@@ -3108,6 +3303,9 @@ mod nonblocking_tests {
             stale_roots: vec![],
             catching_up: None,
             lag_ms: None,
+            phase: None,
+            crawl_entries: None,
+            crawl_dirs_pending: None,
             backend: None,
             entries: None,
         }
