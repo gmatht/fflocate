@@ -963,7 +963,7 @@ impl Daemon {
             // single-tick comparison is too twitchy (one live create would
             // read as a crawl); a sustained window is the honest crawl signal.
             match self.last_entry_change {
-                Some((prev, at)) if prev == entries => {}
+                Some((prev, _)) if prev == entries => {}
                 _ => self.last_entry_change = Some((entries, now)),
             }
             let growing = self
