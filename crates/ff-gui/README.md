@@ -1,13 +1,13 @@
 # ff-gui
 
-A file-search browser for the findex daemon, built on
+A file-search browser for the fflocate daemon, built on
 [rswidgets](https://github.com/) widgets (vendored under `vendor/`).
 
 ```sh
 cargo run -p ff-gui        # after building, target/debug/ff-gui
 ```
 
-It talks to `findexd` over the same NDJSON unix-socket protocol the `ff` CLI
+It talks to `fflocated` over the same NDJSON unix-socket protocol the `ff` CLI
 uses: the daemon owns the index, the GUI only collects input and renders rows.
 
 ## Backends
@@ -82,7 +82,7 @@ While a request is in flight the status line says so — `searching for <query>�
 parsed from partial reply packets. The daemon currently writes the whole reply at
 once, so the count is usually 0 until the answer lands; the elapsed time is the
 signal that matters. When this process spawned the daemon the line instead reads
-`starting findexd… <since-spawn>s (searching for <query>)`, naming the cold start
+`starting fflocated… <since-spawn>s (searching for <query>)`, naming the cold start
 (crawl + trigram build) rather than a slow query. A finished search slower than a
 second keeps its server-side cost on the line (`1 matches  [2.3s server]`, from
 `Meta.elapsed_ms`); faster ones stay quiet. The first search against a cold daemon
@@ -104,7 +104,7 @@ that async was wanted for, without the inversion.
 The window used to verify the daemon *before* presenting: two blocking
 round-trips on the warm path, and a spawn plus a blocking up-to-5-second wait
 when the daemon was missing — a wedged daemon held first paint hostage
-forever. Now `run()` presents first with a `connecting to findexd…` status and
+forever. Now `run()` presents first with a `connecting to fflocated…` status and
 resolves the check from the same 30 ms pump (`StartupProbe` in `src/lib.rs`):
 one `stats` request — which alone proves the daemon is alive, so the old
 `hello` round-trip is gone — stepped through `PendingRequest` like any query,

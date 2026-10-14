@@ -7,7 +7,7 @@
 //! (`last_rescan_cause=manual`) proves the update's own rescan did the work,
 //! not startup.
 //!
-//! Needs release binaries behind `FINDEX_BIN_DIR` like the other e2e suites;
+//! Needs release binaries behind `FFLOCATE_BIN_DIR` like the other e2e suites;
 //! without it the tests skip.
 
 use std::path::{Path, PathBuf};
@@ -15,8 +15,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn bin_dir() -> Option<PathBuf> {
-    let d = std::env::var("FINDEX_BIN_DIR").ok().map(PathBuf::from)?;
-    (d.join(format!("findexd{}", std::env::consts::EXE_SUFFIX))
+    let d = std::env::var("FFLOCATE_BIN_DIR").ok().map(PathBuf::from)?;
+    (d.join(format!("fflocated{}", std::env::consts::EXE_SUFFIX))
         .exists()
         && d.join(format!("ff{}", std::env::consts::EXE_SUFFIX))
             .exists())
@@ -48,7 +48,7 @@ fn test_socket(dir: &std::path::Path) -> PathBuf {
     }
     #[cfg(not(windows))]
     {
-        dir.join("findex.sock")
+        dir.join("fflocate.sock")
     }
 }
 
@@ -72,8 +72,8 @@ fn canon(p: &std::path::Path) -> String {
     }
 }
 
-fn spawn(findexd: &Path, socket: &Path, state: &Path, root: &Path) -> Child {
-    let child = Command::new(findexd)
+fn spawn(fflocated: &Path, socket: &Path, state: &Path, root: &Path) -> Child {
+    let child = Command::new(fflocated)
         .arg("--socket")
         .arg(socket)
         .arg("--state-dir")
@@ -86,7 +86,7 @@ fn spawn(findexd: &Path, socket: &Path, state: &Path, root: &Path) -> Child {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn findexd");
+        .expect("spawn fflocated");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !socket.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -105,7 +105,7 @@ fn kill9(child: &mut Child) {
 fn ff(fxbin: &Path, socket: &Path, args: &[&str]) -> (String, i32) {
     let out = Command::new(fxbin)
         .args(args)
-        .env("FINDEX_SOCKET", socket)
+        .env("FFLOCATE_SOCKET", socket)
         .output()
         .expect("run ff");
     (
@@ -136,10 +136,10 @@ fn settle(fxbin: &Path, socket: &Path) {
 #[test]
 fn update_heals_offline_edits_after_downtime() {
     let Some(bindir) = bin_dir() else {
-        eprintln!("skipping: set FINDEX_BIN_DIR to target/release (see scripts/e2e.sh)");
+        eprintln!("skipping: set FFLOCATE_BIN_DIR to target/release (see scripts/e2e.sh)");
         return;
     };
-    let findexd = bindir.join(format!("findexd{}", std::env::consts::EXE_SUFFIX));
+    let fflocated = bindir.join(format!("fflocated{}", std::env::consts::EXE_SUFFIX));
     let fxbin = bindir.join(format!("ff{}", std::env::consts::EXE_SUFFIX));
     let d = tempfile::tempdir().unwrap();
     let root = d.path().join("tree");
@@ -150,7 +150,7 @@ fn update_heals_offline_edits_after_downtime() {
     std::fs::write(root.join("gone.txt"), b"g").unwrap();
 
     // Baseline: daemon up, both files indexed.
-    let mut daemon = spawn(&findexd, &socket, &state, &root);
+    let mut daemon = spawn(&fflocated, &socket, &state, &root);
     settle(&fxbin, &socket);
     let rel = |p: &str| canon(&root.join(p));
     assert!(listing(&fxbin, &socket).contains(&rel("gone.txt")));
@@ -163,7 +163,7 @@ fn update_heals_offline_edits_after_downtime() {
 
     // Restart, but no update yet: the restart crawl picks up the addition,
     // yet nothing removes the offline deletion — the index is stale.
-    let mut daemon = spawn(&findexd, &socket, &state, &root);
+    let mut daemon = spawn(&fflocated, &socket, &state, &root);
     settle(&fxbin, &socket);
     assert!(
         listing(&fxbin, &socket).contains(&rel("gone.txt")),
@@ -193,10 +193,10 @@ fn update_heals_offline_edits_after_downtime() {
 #[test]
 fn update_unknown_root_is_an_error() {
     let Some(bindir) = bin_dir() else {
-        eprintln!("skipping: set FINDEX_BIN_DIR to target/release (see scripts/e2e.sh)");
+        eprintln!("skipping: set FFLOCATE_BIN_DIR to target/release (see scripts/e2e.sh)");
         return;
     };
-    let findexd = bindir.join(format!("findexd{}", std::env::consts::EXE_SUFFIX));
+    let fflocated = bindir.join(format!("fflocated{}", std::env::consts::EXE_SUFFIX));
     let fxbin = bindir.join(format!("ff{}", std::env::consts::EXE_SUFFIX));
     let d = tempfile::tempdir().unwrap();
     let root = d.path().join("tree");
@@ -207,7 +207,7 @@ fn update_unknown_root_is_an_error() {
     // produces.
     std::fs::write(root.join("seed.txt"), b"s").unwrap();
 
-    let mut daemon = spawn(&findexd, &socket, &state, &root);
+    let mut daemon = spawn(&fflocated, &socket, &state, &root);
     settle(&fxbin, &socket);
 
     let (out, code) = ff(&fxbin, &socket, &["update", "/no-such-root-xyz"]);

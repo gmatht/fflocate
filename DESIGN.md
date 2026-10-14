@@ -1,6 +1,6 @@
-# findex — Design Document (v2)
+# fflocate — Design Document (v2)
 
-Headless, realtime filename index for Linux (macOS later). Daemon (`findexd`) + CLI (`ff`), GUI-ready via IPC. This revision integrates the Watchman lessons: reconciliation as a first-class subsystem, cookie-based sync, journal-as-clock, per-mount probing, and health telemetry. Changes from v1 are summarized in §0; everything else is the complete standalone design.
+Headless, realtime filename index for Linux (macOS later). Daemon (`fflocated`) + CLI (`ff`), GUI-ready via IPC. This revision integrates the Watchman lessons: reconciliation as a first-class subsystem, cookie-based sync, journal-as-clock, per-mount probing, and health telemetry. Changes from v1 are summarized in §0; everything else is the complete standalone design.
 
 ---
 
@@ -41,7 +41,7 @@ Headless, realtime filename index for Linux (macOS later). Daemon (`findexd`) + 
 
 ```
 ┌───────────┐  unix socket, NDJSON  ┌────────────────────────────────────────────┐
-│ ff (CLI)  │◄─────────────────────►│                  findexd                   │
+│ ff (CLI)  │◄─────────────────────►│                  fflocated                   │
 │ GUI later │  query/sync/since/    │                                            │
 └───────────┘  subscribe/stats      │  watcher backend (fanotify|inotify|FSEvents)│
                                     │        │ FsEvent                           │
@@ -175,7 +175,7 @@ trait WatchBackend {
 | dir moved | parent's `MOVED_TO` only | same | same |
 | content write | **ignore** | **ignore** | **ignore** |
 
-- **fanotify FID** (`FAN_MARK_FILESYSTEM`, `FAN_REPORT_DFID_NAME`): whole-mount watch, zero per-dir kernel memory, atomic rename events. Map `(dev, file_handle) → dir id` via `name_to_handle_at` per dir during crawl. **Implemented** (v1.5): `crates/findex/src/watch/fanotify.rs` decodes the `fanotify_event_info_fid` record (handle + NUL-padded name), pairs rename halves by the moved object's handle, and escalates `FAN_Q_OVERFLOW` to a rescan of every root. `watch/fidmap.rs` resolves a DFID to a directory id, keyed on `(handle_type, handle)` — deliberately *not* on the event's `fsid`, which is a different namespace from `name_to_handle_at`'s mount id and silently fails to match. Selection is probed, not assumed: `mount::fanotify_available()` opens the real fd, and `--backend auto` picks fanotify when the kernel supports it else inotify (`ff stats` reports which, and why). Verified against real kernel events on a private tmpfs mount. Note that `watch_dir` is *not* a no-op for this backend: a directory created at runtime has its handle learned only by asking, and skipping that silently blinds the subtree.
+- **fanotify FID** (`FAN_MARK_FILESYSTEM`, `FAN_REPORT_DFID_NAME`): whole-mount watch, zero per-dir kernel memory, atomic rename events. Map `(dev, file_handle) → dir id` via `name_to_handle_at` per dir during crawl. **Implemented** (v1.5): `crates/fflocate/src/watch/fanotify.rs` decodes the `fanotify_event_info_fid` record (handle + NUL-padded name), pairs rename halves by the moved object's handle, and escalates `FAN_Q_OVERFLOW` to a rescan of every root. `watch/fidmap.rs` resolves a DFID to a directory id, keyed on `(handle_type, handle)` — deliberately *not* on the event's `fsid`, which is a different namespace from `name_to_handle_at`'s mount id and silently fails to match. Selection is probed, not assumed: `mount::fanotify_available()` opens the real fd, and `--backend auto` picks fanotify when the kernel supports it else inotify (`ff stats` reports which, and why). Verified against real kernel events on a private tmpfs mount. Note that `watch_dir` is *not* a no-op for this backend: a directory created at runtime has its handle learned only by asking, and skipping that silently blinds the subtree.
 - **inotify fallback**: one watch per dir (~1 KB kernel memory each; `max_user_watches` is real). `IN_Q_OVERFLOW` → `RescanSubtree(root, cause=overflow)`. `IN_IGNORED` → drop wd→id mapping (wds get reused). `IN_UNMOUNT` → drop subtree, wait for remount.
 - **FSEvents**: file-event flag; persistent log + since-when ID gives free crash recovery (store last event ID in snapshot). `kFSEventsMustScanSubDirs` → rescan.
 - **Ignore asymmetry**: inotify can decline to attach to excluded dirs (watch-time ignore); fanotify-FID and FSEvents cannot — they filter in the applier. Encode this in backend capabilities instead of special-casing. **Implemented**: `excludes.rs` holds the rules, and an excluded *directory* is simply never inserted — because events name their parent by id, that one omission prunes the whole subtree with no ancestor walk, in both the crawl and `apply_upsert`.
@@ -218,7 +218,7 @@ The question every consumer eventually asks: *"has the daemon seen everything th
 
 **Mechanism.** `SyncOp{roots?}`:
 
-1. For each watched root that is **writable** (probed, §4): create `.findex-cookie-<uuid>` in the root dir.
+1. For each watched root that is **writable** (probed, §4): create `.fflocate-cookie-<uuid>` in the root dir.
 2. The cookie's create event arrives through the same globally ordered watcher stream as everything before it. The applier recognizes the name prefix and applies it as a marker (never indexed — Watchman's cookies famously leak into other tools' listings; we filter by prefix at apply time).
 3. When the marker is applied **and** the pending collection's event/work queues for that scope are empty, the sync completes; the cookie file is unlinked (that unlink event is also filtered).
 4. Timeout (default 2 s, one retry) → sync returns per-root status; a root that repeatedly fails cookie sync is flagged degraded-for-sync.
@@ -252,10 +252,19 @@ store.meta:    JSON sidecar: format version, creating/writing OS, resolved
                Read once per boot; never part of the snapshot format.
 ```
 
-- **Load = mmap** (MAP_PRIVATE, < 50 ms at millions of entries); tombstone flips are COW. Replay journal tail on startup. Torn/corrupt tail: per-record CRC bounds the damage — keep serving, log it, enqueue `RescanSubtree(cause=journal_corrupt)`.
+- **Load = mmap** (MAP_PRIVATE, < 50 ms at millions of entries); tombstone flips are COW. Replay journal tail on startup — in the background (§9.1): the daemon serves the snapshot immediately and drains the decoded tail in bounded chunks on the applier tick, with `catching_up: true` in meta until the tail *and* the initial crawl drain. Torn/corrupt tail: per-record CRC bounds the damage — the applied prefix replays, every local root is auto-enqueued for `RescanSubtree(cause=journal_corrupt)`, and the daemon keeps serving throughout.
 - **Cursors**: opaque `c:<gen>:<lsn>`. A cursor is valid only while `gen` matches; generation bumps (full-root rescan, compaction) invalidate all cursors by design — consumers resync from a full listing rather than apply deltas of uncertain provenance. This is Watchman's `is_fresh_instance` contract, expressed in our protocol.
-- **Compaction**: build fresh snapshot off-thread, `arc_swap` it in, truncate journal, bump generation. Truncation resets the LSN epoch (snapshot, shared clock, and journal all restart at 0) — otherwise the next boot's `lsn > last_lsn` replay skip would discard every post-compact write. A tail past the threshold at startup is compacted during build, so it replays once, never every boot.
-- Startup: load → replay → serve immediately (meta marks catching-up state) → background rescan only if the journal was unusable.
+- **Compaction**: build fresh snapshot off-thread, `arc_swap` it in, truncate journal, bump generation. Truncation resets the LSN epoch (snapshot, shared clock, and journal all restart at 0) — otherwise the next boot's `lsn > last_lsn` replay skip would discard every post-compact write. A tail past the threshold at startup is compacted once via the normal path *after* it drains (§9.1), so it replays once, never every boot.
+- Startup: load → serve snapshot immediately (`catching_up: true`) → background replay + crawl → background rescan only if the journal was unusable.
+
+### 9.1 Background journal replay
+
+Serving the snapshot first and interleaving the tail with live writes has four soundness rules, each pinned by a test:
+
+1. **Replay drains first and exclusively.** While the tail remains, `drain` pops nothing else — no crawl, no rescan, no event, no cookie. A rescan/crawl diff matches survivors by `(parent, name)` and would read the tail's deletes as done while missing its creates, minting duplicates. Replay is the crash-recovery prefix of history; everything else is ordered after it.
+2. **Split the clock.** The index `last_lsn` tracks the replay prefix exactly (crash → re-skip the prefix; re-application is idempotent). The shared `lsn` is a high-water mark (`fetch_max`) over replay LSNs *and* live journal appends, which interleave by tick past the tail end — an exact store on either side would move a served cursor backwards.
+3. **Defer the build-time compaction.** Renumbering ids while nothing is live breaks pending work and watch requests; the tail's record count is stashed as credit and folds into `records_since_compaction` when the last chunk drains, firing once through `maybe_compact` with live tables to remap.
+4. **A torn tail heals by rescan, automatically.** `Journal::replay` stops at the first bad record, so the suffix is unreachable by construction. `Daemon::build` enqueues a `JournalCorrupt` rescan per local root behind the tail — no manual step, `catching_up` stays true until they drain.
 
 ---
 
@@ -270,7 +279,7 @@ The contract is that this is a **filter, never an authority**: every candidate s
 - Ids are stable across rescans (§3), so posting lists stay meaningful; the cache is keyed on **generation only** and kept current incrementally — every `Add`/`Del`/`Move` record funnels through `Applier::emit`, which indexes or prunes the affected name's trigrams under the same index lock. Additions therefore never invalidate the cache; only a generation bump (whole-root rescan / compaction, which may remap ids) rebuilds it. A *deletion* leaves postings naming tombstoned ids unless pruned — safe either way, because the accelerated path checks liveness and the matcher decides. Measured live on a churning 737 k-entry index: 23 s/query before (full rebuild every query), ~0.3 s after in a debug build.
 - `path:` terms are not accelerated (the index stores no path strings, §3), and literals shorter than three bytes give no trigram. Both fall through to the linear scan for their part of the query.
 
-`crates/findex/tests/trigram_differential.rs` pins the contract against random trees and a corpus spanning every query shape; `crates/findex/examples/trigram_bench.rs` measures it. At 1 M entries the postings cost ~45 MiB against ~13 MiB of name bytes (a name averaging ~13 bytes yields ~11.6 trigrams), so the accelerator roughly quadruples name-side memory and queries run 6–60× faster — a good trade at 10 M+ files, which is why the design gates it at that scale. `path:`-heavy queries see no benefit.
+`crates/fflocate/tests/trigram_differential.rs` pins the contract against random trees and a corpus spanning every query shape; `crates/fflocate/examples/trigram_bench.rs` measures it. At 1 M entries the postings cost ~45 MiB against ~13 MiB of name bytes (a name averaging ~13 bytes yields ~11.6 trigrams), so the accelerator roughly quadruples name-side memory and queries run 6–60× faster — a good trade at 10 M+ files, which is why the design gates it at that scale. `path:`-heavy queries see no benefit.
 
 The accelerator is compiled in by default and can be dropped with the `trigram` cargo feature (`--no-default-features`); without it, queries run the plain linear scan and return the same results. It is not persisted across restarts, so a cold start rebuilds it (1.9 s at 1 M entries).
 
@@ -329,7 +338,7 @@ ff watch                         # tail live events (debugging; preview of subsc
 ff service install               # systemd user unit / launchd plist
 ```
 
-`ff` auto-spawns the daemon if not running and streams crawl progress in the meta line. Results stream as found; default order = index order (fastest), `--sort` opt-in.
+`ff` auto-spawns the daemon if not running and streams crawl progress in the meta line. Results stream as found; default order = index order (fastest), `--sort` opt-in. A client that disconnects mid-scan aborts the in-flight scan: every emit in the chain returns `bool` (first refusal stops the scan, no `Done` follows — a partial total would lie), and the engines additionally poll a disconnect predicate per 4096-entry chunk, so even zero-hit scans and kernel-buffered writes stop within ~4 ms of the FIN/RST. A query with `progress: true` (GUI only) additionally receives `Progress { scanned, total }` records — entries visited vs entries to visit — between `Meta` and `Done`, rate-gated to ~10/s, so long scans render a real percent; `ff` never opts in. Lag behind the filesystem is reported too: queued changes are stamped on arrival, the tick mirrors the oldest unapplied stamp, and `Meta.lag_ms` carries its age (`None` when caught up), so a catching-up daemon can say how many seconds behind it is.
 
 ---
 
@@ -368,8 +377,8 @@ The reconciliation layer is where this project lives or dies; test it like Watch
 
 Lessons from the Watchman/React-Native years, applied pre-emptively:
 
-- **Socket**: `$XDG_RUNTIME_DIR/findex.sock` (0600); system instance `/run/findex.sock`. Never `/tmp` (stale-socket class of bugs).
-- **State dir**: `$XDG_STATE_HOME/findex/<format-version>/` — versioned so a format change migrates or recrawls instead of corrupting. Stale-lock recovery via pidfile + `flock`.
+- **Socket**: `$XDG_RUNTIME_DIR/fflocate.sock` (0600); system instance `/run/fflocate.sock`. Never `/tmp` (stale-socket class of bugs).
+- **State dir**: `$XDG_STATE_HOME/fflocate/<format-version>/` — versioned so a format change migrates or recrawls instead of corrupting. Stale-lock recovery via pidfile + `flock`.
 - **Health in `ff stats`**: `recrawl_count`, `last_rescan_cause` (not just "a rescan happened"), queue depth, drops, per-root state/caps, last compaction. Every rescan logs its cause.
 - **Backoff**: rate-limited rescans (§7); a pathological workload must not become a recrawl loop.
 - **sysctl guidance** for the inotify fallback documented in `ff doctor`: `fs.inotify.max_user_watches`, `max_queued_events`.

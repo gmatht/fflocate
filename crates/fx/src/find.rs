@@ -1,10 +1,10 @@
 //! `find` compatibility mode (§12).
 //!
 //! When this binary is invoked as `find` or `ffind` (argv\[0\], e.g. via a
-//! symlink), it acts as a `find`-compatible front end over the findex index.
+//! symlink), it acts as a `find`-compatible front end over the fflocate index.
 //!
 //! The plan is the two-phase one: translate the `find` expression into a
-//! findex expression tree, let the index prune on everything it can answer
+//! fflocate expression tree, let the index prune on everything it can answer
 //! (name/type/path/depth), and then evaluate the metadata tests (`-size`,
 //! `-mtime`, `-newer`, `-perm`, `-user`, …) with `lstat` on the survivors only.
 //!
@@ -29,7 +29,7 @@ use std::process::ExitCode;
 use crate::client::{CliError, Client};
 
 const USAGE: &str = "\
-find — find files by name in the findex index (find-compatible)
+find — find files by name in the fflocate index (find-compatible)
 
 USAGE:
     find [PATH...] [EXPRESSION]
@@ -201,7 +201,7 @@ pub fn run(argv: &[String]) -> Result<ExitCode, CliError> {
         return Ok(ExitCode::SUCCESS);
     }
     if argv.iter().any(|a| a == "-V" || a == "--version") {
-        println!("find (findex) {}", env!("CARGO_PKG_VERSION"));
+        println!("find (fflocate) {}", env!("CARGO_PKG_VERSION"));
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -266,7 +266,7 @@ fn resolve_bases(paths: &[String]) -> Result<Vec<String>, std::path::PathBuf> {
                 // strip the prefix so bases compare with index paths.
                 #[cfg(windows)]
                 let rp = std::path::PathBuf::from(strip_verbatim_prefix(&rp.to_string_lossy()));
-                let rp = findex::util::normalize_separators(&rp);
+                let rp = fflocate::util::normalize_separators(&rp);
                 match rp.to_str() {
                     Some(s) => out.push(s.to_string()),
                     None => out.push(p.clone()),
@@ -303,7 +303,7 @@ pub struct Plan {
     /// resolved to absolute form by [`resolve_bases`] so they compare equal to
     /// the absolute paths the index stores.
     pub paths: Vec<String>,
-    /// The index-level expression as a findex expression tree (JSON).
+    /// The index-level expression as a fflocate expression tree (JSON).
     pub index_expr: serde_json::Value,
     /// Metadata tests, evaluated with `lstat` on survivors.
     pub meta: Vec<MetaTest>,
@@ -465,7 +465,7 @@ impl Plan {
                 }
                 "-exec" | "-execdir" | "-delete" | "-ok" => {
                     return Err(CliError::Usage(format!(
-                        "find: {a} is not supported (findex does not run actions); \
+                        "find: {a} is not supported (fflocate does not run actions); \
                          this is deliberate — use `ff -0 ... | xargs`"
                     )))
                 }
@@ -484,7 +484,7 @@ impl Plan {
                 }
                 other if other.starts_with('-') => {
                     return Err(CliError::Usage(format!(
-                        "find: unknown predicate '{other}' (findex implements a subset; \
+                        "find: unknown predicate '{other}' (fflocate implements a subset; \
                          unsupported tests are an error, not ignored)"
                     )));
                 }
@@ -735,14 +735,14 @@ mod tests {
         // (verbatim `\\?\` prefixes never survive it on Windows).
         #[cfg(windows)]
         let cwd = std::path::PathBuf::from(strip_verbatim_prefix(&cwd.to_string_lossy()));
-        let cwd = findex::util::normalize_separators(&cwd);
+        let cwd = fflocate::util::normalize_separators(&cwd);
         let got = resolve_bases(&[".".to_string()]).unwrap();
         assert_eq!(got, vec![cwd.to_string_lossy().to_string()]);
 
         // An absolute path that exists round-trips through canonicalization.
         // (`join` reintroduces `\` separators; the expectation is normalized
         // like the result.)
-        let abs = findex::util::normalize_separators(&cwd.join("Cargo.toml"));
+        let abs = fflocate::util::normalize_separators(&cwd.join("Cargo.toml"));
         let got = resolve_bases(&[abs.to_string_lossy().to_string()]).unwrap();
         assert_eq!(got, vec![abs.to_string_lossy().to_string()]);
     }

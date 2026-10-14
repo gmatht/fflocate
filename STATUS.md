@@ -8,23 +8,23 @@ it is a status note.
 
 | Design section | Status | Where |
 |---|---|---|
-| §3 Index data model | done | `crates/findex/src/index.rs`, `roots.rs` |
-| §4 Per-mount probing | done | `crates/findex/src/mount.rs` (`fanotify_available`, `handle_of_path`) |
-| §4/§6 **exclusions** | done | `crates/findex/src/excludes.rs`, `applier.rs`; tests `tests/excludes.rs` |
+| §3 Index data model | done | `crates/fflocate/src/index.rs`, `roots.rs` |
+| §4 Per-mount probing | done | `crates/fflocate/src/mount.rs` (`fanotify_available`, `handle_of_path`) |
+| §4/§6 **exclusions** | done | `crates/fflocate/src/excludes.rs`, `applier.rs`; tests `tests/excludes.rs` |
 | §4 **native-filesystem defaults + mount-aware crawl** | done | `mount.rs` (`NATIVE_FSTYPES`, `default_root_candidates`), `roots.rs` (path-qualified entry names), `applier.rs` (mountpoint set, `may_descend`), `daemon.rs` (covered-root pruning), `config.rs` (`default_roots`); tests `tests/mount_boundary.rs` |
-| §3/§15 **system daemon** | done | `crates/findex/src/ownership.rs`, `server.rs` (`finish_query`), `crates/findexd/src/net.rs` (`bind_system`, `peer_credentials`); tests `tests/system_access.rs`, `tests/system_live.rs` |
-| §5 Initial crawl | done | `crates/findex/src/crawl.rs`, `applier.rs` (`crawl_dir`) |
-| §6 Watcher backends | inotify + **fanotify-FID** + fake | `crates/findex/src/watch/{mod,inotify,fanotify,fake}.rs`, `watch/fidmap.rs`; tests `tests/fanotify_live.rs` |
-| §7 Reconciliation, backoff, degraded mode | done | `crates/findex/src/pending.rs`, `applier.rs` |
-| §8 Cookie sync | done | `crates/findex/src/sync.rs`, `server.rs` (`handle_sync`) |
-| §9 Snapshot + journal + cursors + compaction | done | `crates/findex/src/{snapshot,journal,persist,cursor}.rs` |
-| §10 Query engine | done | `crates/findex/src/query.rs` |
-| §10/§17 **v2 trigram accelerator** | done | `crates/findex/src/trigram.rs`, `query.rs` (`execute_with_trigram`), `applier.rs` (`Shared::trigram_index`); tests `tests/trigram_differential.rs`; bench `examples/trigram_bench.rs` |
-| §10 **fuzzy search** | done | `crates/findex/src/fuzzy.rs`, `query.rs` (`execute_fuzzy`), `proto.rs`/`server.rs`/`fx` (`--fuzzy`, `--distance`) |
-| §11 IPC protocol v2 | done | `crates/findex/src/proto.rs`, `server.rs` |
+| §3/§15 **system daemon** | done | `crates/fflocate/src/ownership.rs`, `server.rs` (`finish_query`), `crates/fflocated/src/net.rs` (`bind_system`, `peer_credentials`); tests `tests/system_access.rs`, `tests/system_live.rs` |
+| §5 Initial crawl | done | `crates/fflocate/src/crawl.rs`, `applier.rs` (`crawl_dir`) |
+| §6 Watcher backends | inotify + **fanotify-FID** + fake | `crates/fflocate/src/watch/{mod,inotify,fanotify,fake}.rs`, `watch/fidmap.rs`; tests `tests/fanotify_live.rs` |
+| §7 Reconciliation, backoff, degraded mode | done | `crates/fflocate/src/pending.rs`, `applier.rs` |
+| §8 Cookie sync | done | `crates/fflocate/src/sync.rs`, `server.rs` (`handle_sync`) |
+| §9 Snapshot + journal + cursors + compaction | done | `crates/fflocate/src/{snapshot,journal,persist,cursor}.rs` |
+| §10 Query engine | done | `crates/fflocate/src/query.rs` |
+| §10/§17 **v2 trigram accelerator** | done | `crates/fflocate/src/trigram.rs`, `query.rs` (`execute_with_trigram`), `applier.rs` (`Shared::trigram_index`); tests `tests/trigram_differential.rs`; bench `examples/trigram_bench.rs` |
+| §10 **fuzzy search** | done | `crates/fflocate/src/fuzzy.rs`, `query.rs` (`execute_fuzzy`), `proto.rs`/`server.rs`/`fx` (`--fuzzy`, `--distance`) |
+| §11 IPC protocol v2 | done | `crates/fflocate/src/proto.rs`, `server.rs` |
 | §12 CLI | done | `crates/fx/src/{main,client,service}.rs` (binary `ff`; the `fx` name collides with the snap JSON viewer. Crate dir kept as `crates/fx`.) |
-| §13 Concurrency model | done | `crates/findex/src/applier.rs`, `crates/findexd/src/daemon.rs` |
-| §14 Testing | done (§14.1–.5) | `crates/findex/tests/*`, `crates/findexd/tests/*`, `scripts/e2e.sh` |
+| §13 Concurrency model | done | `crates/fflocate/src/applier.rs`, `crates/fflocated/src/daemon.rs` |
+| §14 Testing | done (§14.1–.5) | `crates/fflocate/tests/*`, `crates/fflocated/tests/*`, `scripts/e2e.sh` |
 | §15 Operations and hardening | mostly | `config_paths.rs`, `net.rs`, `health.rs`; `--system` socket/permission handling in `net.rs` |
 
 ## Verified behaviour
@@ -40,8 +40,11 @@ All of the following were exercised against real binaries and a real temp tree:
 * `ff stats --roots` — gen/lsn/entries/tombstones, per-root state/fstype/caps.
 * `ff rescan <root>`, `ff --since <cursor>` (cursor is `c:<gen>:<lsn>`).
 * Daemon restart: the index came back from **journal replay** without a
-  recrawl (`journal.log` present, no snapshot yet; `catching_up` cleared once
-  the queue drained).
+  recrawl — the snapshot serves immediately with `catching_up: true` while
+  the tail drains in bounded chunks on the applier tick (§9.1); torn tails
+  auto-enqueue `JournalCorrupt` rescans and converge without a manual step.
+  (`journal.log` present, no snapshot yet; `catching_up` clears once replay
+  *and* the initial crawl drain.)
 * Cookie files are cleaned up on completion and on timeout (no leaks).
 
 `cargo test` runs 377 tests, all green, including a 120-step random
@@ -54,7 +57,7 @@ stdout, use `ff --fuzzy` (§10, above).
 
 ### v2 trigram accelerator (§10/§17)
 
-`crates/findex/src/trigram.rs` maps each lowercased-ASCII **name** trigram to a
+`crates/fflocate/src/trigram.rs` maps each lowercased-ASCII **name** trigram to a
 sorted posting list of entry ids; a query's required literals are intersected
 through it and only the survivors are checked. It is a **filter, never an
 authority** — `execute_with_trigram` runs the full `Query::matches` on every
@@ -63,7 +66,7 @@ keyed on `(generation, entry_count)`; any addition or generation bump rebuilds
 it, and stale postings that still name tombstoned ids are harmless because the
 accelerated path rechecks liveness.
 
-Measured with `cargo run --release -p findex --example trigram_bench -- 1000000`
+Measured with `cargo run --release -p fflocate --example trigram_bench -- 1000000`
 (1 M entries, this machine):
 
 ```
@@ -94,14 +97,14 @@ answer. Two honest caveats:
   fall through to the linear scan. A query that is *only* such terms sees no
   speedup.
 
-`crates/findex/tests/trigram_differential.rs` pins the filter contract across
+`crates/fflocate/tests/trigram_differential.rs` pins the filter contract across
 random trees and a corpus covering substrings (incl. < 3 bytes), smart-case,
 globs, regex, `path:`, phrases, negation and their combinations. The deletion
 case is the one that earned its keep: it caught stale postings producing phantom
 hits until liveness was rechecked in the accelerated path.
 
-The accelerator is behind a **default-on cargo feature, `trigram`** (`findex`,
-with passthroughs on `findexd` and `ff`). `cargo build --no-default-features`
+The accelerator is behind a **default-on cargo feature, `trigram`** (`fflocate`,
+with passthroughs on `fflocated` and `ff`). `cargo build --no-default-features`
 compiles it out entirely — no posting lists, no cache, and queries fall through
 to the plain linear scan with identical results. This is the switch to reach for
 on memory-constrained machines (the ~4× name-byte cost above) or when the
@@ -112,7 +115,7 @@ toggle and no branch cost when off.
 
 `ff --fuzzy` (or `Request::Query.fuzzy`) turns the plain substring terms into
 approximate matches; `--distance N` sets the budget and defaults to **1**. The
-matcher (`crates/findex/src/fuzzy.rs`) is bounded, case-insensitive edit
+matcher (`crates/fflocate/src/fuzzy.rs`) is bounded, case-insensitive edit
 distance: `substring_within` answers "does some substring of the name lie within
 `k` edits of the needle" with a free-prefix first DP row and a free-suffix
 minimum over the last, falling back to an exact `memmem` find when there is one.
@@ -143,7 +146,7 @@ constrain. It is opt-in for exactly that reason.
 
 ### fanotify-FID backend (§6, v1.5)
 
-`crates/findex/src/watch/fanotify.rs` watches whole filesystems
+`crates/fflocate/src/watch/fanotify.rs` watches whole filesystems
 (`FAN_MARK_FILESYSTEM` + `FAN_REPORT_DFID_NAME`) and reports file handles instead
 of watch descriptors. `watch/fidmap.rs` maps a handle back to a directory id.
 Renames arrive as `FAN_MOVED_FROM`/`FAN_MOVED_TO` and are paired by the moved
@@ -174,12 +177,12 @@ unit test:
 A whole-mount watch cannot decline a subtree, so the applier filters instead
 (`excludes.rs`). An excluded **directory is never inserted**; because events name
 their parent by id, that single omission prunes the whole subtree with no
-ancestor walk. `FINDEX_EXCLUDE=build,node_modules` sets the rules; empty by
+ancestor walk. `FFLOCATE_EXCLUDE=build,node_modules` sets the rules; empty by
 default. Verified live on a fanotify daemon.
 
 ### System daemon: privileged, multi-user (§3, §15)
 
-`findexd --system` runs as root, indexes privileged paths, and answers each
+`fflocated --system` runs as root, indexes privileged paths, and answers each
 caller **as themselves**. The pieces:
 
 * **Ownership sidecar** (`ownership.rs`): `Attr { uid, gid, mode }` per entry id,
@@ -192,13 +195,13 @@ caller **as themselves**. The pieces:
   hidden — a per-entry check would get that wrong. All four query shapes (exact,
   fuzzy, expression, count) go through the one function; before it existed, fuzzy
   and expression **leaked**, and the count reported root's total.
-* **Socket and identity** (`net.rs`): `/run/findexd.sock`, mode 0660 owned by the
-  `findex` group; `SO_PEERCRED` for the caller (the kernel's answer, never the
+* **Socket and identity** (`net.rs`): `/run/fflocated.sock`, mode 0660 owned by the
+  `fflocate` group; `SO_PEERCRED` for the caller (the kernel's answer, never the
   client's). The daemon refuses to start without the group rather than widening
   the mode.
 
 Verified **live in this container as root, with a real unprivileged user**:
-a client outside the `findex` group is refused at connect; one inside sees
+a client outside the `fflocate` group is refused at connect; one inside sees
 `public/readable.txt` and cannot see `private/secret.txt` by name, by fuzzy
 search, by expression, or in a count. See `tests/system_access.rs` (the filter's
 logic) and `tests/system_live.rs` (the privileged/unprivileged run).
@@ -232,7 +235,7 @@ never-compacted foreign store is the one documented unprotected case.
 On Linux the daemon now indexes every readable native filesystem by default
 (`ext4`, `btrfs`, `xfs`, `f2fs`, …) instead of just `$HOME`; unreadable mounts
 are skipped loudly at startup, and when discovery yields nothing usable
-(containers) the historical `$HOME` root applies. `$FINDEX_ROOT` and `--root`
+(containers) the historical `$HOME` root applies. `$FFLOCATE_ROOT` and `--root`
 still win outright, and every other platform keeps `$HOME`.
 
 Deliberately **not** a database per filesystem: the index already stores paths
@@ -303,7 +306,7 @@ tests (parsing, glob→regex) and `crates/fx/tests/locate_e2e.rs` (symlinked
 binary against a real daemon, incl. the dangling-symlink `-e`/`-L` case),
 wired into `scripts/e2e.sh`.
 
-### Watchman query-language ports (`crates/findex/src/expr.rs`)
+### Watchman query-language ports (`crates/fflocate/src/expr.rs`)
 
 The expression-tree language (`since.cpp` term added: `ClockSpec` with
 timestamp/`c:pid:ticks`/`c:start:pid:root:ticks` clockspecs, `oclock`/
@@ -320,24 +323,24 @@ match), POSIX `[:class:]` support, and the `/.` period rule for `**`.
 ### Fault injection and soak (§14.3, §14.5)
 
 These spawn real binaries and need kernel capabilities, so they live behind
-`scripts/e2e.sh` (`FINDEX_BIN_DIR`) or `--ignored`:
+`scripts/e2e.sh` (`FFLOCATE_BIN_DIR`) or `--ignored`:
 
-* `crates/findexd/tests/fault_crash.rs` — SIGKILL a live `findexd` mid-churn;
+* `crates/fflocated/tests/fault_crash.rs` — SIGKILL a live `fflocated` mid-churn;
   restart. Plus a **deterministic torn journal tail** (truncate mid-record, which
   is what a real power loss produces; a page-cache SIGKILL on tmpfs rarely
   tears) and **four rounds of repeated `kill -9`**. Every restart comes up,
   reports `journal_corrupt` when torn, never wedges, and converges to filesystem
   truth after a rescan.
-* `crates/findexd/tests/fault_fsops.rs` — a real bind mount on a distinct tmpfs,
+* `crates/fflocated/tests/fault_fsops.rs` — a real bind mount on a distinct tmpfs,
   unmounted under the daemon; a **mount watchdog** notices the device-id change,
   logs `cause=mount_event`, and reconciles. Also: a root whose path vanishes is
   reported `degraded(root_gone)`, and **watch-limit exhaustion** (lowering
   `fs.inotify.max_user_watches` to 8, restored even on panic) degrades the root
   loudly in `watch_failures`/`watch_limit_hits` with no panic.
-* `crates/findex/tests/soak.rs` — a bounded soak: 20 000 random namespace ops
+* `crates/fflocate/tests/soak.rs` — a bounded soak: 20 000 random namespace ops
   with live event injection, a full-tree audit every 2 000 ops and a final one,
   asserting **zero drift** and stable survivor ids. It also drives compaction
-  (threshold lowered to 1 500 records). `FINDEX_SOAK_OPS` / `FINDEX_SOAK_AUDIT`
+  (threshold lowered to 1 500 records). `FFLOCATE_SOAK_OPS` / `FFLOCATE_SOAK_AUDIT`
   raise the budget for a long run; `#[ignore]`d so `cargo test` stays quick.
 
 ### An important finding
@@ -357,7 +360,7 @@ These are deliberate and small; each is noted so the design stays honest.
    performance target (§17: ≥ 1 M files/s/core) is not met by this path. The
    `DT_UNKNOWN` → `fstatat` fallback is expressed as a capability (§4) and
    probed, but the hot loop is the stdlib one. Replacing it is a contained
-   change in `crates/findex/src/crawl.rs`.
+   change in `crates/fflocate/src/crawl.rs`.
 
 2. **`subscribe` is a preview.** Per §11 it is "v1.5". The op is accepted and
    answers with meta + the current cursor, but there is no live per-subscriber
@@ -447,6 +450,114 @@ These are deliberate and small; each is noted so the design stays honest.
   `watcher_services_watch_requests_while_events_back_up` (30 s watchdog — the
   plain blocking-send variant hangs at exactly that watchdog).
 fails at exactly that watchdog).
+* **Deaf daemon: the accept loop is now supervised.** The incident above showed
+  the deeper hole: the accept thread was fire-and-forget, so a live process
+  (pidfile held, applier ticking, watcher polling) could go deaf with nobody
+  left to notice — the client could only fail fast (`spawn::deaf_daemon_message`)
+  and tell the operator to kill it. Now an `AcceptSupervisor`
+  (`crates/fflocated/src/net.rs`) owns the listener: it adopts the startup bind,
+  and re-binds + respawns on death with a 1 s backoff. The supervisor is shared
+  (`Arc<Mutex<..>>`) and ticked from *both* the applier loop (`main`) and the
+  watcher loop (`Daemon::start`, ~20×/s), so either surviving thread revives the
+  listener — which covers the wedged-applier case above, where only the watcher
+  is alive to notice. Each repair bumps `health.accept_restarts` (visible in
+  `ff stats`; 0 is healthy), and `serve_client` no longer panics on a failed
+  stream clone. Pinned by `net::supervisor_tests::supervisor_respawns_a_dead_accept_loop`
+  (kill the adopted generation, tick, assert `accept_restarts == 1` and a live
+  `Hello` round-trip on the same socket path). One honest scope bound: if the
+  applier thread itself is gone, serving is broken regardless (it owns all index
+  mutation), so a resurrected listener would be theater — and a minutes-long
+  `diff_subtree` delays the applier-side tick until the drain returns, bounding
+  the deaf window by the longest single work item, not unbounded.
+* **Dead-client scan halt.** A client that disconnects mid-scan used to cost a
+  full scan to a dead socket: the socket `emit` in `net::respond_streaming`
+  already swallowed the write error into a `closed` flag, but the scan kept
+  running to `Done` (which itself failed silently). Now two mechanisms compose:
+  (1) every `emit` in the chain returns `bool` — `query::consider_emit` + the
+  three `*_emit` engines (`Option<u64>`: `None` on abort, since a partial total
+  would lie in `Done`), the four `server::handle_*_streaming` fns (no `Done`
+  after an abort), and the socket closure (refuses once closed); (2) an active
+  disconnect poll — `query::ScanAbort` (`Option<&dyn Fn() -> bool>`), threaded
+  through all engines and checked per 4096-entry chunk (~4 ms of scan), so the
+  worst overshoot after a disconnect is one chunk. The poll closes the three
+  holes passive write-error detection leaves: zero-hit scans (no writes, no
+  errors), kernel-buffered writes (succeed long after the peer vanished), and
+  fuzzy compute (scores the whole candidate set before the first emit — hence
+  `execute_fuzzy_abortable`, with `execute_fuzzy` delegating abort-free).
+  `net::client_gone_fd` implements the poll on unix (zero-timeout `poll` for
+  `POLLIN|POLLHUP|POLLERR` + `MSG_PEEK`: 0 = FIN, error = RST, bytes = a
+  pipelined request, left untouched); Windows keeps write-error-only halt (no
+  `poll`+peek without going nonblocking, which the serve loop needs blocking).
+  Batched `handle_request` and all collect-then-filter paths pass `None`, so
+  their wire shape is unchanged. Pinned by `query::emit_refusal_aborts_the_scan`,
+  `query::expr_emit_refusal_aborts_the_scan`,
+  `query::abort_poll_stops_a_zero_hit_scan`,
+  `query::abort_poll_stops_fuzzy_mid_compute`,
+  `server::streaming_abort_skips_done_and_stops_the_scan`,
+  `server::streaming_abort_poll_stops_the_scan_without_any_refusal`, and
+  `net::client_gone_detects_fin_but_not_data` (socketpair: live/pipelined alive,
+  FIN gone, peek consumes nothing).
+* **Daemon-emitted scan-fraction progress.** Slow GUI searches used to show
+  only elapsed seconds (`searching for comp… 44s`) with no sense of how much
+  scan remained — the client knew hits-so-far but neither the scan fraction
+  nor the total (`Done` comes last), and `hits/entries` sits at ~0.08% for a
+  query like `comp`, which is noise, not progress. Now an opt-in
+  `Query.progress` flag (GUI only; `ff` never sends it, so its output is
+  byte-identical) asks the daemon to emit `Progress { scanned, total }`
+  records — entries *visited* vs entries to visit — between `Meta` and
+  `Done`, on all four scan paths (linear, trigram, fuzzy scoring, expr).
+  The engines report per 4096-entry chunk through a single `ScanEvent`
+  callback (one `&mut` borrow: `Hit` and `Progress` share it, since they emit
+  interleaved); the server rate-gates to ~10/s (`PROGRESS_MIN_INTERVAL`) plus
+  the initial `(0, total)` denominator announcement, so fast queries send 0–2
+  lines and the percent simply never appears for them. The GUI renders
+  `searching for comp… 42%` / `7 hits… (counting total… 1.2s, 3%)` from a
+  per-ticket monotone watermark (capped at 99 — 100% is `Done`'s privilege),
+  dropped on supersede like the partial-render count. No version bump: the
+  flag is an unknown JSON *field* to old daemons (serde ignores it) and
+  Progress-free replies render seconds-only, exactly as before. Pinned by
+  `query::progress_reports_scan_fraction_then_completes`,
+  `query::progress_refusal_aborts_with_no_total`,
+  `server::progress_records_flow_between_meta_and_done`,
+  `daemon_e2e::progress_opt_in_streams_scan_fraction_over_the_socket`, and
+  the GUI's `scan_percent_*` / `progress_percent_*` / `query_request_opts_*`
+  / `outcome_ignores_progress_records` tests; the `streaming_lockorder`
+  wire-shape assert allows (never requires) Progress between Meta and Done.
+  Verified live against a release daemon: a 3k-entry opt-in query yields
+  `Meta → Progress(0/3000) → Hits → Done`, opt-out yields no Progress, and
+  `ff` output is unchanged. Honest scope bound: fuzzy percent covers the
+  *scoring* pass (candidates visited), not the ranking that follows — and a
+  sparse trigram candidate set finishes in 1–2 chunks, so percent jumps
+  rather than glides. Both are the scan's real work, not estimates.
+* **Daemon lag, in seconds.** `[daemon catching up]` said *that* the daemon
+  was behind, never *how far* — the honest half of the warning was missing.
+  Now every queued change (watcher event, crawl, rescan) is stamped with its
+  arrival wall time in `pending::Pending` (`Stamped<T>`), the applier tick
+  mirrors the oldest still-unapplied stamp into `health.oldest_queued_at_ms`
+  (`0` = caught up, and a still-draining journal-replay tail counts as
+  unapplied work with `pending_replay_started_ms` as its floor), and
+  `meta_preamble` computes the *age at reply time* as `Meta.lag_ms`
+  (saturating, so a clock step cannot underflow into a colossal number).
+  Clients render it as seconds: the GUI shows
+  `1 matches  [daemon catching up, 12s behind]` and the in-flight lines too
+  (`searching for comp… 1.3s 42%  [daemon catching up, 7s behind]`), `ff`
+  warns `daemon is still catching up (4s behind)`, and `ff stats` prints a
+  derived `lag  12.3s behind (oldest unapplied change)`. Honest bounds, all
+  deliberate: the age is measured from *queue arrival*, so it is the
+  daemon's own backlog age, not a filesystem-wide clock skew measure;
+  seconds round down and a sub-second lag keeps the old bare
+  `[daemon catching up]` (a number would claim precision the clock lacks);
+  ancestry collapse inherits the *oldest* member's stamp rather than
+  resetting to `now`, so a rescan storm cannot hide lag; a coalesced
+  re-enqueue keeps the original stamp for the same reason; and an older
+  daemon that omits `lag_ms` renders exactly the previous wording. Pinned by
+  `pending::tests::oldest_queued_*` / `coalesced_reenqueue_keeps_original_stamp`,
+  `server::tests::meta_reports_lag_age_when_work_is_queued` (age at reply
+  time, saturation, the `0` sentinel), `proto::tests::response_lines_roundtrip`
+  (present when behind, absent when caught up, an old client line parses as
+  `None`), and the GUI's `catching_up_suffix_*` / `*_line_shows_lag_seconds` /
+  `outcome_from_records_carries_lag`. Verified live against a real daemon:
+  a churning queue reports a rising age, and a settled one omits the field.
 
 ## Reproducing the checks
 
@@ -479,10 +590,10 @@ plus the release-binary e2e suites (`locate_e2e`, `update_e2e`, `fault_crash`,
 `fault_fsops` — the last two skip only what needs bind mounts/inotify
 sysctls). Findings from the bring-up, all fixed:
 
-* **IPC**: `findex::transport` (`Stream`/`Listener` aliases + `connect`);
+* **IPC**: `fflocate::transport` (`Stream`/`Listener` aliases + `connect`);
   unix sockets on unix, TCP loopback on Windows. The socket "path" stays a
   `PathBuf` everywhere: on Windows it carries `127.0.0.1:PORT` text
-  (`FINDEX_PORT`, default 18923). No new dependencies.
+  (`FFLOCATE_PORT`, default 18923). No new dependencies.
 * **Paths**: index stays `/`-canonical; `util::normalize_separators` runs at
   root ingestion (`Root::new`), `handle_rescan`, and the `ff` sends, so
   `C:\tree` keys and matches. Non-UTF-8 names go lossy (documented).

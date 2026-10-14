@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  ff-gui.exe application manifest (Windows).
+  The Common-Controls v6 dependency is load-bearing, not cosmetic:
+  native-windows-gui binds raw event handlers through
+  comctl32!SetWindowSubclass, which does not exist in the v5 controls.
+  Without this manifest the loader resolves comctl32 v5.82 and the
+  process dies at startup with 0xC0000139 (entry point not found) —
+  before main() runs, so --version fails too.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+    version="0.1.0.0"
+    processorArchitecture="*"
+    name="fflocate.ff-gui"
+    type="win32"
+  />
+  <description>ff-gui: a file-search browser for the fflocate daemon.</description>
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

@@ -4,41 +4,55 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "ff-gui: a file-search browser for the findex daemon."
+description = "ff-gui: a file-search browser for the fflocate daemon."
 
 [[bin]]
 name = "ff-gui"
 path = "src/main.rs"
 
 [features]
-# On Linux the GUI defaults to the real widget toolkit (GTK), which is what a
-# user expects from `ff --gui`. The `zork` backend is a display-free fallback:
+# Backend selection. On Linux the GUI defaults to the real widget toolkit
+# (GTK), which is what a user expects from `ff --gui`. On macOS it defaults
+# to the native AppKit backend. The `zork` backend is a display-free fallback:
 # it drives the same widget API from a REPL, so the GUI still runs over ssh or
 # in a container with no X server.
 #
 # Cargo features cannot be target-conditional, so `gtk` is on everywhere; that
-# is harmless off Linux. rustxwidgets selects its backend by target as well as
-# feature (`cfg(windows)` -> nwg, `cfg(target_arch = "wasm32")` -> wasm), and the
-# gtk module itself is `cfg(target_os = "linux")`, so on Windows/macOS/wasm the
-# feature is inert rather than wrong.
-default = ["gtk"]
-gtk = ["rustxwidgets/gtk"]
-zork = ["rustxwidgets/zork"]
+# is harmless off Linux. rswidgets selects its backend by target as well as
+# feature (`cfg(target_os = "macos")` -> appkit, `cfg(windows)` -> nwg,
+# `cfg(target_arch = "wasm32")` -> wasm), and the gtk module itself is
+# `cfg(target_os = "linux")`, so on Windows/macOS/wasm the feature is inert
+# rather than wrong. Conversely the `macos` feature only activates the AppKit
+# backend on macOS; elsewhere it is inert.
+default = ["gtk", "macos"]
+gtk = ["rswidgets/gtk"]
+macos = ["rswidgets/macos"]
+zork = ["rswidgets/zork"]
 
 [dependencies]
-findex.workspace = true
+fflocate.workspace = true
 serde_json.workspace = true
 
-# rustxWidgets, vendored with its gtk backend and the gtk_dynamic_loader it
-# needs. Two crates rather than a path into a checkout outside this repository
-# so the build is self-contained; see README.md for why they are vendored and
-# what was fixed in them.
+# rswidgets (the rustxWidgets widget crate), vendored with its gtk backend and
+# the gtk_dynamic_loader it needs. Two crates rather than a path into a
+# checkout outside this repository so the build is self-contained; see
+# README.md for why they are vendored and what was fixed in them.
 #
 # NB: this must stay in [dependencies]. A [dev-dependencies] table placed above
 # it silently swallows it into the dev-dependency set, so the library and binary
-# no longer link it (the symptom is "cannot find crate `rustxwidgets`" despite
+# no longer link it (the symptom is "cannot find crate `rswidgets`" despite
 # Cargo reporting the dependency normally).
-rustxwidgets = { path = "../../vendor/rustxwidgets", default-features = false }
+rswidgets = { path = "../../vendor/rustxwidgets", default-features = false }
 
 [dev-dependencies]
 tempfile.workspace = true
+# Windows-only: embed the Common-Controls v6 manifest (see build.rs). Without
+# it the loader binds comctl32 v5.82, which lacks the SetWindowSubclass API
+# native-windows-gui binds through — the exe dies with 0xC0000139 at startup.
+[target.'cfg(windows)'.build-dependencies]
+embed-manifest = "1"
+# Deaf-daemon probe test holds a real flock (unix-only code path).
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+# Display-gated context-menu regression test only (see tests/context_menu_gtk.rs).
+gtk_dynamic_loader = { path = "../../vendor/gtk_dynamic_loader" }

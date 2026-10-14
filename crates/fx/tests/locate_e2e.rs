@@ -3,15 +3,15 @@
 //! GNU-locate behaviour: substring/glob/regex matching, flags, exit codes.
 //!
 //! Needs release binaries like the other e2e suites: gated behind
-//! `FINDEX_BIN_DIR` (set by `scripts/e2e.sh`); without it the tests skip.
+//! `FFLOCATE_BIN_DIR` (set by `scripts/e2e.sh`); without it the tests skip.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 fn bin_dir() -> Option<PathBuf> {
-    let d = std::env::var("FINDEX_BIN_DIR").ok().map(PathBuf::from)?;
-    (d.join(format!("findexd{}", std::env::consts::EXE_SUFFIX))
+    let d = std::env::var("FFLOCATE_BIN_DIR").ok().map(PathBuf::from)?;
+    (d.join(format!("fflocated{}", std::env::consts::EXE_SUFFIX))
         .exists()
         && d.join(format!("ff{}", std::env::consts::EXE_SUFFIX))
             .exists())
@@ -43,7 +43,7 @@ fn test_socket(dir: &std::path::Path) -> PathBuf {
     }
     #[cfg(not(windows))]
     {
-        dir.join("findex.sock")
+        dir.join("fflocate.sock")
     }
 }
 
@@ -77,7 +77,7 @@ fn setup(root: &Path, tag: &str) -> (std::process::Child, PathBuf, PathBuf) {
     // Keep the tempdir alive via the returned paths' parent: leak it like the
     // fault suites do by forgetting (the daemon holds state under it).
     let dir = d.keep();
-    let child = Command::new(bindir.join(format!("findexd{}", std::env::consts::EXE_SUFFIX)))
+    let child = Command::new(bindir.join(format!("fflocated{}", std::env::consts::EXE_SUFFIX)))
         .arg("--socket")
         .arg(&socket)
         .arg("--state-dir")
@@ -90,7 +90,7 @@ fn setup(root: &Path, tag: &str) -> (std::process::Child, PathBuf, PathBuf) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn findexd");
+        .expect("spawn fflocated");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !socket.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -132,11 +132,11 @@ fn locate(locate_bin: &Path, socket: &Path, fxbin: &Path, args: &[&str]) -> (Str
     // Deterministic settle first (locate itself has no sync flag).
     let _ = Command::new(fxbin)
         .args(["--sync", "", "-l", "1", ""])
-        .env("FINDEX_SOCKET", socket)
+        .env("FFLOCATE_SOCKET", socket)
         .output();
     let out = Command::new(locate_bin)
         .args(args)
-        .env("FINDEX_SOCKET", socket)
+        .env("FFLOCATE_SOCKET", socket)
         .output()
         .expect("run locate");
     (
@@ -167,7 +167,7 @@ fn fixture_tree() -> (tempfile::TempDir, PathBuf) {
 #[test]
 fn locate_substring_glob_and_regex() {
     let Some(bindir) = bin_dir() else {
-        eprintln!("skipping: set FINDEX_BIN_DIR to target/release (see scripts/e2e.sh)");
+        eprintln!("skipping: set FFLOCATE_BIN_DIR to target/release (see scripts/e2e.sh)");
         return;
     };
     let (_tree, root) = fixture_tree();
@@ -212,7 +212,7 @@ fn locate_substring_glob_and_regex() {
 #[test]
 fn locate_flags_count_limit_case_all_basename() {
     let Some(bindir) = bin_dir() else {
-        eprintln!("skipping: set FINDEX_BIN_DIR to target/release (see scripts/e2e.sh)");
+        eprintln!("skipping: set FFLOCATE_BIN_DIR to target/release (see scripts/e2e.sh)");
         return;
     };
     let (_tree, root) = fixture_tree();
@@ -266,7 +266,7 @@ fn locate_flags_count_limit_case_all_basename() {
 #[cfg(unix)]
 fn locate_existing_filters_dangling_symlink() {
     let Some(bindir) = bin_dir() else {
-        eprintln!("skipping: set FINDEX_BIN_DIR to target/release (see scripts/e2e.sh)");
+        eprintln!("skipping: set FFLOCATE_BIN_DIR to target/release (see scripts/e2e.sh)");
         return;
     };
     let (_tree, root) = fixture_tree();
@@ -298,7 +298,7 @@ fn locate_existing_filters_dangling_symlink() {
 #[test]
 fn locate_stats_and_help_do_not_search() {
     let Some(bindir) = bin_dir() else {
-        eprintln!("skipping: set FINDEX_BIN_DIR to target/release (see scripts/e2e.sh)");
+        eprintln!("skipping: set FFLOCATE_BIN_DIR to target/release (see scripts/e2e.sh)");
         return;
     };
     let (_tree, root) = fixture_tree();

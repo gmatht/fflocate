@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use crate::client::CliError;
-use findex::config_paths::{socket_path, state_dir};
+use fflocate::config_paths::{socket_path, state_dir};
 
 pub fn run(args: &[String]) -> Result<std::process::ExitCode, CliError> {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("install");
@@ -28,19 +28,19 @@ fn install() -> Result<std::process::ExitCode, CliError> {
     {
         let dir = config_home().join("systemd/user");
         std::fs::create_dir_all(&dir).map_err(|e| CliError::Io(e.to_string()))?;
-        let path = dir.join("findexd.service");
+        let path = dir.join("fflocated.service");
         std::fs::write(&path, systemd_unit()).map_err(|e| CliError::Io(e.to_string()))?;
         println!("wrote {}", path.display());
         println!("enable and start it with:");
         println!("  systemctl --user daemon-reload");
-        println!("  systemctl --user enable --now findexd.service");
+        println!("  systemctl --user enable --now fflocated.service");
         Ok(std::process::ExitCode::SUCCESS)
     }
     #[cfg(target_os = "macos")]
     {
         let dir = home().join("Library/LaunchAgents");
         std::fs::create_dir_all(&dir).map_err(|e| CliError::Io(e.to_string()))?;
-        let path = dir.join("dev.findex.findexd.plist");
+        let path = dir.join("dev.fflocate.fflocated.plist");
         std::fs::write(&path, launchd_plist()).map_err(|e| CliError::Io(e.to_string()))?;
         println!("wrote {}", path.display());
         println!("load it with:");
@@ -81,12 +81,12 @@ pub fn systemd_unit() -> String {
     let state = state_dir();
     format!(
         "[Unit]\n\
-         Description=findex filename index daemon\n\
-         Documentation=https://github.com/findex\n\
+         Description=fflocate filename index daemon\n\
+         Documentation=https://github.com/fflocate\n\
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart=%h/.cargo/bin/findexd --socket {socket} --state-dir {state}\n\
+         ExecStart=%h/.cargo/bin/fflocated --socket {socket} --state-dir {state}\n\
          Restart=on-failure\n\
          RestartSec=2\n\
          # The daemon is per-user and indexes only what the user can read (§16).\n\
@@ -107,10 +107,10 @@ pub fn launchd_plist() -> String {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>dev.findex.findexd</string>
+  <key>Label</key><string>dev.fflocate.fflocated</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/findexd</string>
+    <string>/usr/local/bin/fflocated</string>
     <string>--socket</string><string>{socket}</string>
     <string>--state-dir</string><string>{state}</string>
   </array>
@@ -133,7 +133,7 @@ mod tests {
         let u = systemd_unit();
         assert!(u.contains("[Service]"));
         assert!(u.contains("ExecStart="));
-        assert!(u.contains("findexd"));
+        assert!(u.contains("fflocated"));
         assert!(u.contains("[Install]"));
         assert!(u.contains("WantedBy=default.target"));
         assert!(!u.contains("/tmp"), "unit must not point at /tmp");

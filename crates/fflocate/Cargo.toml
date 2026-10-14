@@ -1,0 +1,37 @@
+[package]
+name = "fflocate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Headless realtime filename index: core library (data model, persistence, query, reconciliation)."
+
+[features]
+default = ["trigram"]
+# §17 v2: the plocate-style name-trigram posting-list accelerator (§10). On by
+# default. Disable with `--no-default-features` to build fflocate without the
+# accelerator (and without its ~4x name-byte memory cost); queries then fall
+# back to the plain linear scan, with identical results.
+trigram = ["dep:roaring"]
+
+[dependencies]
+libc.workspace = true
+aho-corasick.workspace = true
+memchr.workspace = true
+memmap2.workspace = true
+crossbeam-channel.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+roaring = { version = "0.10", optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+# Deaf-daemon lock tests hold a real flock (unix-only code path).
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
+# Physical-drive identification on Windows (volume GUID/serial, disk serial).
+# Pinned to 0.52 for the workspace MSRV (1.75); only the listed API families.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Ioctl", "Win32_System_IO"] }

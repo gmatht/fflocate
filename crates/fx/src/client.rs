@@ -5,10 +5,10 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use findex::config_paths::socket_path_from_env;
-use findex::proto::{Request, Response};
-use findex::spawn::spawn_daemon;
-use findex::transport::{self, Stream};
+use fflocate::config_paths::socket_path_from_env;
+use fflocate::proto::{Request, Response};
+use fflocate::spawn::spawn_daemon;
+use fflocate::transport::{self, Stream};
 
 #[derive(Debug)]
 pub enum CliError {
@@ -65,9 +65,9 @@ impl Client {
                 // for a listener that will never appear only hides the cause.
                 // Fail fast and loud instead; anything else spawns as before.
                 if first.kind() == std::io::ErrorKind::ConnectionRefused {
-                    let pidfile = findex::spawn::pidfile_for_socket(&socket);
-                    if findex::spawn::daemon_lock_held(&pidfile) {
-                        return Err(CliError::Io(findex::spawn::deaf_daemon_message(
+                    let pidfile = fflocate::spawn::pidfile_for_socket(&socket);
+                    if fflocate::spawn::daemon_lock_held(&pidfile) {
+                        return Err(CliError::Io(fflocate::spawn::deaf_daemon_message(
                             &socket, &pidfile,
                         )));
                     }
@@ -89,7 +89,7 @@ impl Client {
                         }
                         Err(e) => {
                             return Err(CliError::Io(format!(
-                                "cannot connect to findexd at {}: {e} (last error: {})",
+                                "cannot connect to fflocated at {}: {e} (last error: {})",
                                 socket.display(),
                                 last_err
                                     .map(|e| e.to_string())
@@ -185,6 +185,7 @@ impl Client {
                     // expression trees (§10).
                     fuzzy: false,
                     max_distance: None,
+                    progress: false,
                 }
             }
             None => {
@@ -210,15 +211,25 @@ impl Client {
                 Response::Meta {
                     stale_roots,
                     catching_up,
+                    lag_ms,
                     ..
                 } => {
                     if !stale_roots.is_empty() {
                         eprintln!("ff: warning: stale roots: {}", stale_roots.join(", "));
                     }
                     if catching_up == &Some(true) {
-                        eprintln!(
-                            "ff: warning: daemon is still catching up; results may be incomplete"
-                        );
+                        // Name the age when the daemon reports one: "how far
+                        // behind" is the actionable half of the warning. An
+                        // older daemon omits the field and keeps the old text.
+                        match lag_ms {
+                            Some(ms) if *ms >= 1000 => eprintln!(
+                                "ff: warning: daemon is still catching up ({}s behind); results may be incomplete",
+                                ms / 1000
+                            ),
+                            _ => eprintln!(
+                                "ff: warning: daemon is still catching up; results may be incomplete"
+                            ),
+                        }
                     }
                 }
                 Response::Hit { path, id } => {
@@ -310,6 +321,7 @@ impl Client {
             case_sensitive: None,
             fuzzy: false,
             max_distance: None,
+            progress: false,
         };
         let resp = self.send(&req)?;
         let mut paths: Vec<String> = Vec::new();
@@ -412,6 +424,7 @@ impl Client {
             // find mode is exact; fuzzy belongs to the ff string query.
             fuzzy: false,
             max_distance: None,
+            progress: false,
         };
         let resp = self.send(&req)?;
 
@@ -805,9 +818,30 @@ fn print_stats(stats: &serde_json::Value) {
     p!("journal_corrupt");
     p!("catching_up");
     p!("queue_depth");
+    // Lag behind the filesystem. The raw field is an arrival timestamp (wall
+    // ms), which is unreadable on its own; render the age it implies as well,
+    // computed here so it is honest at print time. `0` is the caught-up
+    // sentinel.
+    if let Some(at) = stats.get("oldest_queued_at_ms").and_then(|v| v.as_u64()) {
+        if at == 0 {
+            println!("{:<20} {}", "lag", "0s (caught up)");
+        } else {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(at);
+            let age = now.saturating_sub(at);
+            println!(
+                "{:<20} {:.1}s behind (oldest unapplied change)",
+                "lag",
+                age as f64 / 1000.0
+            );
+        }
+    }
     p!("rescans_collapsed");
     p!("dropped_events");
     p!("escalated_events");
+    p!("accept_restarts");
     if let Some(roots) = stats.get("roots").and_then(|r| r.as_array()) {
         println!("\nroots:");
         for r in roots {

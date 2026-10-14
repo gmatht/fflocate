@@ -1,4 +1,4 @@
-//! `ff` — the findex command-line client (§12).
+//! `ff` — the fflocate command-line client (§12).
 //!
 //! ```text
 //! ff main.rs                       # instant search
@@ -27,7 +27,7 @@ use std::process::ExitCode;
 use client::{CliError, Client};
 
 const USAGE: &str = "\
-ff — search the findex index
+ff — search the fflocate index
 
 USAGE:
     ff [OPTIONS] [QUERY...]
@@ -300,7 +300,7 @@ fn parse_args<I: Iterator<Item = String>>(mut it: I) -> Result<Args, CliError> {
     Ok(a)
 }
 
-/// Locate a sibling binary (a `findexd`/`ff-gui` next to `ff`).
+/// Locate a sibling binary (a `fflocated`/`ff-gui` next to `ff`).
 ///
 /// Mirrors the daemon lookup: `$<OVERRIDE>`, then the directory of `argv[0]`
 /// (deliberately *not* resolving a symlink, so a `ff` symlinked into a bin dir

@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "ff: command-line client for the findex daemon."
+description = "ff: command-line client for the fflocate daemon."
 # `cargo run` with no `--bin` runs the CLI: it is the primary interface, and
 # the only binary that makes sense without arguments or a display.
 default-run = "ff"
@@ -15,11 +15,11 @@ path = "src/main.rs"
 
 [features]
 default = ["trigram"]
-# Passthrough for findex's §17 v2 trigram accelerator.
-trigram = ["findex/trigram"]
+# Passthrough for fflocate's §17 v2 trigram accelerator.
+trigram = ["fflocate/trigram"]
 
 [dependencies]
-findex.workspace = true
+fflocate.workspace = true
 serde_json.workspace = true
 regex.workspace = true
 

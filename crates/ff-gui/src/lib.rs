@@ -1,8 +1,8 @@
-//! `ff-gui` — a file-search browser for the findex daemon, built on
+//! `ff-gui` — a file-search browser for the fflocate daemon, built on
 //! [rustxWidgets].
 //!
-//! The GUI talks to `findexd` over the same NDJSON protocol the CLI uses
-//! (`findex::proto`, unix sockets on unix, TCP loopback on Windows): a query
+//! The GUI talks to `fflocated` over the same NDJSON protocol the CLI uses
+//! (`fflocate::proto`, unix sockets on unix, TCP loopback on Windows): a query
 //! box drives `query`, and the result list is
 //! rendered as labels. Because the only rustxWidgets backend that builds without
 //! a display server is `zork` (headless), the binary is usable in a terminal and
@@ -21,11 +21,11 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use findex::config_paths::socket_path_from_env;
-use findex::proto::{Request, Response};
+use fflocate::config_paths::socket_path_from_env;
+use fflocate::proto::{Request, Response};
 
 /// Re-exported because `PendingRequest::records` hands these back to the GUI.
-pub use findex::proto::Response as WireResponse;
+pub use fflocate::proto::Response as WireResponse;
 
 /// Errors surfaced to the status line.
 #[derive(Debug)]
@@ -41,7 +41,7 @@ impl std::error::Error for GuiError {}
 impl std::fmt::Display for GuiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GuiError::Connect(m) => write!(f, "cannot reach findexd: {m}"),
+            GuiError::Connect(m) => write!(f, "cannot reach fflocated: {m}"),
             GuiError::Io(m) => write!(f, "io: {m}"),
             GuiError::Protocol(m) => write!(f, "protocol: {m}"),
             GuiError::Backend(m) => write!(f, "widget backend: {m}"),
@@ -50,7 +50,7 @@ impl std::fmt::Display for GuiError {
 }
 
 /// A connection to the daemon. Each call opens its own stream: the protocol is
-/// request/response, and `findexd` closes a client after the terminal message,
+/// request/response, and `fflocated` closes a client after the terminal message,
 /// so holding one socket open would leave a dead reader behind.
 pub struct DaemonClient {
     socket: PathBuf,
@@ -63,7 +63,7 @@ impl Default for DaemonClient {
 }
 
 impl DaemonClient {
-    /// Locate the daemon socket (honouring `$FINDEX_SOCKET`).
+    /// Locate the daemon socket (honouring `$FFLOCATE_SOCKET`).
     pub fn new() -> DaemonClient {
         DaemonClient {
             socket: socket_path_from_env(),
@@ -80,7 +80,7 @@ impl DaemonClient {
 
     /// Send one request, collect the response lines until the terminal message.
     pub fn request(&self, req: &Request) -> Result<Vec<Response>, GuiError> {
-        let stream = findex::transport::connect(&self.socket)
+        let stream = fflocate::transport::connect(&self.socket)
             .map_err(|e| GuiError::Connect(format!("{}: {e}", self.socket.display())))?;
         let mut writer = stream
             .try_clone()
@@ -94,14 +94,14 @@ impl DaemonClient {
         if let Some(obj) = v.as_object_mut() {
             obj.insert(
                 "v".into(),
-                serde_json::Value::from(findex::proto::PROTOCOL_VERSION),
+                serde_json::Value::from(fflocate::proto::PROTOCOL_VERSION),
             );
         }
         let line = serde_json::to_string(&v).map_err(|e| GuiError::Protocol(e.to_string()))?;
-        // FINDEX_DEBUG=1 prints each request, so a setting that "does nothing"
+        // FFLOCATE_DEBUG=1 prints each request, so a setting that "does nothing"
         // can be traced to what was actually sent (e.g. whether case_sensitive
         // was included at all).
-        if std::env::var_os("FINDEX_DEBUG").is_some() {
+        if std::env::var_os("FFLOCATE_DEBUG").is_some() {
             eprintln!("ff-gui -> {line}");
         }
         writeln!(writer, "{line}").map_err(|e| GuiError::Io(e.to_string()))?;
@@ -174,6 +174,9 @@ impl DaemonClient {
             case_sensitive: opts.case_sensitive.then_some(true),
             fuzzy: opts.fuzzy,
             max_distance: if opts.fuzzy { opts.max_distance } else { None },
+            // The GUI renders scan-fraction percent from these; `ff` leaves
+            // it off (its output must stay byte-identical).
+            progress: true,
         }
     }
 
@@ -187,6 +190,7 @@ impl DaemonClient {
         let mut fresh = true;
         let mut stale: Vec<String> = Vec::new();
         let mut catching_up = false;
+        let mut lag_ms: Option<u64> = None;
         let mut elapsed_ms: Option<f64> = None;
         for r in resp {
             match r {
@@ -194,12 +198,14 @@ impl DaemonClient {
                     fresh: f,
                     stale_roots,
                     catching_up: c,
+                    lag_ms: l,
                     elapsed_ms: e,
                     ..
                 } => {
                     fresh = *f;
                     stale = stale_roots.clone();
                     catching_up = c.unwrap_or(false);
+                    lag_ms = *l;
                     elapsed_ms = Some(*e);
                 }
                 Response::Hit { path, .. } => paths.push(path.clone()),
@@ -210,8 +216,8 @@ impl DaemonClient {
                     // protocol string that looks like a bug in the GUI.
                     if message.contains("unsupported protocol version") {
                         return Err(GuiError::Protocol(format!(
-                            "{message} — the running findexd predates this build; \
-                             restart it (findexd reads --socket/--state-dir, or \
+                            "{message} — the running fflocated predates this build; \
+                             restart it (fflocated reads --socket/--state-dir, or \
                              kill {} and let `ff` respawn one)",
                             self.socket.display()
                         )));
@@ -227,6 +233,7 @@ impl DaemonClient {
             fresh,
             stale_roots: stale,
             catching_up,
+            lag_ms,
             elapsed_ms,
         })
     }
@@ -269,7 +276,7 @@ impl DaemonClient {
         let entries = stats.get("entries").and_then(|v| v.as_u64()).unwrap_or(0);
         let backend = stats.get("backend").and_then(|v| v.as_str()).unwrap_or("?");
         format!(
-            "connected to findexd at {} ({entries} entries, {backend})",
+            "connected to fflocated at {} ({entries} entries, {backend})",
             socket.display()
         )
     }
@@ -391,7 +398,7 @@ impl StartupProbe {
 
     fn no_daemon_line(&self) -> String {
         format!(
-            "no daemon at {} — start findexd and search again",
+            "no daemon at {} — start fflocated and search again",
             self.socket.display()
         )
     }
@@ -400,7 +407,7 @@ impl StartupProbe {
         // Same wording the blocking startup path used, so logs and muscle
         // memory keep matching.
         format!(
-            "spawned findexd at {} — still starting; search again shortly",
+            "spawned fflocated at {} — still starting; search again shortly",
             self.socket.display()
         )
     }
@@ -418,7 +425,7 @@ impl StartupProbe {
                 self.still_starting_line()
             } else {
                 format!(
-                    "findexd at {} — not responding; search again shortly",
+                    "fflocated at {} — not responding; search again shortly",
                     self.socket.display()
                 )
             };
@@ -432,7 +439,7 @@ impl StartupProbe {
                 Ok(l) => l,
                 Err(e) => return self.done(format!("{e}")),
             };
-            match findex::transport::connect(&self.socket)
+            match fflocate::transport::connect(&self.socket)
                 .map_err(|e| GuiError::Connect(format!("{}: {e}", self.socket.display())))
                 .and_then(|stream| PendingRequest::start(stream, &line))
             {
@@ -445,12 +452,12 @@ impl StartupProbe {
                         // child just exits "already running") and polling to
                         // the deadline only hides the cause. The lock probe is
                         // cheap and definitive, so no errno matching is needed.
-                        let pidfile = findex::spawn::pidfile_for_socket(&self.socket);
-                        if findex::spawn::daemon_lock_held(&pidfile) {
+                        let pidfile = fflocate::spawn::pidfile_for_socket(&self.socket);
+                        if fflocate::spawn::daemon_lock_held(&pidfile) {
                             return self
-                                .done(findex::spawn::deaf_daemon_message(&self.socket, &pidfile));
+                                .done(fflocate::spawn::deaf_daemon_message(&self.socket, &pidfile));
                         }
-                        match findex::spawn::spawn_daemon(&self.socket) {
+                        match fflocate::spawn::spawn_daemon(&self.socket) {
                             Ok(()) => {
                                 self.spawned = true;
                                 self.spawned_at = Some(std::time::Instant::now());
@@ -458,7 +465,7 @@ impl StartupProbe {
                             }
                             Err(e) => {
                                 return self.done(format!(
-                                    "no daemon at {} — could not spawn findexd: {e}",
+                                    "no daemon at {} — could not spawn fflocated: {e}",
                                     self.socket.display()
                                 ));
                             }
@@ -690,6 +697,11 @@ pub struct SearchOutcome {
     pub stale_roots: Vec<String>,
     /// The daemon is still replaying its journal / initial crawl.
     pub catching_up: bool,
+    /// How far the daemon is behind the filesystem: the age of its oldest
+    /// unapplied change, as reported in `Meta.lag_ms`. `None` when the daemon
+    /// is caught up (or is old enough not to report it). Shown in seconds so
+    /// "catching up" says *how far* behind, not just that it is.
+    pub lag_ms: Option<u64>,
     /// What the daemon itself reported in `Meta.elapsed_ms`: query + trigram
     /// build + lock waits, server-side. Shown when slow so a first search
     /// that took seconds explains itself instead of looking instant-but-late.
@@ -717,8 +729,8 @@ impl SearchOutcome {
         if !self.fresh {
             s.push_str("  [fresh view]");
         }
-        if self.catching_up {
-            s.push_str("  [daemon catching up]");
+        if let Some(suffix) = catching_up_suffix(self.catching_up, self.lag_ms) {
+            s.push_str(&suffix);
         }
         if !self.stale_roots.is_empty() {
             s.push_str(&format!("  [stale roots: {}]", self.stale_roots.join(", ")));
@@ -750,9 +762,9 @@ pub fn starting_status_line(
 ) -> String {
     let show = daemon_elapsed.unwrap_or(elapsed);
     let mut s = if query.is_empty() {
-        format!("starting findexd… {:.1}s", show.as_secs_f64())
+        format!("starting fflocated… {:.1}s", show.as_secs_f64())
     } else {
-        format!("starting findexd… {:.1}s (searching for {query})", show.as_secs_f64())
+        format!("starting fflocated… {:.1}s (searching for {query})", show.as_secs_f64())
     };
     if hits_so_far > 0 {
         s.push_str(&format!(
@@ -762,6 +774,48 @@ pub fn starting_status_line(
         ));
     }
     s
+}
+
+/// The `[daemon catching up…]` suffix for a status line, in seconds.
+///
+/// `lag_ms` is the daemon's own age for its oldest unapplied change, so the
+/// number answers "*how far* behind is it" rather than merely that it is
+/// behind. Three shapes:
+///
+/// * `catching_up` with an age → `[daemon catching up, 4s behind]`
+/// * `catching_up` with no age (old daemon, or the age was too small to
+///   measure) → `[daemon catching up]` — the honest wording from before
+/// * not catching up → nothing at all
+///
+/// Seconds are rounded *down* to whole seconds: a sub-second lag rounds to
+/// `0s behind`, which reads as "essentially caught up" rather than inventing
+/// precision. Sub-second lags are reported as plain `[daemon catching up]`
+/// instead, so a number never claims a granularity the clock does not have.
+pub fn catching_up_suffix(catching_up: bool, lag_ms: Option<u64>) -> Option<String> {
+    if !catching_up {
+        return None;
+    }
+    match lag_ms {
+        Some(ms) if ms >= 1000 => Some(format!("  [daemon catching up, {}s behind]", ms / 1000)),
+        _ => Some("  [daemon catching up]".to_string()),
+    }
+}
+
+/// Scan-fraction percent from a daemon `Progress` record: `scanned` of
+/// `total` entries visited.
+///
+/// `None` when there is nothing to show: no Progress records yet (old
+/// daemon, fast query, or the denominator announcement not yet arrived) or
+/// a vacuous `total == 0`. Otherwise `0..=99` — capped at 99, because 100%
+/// is `Done`'s privilege: a "100%" that sits while the total is still being
+/// counted would be the same lie the streaming line was built to avoid.
+/// Monotonicity across records is the caller's watermark, not this helper's.
+pub fn scan_percent(scanned: u64, total: u64) -> Option<u8> {
+    if total == 0 {
+        return None;
+    }
+    let pct = (scanned as u128 * 100 / total as u128).min(99) as u8;
+    Some(pct)
 }
 
 /// The status line while a request is in flight (no reply yet).
@@ -779,12 +833,17 @@ pub fn searching_status_line(
     elapsed: std::time::Duration,
     hits_so_far: usize,
     catching_up: bool,
+    progress: Option<u8>,
+    lag_ms: Option<u64>,
 ) -> String {
     let mut s = if query.is_empty() {
         format!("searching… {:.1}s", elapsed.as_secs_f64())
     } else {
         format!("searching for {query}… {:.1}s", elapsed.as_secs_f64())
     };
+    if let Some(pct) = progress {
+        s.push_str(&format!(" {pct}%"));
+    }
     if hits_so_far > 0 {
         s.push_str(&format!(
             " ({} hit{} so far)",
@@ -792,8 +851,8 @@ pub fn searching_status_line(
             if hits_so_far == 1 { "" } else { "s" }
         ));
     }
-    if catching_up {
-        s.push_str("  [daemon catching up]");
+    if let Some(suffix) = catching_up_suffix(catching_up, lag_ms) {
+        s.push_str(&suffix);
     }
     s
 }
@@ -803,13 +862,22 @@ pub fn searching_status_line(
 /// so the line says so — "201 hits… (counting total… 1.2s)" — rather than
 /// claiming a total it does not have. Once `Done` arrives the pump renders the
 /// final [`SearchOutcome::status_line_opts`] line as before.
-pub fn streaming_status_line(hits_shown: usize, elapsed: std::time::Duration) -> String {
-    format!(
-        "{} hit{}… (counting total… {:.1}s)",
+pub fn streaming_status_line(
+    hits_shown: usize,
+    elapsed: std::time::Duration,
+    progress: Option<u8>,
+) -> String {
+    let mut s = format!(
+        "{} hit{}… (counting total… {:.1}s",
         hits_shown,
         if hits_shown == 1 { "" } else { "s" },
         elapsed.as_secs_f64()
-    )
+    );
+    if let Some(pct) = progress {
+        s.push_str(&format!(", {pct}%"));
+    }
+    s.push(')');
+    s
 }
 
 /// A short human label for the query in the two boxes, for the in-flight line.
@@ -1534,17 +1602,17 @@ mod tests {
             let q = action
                 .preset_query()
                 .unwrap_or_else(|| panic!("{action:?} needs a preset"));
-            findex::query::Query::compile(q)
+            fflocate::query::Query::compile(q)
                 .unwrap_or_else(|e| panic!("preset {q:?} does not compile: {e}"));
         }
         // ... and select the right things: case-insensitive extensions, and
         // directories only for the folder preset.
-        let audio = findex::query::Query::compile(FilterAudio.preset_query().unwrap()).unwrap();
+        let audio = fflocate::query::Query::compile(FilterAudio.preset_query().unwrap()).unwrap();
         assert!(audio.matches(b"song.mp3", false, false, || None));
         assert!(audio.matches(b"song.MP3", false, false, || None));
         assert!(!audio.matches(b"song.mp3.bak", false, false, || None));
         assert!(!audio.matches(b"song.txt", false, false, || None));
-        let folder = findex::query::Query::compile(FilterFolder.preset_query().unwrap()).unwrap();
+        let folder = fflocate::query::Query::compile(FilterFolder.preset_query().unwrap()).unwrap();
         assert!(folder.matches(b"src", true, false, || None));
         assert!(
             folder.matches(b"src.rs", true, false, || None),
@@ -1683,7 +1751,7 @@ mod tests {
         // modifier, glob or negation.
         for raw in ["ext:rs", "type:dir", "regex:a.*", "*.rs", "-main", "a b"] {
             let q = quote_literal(raw).unwrap();
-            let query = findex::query::Query::compile(&q).unwrap();
+            let query = fflocate::query::Query::compile(&q).unwrap();
             assert_eq!(query.raw, q);
             // Exactly one required literal, and it is the raw text itself.
             let lits = query.required_literals();
@@ -1734,7 +1802,7 @@ mod tests {
         // The AND is real: the engine must enforce the literal AND the
         // modifier, not either alone.
         let q = effective_query("report", "ext:rs").unwrap();
-        let query = findex::query::Query::compile(&q).unwrap();
+        let query = fflocate::query::Query::compile(&q).unwrap();
         assert!(query.matches(b"report.rs", false, false, || None));
         assert!(
             !query.matches(b"report.txt", false, false, || None),
@@ -2184,23 +2252,51 @@ mod tests {
 
     #[test]
     fn searching_line_shows_query_and_elapsed() {
-        let s = searching_status_line("main", std::time::Duration::from_millis(1340), 0, false);
+        let s = searching_status_line(
+            "main",
+            std::time::Duration::from_millis(1340),
+            0,
+            false,
+            None,
+            None,
+        );
         assert_eq!(s, "searching for main… 1.3s");
     }
 
     #[test]
     fn searching_line_counts_hits_and_catching_up() {
-        let s = searching_status_line("main", std::time::Duration::from_millis(300), 1, true);
+        let s = searching_status_line(
+            "main",
+            std::time::Duration::from_millis(300),
+            1,
+            true,
+            None,
+            None,
+        );
         assert!(s.contains("(1 hit so far)"), "{s}");
         assert!(s.contains("[daemon catching up]"), "{s}");
-        let s = searching_status_line("main", std::time::Duration::from_millis(300), 12, false);
+        let s = searching_status_line(
+            "main",
+            std::time::Duration::from_millis(300),
+            12,
+            false,
+            None,
+            None,
+        );
         assert!(s.contains("(12 hits so far)"), "{s}");
     }
 
     #[test]
     fn searching_line_without_a_query_still_shows_time() {
         // The label is display-only; an empty box still reports elapsed.
-        let s = searching_status_line("", std::time::Duration::from_millis(200), 0, false);
+        let s = searching_status_line(
+            "",
+            std::time::Duration::from_millis(200),
+            0,
+            false,
+            None,
+            None,
+        );
         assert_eq!(s, "searching… 0.2s");
     }
 
@@ -2251,7 +2347,7 @@ mod tests {
         );
         // The daemon age (since spawn), not the query age, is the headline:
         // the query only just started, the daemon has been cold for longer.
-        assert_eq!(s, "starting findexd… 3.4s (searching for main)");
+        assert_eq!(s, "starting fflocated… 3.4s (searching for main)");
     }
 
     #[test]
@@ -2262,19 +2358,209 @@ mod tests {
             None,
             2,
         );
-        assert_eq!(s, "starting findexd… 0.5s (2 hits so far)");
+        assert_eq!(s, "starting fflocated… 0.5s (2 hits so far)");
     }
 
     #[test]
     fn streaming_line_counts_hits_without_a_total() {
         assert_eq!(
-            streaming_status_line(1, std::time::Duration::from_millis(300)),
+            streaming_status_line(1, std::time::Duration::from_millis(300), None),
             "1 hit… (counting total… 0.3s)"
         );
         assert_eq!(
-            streaming_status_line(201, std::time::Duration::from_millis(1200)),
+            streaming_status_line(201, std::time::Duration::from_millis(1200), None),
             "201 hits… (counting total… 1.2s)"
         );
+    }
+
+    #[test]
+    fn catching_up_suffix_reports_seconds_behind() {
+        // Behind with a measured age: the number IS the answer to "how many
+        // seconds behind".
+        assert_eq!(
+            catching_up_suffix(true, Some(4200)).as_deref(),
+            Some("  [daemon catching up, 4s behind]")
+        );
+        // Seconds round down: 1999 ms is still "1s behind", not 2.
+        assert_eq!(
+            catching_up_suffix(true, Some(1999)).as_deref(),
+            Some("  [daemon catching up, 1s behind]")
+        );
+        // Sub-second lag: no number, because the clock cannot honestly claim
+        // one — the original wording survives.
+        assert_eq!(
+            catching_up_suffix(true, Some(400)).as_deref(),
+            Some("  [daemon catching up]")
+        );
+        assert_eq!(
+            catching_up_suffix(true, Some(0)).as_deref(),
+            Some("  [daemon catching up]")
+        );
+        // Old daemon (no field at all): same wording as before.
+        assert_eq!(
+            catching_up_suffix(true, None).as_deref(),
+            Some("  [daemon catching up]")
+        );
+        // Caught up: silent, regardless of a stale age.
+        assert_eq!(catching_up_suffix(false, Some(9000)), None);
+        assert_eq!(catching_up_suffix(false, None), None);
+    }
+
+    #[test]
+    fn final_line_shows_lag_seconds() {
+        let o = SearchOutcome {
+            paths: vec!["a".into()],
+            total: 1,
+            fresh: true,
+            catching_up: true,
+            lag_ms: Some(12_400),
+            ..Default::default()
+        };
+        assert_eq!(o.status_line(1), "1 matches  [daemon catching up, 12s behind]");
+        // No age → the pre-existing wording, byte for byte.
+        let o = SearchOutcome {
+            fresh: true,
+            catching_up: true,
+            lag_ms: None,
+            ..Default::default()
+        };
+        assert_eq!(o.status_line(0), "0 matches  [daemon catching up]");
+        // Caught up → no suffix at all.
+        let o = SearchOutcome {
+            paths: vec!["a".into()],
+            total: 1,
+            fresh: true,
+            ..Default::default()
+        };
+        assert_eq!(o.status_line(1), "1 matches");
+    }
+
+    #[test]
+    fn in_flight_line_shows_lag_seconds() {
+        let s = searching_status_line(
+            "comp",
+            std::time::Duration::from_millis(1300),
+            0,
+            true,
+            Some(42),
+            Some(7300),
+        );
+        assert_eq!(s, "searching for comp… 1.3s 42%  [daemon catching up, 7s behind]");
+    }
+
+    #[test]
+    fn outcome_from_records_carries_lag() {
+        let recs = vec![
+            Response::Meta {
+                gen: 1,
+                lsn: 2,
+                fresh: true,
+                elapsed_ms: 3.0,
+                stale_roots: vec![],
+                catching_up: Some(true),
+                lag_ms: Some(2500),
+                backend: None,
+                entries: None,
+            },
+            Response::Done {
+                count: 0,
+                cursor: "c:1:2".into(),
+            },
+        ];
+        let o = DaemonClient::new().outcome_from_records(&recs).unwrap();
+        assert_eq!(o.lag_ms, Some(2500));
+        assert!(o.catching_up);
+        assert!(o.status_line(0).contains("2s behind"), "{}", o.status_line(0));
+    }
+
+    #[test]
+    fn scan_percent_caps_at_99_and_rejects_empty() {
+        // 100% is Done's privilege: a "100%" that sits while the total is
+        // still being counted would be the same lie the streaming line was
+        // built to avoid.
+        assert_eq!(scan_percent(0, 1000), Some(0));
+        assert_eq!(scan_percent(500, 1000), Some(50));
+        assert_eq!(scan_percent(999, 1000), Some(99));
+        assert_eq!(scan_percent(1000, 1000), Some(99));
+        assert_eq!(scan_percent(5000, 1000), Some(99), "overshoot still caps");
+        assert_eq!(scan_percent(0, 0), None, "no denominator, no percent");
+        assert_eq!(scan_percent(5, 0), None);
+    }
+
+    #[test]
+    fn progress_percent_appears_in_both_inflight_lines() {
+        let s = searching_status_line(
+            "comp",
+            std::time::Duration::from_millis(1300),
+            0,
+            false,
+            Some(42),
+            None,
+        );
+        assert_eq!(s, "searching for comp… 1.3s 42%");
+        // None keeps the legacy wording byte-for-byte (old daemon,
+        // fast query, no Progress yet).
+        let s = searching_status_line(
+            "comp",
+            std::time::Duration::from_millis(1300),
+            0,
+            false,
+            None,
+            None,
+        );
+        assert_eq!(s, "searching for comp… 1.3s");
+        let s = streaming_status_line(7, std::time::Duration::from_millis(1200), Some(3));
+        assert_eq!(s, "7 hits… (counting total… 1.2s, 3%)");
+        let s = streaming_status_line(7, std::time::Duration::from_millis(1200), None);
+        assert_eq!(s, "7 hits… (counting total… 1.2s)");
+    }
+
+    #[test]
+    fn query_request_opts_into_scan_progress() {
+        // The GUI asks for Progress; `ff` never does (its output must stay
+        // byte-identical, and old daemons ignore the unknown field anyway).
+        match DaemonClient::query_request("comp", 201, &SearchOptions::default()) {
+            Request::Query { progress, .. } => assert!(progress),
+            other => panic!("expected a Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outcome_ignores_progress_records() {
+        // Progress is non-terminal and carries no Web-facing meaning: the
+        // final line is Meta/Hits/Done exactly as before.
+        let recs = vec![
+            Response::Meta {
+                gen: 1,
+                lsn: 2,
+                fresh: true,
+                elapsed_ms: 3.0,
+                stale_roots: vec![],
+                catching_up: None,
+                lag_ms: None,
+                backend: None,
+                entries: None,
+            },
+            Response::Progress {
+                scanned: 100,
+                total: 1000,
+            },
+            Response::Hit {
+                path: "/a/b".into(),
+                id: 9,
+            },
+            Response::Progress {
+                scanned: 1000,
+                total: 1000,
+            },
+            Response::Done {
+                count: 1,
+                cursor: "c:1:2".into(),
+            },
+        ];
+        let o = DaemonClient::new().outcome_from_records(&recs).unwrap();
+        assert_eq!(o.paths, vec!["/a/b".to_string()]);
+        assert_eq!(o.total, 1);
     }
 
     #[test]
@@ -2458,7 +2744,7 @@ pub enum Progress {
 
 /// A request in flight over a non-blocking socket.
 pub struct PendingRequest {
-    stream: findex::transport::Stream,
+    stream: fflocate::transport::Stream,
     /// The request line, held until it has been fully written. `sent` is how many
     /// bytes of it the kernel has accepted so far.
     out: Vec<u8>,
@@ -2491,7 +2777,7 @@ impl PendingRequest {
     /// The socket must be non-blocking *before* any I/O, hence this constructor
     /// rather than a flag a caller could forget.
     pub fn start(
-        stream: findex::transport::Stream,
+        stream: fflocate::transport::Stream,
         line: &str,
     ) -> Result<PendingRequest, GuiError> {
         stream
@@ -2641,7 +2927,7 @@ pub fn encode_request(req: &Request) -> Result<String, GuiError> {
     if let Some(obj) = v.as_object_mut() {
         obj.insert(
             "v".into(),
-            serde_json::Value::from(findex::proto::PROTOCOL_VERSION),
+            serde_json::Value::from(fflocate::proto::PROTOCOL_VERSION),
         );
     }
     serde_json::to_string(&v).map_err(|e| GuiError::Protocol(e.to_string()))
@@ -2788,8 +3074,8 @@ mod nonblocking_tests {
     /// plus a connected client stream.
     fn pair() -> (
         tempfile::TempDir,
-        findex::transport::Stream,
-        findex::transport::Stream,
+        fflocate::transport::Stream,
+        fflocate::transport::Stream,
     ) {
         let dir = tempfile::tempdir().unwrap();
         #[cfg(windows)]
@@ -2801,8 +3087,8 @@ mod nonblocking_tests {
         };
         #[cfg(not(windows))]
         let path = dir.path().join("s.sock");
-        let listener = findex::transport::bind(&path).unwrap();
-        let client = findex::transport::connect(&path).unwrap();
+        let listener = fflocate::transport::bind(&path).unwrap();
+        let client = fflocate::transport::connect(&path).unwrap();
         let (server, _) = listener.accept().unwrap();
         (dir, client, server)
     }
@@ -2821,6 +3107,7 @@ mod nonblocking_tests {
             elapsed_ms: 0.1,
             stale_roots: vec![],
             catching_up: None,
+            lag_ms: None,
             backend: None,
             entries: None,
         }
@@ -2852,7 +3139,7 @@ mod nonblocking_tests {
     /// steps. Returns the number of ticks it took and the final progress.
     fn pump_until_done(
         p: &mut PendingRequest,
-        server: &mut findex::transport::Stream,
+        server: &mut fflocate::transport::Stream,
         max_ticks: usize,
     ) -> (usize, Progress) {
         let mut last = Progress::WouldBlock;

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/findex", "crates/findexd", "crates/fx", "crates/ff-gui"]
+members = ["crates/fflocate", "crates/fflocated", "crates/fx", "crates/ff-gui"]
 # Vendored third-party code: usable as a path dependency, but not a workspace
 # member (keeps workspace-wide clippy/test runs to first-party code).
 exclude = ["vendor/rustxwidgets", "vendor/gtk_dynamic_loader"]
@@ -12,7 +12,7 @@ license = "MIT"
 rust-version = "1.75"
 
 [workspace.dependencies]
-findex = { path = "crates/findex" }
+fflocate = { path = "crates/fflocate" }
 
 libc = "0.2"
 aho-corasick = "1"

@@ -3,7 +3,7 @@
 //! When this binary is invoked under the name `locate` (argv\[0\], e.g. via a
 //! symlink), it acts as a drop-in replacement for GNU locate: the same flags,
 //! the same stdout (absolute paths, one per line), the same exit statuses
-//! (0 = matches, 1 = none, 2 = error). The "database" is the live findex
+//! (0 = matches, 1 = none, 2 = error). The "database" is the live fflocate
 //! index instead of an updatedb snapshot, so results are always current;
 //! `-d/--database` is accepted and ignored for script compatibility.
 //!
@@ -19,7 +19,7 @@ use std::process::ExitCode;
 use crate::client::{CliError, Client};
 
 const USAGE: &str = "\
-locate — find files by name in the findex index (locate-compatible)
+locate — find files by name in the fflocate index (locate-compatible)
 
 USAGE:
     locate [OPTIONS] PATTERN...

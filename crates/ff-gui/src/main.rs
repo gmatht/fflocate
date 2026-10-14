@@ -1,4 +1,4 @@
-//! `ff-gui` — search the findex daemon through a rustxWidgets window.
+//! `ff-gui` — search the fflocate daemon through a rustxWidgets window.
 //!
 //! Layout:
 //!
@@ -32,7 +32,7 @@ use std::rc::Rc;
 
 use ff_gui::{
     box_change_clears, containing_dir, context_menu_target, effective_query, encode_request,
-    extension_sort_key, render_count, rows_from_paths, search_label, searching_status_line,
+    extension_sort_key, render_count, rows_from_paths, scan_percent, search_label, searching_status_line,
     starting_status_line, step_max_distance, streaming_status_line, DaemonClient, GuiError,
     MenuAction, PendingRequest, Progress, RowAction, SearchGate, SearchOptions, SearchOutcome,
     StartupPoll, StartupProbe,
@@ -280,7 +280,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // daemon and an empty list from a real "no matches" must not look the same.
     // Spawning runs at most once per process: later searches just report an
     // unreachable daemon.
-    status.set_text("connecting to findexd…");
+    status.set_text("connecting to fflocated…");
     let startup = Rc::new(RefCell::new(StartupProbe::new(
         socket_path,
         SPAWN_STARTUP_GRACE,
@@ -445,8 +445,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // painted). `rendered` drives partial renders: each tick paints only
             // the Hits that arrived since the last paint, so the first page
             // fills while the daemon is still counting the total.
+            // (gate seq, request, when issued, display label, hits already
+            // painted, scan-fraction percent watermark). The watermark folds
+            // every `Progress` record in and never rewinds — a rescanned
+            // denominator could shrink mid-reply, and the line must not jump
+            // backwards. Dropped with the ticket on supersede, like
+            // `rendered`.
+            // ...(gate seq, request, issued, label, rendered, percent
+            // watermark, lag watermark). The lag watermark is the last
+            // `Meta.lag_ms` seen on this reply — the daemon's age for its
+            // oldest unapplied change, which the in-flight line renders as
+            // seconds.
             let pending: Rc<
-                RefCell<Option<(u64, PendingRequest, std::time::Instant, String, usize)>>,
+                RefCell<
+                    Option<(
+                        u64,
+                        PendingRequest,
+                        std::time::Instant,
+                        String,
+                        usize,
+                        Option<u8>,
+                        Option<u64>,
+                    )>,
+                >,
             > = Rc::new(RefCell::new(None));
             App::timeout_add(
                 PUMP_MS,
@@ -467,7 +488,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     //    keeps the loop live.
                     let mut finished: Option<(u64, Result<Vec<WireResponse>, GuiError>)> = None;
                     let mut finished_started: Option<std::time::Instant> = None;
-                    if let Some((seq, p, started, _, _)) = pending.borrow_mut().as_mut() {
+                    if let Some((seq, p, started, _, _, _, _)) = pending.borrow_mut().as_mut() {
                         let seq = *seq;
                         let started_at = *started;
                         match p.advance() {
@@ -518,7 +539,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     //     ticket — partials cannot overwrite a newer answer.
                     {
                         let mut pending_ref = pending.borrow_mut();
-                        if let Some((seq, p, started, label, rendered)) = pending_ref.as_mut() {
+                        if let Some((seq, p, started, label, rendered, watermark, lag)) =
+                            pending_ref.as_mut()
+                        {
                             let seq = *seq;
                             let started_at = *started;
                             let hits: Vec<String> = p
@@ -529,6 +552,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     _ => None,
                                 })
                                 .collect();
+                            // Fold every Progress record into the watermark:
+                            // monotone, never rewinds.
+                            for r in p.records() {
+                                if let WireResponse::Progress { scanned, total } = r {
+                                    if let Some(pct) = scan_percent(*scanned, *total) {
+                                        let w = watermark.get_or_insert(0);
+                                        *w = (*w).max(pct);
+                                    }
+                                }
+                                // The daemon's lag rides on Meta: keep the
+                                // latest (a reply carries one Meta, and a
+                                // re-issued ticket is a different tuple).
+                                if let WireResponse::Meta { lag_ms, .. } = r {
+                                    if lag_ms.is_some() {
+                                        *lag = *lag_ms;
+                                    }
+                                }
+                            }
+                            let pct = *watermark;
+                            let lag_ms = *lag;
                             if hits.len() > *rendered {
                                 *rendered = hits.len();
                                 let label_owned = label.clone();
@@ -550,8 +593,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                             hits.len(),
                                         ));
                                     } else {
-                                        startup_status
-                                            .set_text(&streaming_status_line(hits.len(), elapsed));
+                                        startup_status.set_text(&streaming_status_line(
+                                            hits.len(),
+                                            elapsed,
+                                            pct,
+                                        ));
                                     }
                                 }
                             } else if hits.is_empty() {
@@ -568,7 +614,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         n,
                                     )
                                 } else {
-                                    searching_status_line(&label_owned, elapsed, n, false)
+                                    searching_status_line(&label_owned, elapsed, n, false, pct, lag_ms)
                                 };
                                 startup_status.set_text(&line);
                             }
@@ -643,7 +689,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }) {
                         Ok(p) => {
                             *pending.borrow_mut() =
-                                Some((ticket.seq, p, std::time::Instant::now(), label, 0));
+                                Some((ticket.seq, p, std::time::Instant::now(), label, 0, None, None));
                         }
                         Err(e) => {
                             // The request never started, so it can never finish: release
@@ -1074,7 +1120,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    println!("ff-gui — findex search browser (backend: {BACKEND})");
+    println!("ff-gui — fflocate search browser (backend: {BACKEND})");
     println!("Enter a query in the entry, then invoke Search.");
     app.run()
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
@@ -1171,9 +1217,9 @@ impl TextViewLike for TextView {
 }
 
 /// Open a non-blocking connection for a query.
-fn connect_stream() -> Result<findex::transport::Stream, GuiError> {
+fn connect_stream() -> Result<fflocate::transport::Stream, GuiError> {
     let path = DaemonClient::new().socket().to_path_buf();
-    findex::transport::connect(&path)
+    fflocate::transport::connect(&path)
         .map_err(|e| GuiError::Connect(format!("{}: {e}", path.display())))
 }
 
