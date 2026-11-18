@@ -138,8 +138,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     trace_step!("window title");
     win.set_title("fflocate");
     // The fflocate mark as the window/taskbar icon (on macOS: the Dock icon).
-    // Best-effort — a backend with no icon support simply ignores it.
+    // Best-effort — a backend with no icon support simply ignores it. Set
+    // before `present()`: GTK applies the icon it holds when the window is
+    // mapped, so one call here is enough.
     win.set_icon(&icon_path, icon::ICON_NAME, icon::ICON_PNG);
+
     // Roomy enough that all three columns are visible on launch.
     win.set_default_size(DEFAULT_WINDOW_W, DEFAULT_WINDOW_H);
 
@@ -1143,9 +1146,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     layout.append(&status);
     layout.append(&results_scroll);
 
-    trace_step!("attach + present");
+    trace_step!("attach content view");
     win.set_child(&layout);
+    trace_step!("present");
     win.present();
+    trace_step!("grab focus");
 
     // The Basic Search box owns the keyboard from the start: the window opens
     // ready to type, with no click needed. After `present()` — grabbing focus

@@ -172,7 +172,8 @@ re-applied on top. The merged tree has no `Expander`, `TreeView` or
 portable layer (see above) — and no drag or icon-loading support at all, so
 those calls report their absence. Timer, placeholder text and sensitivity are
 per-adapter: the GTK loader gained `gtk_entry_set_placeholder_text`,
-`gtk_widget_set_sensitive` and a `scroll-event` connection for them. Two
+`gtk_widget_set_sensitive`, a `scroll-event` connection and the window-icon
+pair `gtk_window_set_icon_from_file` / `gtk_window_set_icon_name` for them. Two
 fx-only manifest adjustments: the `pdcurses-sys` path dep is dropped (fx never
 builds pancurses and cargo resolves optional path deps eagerly), and the
 `build.rs` Android resource generator is gated on `RSWIDGETS_ANDROID_PROJECT`
@@ -182,6 +183,16 @@ depend on a checkout outside this repository.
 
 ## Status
 
+* The window carries the **fflocate icon** — the logo with the wordmark
+  cropped away (`assets/fflocate.png`, 1024² on transparent, plus the
+  `assets/hicolor/` sizes). GTK gets it as its window icon (GTK3 reads the
+  512 px file, GTK4 resolves the theme *name*), so the hicolor tree is
+  installed under `$XDG_DATA_HOME/icons/hicolor/` before the toolkit starts.
+  On macOS the same PNG becomes `NSApplication.applicationIconImage`, i.e. the
+  **Dock** icon — a bare Rust binary has no `.app` bundle to carry one. Windows
+  and the `zork` fallback accept the call and do nothing (a Windows icon has to
+  be an `HICON` resource); launchers on Linux still need a `.desktop` entry
+  with `Icon=fflocate` and `StartupWMClass=ff-gui` to show it in an app grid.
 * Query box + Search button + a status line and a results list, driven by
   `App::run()`.
 * The window opens at 1000x700 and the results area takes the leftover height. The

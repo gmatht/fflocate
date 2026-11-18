@@ -329,14 +329,14 @@ mod macos_adapter {
             if !self.0.is_null() {
                 unsafe {
                     msg0v(self.0, "setNeedsLayout");
-                    msg0v(self.0, "setNeedsDisplay:");
+                    msg0v(self.0, "setNeedsDisplay");
                 }
             }
         }
 
         pub fn queue_redraw(&self) {
             if !self.0.is_null() {
-                unsafe { msg0v(self.0, "setNeedsDisplay:") };
+                unsafe { msg0v(self.0, "setNeedsDisplay") };
             }
         }
 
@@ -1210,7 +1210,7 @@ mod macos_adapter {
             // iOS and Android adapters.
             if !self.0.is_null() {
                 unsafe {
-                    msg0v(self.0, "setNeedsDisplay:");
+                    msg0v(self.0, "setNeedsDisplay");
                 }
             }
             let mut map = DRAW_CALLBACKS.lock().unwrap();
@@ -1316,7 +1316,7 @@ mod macos_adapter {
         /// [`Canvas::queue_redraw`] (plus a display request).
         pub fn force_draw(&self, _window_ptr: *mut c_void, fallback_w: i32, fallback_h: i32) {
             if !self.0.is_null() {
-                unsafe { msg0v(self.0, "setNeedsDisplay:") };
+                unsafe { msg0v(self.0, "setNeedsDisplay") };
             }
             let mut map = DRAW_CALLBACKS.lock().unwrap();
             if let Some(SendDrawCallback(ptr)) = map.get_mut(&self.canvas_id()) {

@@ -294,6 +294,35 @@ terminates the process). On zork, menu-item selection now dispatches the
 item's registered action by name (bare or `app.`-prefixed, as on NWG);
 previously only parent-menu callbacks fired.
 
+### GUI icon (`crates/ff-gui/src/icon.rs`)
+
+The GUI uses the fflocate logo as its icon, **cropped to the mark**: the
+wordmark is removed (unreadable at 16–32 px, and the taskbar already carries
+the window title). `assets/fflocate.png` is the magnifier at 1024², centred on
+a transparent canvas; `assets/hicolor/<size>/apps/fflocate.png` is the same art
+at 16–512 px.
+
+`icon::prepare()` runs **before** `App::init()`: GTK reads the icon theme while
+initialising, so the hicolor tree is installed under
+`$XDG_DATA_HOME/icons/hicolor/` (falling back to a temp tree, then to no icon)
+first. `win.set_icon(path, "fflocate", png)` then hands the same art to the
+backend, which takes what it has: GTK3 the 512 px file,
+`gtk_window_set_icon_from_file`; GTK4 the theme name, since it dropped that
+function (`gtk_window_set_icon_name` is the only way left); macOS the PNG
+bytes, as `NSApplication.applicationIconImage` — a bare Rust binary has no
+`.app` bundle to carry an `Info.plist` icon. Windows needs an `HICON` resource,
+so NWG and the `zork` fallback accept the call as a no-op.
+
+Verified on Linux: the window of a real `ff-gui` carries the icon —
+`xprop -id <window> WM_HINTS` reports the `icon_pixmap`/`icon_mask` bitmap ids
+GTK3 set from the installed PNG. Two honest limits: GTK3 in this XWayland
+session publishes the icon as `WM_HINTS` legacy pixmaps and **not** as
+`_NET_WM_ICON` (a plain `Gtk.Window` behaves identically — it is GTK/GDK, not
+this call), and a Wayland/GNOME app grid takes the icon from a `.desktop`
+entry matched to the app, which this repository does not install. The macOS
+arm compiles (`cargo check --target aarch64-apple-darwin`) but was not run on
+a Mac here.
+
 ### `locate` drop-in (`crates/fx/src/locate.rs`)
 
 Invoking the `ff` binary as `locate` (argv\[0\], e.g. a symlink) speaks GNU
