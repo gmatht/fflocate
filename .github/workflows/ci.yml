@@ -22,7 +22,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # ff-gui is excluded: it does not build in either tree (widget-API drift).
+      # ff-gui has its own build+test step below; the daemon, CLI and core are
+      # what this step covers.
       # Failures are re-emitted as an annotation so they can be read without
       # downloading logs (job logs require a token; annotations do not).
       - name: Unit and integration tests
@@ -36,20 +37,26 @@ jobs:
           echo "::error title=test failure (${RUNNER_OS})::${msg}"
           exit 1
 
-      # The GUI *binary* does not build (its widget calls drifted from the
-      # vendored rustxWidgets snapshot: set_placeholder_text, connect_scroll_event,
-      # get_size/resize, ScrollDirection, insert_action_group). The GUI library
-      # holds the protocol client, filtering and parsing logic and needs no
-      # display, so that part is gated until the binary is fixed.
-      - name: GUI logic tests (headless)
+      # The GUI binary compiles on both platforms (its widgets come from
+      # rswidgets::compat), so the whole crate is built and tested here — lib,
+      # binary and integration tests — plus the documented `zork` fallback
+      # configuration. The display-gated GTK regression tests
+      # (menubar_gtk / startup_gtk) return early without a display, which is how
+      # they run on CI.
+      - name: GUI build and tests
         shell: bash
         run: |
           set -o pipefail
-          if cargo test -p ff-gui --lib 2>&1 | tee gui-test.log; then
+          if (
+            cargo build -p ff-gui \
+            && cargo test -p ff-gui \
+            && cargo build -p ff-gui --no-default-features --features zork \
+            && cargo test -p ff-gui --no-default-features --features zork
+          ) 2>&1 | tee gui-test.log; then
             exit 0
           fi
           msg=$(grep -E '^(error|failures:)|panicked at|^ *---- ' gui-test.log | head -20 | tr '\n' '|' | cut -c1-3000)
-          echo "::error title=GUI logic test failure (${RUNNER_OS})::${msg}"
+          echo "::error title=GUI build/test failure (${RUNNER_OS})::${msg}"
           exit 1
 
       # The FSEvents backend is cfg(target_os = "macos"), so its unit tests only

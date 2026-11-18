@@ -588,6 +588,15 @@ impl Label {
         }
     }
 
+    /// The toolkit's enabled flag; a label that is not sensitive renders in the
+    /// theme's dimmed colour.
+    pub fn set_sensitive(&self, sensitive: bool) {
+        guard_widget!(self, "Label", "set_sensitive");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_sensitive {
+            unsafe { set(self.inner, if sensitive { 1 } else { 0 }); }
+        }
+    }
+
     pub fn set_xalign(&self, x: f32) {
         guard_widget!(self, "Label", "set_xalign");
         if let Some(xalign_fn) = self.loader.symbols.gtk_label_set_xalign {
@@ -2090,6 +2099,66 @@ impl Entry {
         let cb: Box<dyn FnMut(*mut c_void) -> i32> = Box::new(f);
         let res = unsafe { crate::signals::connect_signal_bool(&self.loader.symbols, self.inner, "focus-out-event", cb) };
         match res { Ok(id) => Ok(id), Err(e) => Err(Error::Other(e)) }
+    }
+
+    /// Grey hint text, shown while the entry is empty.
+    ///
+    /// `gtk_entry_set_placeholder_text` is optional on the symbol table (an
+    /// older or stripped libgtk may not export it), so a missing symbol leaves
+    /// the entry without a hint instead of failing the caller's build.
+    pub fn set_placeholder_text(&self, text: &str) {
+        guard_widget!(self, "Entry", "set_placeholder_text");
+        if let Some(set) = self.loader.symbols.gtk_entry_set_placeholder_text {
+            let c = CString::new(text).unwrap_or_else(|_| CString::new("").unwrap());
+            unsafe { set(self.inner, c.as_ptr() as *const u8); }
+        }
+    }
+
+    /// The toolkit's enabled flag: `false` greys the widget out and stops it
+    /// reacting to input.
+    pub fn set_sensitive(&self, sensitive: bool) {
+        guard_widget!(self, "Entry", "set_sensitive");
+        if let Some(set) = self.loader.symbols.gtk_widget_set_sensitive {
+            unsafe { set(self.inner, if sensitive { 1 } else { 0 }); }
+        }
+    }
+
+    /// Wheel notches over the entry, delivered as `(dx, dy)` in wheel units:
+    /// `dy < 0` is up, `dy > 0` down, `dx` likewise left/right. The callback
+    /// returns whether it handled the event (a handled notch does not scroll a
+    /// parent).
+    ///
+    /// This is the `scroll-event` signal, which GTK only delivers to a widget
+    /// whose event mask includes the scroll bits, so the mask is added first.
+    /// `gdk_event_get_scroll_deltas` supplies the deltas for both trackpads
+    /// (fractional) and discrete wheel notches (see its fallback).
+    pub fn connect_scroll_event<F: FnMut(f64, f64) -> bool + 'static>(&self, f: F) -> Result<u64, Error> {
+        guard_widget_or!(self, "Entry", "connect_scroll_event", Err(Error::Other("entry dropped".into())));
+        const GDK_SCROLL_MASK: i32 = 1 << 4;
+        const GDK_SMOOTH_SCROLL_MASK: i32 = 1 << 11;
+        unsafe {
+            widget_add_events(&self.loader, self.inner, GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK);
+        }
+        let outer = self.loader.clone();
+        let inner = self.loader.clone();
+        let mut f = f;
+        let cb: Box<dyn FnMut(*mut c_void) -> i32> = Box::new(move |ev: *mut c_void| {
+            let Some((dx, dy)) = (unsafe { gdk_event_get_scroll_deltas(&inner, ev) }) else {
+                return 0;
+            };
+            if dx == 0.0 && dy == 0.0 {
+                return 0;
+            }
+            if f(dx, dy) {
+                1
+            } else {
+                0
+            }
+        });
+        match unsafe { widget_connect_signal_bool(&outer, self.inner, "scroll-event", cb) } {
+            Ok(id) => Ok(id),
+            Err(e) => Err(Error::Other(e.to_string())),
+        }
     }
 }
 

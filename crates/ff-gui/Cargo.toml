@@ -51,5 +51,6 @@ embed-manifest = "1"
 # Deaf-daemon probe test holds a real flock (unix-only code path).
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
-# Display-gated context-menu regression test only (see tests/context_menu_gtk.rs).
+# The display-gated GTK regression tests reach the raw loader directly
+# (tests/menubar_gtk.rs, tests/startup_gtk.rs).
 gtk_dynamic_loader = { path = "../../vendor/gtk_dynamic_loader" }

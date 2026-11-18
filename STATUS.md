@@ -391,11 +391,14 @@ These are deliberate and small; each is noted so the design stays honest.
    not proven: the trait and `BackendCaps` are what let it slot in without
    touching the applier, and that boundary has held under typechecking only.
 
-6. **There is no native macOS GUI.** The GUI needs rustxWidgets' AppKit
-   backend, which the vendored snapshot does not have; `ff-gui` therefore does
-   not build for macOS in this tree (nor on Linux, for unrelated pre-existing
-   API drift). The daemon and CLI are unaffected — the index, queries and
-   service management work without the GUI.
+6. **The GUI builds on Linux and macOS, but its list is canvas-drawn.** The merged
+   rustxWidgets backends dropped `TreeView`, `Expander` and `ContextMenu`;
+   `vendor/rustxwidgets/src/compat.rs` rebuilds them on the portable layer, so
+   `ff-gui` builds for Linux (GTK) and macOS (AppKit) from one source. The cost
+   is fidelity, recorded in `crates/ff-gui/README.md`: the results list draws a
+   glyph per file kind instead of a themed icon and its headers do not sort,
+   the row context menu cannot be popped up (the status line says so) and
+   drag-and-drop is unavailable. The daemon and CLI are unaffected.
 
 7. **The system daemon's ownership sidecar can be stale, by design.** It is
    captured at crawl time and refreshed on rescan; a `chown`/`chmod` between

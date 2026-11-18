@@ -242,6 +242,7 @@ pub type GtkTextViewSetWrapMode = unsafe extern "C" fn(text_view: *mut c_void, w
 // GtkWidget helper for visibility/event handling
 pub type GtkWidgetSetCanFocus = unsafe extern "C" fn(widget: *mut c_void, can_focus: i32);
 pub type GtkWidgetSetHexpand = unsafe extern "C" fn(widget: *mut c_void, expand: i32);
+pub type GtkWidgetSetSensitive = unsafe extern "C" fn(widget: *mut c_void, sensitive: i32);
 pub type GtkWidgetSetVexpand = unsafe extern "C" fn(widget: *mut c_void, expand: i32);
 pub type GtkWidgetGetHexpand = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkWidgetGetVexpand = unsafe extern "C" fn(widget: *mut c_void) -> i32;
@@ -338,6 +339,10 @@ pub type GtkEntryNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkEntrySetText = unsafe extern "C" fn(entry: *mut c_void, text: *const u8);
 pub type GtkEntryGetText = unsafe extern "C" fn(entry: *mut c_void) -> *const u8;
 pub type GtkEntrySetWidthChars = unsafe extern "C" fn(entry: *mut c_void, n_chars: i32);
+/// `gtk_entry_set_placeholder_text`: grey hint text shown while the entry is
+/// empty. Present in both GTK3 and GTK4 (`GtkEntry` kept it when `GtkText`
+/// arrived), so one symbol serves both versions.
+pub type GtkEntrySetPlaceholderText = unsafe extern "C" fn(entry: *mut c_void, text: *const u8);
 pub type GtkWidgetSetSizeRequest = unsafe extern "C" fn(widget: *mut c_void, width: i32, height: i32);
 pub type GtkEntrySetHasFrame = unsafe extern "C" fn(entry: *mut c_void, has_frame: i32);
 pub type GtkEntrySetEditable = unsafe extern "C" fn(entry: *mut c_void, editable: i32);
@@ -443,6 +448,7 @@ pub struct Symbols {
     pub gtk_entry_set_text: Option<GtkEntrySetText>,
     pub gtk_entry_get_text: Option<GtkEntryGetText>,
     pub gtk_entry_set_width_chars: Option<GtkEntrySetWidthChars>,
+    pub gtk_entry_set_placeholder_text: Option<GtkEntrySetPlaceholderText>,
     pub gtk_widget_set_size_request: Option<GtkWidgetSetSizeRequest>,
     pub gtk_entry_set_has_frame: Option<GtkEntrySetHasFrame>,
     pub gtk_entry_set_editable: Option<GtkEntrySetEditable>,
@@ -630,6 +636,9 @@ pub struct Symbols {
 
     // Widget helpers
     pub gtk_widget_set_hexpand: Option<GtkWidgetSetHexpand>,
+    /// `gtk_widget_set_sensitive`: the toolkit's "enabled" flag, and the only
+    /// thing that greys a widget out.
+    pub gtk_widget_set_sensitive: Option<GtkWidgetSetSensitive>,
     pub gtk_widget_set_vexpand: Option<GtkWidgetSetVexpand>,
     pub gtk_widget_get_hexpand: Option<GtkWidgetGetHexpand>,
     pub gtk_widget_get_vexpand: Option<GtkWidgetGetVexpand>,
@@ -821,6 +830,7 @@ impl Symbols {
         let gtk_entry_set_text = unsafe { sym::<GtkEntrySetText>(gtk, "gtk_entry_set_text") };
         let gtk_entry_get_text = unsafe { sym::<GtkEntryGetText>(gtk, "gtk_entry_get_text") };
         let gtk_entry_set_width_chars = unsafe { sym::<GtkEntrySetWidthChars>(gtk, "gtk_entry_set_width_chars") };
+        let gtk_entry_set_placeholder_text = unsafe { sym::<GtkEntrySetPlaceholderText>(gtk, "gtk_entry_set_placeholder_text") };
         let gtk_widget_set_size_request = unsafe { sym::<GtkWidgetSetSizeRequest>(gtk, "gtk_widget_set_size_request") };
         let gtk_entry_set_has_frame = unsafe { sym::<GtkEntrySetHasFrame>(gtk, "gtk_entry_set_has_frame") };
         let gtk_entry_set_editable = unsafe { sym::<GtkEntrySetEditable>(gtk, "gtk_editable_set_editable") };
@@ -1014,6 +1024,7 @@ impl Symbols {
 
         // Widget helpers
         let gtk_widget_set_hexpand = unsafe { sym::<GtkWidgetSetHexpand>(gtk, "gtk_widget_set_hexpand") };
+        let gtk_widget_set_sensitive = unsafe { sym::<GtkWidgetSetSensitive>(gtk, "gtk_widget_set_sensitive") };
         let gtk_widget_set_vexpand = unsafe { sym::<GtkWidgetSetVexpand>(gtk, "gtk_widget_set_vexpand") };
         let gtk_widget_get_hexpand = unsafe { sym::<GtkWidgetGetHexpand>(gtk, "gtk_widget_get_hexpand") };
         let gtk_widget_get_vexpand = unsafe { sym::<GtkWidgetGetVexpand>(gtk, "gtk_widget_get_vexpand") };
@@ -1139,7 +1150,8 @@ impl Symbols {
             gtk_check_button_new_with_label, gtk_check_button_get_active, gtk_check_button_set_active, gtk_check_button_set_group, gtk_toggle_button_get_active, gtk_toggle_button_set_active,
             gtk_radio_button_new_with_label, gtk_radio_button_get_group,
             gtk_text_view_new, gtk_text_buffer_new, gtk_text_view_get_buffer, gtk_text_buffer_set_text, gtk_text_buffer_get_text, gtk_text_buffer_get_start_iter, gtk_text_buffer_get_end_iter, gtk_text_buffer_insert_at_cursor, gtk_text_iter_copy, gtk_text_iter_free, gtk_text_view_set_wrap_mode,
-            gtk_widget_set_hexpand, gtk_widget_set_vexpand,
+            gtk_widget_set_hexpand, gtk_widget_set_vexpand, gtk_widget_set_sensitive,
+            gtk_entry_set_placeholder_text,
             gtk_widget_get_hexpand, gtk_widget_get_vexpand,
             gtk_editable_get_text, gtk_editable_set_text, gtk_editable_set_position,
             gtk_editable_get_position,

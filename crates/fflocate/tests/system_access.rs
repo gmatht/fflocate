@@ -46,6 +46,20 @@ fn dir(mode: u32, uid: u32, gid: u32) -> Attr {
     }
 }
 
+/// A caller who is not the user that created the files under test.
+///
+/// The filesystem-backed tests below write files as the test process and then
+/// ask whether a stranger may see them. A hardcoded uid is only a stranger when
+/// the suite happens to run as somebody else: on a machine whose first user is
+/// uid 1000, `Caller::new(1000, 1000)` *is* the owner, the owner bits decide,
+/// and a `0600` file comes back visible — the opposite of what these tests pin.
+/// So derive the caller from the real uid, never root (who sees everything).
+fn stranger() -> Caller {
+    let me = unsafe { libc::geteuid() };
+    let uid = if me == 1000 { 1001 } else { 1000 };
+    Caller::new(uid, uid)
+}
+
 /// A tree at `/model`:
 ///
 /// ```text
@@ -331,7 +345,7 @@ fn a_file_found_by_rescan_is_still_visible() {
         sync: SyncRegistry::new(),
         backend: "fake".into(),
         control: None,
-        caller: Some(Caller::new(1000, 1000)),
+        caller: Some(stranger()),
     };
     let got = hits(&ctx, &Request::query("", 0, false, false));
     assert!(
@@ -382,7 +396,7 @@ fn re_upsert_refreshes_ownership() {
     applier.pending_mut().enqueue_crawl(rid);
     applier.drain();
 
-    let caller = Caller::new(1000, 1000);
+    let caller = stranger();
     // While it is 0600, a stranger must not see it.
     let id = {
         let ix = shared.index.read().unwrap();
@@ -431,8 +445,9 @@ fn ownership_survives_compaction() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     use std::os::unix::fs::PermissionsExt;
-    // `early.txt` is created *first* so it takes the lowest id; deleting it later
-    // forces compaction to renumber everything after it.
+    // Three files, one of which is deleted below to leave a hole. Which id each
+    // one gets is decided by the crawl's readdir order, not by the order they are
+    // created here, so the victim is chosen by id further down.
     std::fs::write(root.join("early.txt"), b"e").unwrap();
     // One world-readable and one owner-only file, at different ids.
     std::fs::write(root.join("open.txt"), b"x").unwrap();
@@ -452,8 +467,6 @@ fn ownership_survives_compaction() {
         std::fs::Permissions::from_mode(0o644),
     )
     .unwrap();
-    let early = root.join("early.txt");
-
     let d = tempfile::tempdir().unwrap();
     let store = fflocate::persist::Store::open(&d.path().join("state")).unwrap();
     let mut ix = Index::new();
@@ -471,7 +484,7 @@ fn ownership_survives_compaction() {
     applier.pending_mut().enqueue_crawl(rid);
     applier.drain();
 
-    let caller = Caller::new(1000, 1000);
+    let caller = stranger();
     let visible = |shared: &Arc<Shared>| -> Vec<String> {
         let own = shared.ownership.read().unwrap();
         let ix = shared.index.read().unwrap();
@@ -504,13 +517,20 @@ fn ownership_survives_compaction() {
         v
     };
 
-    // Delete a file *earlier* in id order than the survivors, so compaction must
-    // actually shift their ids. Without a tombstone ahead of them, renaming is a
-    // no-op and the test proves nothing.
-    std::fs::remove_file(&early).unwrap();
+    // Delete the file that actually holds the lowest id, so compaction must
+    // shift the survivors' ids. `readdir` order decides which one that is, so
+    // pick it from the index: deleting any other leaves no hole, compaction then
+    // renumbers nothing, and the test proves nothing.
+    let victim = ids_before
+        .iter()
+        .filter(|(_, name)| name.ends_with(".txt"))
+        .min()
+        .map(|(_, name)| name.clone())
+        .expect("the crawl found the files");
+    std::fs::remove_file(root.join(&victim)).unwrap();
     applier.push(fflocate::event::FsEvent::remove(
         fflocate::event::DirKey::new(rid),
-        b"early.txt".to_vec(),
+        victim.as_bytes().to_vec(),
     ));
     applier.drain();
 
@@ -526,23 +546,27 @@ fn ownership_survives_compaction() {
         v
     };
     assert!(
-        ids_before.iter().any(|(id, name)| name != "early.txt" && !ids_after.contains(&(*id, name.clone()))),
+        ids_before
+            .iter()
+            .any(|(id, name)| *name != victim && !ids_after.contains(&(*id, name.clone()))),
         "ids must actually have been renumbered, or this test is vacuous: {ids_before:?} -> {ids_after:?}"
     );
 
     let after = visible(&shared);
-    // `early.txt` was deleted, so it is gone from both; the survivors must be
-    // exactly the ones that were visible before.
-    let mut expected: Vec<String> = before.into_iter().filter(|n| n != "early.txt").collect();
+    // The victim is gone from both tables; the survivors must be exactly the ones
+    // that were visible before.
+    let mut expected: Vec<String> = before.into_iter().filter(|n| *n != victim).collect();
     expected.sort();
     assert_eq!(
         after, expected,
         "compaction must not change *which* surviving files a caller can see; got {after:?}"
     );
-    // The decisive check: `shut.txt` is 0600 and must still be hidden, and
-    // `open.txt` must still be shown — after their ids moved.
-    assert!(after.contains(&"open.txt".to_string()), "got {after:?}");
-    assert!(!after.contains(&"shut.txt".to_string()), "got {after:?}");
+    // The decisive check: ownership must follow the entries, not their slots.
+    // `shut.txt` is 0600, so if the table had been renumbered by position it
+    // would now answer with a neighbour's 0644 record and be shown.
+    if victim != "shut.txt" {
+        assert!(!after.contains(&"shut.txt".to_string()), "got {after:?}");
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -603,7 +627,7 @@ fn ownership_is_backfilled_after_a_restart() {
         sync: SyncRegistry::new(),
         backend: "fake".into(),
         control: None,
-        caller: Some(Caller::new(1000, 1000)),
+        caller: Some(stranger()),
     };
     let got = hits(&ctx, &Request::query("", 0, false, false));
     assert!(
@@ -672,7 +696,7 @@ fn a_restart_walks_into_already_known_directories() {
         sync: SyncRegistry::new(),
         backend: "fake".into(),
         control: None,
-        caller: Some(Caller::new(1000, 1000)),
+        caller: Some(stranger()),
     };
     let got = hits(&ctx, &Request::query("", 0, false, false));
     assert!(

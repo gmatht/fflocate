@@ -461,6 +461,10 @@ impl Label {
     pub fn set_vexpand(&self, expand: bool) {
         crate::backends::zork::set_vexpand(self.id, expand);
     }
+
+    /// No-op: the REPL renders every label the same way, so there is no dimmed
+    /// state to switch to.
+    pub fn set_sensitive(&self, _sensitive: bool) {}
 }
 
 // -- BoxWidget --
@@ -662,6 +666,26 @@ impl Entry {
         crate::backends::zork::set_vexpand(self.id, expand);
     }
 
+    /// No-op: the REPL has no greyed hint text to show. The call is accepted
+    /// rather than failing, because a client that sets a placeholder is asking
+    /// for a hint it will simply not see here.
+    pub fn set_placeholder_text(&self, _text: &str) {}
+
+    /// No-op: a REPL line is either accepting input or it is not, and there is
+    /// no dimmed rendering to turn on.
+    pub fn set_sensitive(&self, _sensitive: bool) {}
+
+    /// Wheel events do not exist on a terminal line; report it rather than
+    /// returning a handler id that can never fire.
+    pub fn connect_scroll_event<F: FnMut(crate::compat::ScrollDirection) -> bool + 'static>(
+        &self,
+        _f: F,
+    ) -> Result<u64, Error> {
+        Err(Error::Backend(
+            "wheel events are not available on the zork backend".to_string(),
+        ))
+    }
+
     /// The caret, as a character index. The model tracks it (it used to be
     /// hard-coded `None`, so `common::Entry`'s caret-override fallback was the
     /// only thing that ever worked here).
@@ -821,6 +845,12 @@ impl MenuBar {
     /// See [`Self::activate_submenu_by_mnemonic`]: no popups, so no
     /// positioned popup either.
     pub fn popup_submenu_by_mnemonic_at(&self, _keyval: u32, _screen_x: i32, _screen_y: i32) -> bool {
+        false
+    }
+    /// [`popup_submenu_by_mnemonic_at`](Self::popup_submenu_by_mnemonic_at) by
+    /// label, anchored to a canvas. The portable `MenuBar` wrapper forwards
+    /// here on every backend that has no popup, so it has to exist off GTK too.
+    pub fn popup_at(&self, _label: &str, _anchor: &Canvas, _x: f64, _y: f64) -> bool {
         false
     }
     pub fn activate_submenu_item_by_mnemonic(&self, _keyval: u32) -> bool {

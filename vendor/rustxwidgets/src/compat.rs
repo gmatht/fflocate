@@ -20,6 +20,7 @@
 //!   never appears is worse than one that says why.
 
 use crate::common::{Canvas, ScrolledWindow, WidgetBox};
+use crate::core::App;
 use crate::Error;
 use std::cell::{Cell, RefCell};
 use std::os::raw::c_void;
@@ -381,10 +382,14 @@ impl TreeView {
 
     /// Dragging rows out as file URIs needs native drag-and-drop, which the
     /// portable layer does not expose. Report it; the caller shows the reason.
+    ///
+    /// The argument shapes are the old `GtkTreeView` ones, so a client written
+    /// against that surface compiles unchanged: `payload` yields the URI list
+    /// plus the plain text, `icon` yields a theme name plus a drawn fallback.
     pub fn enable_uri_drag_source<F, G>(&self, _payload: F, _icon: G) -> Result<(), Error>
     where
-        F: FnMut() -> Option<String> + 'static,
-        G: FnMut() -> Option<String> + 'static,
+        F: FnMut() -> Option<(Vec<String>, String)> + 'static,
+        G: FnMut() -> Option<(String, String)> + 'static,
     {
         Err(Error::Backend(
             "drag-and-drop is not available in this build".to_string(),
@@ -428,7 +433,6 @@ pub fn clipboard_set_text(_text: &str) -> Result<(), Error> {
 #[derive(Clone)]
 pub struct Expander {
     root: WidgetBox,
-    child: Rc<RefCell<Option<WidgetBox>>>,
     expanded: Rc<Cell<bool>>,
     body: WidgetBox,
 }
@@ -445,15 +449,16 @@ impl Expander {
         root.append(&body);
         Ok(Expander {
             root,
-            child: Rc::new(RefCell::new(None)),
             expanded: Rc::new(Cell::new(false)),
             body,
         })
     }
 
-    pub fn set_child(&self, child: &WidgetBox) {
+    /// Append `child` under the header. Generic over the widget handle so the
+    /// caller can pass the backend's own box type (what `App::create_box`
+    /// returns) instead of this layer's wrapper.
+    pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
         self.body.append(child);
-        *self.child.borrow_mut() = Some(child.clone());
     }
 
     pub fn set_expanded(&self, expanded: bool) {
@@ -461,6 +466,19 @@ impl Expander {
         let _ = &self.body; // collapsing is not rendered by this layer
     }
 
+    /// Whether the section was last asked to be expanded. The body is always
+    /// laid out, so this is the state a caller set, not a rendered state.
+    pub fn is_expanded(&self) -> bool {
+        self.expanded.get()
+    }
+}
+
+/// The expander is itself a widget: it can be packed into a box like any
+/// other child (its handle is the root box's).
+impl AsRef<*mut c_void> for Expander {
+    fn as_ref(&self) -> &*mut c_void {
+        self.root.as_ref()
+    }
 }
 
 /// A menu built from labelled closures.
@@ -514,6 +532,41 @@ impl ContextMenu {
 impl Default for ContextMenu {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// --------------------------------------------------------------------------
+// Constructors on `App`.
+//
+// The widgets above are built on the portable layer rather than on a backend
+// adapter, so the usual `App::create_*` shape is restored here: a client can
+// keep calling them uniformly instead of branching per backend.
+// --------------------------------------------------------------------------
+
+impl App {
+    /// A three-column results list: `(title, is_icon, sortable)` per column.
+    ///
+    /// `sortable` is accepted for source compatibility and not acted on — the
+    /// canvas list has no click-to-sort headers (see [`TreeView`]).
+    pub fn create_treeview(
+        &self,
+        columns: &[(&str, bool, bool)],
+    ) -> Result<TreeView, Error> {
+        TreeView::new(columns)
+    }
+
+    /// A native disclosure section; see [`Expander`].
+    pub fn create_expander(&self, label: &str) -> Result<Expander, Error> {
+        Expander::new(label)
+    }
+
+    /// A menu of labelled actions for a right-click; see [`ContextMenu`].
+    ///
+    /// Always succeeds: collecting items needs no toolkit, and a menu that
+    /// cannot be shown reports that from [`ContextMenu::popup_at_pointer`],
+    /// which is where the caller can surface it.
+    pub fn new_context_menu(&self) -> Result<ContextMenu, Error> {
+        Ok(ContextMenu::new())
     }
 }
 

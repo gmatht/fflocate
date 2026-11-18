@@ -282,6 +282,9 @@ mod gtk_adapter {
         pub fn remove_class(&self, class_name: &str) { self.0.remove_class(class_name); }
         pub fn set_markup(&self, markup: &str) { self.0.set_markup(markup); }
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+        /// Gate the label on the toolkit's enabled flag; GTK renders an
+        /// insensitive label in its dimmed colour.
+        pub fn set_sensitive(&self, sensitive: bool) { self.0.set_sensitive(sensitive); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
@@ -414,6 +417,34 @@ mod gtk_adapter {
         pub fn set_visible(&self, visible: bool) { self.inner.set_visible(visible); }
         pub fn set_hexpand(&self, expand: bool) { self.inner.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.inner.set_vexpand(expand); }
+        /// Grey hint text, shown while the entry is empty.
+        pub fn set_placeholder_text(&self, text: &str) { self.inner.set_placeholder_text(text); }
+        /// Enabled flag: `false` greys the field out and stops it taking input.
+        pub fn set_sensitive(&self, sensitive: bool) { self.inner.set_sensitive(sensitive); }
+        /// Wheel notches over the field, as a [`ScrollDirection`].
+        ///
+        /// [`ScrollDirection`]: crate::compat::ScrollDirection
+        pub fn connect_scroll_event<F: FnMut(crate::compat::ScrollDirection) -> bool + 'static>(
+            &self,
+            mut f: F,
+        ) -> Result<u64, Error> {
+            self.inner
+                .connect_scroll_event(move |dx: f64, dy: f64| {
+                    let dir = if dy.abs() >= dx.abs() {
+                        if dy < 0.0 {
+                            crate::compat::ScrollDirection::Up
+                        } else {
+                            crate::compat::ScrollDirection::Down
+                        }
+                    } else if dx < 0.0 {
+                        crate::compat::ScrollDirection::Left
+                    } else {
+                        crate::compat::ScrollDirection::Right
+                    };
+                    f(dir)
+                })
+                .map_err(|e| Error::Backend(format!("{}", e)))
+        }
         pub fn on_key_raw(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
             if let Some(loader) = crate::backends::gtk::loader() {
                 let entry_ptr = *self.inner.as_ref();

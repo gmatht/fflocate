@@ -47,8 +47,8 @@ fn pump(loader: &gtk_dynamic_loader::Loader) {
         return;
     };
     unsafe {
-        // `Library::get` infers the symbol type; no direct libloading import
-        // needed (same shape as `tests/context_menu_gtk.rs`).
+        // `Library::get` infers the symbol type, so no direct libloading
+        // import is needed.
         let it = gtk.get::<unsafe extern "C" fn()>(b"gtk_main_iteration_do");
         if let Ok(f) = it {
             for _ in 0..100 {

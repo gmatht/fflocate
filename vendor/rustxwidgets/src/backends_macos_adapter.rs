@@ -413,6 +413,18 @@ mod macos_adapter {
             unsafe { msg1bv(self.0, "setHidden:", !visible) };
         }
 
+        /// Dim the label.
+        ///
+        /// A plain `NSTextField` label has no "sensitive" flag (there is
+        /// nothing to enable or disable), so the greyed-out look GTK gives an
+        /// insensitive label is reproduced with the view's alpha.
+        pub fn set_sensitive(&self, sensitive: bool) {
+            if self.0.is_null() {
+                return;
+            }
+            unsafe { msg1cv(self.0, "setAlphaValue:", if sensitive { 1.0 } else { 0.55 }) };
+        }
+
         /// `setMarkup` in the shared API. `NSTextField` is plain text, so the
         /// markup is flattened to its text content (Pango markup on GTK,
         /// nothing at all on Android/iOS).
@@ -657,6 +669,11 @@ mod macos_adapter {
             core_apple::set_view_expanding(self.0, expand);
         }
 
+        /// A stack view distributes along its own axis, so a box's vertical
+        /// expansion is the axis' business (`set_child_vexpand` handles a
+        /// child); recorded as a no-op, as on `Entry`.
+        pub fn set_vexpand(&self, _expand: bool) {}
+
         /// Size the stack view.
         ///
         /// `NSStackView` distributes along its axis by default, so an explicit
@@ -700,6 +717,46 @@ mod macos_adapter {
         }
 
         pub fn set_vexpand(&self, _expand: bool) {}
+
+        /// Grey hint text, shown while the field is empty.
+        ///
+        /// `NSTextField`'s `placeholderString` (10.10+) is exactly this, and the
+        /// host shim does not have to be involved: the field draws it itself.
+        pub fn set_placeholder_text(&self, text: &str) {
+            if self.0.is_null() {
+                return;
+            }
+            let s = nsstring(text);
+            if s.is_null() {
+                return;
+            }
+            unsafe { msg1v(self.0, "setPlaceholderString:", s) };
+        }
+
+        /// `NSControl`'s enabled flag: `false` dims the field and drops input,
+        /// the AppKit equivalent of GTK's insensitive state.
+        pub fn set_sensitive(&self, sensitive: bool) {
+            if self.0.is_null() {
+                return;
+            }
+            unsafe { msg1bv(self.0, "setEnabled:", sensitive) };
+        }
+
+        /// Wheel events are not delivered to the field in this build.
+        ///
+        /// AppKit would need a `scrollWheel:` override on a host shim class
+        /// (the same host-shim route the canvas uses for clicks); until that
+        /// exists, report it instead of accepting a callback that can never
+        /// fire — a handler that silently never runs is worse than one that
+        /// says why.
+        pub fn connect_scroll_event<F: FnMut(crate::compat::ScrollDirection) -> bool + 'static>(
+            &self,
+            _f: F,
+        ) -> Result<u64, Error> {
+            Err(Error::Backend(
+                "wheel events are not wired up on the AppKit backend".to_string(),
+            ))
+        }
 
         pub fn set_width_chars(&self, n: i32) {
             core_apple::set_view_min_chars(self.0, n);

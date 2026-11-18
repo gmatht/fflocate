@@ -27,12 +27,21 @@
 
 use rswidgets::prelude::*;
 
+// The results list, the advanced-search foldout and the row context menu come
+// from rswidgets' *compat* layer: the merged backends dropped `TreeView`,
+// `Expander` and `ContextMenu`, and compat rebuilds them on the portable
+// (Canvas/Box/Button) surface so one implementation serves GTK and AppKit.
+// `CellValue`/`ScrollDirection` are the cell and wheel types those widgets use.
+use rswidgets::compat::{CellValue, ContextMenu, ScrollDirection};
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use ff_gui::{
     box_change_clears, containing_dir, context_menu_target, effective_query, encode_request,
-    extension_sort_key, render_count, rows_from_paths, scan_percent, search_label, searching_status_line,
+    render_count, rows_from_paths, scan_percent, search_label, searching_status_line,
     step_max_distance, streaming_status_line, DaemonClient, GuiError,
     MenuAction, PendingRequest, Progress, RowAction, SearchGate, SearchOptions, SearchOutcome,
     StartupPoll, StartupProbe,
@@ -69,26 +78,6 @@ const BACKEND: &str = if cfg!(feature = "zork") {
 /// Default window size, big enough for the three columns to be readable.
 const DEFAULT_WINDOW_W: i32 = 1000;
 const DEFAULT_WINDOW_H: i32 = 700;
-/// Width the window maps at on GTK: 1 px narrower than the default. The sortable
-/// headers grow a little in the first frames (sort-arrow space arriving with
-/// the theme), widening the results columns ~38 px past the viewport with no
-/// compensating redistribution — queuing a resize does not help (GTK skips
-/// no-change reallocations) and only a real allocation change or row arrival
-/// redistributes. So the window starts 1 px narrow and steps out to the
-/// default once settled (see below): that step *is* a real allocation change,
-/// and the fixed-sized text columns snap to the viewport exactly. Later
-/// resizes and row changes redistribute by themselves. An imperceptible
-/// difference either way; the default above stays the documented size.
-/// GTK-only: other backends map straight at the default (their headers do not
-/// grow late, and nothing there steps the size back out).
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
-const INITIAL_WINDOW_W: i32 = DEFAULT_WINDOW_W - 1;
-/// How long after present the settle step runs. The header growth lands at
-/// ~30 ms here; this has an order of magnitude of margin. A machine slower
-/// than that keeps the bar until its first search or resize (which
-/// redistribute by themselves) — accepted, and documented there.
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
-const SETTLE_RESIZE_MS: u32 = 300;
 
 /// How many rows to render at most (the daemon may match millions).
 const MAX_ROWS: usize = 200;
@@ -118,12 +107,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let win = app.create_window()?;
     win.set_title("fflocate");
-    // Roomy enough that all three columns are visible on launch. On GTK it
-    // starts 1 px narrow (see INITIAL_WINDOW_W) and steps out once settled,
-    // below; elsewhere it maps straight at the default.
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
-    win.set_default_size(INITIAL_WINDOW_W, DEFAULT_WINDOW_H);
-    #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
+    // Roomy enough that all three columns are visible on launch.
     win.set_default_size(DEFAULT_WINDOW_W, DEFAULT_WINDOW_H);
 
     let query_row = app.create_box(Orientation::Horizontal, 2)?;
@@ -138,28 +122,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     query_row.append(&search);
     query_row.set_child_hexpand(&query, true);
     let status = app.create_label("type a query and press Search")?;
-    // The results are a three-column list: icon, name, path. On GTK this is a
-    // real GtkTreeView (so the columns align and the icon column shows a themed
-    // icon); the display-free fallbacks render the same three columns as text.
-    // (title, is_icon, sortable): every header sorts when clicked — Name and
-    // Path by themselves, the icon column by file extension (see
-    // `extension_sort_key`; a pixbuf has no order of its own).
+    // The results are a three-column list: icon, name, path. The compat
+    // `TreeView` draws the header and rows on a canvas, hit-tests clicks and
+    // tracks a selection on every backend, so the three columns align and the
+    // same code serves GTK and AppKit. (title, is_icon, sortable): the
+    // `sortable` flag is accepted for source compatibility — the canvas list
+    // has no click-to-sort headers.
     let results = app.create_treeview(&[
         ("", true, true),
         ("Name", false, true),
         ("Path", false, true),
     ])?;
-    // Column index of the full path, which Copy / Open / drag act on.
+    // Column index of the full path, which Copy / Open act on.
     const PATH_COLUMN: usize = 2;
 
-    // On GTK the tree view needs its own scrolled container to scroll, and that
-    // container must expand with the window — otherwise the results stay at
-    // their minimum height while the window grows.
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    // The list scrolls, and the scrolled container must expand with the window —
+    // otherwise the results stay at their minimum height while the window grows.
     let results_scroll = {
-        let sw = results.into_scrolled()?;
+        let sw = results.clone().into_scrolled()?;
+        // The list takes the leftover height. Only the vertical flag is set:
+        // `set_hexpand` belonged to the GTK adapter's scrolled window and is not
+        // part of the portable layer, so the width is whatever the enclosing box
+        // gives it.
         sw.set_vexpand(true);
-        sw.set_hexpand(true);
         sw
     };
 
@@ -267,10 +252,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // keep it alive until the user dismisses it.
     let current: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let live_menu: Rc<RefCell<Option<ContextMenu>>> = Rc::new(RefCell::new(None));
-    // The row a drag would carry. Set on left-press (the drag's start), read
-    // when a drop target asks for the data: `drag-data-get` carries no start
-    // position of its own.
-    let drag_row: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
     // The daemon check is deferred past first paint: it rides the timer pump
     // (see `StartupProbe`), so the window appears immediately even when the
@@ -357,19 +338,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    // The same closure backs the Search button, the Return key and the as-you-type
-    // debounce, so the three cannot drift apart. It does not run the query itself —
-    // it asks the pump to start one *now* (bypassing the debounce), so even an
+    // The same flag backs the Search button, the Return key and the as-you-type
+    // debounce, so the three cannot drift apart. Nothing here runs a query: it
+    // asks the pump to start one *now* (bypassing the debounce), so even an
     // explicit click cannot block the window on a slow daemon.
+    //
+    // An atomic rather than the obvious `Rc<Cell<bool>>`: the AppKit button's
+    // click handler must be `Send` (its callback registry is process-global),
+    // while every other widget here stays on the main thread. One flag both can
+    // share keeps the button on the same path as the keyboard and the menubar.
+    let start_now: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
+    // The keyboard/menubar path: a plain main-thread closure that sets the flag.
     let run_search: Rc<RefCell<Box<dyn FnMut()>>> = Rc::new(RefCell::new(Box::new(|| {})));
 
     {
-        let run_search = run_search.clone();
-        search.on_click(move || {
-            if let Ok(mut f) = run_search.try_borrow_mut() {
-                f();
-            }
-        })?;
+        let start_now = start_now.clone();
+        search.on_click(move || start_now.store(true, Ordering::SeqCst))?;
     }
 
     // ---------------------------------------------------------------------
@@ -414,10 +399,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // Set by the Search button / Return: "start the next request without waiting
         // for the debounce". They share the pump rather than making their own request
         // so that every path through the GUI does the I/O the same non-blocking way.
-        let start_now: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
         {
             let start_now = start_now.clone();
-            *run_search.borrow_mut() = Box::new(move || *start_now.borrow_mut() = true);
+            *run_search.borrow_mut() = Box::new(move || start_now.store(true, Ordering::SeqCst));
         }
 
         let pump = {
@@ -682,7 +666,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     //    itself). The win is client latency, not daemon CPU:
                     //    the fresh query issues now instead of after the stale
                     //    4 s scan completes.
-                    let immediate = std::mem::replace(&mut *start_now.borrow_mut(), false);
+                    let immediate = start_now.swap(false, Ordering::SeqCst);
                     if !immediate {
                         let Some(t) = *due_at.borrow() else {
                             // No keystroke pending. But the user may have hit
@@ -825,20 +809,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let live_menu = live_menu.clone();
         let cb_results = results.clone();
         let status_for_err = status.clone();
-        let drag_row = drag_row.clone();
         if let Err(e) = results.connect_button_press_event(move |button, x, y, event| {
             // Buttons arrive normalized (`normalize_press_button`): a
-            // middle-press is already button 1 here, so primary handling
-            // covers it with no special case.
-            // Primary press starts a potential drag: remember the row grabbed.
-            // (button-press fires before the drag begins, so this is set by the
-            // time `drag-data-get` runs.) The row is the one under the pointer.
-            if button == 1 {
-                let row = cb_results.row_at(x, y);
-                let path = row.and_then(|r| current.borrow().get(r.max(0) as usize).cloned());
-                *drag_row.borrow_mut() = path;
-                return;
-            }
+            // middle-press is already button 1, so only the secondary button
+            // needs handling here — a primary click selects its row inside the
+            // compat list itself.
             if button != 3 {
                 return;
             }
@@ -846,7 +821,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // space below the rows does nothing rather than acting on a
             // neighbour (see `ff_gui::context_menu_target`).
             let row = cb_results.row_at(x, y);
-            let path = match context_menu_target(button, row, &current.borrow()) {
+            let path = match context_menu_target(button, row.map(|r| r as i32), &current.borrow()) {
                 Some(p) => p,
                 None => return,
             };
@@ -899,48 +874,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Dragging a row out of the window carries it as a file URI *and* as plain
-    // text, so it can be dropped on a file manager (which wants the URI) or a
-    // terminal/editor (which wants the path). The payload is read lazily at
-    // drop time from the row recorded on left-press. The drag icon shows the
-    // same row's themed icon under the cursor (via `drag-begin`): without it
-    // GTK drags invisibly and there is no indication anything was picked up.
-    {
-        let results = results.clone();
-        let status = status.clone();
-        let drag_row = drag_row.clone();
-        let cb_results = results.clone();
-        let icon_row = drag_row.clone();
-        let icon_results = results.clone();
-        if let Err(e) = results.enable_uri_drag_source(
-            move || {
-                // Prefer the row recorded on left-press; fall back to the widget's
-                // own selection (which is what the drop target sees).
-                let recorded = drag_row.borrow().clone();
-                let path = recorded.or_else(|| cb_results.selected_path(PATH_COLUMN));
-                path.as_deref().map(ff_gui::drag_payload)
-            },
-            move || {
-                // The icon for the row being dragged: the same row the payload
-                // carries, mapped back through the icon table so the cursor
-                // shows the file's own glyph (folder, Rust source, image…).
-                // `None` keeps the default cursor rather than a wrong icon.
-                let recorded = icon_row.borrow().clone();
-                let path = recorded.or_else(|| icon_results.selected_path(PATH_COLUMN))?;
-                let row = ff_gui::row_from_path(&path);
-                // `row_from_path` already resolved the fallback the list
-                // itself shows; recompute it the same way so the two agree.
-                let fallback = if row.icon == "folder" {
-                    "folder"
-                } else {
-                    "text-x-generic"
-                };
-                Some((row.icon, fallback.to_string()))
-            },
-        ) {
-            // Not fatal: the list still works, only dragging is unavailable.
-            status.set_text(&format!("drag and drop unavailable: {e}"));
-        }
+    // Dragging a row out of the window is not available in this build: the
+    // compat list has no native drag source, so this asks it and reports the
+    // reason instead of starting a drag that carries nothing. The
+    // `enable_uri_drag_source` surface and `ff_gui::drag_payload` stay for a
+    // backend that can carry a URI.
+    if let Err(e) = results.enable_uri_drag_source(|| None, || None) {
+        status.set_text(&format!("drag and drop unavailable: {e}"));
     }
 
     // Menubar (File/Search/View/Help). Every item reuses a handler something
@@ -1150,12 +1090,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     layout.append(&query_row);
     layout.append(&advanced);
     layout.append(&status);
-    // On GTK the tree view lives in its own scrolled container so it scrolls;
-    // elsewhere the widget itself is the list.
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
     layout.append(&results_scroll);
-    #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
-    layout.append(&results);
 
     win.set_child(&layout);
     win.present();
@@ -1164,27 +1099,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ready to type, with no click needed. After `present()` — grabbing focus
     // on an unmapped widget is a silent no-op in GTK, so this must come after.
     query.grab_focus();
-
-    // The settle step for the results columns (see INITIAL_WINDOW_W): once the
-    // late header growth has landed, step out to the documented width — but
-    // only if the user has not resized meanwhile (a resize of their own
-    // already redistributed, and yanking it back would steal their size).
-    // One-shot; the height is read live so a height-only tweak of theirs is
-    // preserved. Later resizes and row changes redistribute by themselves.
-    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
-    {
-        let settle_win = win.clone();
-        let _ = App::timeout_add(
-            SETTLE_RESIZE_MS,
-            Box::new(move || {
-                let (w, h) = settle_win.get_size();
-                if w == INITIAL_WINDOW_W {
-                    settle_win.resize(DEFAULT_WINDOW_W, h);
-                }
-                false
-            }),
-        );
-    }
 
     println!("ff-gui — fflocate search browser (backend: {BACKEND})");
     println!("Enter a query in the entry, then invoke Search.");
@@ -1276,12 +1190,6 @@ pub trait TextViewLike {
     fn clipboard_set_text(&self, text: &str) -> Result<(), rswidgets::Error>;
 }
 
-impl TextViewLike for TextView {
-    fn clipboard_set_text(&self, text: &str) -> Result<(), rswidgets::Error> {
-        TextView::clipboard_set_text(self, text)
-    }
-}
-
 /// Open a non-blocking connection for a query.
 fn connect_stream() -> Result<fflocate::transport::Stream, GuiError> {
     let path = DaemonClient::new().socket().to_path_buf();
@@ -1338,7 +1246,7 @@ fn expand_query_entry(entry: &impl Expandable) {
 // explicitly — and per backend, since only one adapter exists in a given build.
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 mod widget_traits {
-    use super::{Active, Expandable, TextValue, TextViewLike};
+    use super::{Active, Expandable, TextValue};
 
     impl Active for rswidgets::backends_gtk_adapter::CheckButton {
         fn is_active(&self) -> bool {
@@ -1355,17 +1263,16 @@ mod widget_traits {
             rswidgets::backends_gtk_adapter::Entry::set_hexpand(self, expand)
         }
     }
-    impl TextViewLike for rswidgets::backends_gtk_adapter::TreeView {
-        fn clipboard_set_text(&self, text: &str) -> Result<(), rswidgets::Error> {
-            // The tree view is a widget; the clipboard is process-wide.
-            rswidgets::backends_gtk_adapter::clipboard_set_text(text)
-        }
-    }
 }
 
-#[cfg(all(feature = "zork", not(feature = "gtk")))]
+// Keyed on the feature alone, not on `not(feature = "gtk")`: zork wins backend
+// selection whenever its feature is on (every other `App::create_*` arm
+// excludes `zork`), so `--features zork` on top of the defaults still hands the
+// app zork's adapter types. Requiring GTK to be *off* left those types with no
+// trait impls at all in exactly that build.
+#[cfg(feature = "zork")]
 mod widget_traits {
-    use super::{Active, Expandable, TextValue, TextViewLike};
+    use super::{Active, Expandable, TextValue};
 
     impl Active for rswidgets::backends_zork_adapter::CheckButton {
         fn is_active(&self) -> bool {
@@ -1382,19 +1289,13 @@ mod widget_traits {
             rswidgets::backends_zork_adapter::Entry::set_hexpand(self, expand)
         }
     }
-    impl TextViewLike for rswidgets::backends_zork_adapter::TreeView {
-        fn clipboard_set_text(&self, text: &str) -> Result<(), rswidgets::Error> {
-            // The REPL copies with the terminal clipboard escape.
-            rswidgets::backends_zork_adapter::clipboard_set_text(text)
-        }
-    }
 }
 
 // The other targets build the same UI from their own adapter types. These are
 // not built on this host, but must compile there.
 #[cfg(all(windows, not(feature = "zork")))]
 mod widget_traits {
-    use super::{Active, Expandable, TextValue, TextViewLike};
+    use super::{Active, Expandable, TextValue};
     impl Active for rswidgets::backends_nwg_adapter::CheckButton {
         fn is_active(&self) -> bool {
             rswidgets::backends_nwg_adapter::CheckButton::is_active(self)
@@ -1410,19 +1311,11 @@ mod widget_traits {
             rswidgets::backends_nwg_adapter::Entry::set_hexpand(self, expand)
         }
     }
-    impl TextViewLike for rswidgets::backends_nwg_adapter::TreeView {
-        fn clipboard_set_text(&self, text: &str) -> Result<(), rswidgets::Error> {
-            // The list is text-backed; the clipboard is process-wide — and
-            // unsupported on this backend, so Copy reports the failure
-            // through the status line rather than silently doing nothing.
-            rswidgets::backends_nwg_adapter::TreeView::clipboard_set_text(self, text)
-        }
-    }
 }
 
 #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
 mod widget_traits {
-    use super::{Active, Expandable, TextValue, TextViewLike};
+    use super::{Active, Expandable, TextValue};
     impl Active for rswidgets::backends_wasm_adapter::CheckButton {
         fn is_active(&self) -> bool {
             rswidgets::backends_wasm_adapter::CheckButton::is_active(self)
@@ -1440,14 +1333,12 @@ mod widget_traits {
     }
 }
 
-// macOS builds the same UI from the AppKit adapter types: checkbox/entry
-// layout traits plus clipboard through the AppKit pasteboard. The results
-// list is the TextView-backed TreeView stub (no click-to-select yet), so
-// there is no TextViewLike arm — Copy/Open act on the selected path where
-// the backend reports one.
+// macOS builds the same UI from the AppKit adapter types: the checkbox and
+// entry traits only. The results list — and with it the clipboard hook — is
+// the compat layer's on every backend (see below).
 #[cfg(all(target_os = "macos", not(feature = "zork")))]
 mod widget_traits {
-    use super::{Active, Expandable, TextValue, TextViewLike};
+    use super::{Active, Expandable, TextValue};
     impl Active for rswidgets::backends_macos_adapter::CheckButton {
         fn is_active(&self) -> bool {
             rswidgets::backends_macos_adapter::CheckButton::is_active(self)
@@ -1463,39 +1354,58 @@ mod widget_traits {
             rswidgets::backends_macos_adapter::Entry::set_hexpand(self, expand)
         }
     }
-    impl TextViewLike for rswidgets::backends_macos_adapter::TreeView {
-        fn clipboard_set_text(&self, text: &str) -> Result<(), rswidgets::Error> {
-            // The list is text-backed; the clipboard is process-wide.
-            rswidgets::backends_macos_adapter::clipboard_set_text(text)
-        }
+}
+
+// The results list is the compat `TreeView` on *every* backend, so the
+// clipboard hook is one implementation rather than one per adapter. Copy
+// reports whatever the compat layer says: the merged toolkit carries no
+// clipboard helper, so this answers with the reason instead of pretending the
+// copy happened.
+impl TextViewLike for rswidgets::compat::TreeView {
+    fn clipboard_set_text(&self, text: &str) -> Result<(), rswidgets::Error> {
+        rswidgets::compat::TreeView::clipboard_set_text(self, text)
     }
 }
 
-/// Render the result list: one path per line.
+/// The glyph the icon column draws for a themed icon name.
+///
+/// The compat `TreeView` paints on a canvas, so it cannot load a themed pixbuf:
+/// the column shows one character per file kind. The theme name still travels
+/// with the cell (`CellValue::Icon::name`) for a backend that can use a real
+/// icon, and this is only the drawn fallback — which is why it is a glyph rather
+/// than the name spelled out.
+fn icon_glyph(icon: &str) -> &'static str {
+    match icon {
+        "folder" => "\u{25b8}",
+        "text-x-rust" => "R",
+        "text-x-python" => "P",
+        "text-x-javascript" | "text-x-typescript" | "application-json" => "{}",
+        "text-x-csrc" | "text-x-c++src" | "text-x-go" | "text-x-java" => "C",
+        "text-x-ruby" => "r",
+        "text-x-script" => "$",
+        "text-markdown" | "text-html" | "text-css" | "text-x-generic" => "\u{2261}",
+        "image-x-generic" => "\u{25a3}",
+        "application-pdf" => "p",
+        "package-x-generic" => "\u{25a4}",
+        _ => "\u{00b7}",
+    }
+}
+
 /// Build the three-column cells (icon, name, path) for a list of paths.
 ///
-/// The icon is given as a theme name plus a generic fallback, since a minimal
-/// icon theme may not carry the specific name. A fourth, hidden value carries
-/// the file extension: on GTK it fills the store's hidden extension column,
-/// which the (otherwise unorderable) icon column sorts by.
+/// The icon is a theme name plus the glyph the canvas draws in its place.
 fn rows_to_cells(paths: &[String]) -> Vec<Vec<CellValue>> {
     rows_from_paths(paths)
         .into_iter()
         .map(|r| {
-            let fallback = if r.icon == "folder" {
-                "folder"
-            } else {
-                "text-x-generic"
-            };
-            let ext = extension_sort_key(&r.name);
+            let glyph = icon_glyph(&r.icon);
             vec![
                 CellValue::Icon {
                     name: r.icon,
-                    fallback: fallback.to_string(),
+                    fallback: glyph.to_string(),
                 },
                 CellValue::Text(r.name),
                 CellValue::Text(r.path),
-                CellValue::Text(ext),
             ]
         })
         .collect()
@@ -1632,13 +1542,16 @@ mod tests {
         let cells = rows_to_cells(&paths);
         assert_eq!(cells.len(), 1);
         let row = &cells[0];
-        // Column 0 is the icon (with a sensible generic fallback), 1 the name,
-        // 2 the full path, plus a hidden 4th value carrying the extension the
-        // icon column sorts by.
+        // Exactly three columns — icon, name, path. The canvas list draws the
+        // first cell, so a fourth hidden value would be dead weight (and the
+        // hidden extension column went with the `GtkListStore`).
+        assert_eq!(row.len(), 3);
         match &row[0] {
             CellValue::Icon { name, fallback } => {
                 assert_eq!(name, "text-x-rust");
-                assert_eq!(fallback, "text-x-generic");
+                // The theme name travels with the cell; the canvas draws the
+                // glyph, which is what the column actually shows.
+                assert_eq!(fallback, "R");
             }
             _ => panic!("column 0 must be the icon"),
         }
@@ -1650,21 +1563,6 @@ mod tests {
             CellValue::Text(t) => assert_eq!(t, "/a/b/main.rs"),
             _ => panic!("column 2 must be the path"),
         }
-        match &row[3] {
-            CellValue::Text(t) => assert_eq!(t, "rs"),
-            _ => panic!("column 3 must be the extension sort key"),
-        }
-    }
-
-    #[test]
-    fn rows_to_cells_carries_an_empty_extension_for_directories() {
-        // A directory has no extension: its hidden sort key is empty, so
-        // directories group together ahead of any extension.
-        let cells = rows_to_cells(&["/a/src/".to_string()]);
-        match &cells[0][3] {
-            CellValue::Text(t) => assert_eq!(t, ""),
-            _ => panic!("column 3 must be the extension sort key"),
-        }
     }
 
     #[test]
@@ -1673,10 +1571,29 @@ mod tests {
         match &cells[0][0] {
             CellValue::Icon { name, fallback } => {
                 assert_eq!(name, "folder");
-                // A folder falls back to itself, not to a generic file icon.
-                assert_eq!(fallback, "folder");
+                // A folder draws a folder glyph, not a generic file one.
+                assert_eq!(fallback, "\u{25b8}");
             }
             _ => panic!("expected an icon"),
+        }
+    }
+
+    #[test]
+    fn icon_glyphs_are_one_character_each() {
+        // The icon column is a fixed narrow fraction of the list, so a glyph
+        // that is more than one character wide would be clipped.
+        for icon in [
+            "folder",
+            "text-x-rust",
+            "text-x-python",
+            "text-x-generic",
+            "image-x-generic",
+            "package-x-generic",
+            "application-pdf",
+            "something-new",
+        ] {
+            let glyph = icon_glyph(icon);
+            assert_eq!(glyph.chars().count(), 1, "{icon} -> {glyph:?}");
         }
     }
 

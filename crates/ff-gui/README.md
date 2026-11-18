@@ -33,17 +33,43 @@ The `zork` backend is a display-free driver for the same widget API: it renders
 to a REPL rather than a window, so the GUI still runs over ssh or in a container
 with no X server. Backends are selected at build time via the crate's
 `gtk` / `macos` / `zork` features (`default = ["gtk", "macos"]`; each is inert
-off its target).
+off its target). `zork` wins whenever it is enabled, so both
+`--no-default-features --features zork` and the additive `--features zork` (on
+top of the defaults) build the display-free backend.
 
-### macOS v1 scope
+### One widget set for both platforms: `rswidgets::compat`
 
-The AppKit port is functional but deliberately narrower than GTK: the results
-list is a text-backed `TreeView` (rows render as `name  path` lines with path
-selection, but no click-to-sort headers or hit-testing yet), the context menu
-logs instead of popping an `NSMenu`, the foldout is inert, and the timer is a
-delayed-perform tick rather than an `NSTimer`. A real `NSTableView`,
-`NSMenu`, disclosure and canvas port is future work; every stub degrades
-loudly (status line / log), never silently.
+The toolkit this is built on is a vendored rustxWidgets snapshot; when its
+backends were merged it dropped `TreeView`, `Expander` and `ContextMenu`, so
+those three now come from `rswidgets::compat`, which rebuilds them on the
+portable `Canvas` / `Box` / `Label` layer. One implementation therefore serves
+GTK and AppKit, and the same code path runs on both — which is what makes this
+crate build for Linux and macOS from one source.
+
+What that means in practice, stated rather than implied:
+
+* The results list **draws its own header and rows on a canvas** and hit-tests
+  clicks by hand. The three columns line up and a click selects a row (so
+  Copy / Open act on the right file), the icon column shows a **glyph per file
+  kind** instead of a themed pixbuf, and the headers are **not click-to-sort** —
+  the canvas layer has no sorting UI. Row height is fixed.
+* **Right-click opens no menu.** `ContextMenu` collects its items, but popping
+  one up needs a native menu the merged toolkit does not expose, so
+  `popup_at_pointer` returns an error and the status line says so. Copy and
+  Open are still reachable from the **Search** menu, which acts on the selected
+  row.
+* **Drag-and-drop is unavailable** for the same reason: `enable_uri_drag_source`
+  reports it (status line) rather than starting a drag that carries nothing.
+* The **Advanced search foldout** appends its body under the header; the
+  expander tracks the expanded flag but does not hide the body, because the
+  portable layer has no click callback to toggle it. Every control inside it
+  (case, fuzzy, max distance, count) works.
+* **Wheel stepping** of the max-distance field works where the backend delivers
+  wheel events to an entry — GTK does; AppKit and the `zork` REPL report that
+  they cannot, which the GUI swallows (the field simply ignores the wheel).
+* The timer is per platform: GTK uses `g_timeout_add`, AppKit a delayed-perform
+  tick, and the `zork` REPL has none — it returns `Err`, which is why the REPL
+  says the pump will not tick rather than silently never firing.
 
 ## As-you-type search over a non-blocking socket
 
@@ -141,10 +167,12 @@ presents in ~80 ms — previously it never appeared at all.
 `vendor/rustxwidgets` (crate `rswidgets`) and `vendor/gtk_dynamic_loader` are
 copies of those crates at the revision corro uses (the `corro_macos_app`
 worktree, including its uncommitted AppKit ABI fixes), with the fx additions
-re-applied on top. The upstream tree has no `Expander`, `TreeView`,
-`ContextMenu`, timer, clipboard, placeholder, drag, or icon-loading support —
-those are all fx additions, now merged into the new tree across every backend
-(gtk real, zork headless, nwg/wasm/android/pancurses/ios/macos stubs). Two
+re-applied on top. The merged tree has no `Expander`, `TreeView` or
+`ContextMenu` — those live in `vendor/rustxwidgets/src/compat.rs`, rebuilt on the
+portable layer (see above) — and no drag or icon-loading support at all, so
+those calls report their absence. Timer, placeholder text and sensitivity are
+per-adapter: the GTK loader gained `gtk_entry_set_placeholder_text`,
+`gtk_widget_set_sensitive` and a `scroll-event` connection for them. Two
 fx-only manifest adjustments: the `pdcurses-sys` path dep is dropped (fx never
 builds pancurses and cargo resolves optional path deps eagerly), and the
 `build.rs` Android resource generator is gated on `RSWIDGETS_ANDROID_PROJECT`
@@ -156,25 +184,18 @@ depend on a checkout outside this repository.
 
 * Query box + Search button + a status line and a results list, driven by
   `App::run()`.
-* The window opens at 1000x700 and the results area expands to fill it; every
-  column header separator drags (all columns are user-resizable) and the Path
-  column absorbs the spare width, so it never gets squeezed out as the window
-  grows. Name defaults to 250 px so filenames read instead of ellipsizing to
-  stubs. The default screen never needs a horizontal scrollbar: the fixed Name
-  default plus the expanding Path hold widths steady (long paths ellipsize
-  with "…" instead of forcing the bar — FIXED sizing is not the mechanism, it
-  would kill the draggable dividers), and the window steps out from 1 px
-  narrow once settled so the headers' late growth cannot leave it wider than
-  the glass.
-* Results are a **three-column list — Icon / Name / Path**. On GTK this is a
-  real `GtkTreeView` backed by a `GtkListStore`, so the columns actually align
-  and the icon column shows a real themed icon. **Click a header
-  to sort by it** (GTK sorts the store and draws the header arrow): Name and
-  Path sort by themselves, the icon column sorts by file extension. (picked from the file's name and
-  type, with a generic fallback when the theme lacks a specific one). The
-  display-free fallback renders the same three columns as aligned text (glyph,
-  padded name, path). Clicking blank space below the rows does nothing rather
-  than acting on a neighbour; `(no matches)` stays an explicit line.
+* The window opens at 1000x700 and the results area takes the leftover height. The
+  columns are fractions of the list's own width (icon narrow, Name and Path
+  sharing the rest), so there is no late `GtkTreeView` header growth to
+  compensate for and no one-pixel settle step any more. Column separators do
+  not drag: the canvas list has no per-column sizing UI.
+* Results are a **three-column list — Icon / Name / Path**, drawn on a canvas
+  by `rswidgets::compat::TreeView`, so the columns line up on GTK and AppKit
+  alike and a click selects a row. The icon column shows a **glyph per file
+  kind** (folder, source, image, …) rather than a themed pixbuf, and the
+  headers are not click-to-sort. Clicking blank space below the rows does
+  nothing rather than acting on a neighbour; `(no matches)` stays an explicit
+  line. The `zork` fallback renders the same three columns as aligned text.
 * Press **Return** in either query field to search — the same code path as the
   Search button, so the two cannot diverge. (In the `zork` fallback, `enter`
   presses Return on the focused field.)
@@ -184,7 +205,7 @@ depend on a checkout outside this repository.
 * An **Advanced search** foldout (a native disclosure) holds a free-form query
   field for the full syntax (`ext:`, `path:`, `case:`, `regex:`, `type:`,
   globs, phrases, `-` negation). The field shows that syntax as grey hint
-  text while it is empty and unfocused;
+  text while it is empty (GTK and AppKit both support placeholder text);
   the hint disappears as soon as the field holds text or is selected for typing.
   The main search box is literal-only: whatever you type there is quoted, so
   `ext:rs` finds files with those exact characters and `*.rs` finds the
@@ -201,21 +222,16 @@ depend on a checkout outside this repository.
   and *Count only* (`count`) which returns just the total — shown as
   `N matches (count only)` rather than an empty list that would read as "no
   matches". Ticking them changes what is searched; they are not decoration.
-* **Right-click a result** for a context menu: *Copy path*, *Open*, and *Open
-  containing folder*. The row under the cursor is found with GTK's own text
-  hit-test, so it stays correct under scrolling. Copy uses the system clipboard
-  on GTK and the terminal's OSC 52 escape in the `zork` fallback (so it works
-  over ssh); Open and Open-containing-folder invoke `xdg-open` on the file and
-  its parent directory respectively.
-* **Drag a result** into another window. The row is picked up from the pointer
-  position at drag start and carried as both a `file://` URI (for a file manager
-  or editor) and plain text (for a terminal or text field), so the drop target
-  can choose. While dragging, the row's own themed icon rides under the cursor
-  (via `drag-begin`), so the picked-up item stays visible in flight. The `zork`
-  fallback has no other window to drop into; its
-  `drag <line>` command prints the payload instead. Note: the drop target must
-  speak XDND — xterm does not (no `XdndAware`), so drops into xterm silently go
-  nowhere from any application; Kitty and other XDND-aware terminals work.
+* **Right-clicking a result reports that the popup menu is unavailable** in
+  this build (see *One widget set for both platforms* above): the row under the
+  cursor is found by the canvas hit-test and selected, then the status line
+  carries the reason. The same row actions (*Copy full path*, *Copy folder
+  path*, *Open*, *Open with…*, *Open containing folder*, *Open in terminal*)
+  are reachable from the **Search** menu and act on the selected row. Copy
+  reports the toolkit's clipboard answer — the merged toolkit carries no
+  clipboard helper, so it says so instead of pretending the copy happened.
+* **Drag-and-drop is unavailable** in this build, and the status line says so
+  instead of starting a drag that carries nothing.
 * Results come from the daemon's `query` op; the consistency metadata
   (`fresh`, `stale_roots`, `catching_up`, and the daemon's own `phase` with crawl
   progress) is shown in the status line, so a stale view is never presented as an

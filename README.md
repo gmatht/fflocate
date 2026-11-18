@@ -59,9 +59,12 @@ Notes and limits:
   process with Full Disk Access.
 * APFS stores decomposed names; the index normalizes to NFC so a typed
   precomposed query still matches.
-* `ff --gui` does not build on macOS: it needs the AppKit backend, which the
-  vendored rustxWidgets snapshot does not include (and the GUI is currently
-  broken on Linux too, for unrelated widget-API drift). The CLI is unaffected.
+* `ff --gui` builds and runs on macOS through the AppKit backend. Because the
+  merged widget toolkit dropped `TreeView`/`Expander`/`ContextMenu`, the GUI
+  takes them from `rswidgets`' compat layer on **both** platforms: the results
+  list is canvas-drawn (no themed icons, no click-to-sort headers), right-click
+  reports that the popup menu is unavailable, and drag-and-drop is off. The
+  daemon and CLI are unaffected; see `crates/ff-gui/README.md`.
 
 ## Quick start
 
