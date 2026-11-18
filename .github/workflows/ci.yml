@@ -68,26 +68,28 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          ulimit -c 0 || true
+          # Aqua means a window server session; anything else is headless, and
+          # AppKit cannot open a window there at all.
+          session=$(launchctl managername 2>&1 | tr -d '\n')
           cargo build -p ff-gui 2>&1 | tail -2
           ./target/debug/ff-gui >gui-run.log 2>&1 &
           pid=$!
           sleep 8
-          alive=no
+          # The log is echoed through a workflow command, which is readable
+          # without a token; printable-only and short so it cannot upset the
+          # runner's command parsing.
+          log() { head -c 900 gui-run.log | tr -cd '[:print:]\n' | tr '\n' '|'; }
           if kill -0 "$pid" 2>/dev/null && ! ps -o stat= -p "$pid" | grep -q '^ *Z'; then
-            alive=yes
             kill "$pid" 2>/dev/null || true
-          else
-            wait "$pid"
-            status=$?
-          fi
-          if [ "$alive" = yes ]; then
+            wait "$pid" 2>/dev/null || true
+            echo "::notice title=GUI log (macOS)::session=${session}; $(log)"
             echo "ok: ff-gui stayed alive for 8s (pid $pid)"
-            # Readable without a token, like the failure annotations: shows what
-            # the GUI logged while the AppKit loop ran.
-            echo "::notice title=GUI log (macOS)::$(head -c 1200 gui-run.log | tr '\n' '|')"
             exit 0
           fi
-          echo "::error title=GUI did not start (${RUNNER_OS})::exit ${status:-?}: $(tail -c 1500 gui-run.log | tr '\n' '|')"
+          status=0
+          wait "$pid" 2>/dev/null || status=$?
+          echo "::error title=GUI did not start (${RUNNER_OS})::session=${session} exit ${status}: $(log)"
           exit 1
 
       # The FSEvents backend is cfg(target_os = "macos"), so its unit tests only
