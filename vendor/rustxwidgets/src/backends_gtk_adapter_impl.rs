@@ -1,8 +1,9 @@
-// High-level ergonomic wrappers over gtk_compat for the rustxwidgets API
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+// High-level ergonomic wrappers over gtk_compat for the rswidgets API
+#[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
 mod gtk_adapter {
     use std::os::raw::c_void;
     use std::cell::RefCell;
+
     use std::rc::Rc;
     use crate::core::{Error, Widget};
     use gtk_dynamic_loader::{Window as GWindow, Button as GButton, Label as GLabel, BoxWidget as GBox, Grid as GGrid, Entry as GEntry, Dialog as GDialog, DropDown as GDropDown, CheckButton as GCheckButton, RadioButton as GRadioButton, TextView as GTextView, ScrolledWindow as GScrolledWindow};
@@ -12,6 +13,26 @@ mod gtk_adapter {
     /// (which adds a GtkEventControllerKey to the window) keeps the
     /// Rust-side wrapper alive.  Without this the controller is dropped
     /// while still owned by the window, causing a segfault later.
+    /// Swallow GTK4 `key-released` on a key controller, if this GTK is GTK4.
+    ///
+    /// A physical key produces BOTH `key-pressed` and `key-released` from the
+    /// same `GtkEventControllerKey`. On the GTK4/WSLg versions where a release
+    /// is routed through the *pressed* handler, a host hooking only
+    /// `key-pressed` sees every key twice — which forced `gui_backend.rs` to
+    /// carry consecutive-keyval dedup heuristics gated on `feature = "gtk4"`.
+    ///
+    /// Registering the release signal here and returning `GDK_EVENT_STOP`
+    /// without invoking the host gives every host a pure press stream, so no
+    /// application needs to know which toolkit it is running on.
+    ///
+    /// No-op on GTK3, which exposes only `key-press-event`.
+    fn swallow_key_releases_gtk4(ctrl: &gtk_dynamic_loader::EventControllerKey) {
+        let _ = ctrl.connect_key_released(Box::new(|_keyval: u32, _state: u32| -> i32 {
+            // GDK_EVENT_STOP: consume the release, never call the host.
+            1
+        }));
+    }
+
     pub struct Window(pub GWindow, pub Rc<RefCell<Vec<Box<dyn std::any::Any>>>>);
 
     impl Widget for Window {
@@ -30,6 +51,9 @@ mod gtk_adapter {
         pub fn set_default_size(&self, w: i32, h: i32) {
             self.0.set_default_size(w, h);
         }
+        /// Immediate resize; see the loader's `Window::resize`. Needed where
+        /// `set_default_size` is advisory (no window manager).
+        pub fn resize(&self, w: i32, h: i32) { self.0.resize(w, h); }
 
         pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
             self.0.set_child(child);
@@ -99,30 +123,95 @@ mod gtk_adapter {
                 }
             }
         }
-        pub fn on_event_key(&self, mut cb: Box<dyn FnMut(u32, u32) -> i32>) {
+        pub fn on_event_key(&self, cb: Box<dyn FnMut(u32, u32) -> i32>) {
             if let Some(loader) = crate::backends::gtk::loader() {
                 let win_ptr = *self.0.as_ref();
                 if !win_ptr.is_null() {
                     let l = loader.clone();
                     let is_gtk4 = l.symbols.gtk_drawing_area_set_draw_func.is_some();
+                    // Shared callback wrapper used by both GTK4 and GTK3 paths.
+                    let shared_cb: Rc<RefCell<Option<Box<dyn FnMut(u32, u32) -> i32>>>> = Rc::new(RefCell::new(Some(cb)));
                     if is_gtk4 {
+                        // CAPTURE-phase controller: handles ALL keys (not just navigation keys).
+                        // On GTK4/WSLg, when the formula entry doesn't have keyboard focus,
+                        // keyboard events are silently dropped because there's no focused
+                        // widget to receive them.  By processing ALL keys in the window
+                        // CAPTURE phase, we ensure every keystroke reaches our key handler
+                        // regardless of focus state.
+                        //
+                        // We always call the application callback and return its result
+                        // (GDK_EVENT_STOP for handled keys, GDK_EVENT_PROPAGATE otherwise).
+                        // For printable characters, the application's callback now returns
+                        // STOP (1) because start_edit_with/set_text updates the entry widget
+                        // directly — there's no need for the event to reach the entry widget.
+                        //
+                        // Mutual-exclusion flag: the CAPTURE controller sets this before
+                        // returning STOP; the BUBBLE controller checks it to avoid
+                        // processing the same event twice.  On some GTK4/WSLg versions
+                        // the BUBBLE controller fires even when CAPTURE returns STOP,
+                        // so a simple GDK_EVENT_STOP return is not sufficient — we need
+                        // this explicit handshake.
+                        let capture_handled: std::cell::Cell<bool> = std::cell::Cell::new(false);
+                        let capture_handled = std::rc::Rc::new(capture_handled);
                         if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(l.clone()) {
+                            ctrl.set_propagation_phase_capture();
+                            let sc = shared_cb.clone();
+                            let ch = capture_handled.clone();
                             let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
-                                cb(keyval, state)
+                                ch.set(false);
+                                let result = if let Some(ref mut f) = *sc.borrow_mut() {
+                                    f(keyval, state)
+                                } else {
+                                    0
+                                };
+                                if result != 0 {
+                                    ch.set(true);
+                                }
+                                result
                             }));
+                            swallow_key_releases_gtk4(&ctrl);
                             ctrl.add_to_widget(&self.0);
-                            // Store the controller so it stays alive as long as the Window does.
-                            // Without this, the Rust wrapper's Drop calls g_object_unref,
-                            // which — even though the widget also owns a ref — interacts
-                            // badly with GTK's widget-tree walk during gtk_window_present,
-                            // causing a segfault in g_type_check_instance_is_a.
+                            self.1.borrow_mut().push(Box::new(ctrl));
+                        }
+                        // BUBBLE-phase controller: safety net.  The CAPTURE-phase controller
+                        // above handles all keys and sets capture_handled=true.  If BUBBLE
+                        // fires despite CAPTURE having returned STOP (a known issue on some
+                        // GTK4/WSLg versions), we check the flag and skip.
+                        if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(l.clone()) {
+                            let sc = shared_cb.clone();
+                            let ch = capture_handled.clone();
+                            let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
+                                if ch.get() {
+                                    ch.set(false);
+                                    return 0;
+                                }
+                                if let Some(ref mut f) = *sc.borrow_mut() {
+                                    f(keyval, state)
+                                } else {
+                                    0
+                                }
+                            }));
+                            swallow_key_releases_gtk4(&ctrl);
+                            ctrl.add_to_widget(&self.0);
                             self.1.borrow_mut().push(Box::new(ctrl));
                         }
                     } else {
                         unsafe {
+                            let sc = shared_cb.clone();
                             let _ = gtk_dynamic_loader::widget_connect_signal_bool(
                                 &l.clone(), win_ptr, "event",
                                 Box::new(move |ev: *mut c_void| -> i32 {
+                                    // The unfiltered "event" signal also delivers key
+                                    // RELEASES, which carry the same keyval/state as
+                                    // presses and are indistinguishable downstream —
+                                    // heuristics there eat genuine repeats. Drop
+                                    // everything but GDK_KEY_PRESS (8) at the source.
+                                    // If the symbol is missing, fail open (old behavior).
+                                    if let Some(get_ty) = l.symbols.gdk_event_get_event_type {
+                                        if get_ty(ev) != 8 {
+                                            return 0;
+                                        }
+                                    }
                                     let mut keyval: u32 = 0;
                                     if let Some(get_kv) = l.symbols.gdk_event_get_keyval {
                                         if get_kv(ev, &mut keyval) == 0 {
@@ -135,7 +224,11 @@ mod gtk_adapter {
                                     if let Some(get_st) = l.symbols.gdk_event_get_state {
                                         get_st(ev, &mut state);
                                     }
-                                    cb(keyval, state)
+                                    if let Some(ref mut f) = *sc.borrow_mut() {
+                                        f(keyval, state)
+                                    } else {
+                                        0
+                                    }
                                 }),
                             );
                         }
@@ -189,16 +282,40 @@ mod gtk_adapter {
         pub fn remove_class(&self, class_name: &str) { self.0.remove_class(class_name); }
         pub fn set_markup(&self, markup: &str) { self.0.set_markup(markup); }
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
-        /// Grey the label out and stop it responding (for controls that have
-        /// no effect until something else is enabled).
-        pub fn set_sensitive(&self, sensitive: bool) {
-            if let Some(loader) = crate::backends::gtk::loader() {
-                unsafe { gtk_dynamic_loader::widget_set_sensitive(&loader, *self.0.as_ref(), sensitive); }
-            }
-        }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
+        /// Left margin of the label's contents, in device px.
+        ///
+        /// Useful next to [`Label::set_fixed_width`]: a pinned-and-left-aligned
+        /// label sits flush against its slot's edge, so this is how the text
+        /// keeps the inset it had when the label sized itself to its content.
+        pub fn set_margin_start(&self, px: i32) { self.0.set_margin_start(px); }
+        /// Pin the label's width so changing its text never reflows the
+        /// siblings packed after it. `None` releases the pin.
+        ///
+        /// GTK honours a width request as the widget's *minimum* width, so the
+        /// label keeps its slot and only clips text wider than the pin — the
+        /// fixed-slot behaviour, and the same trade the NWG implementation
+        /// makes. This used to be a no-op here, on the belief that "a GtkLabel
+        /// already lays out at its natural text width and the box does not
+        /// re-pack children on a text change". That belief was wrong: the
+        /// formula row's address label grows with its text and drags the `fx`
+        /// caption and the entry's caret sideways on every cursor move. A GTK
+        /// width request is what actually stops it, so the pin is real now.
+        ///
+        /// The caller must size the pin for the widest text the label will
+        /// ever show, since GTK clips rather than growing past the request.
+        pub fn set_fixed_width(&self, w: Option<i32>) {
+            match w {
+                // Height -1 keeps the natural height: only the width is pinned.
+                Some(w) => self.0.set_size_request(w, -1),
+                None => self.0.set_size_request(-1, -1),
+            }
+        }
+        /// Vertical outer spacing; pairs with `set_margin_start` so a label
+        /// can be inset on all four sides from one code path.
+        pub fn set_margin_top(&self, m: i32) { self.0.set_margin_top(m); }
         /// Set the x alignment of the label's text (0.0 left .. 1.0 right)
         pub fn set_xalign(&self, x: f32) { self.0.set_xalign(x); }
         pub fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() }
@@ -267,13 +384,13 @@ mod gtk_adapter {
     impl Entry {
         pub fn set_text(&self, text: &str) { self.inner.set_text(text); }
         pub fn get_text(&self) -> Option<String> { self.inner.get_text() }
-        pub fn set_width_chars(&self, n: i32) { self.inner.set_width_chars(n); }
-        /// Enable or disable the entry (a disabled field is greyed out).
-        pub fn set_sensitive(&self, sensitive: bool) {
-            if let Some(loader) = crate::backends::gtk::loader() {
-                unsafe { gtk_dynamic_loader::widget_set_sensitive(&loader, *self.inner.as_ref(), sensitive); }
-            }
+        pub fn get_position(&self) -> Option<usize> {
+            self.inner.get_position().and_then(|p| if p < 0 { None } else { Some(p as usize) })
         }
+        pub fn set_position(&self, pos: usize) {
+            self.inner.set_position(pos as i32);
+        }
+        pub fn set_width_chars(&self, n: i32) { self.inner.set_width_chars(n); }
         pub fn set_size_request(&self, w: i32, h: i32) { self.inner.set_size_request(w, h); }
         pub fn connect_changed(&self, f: impl FnMut() + 'static) -> Result<u64, Error> { self.inner.connect_changed(f).map_err(|e| Error::Backend(format!("{}", e))) }
         pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
@@ -283,6 +400,7 @@ mod gtk_adapter {
         pub fn add_class(&self, class_name: &str) { self.inner.add_class(class_name); }
         pub fn remove_class(&self, class_name: &str) { self.inner.remove_class(class_name); }
         pub fn grab_focus(&self) { self.inner.grab_focus(); }
+        pub fn has_focus(&self) -> bool { self.inner.has_focus() }
         pub fn connect_focus_in_event<F: FnMut(*mut c_void) -> i32 + 'static>(&self, f: F) -> Result<u64, Error> {
             self.inner.connect_focus_in_event(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
@@ -304,34 +422,33 @@ mod gtk_adapter {
                     let is_gtk4 = symbols.gtk_drawing_area_set_draw_func.is_some();
                     if is_gtk4 {
                         // GTK4: GtkEntry's internal EventControllerKey (CAPTURE phase) consumes
-                        // RETURN/TAB/ESCAPE/arrows before our bubble-phase EventControllerKey can
-                        // fire.  We use two mechanisms:
+                        // RETURN/TAB/ESCAPE/arrows before a BUBBLE-phase EventControllerKey can
+                        // fire.  We use CAPTURE phase here so our controller fires BEFORE the
+                        // internal handler, intercepting RETURN directly instead of relying on
+                        // the "activate" signal (which doesn't fire reliably on WSLg/WSL).
                         //
-                        // 1. EventControllerKey for printable characters (which the entry does
-                        //    NOT consume for non-IM keys).
-                        // 2. The "activate" signal for RETURN.  GtkEntry emits "activate"
-                        //    synchronously before its internal controller returns GDK_EVENT_STOP,
-                        //    so we can commit the edit.
+                        // For printable characters our callback returns GDK_EVENT_PROPAGATE (false),
+                        // letting the internal handler insert the character normally.
+                        // The "changed" signal then fires on_formula_entry_changed as before.
                         let shared_cb = std::rc::Rc::new(std::cell::RefCell::new(Some(cb)));
                         self._controllers.borrow_mut().push(Box::new(shared_cb.clone()));
                         if let Ok(ctrl) = gtk_dynamic_loader::EventControllerKey::new(loader.clone()) {
+                            ctrl.set_propagation_phase_capture();
                             let sc = shared_cb.clone();
                             let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
                                 if let Some(ref mut f) = *sc.borrow_mut() {
                                     if f(keyval, state) { 1 } else { 0 }
                                 } else { 0 }
                             }));
+                            swallow_key_releases_gtk4(&ctrl);
                             ctrl.add_to_widget(&self.inner);
                             self._controllers.borrow_mut().push(Box::new(ctrl));
                         }
-                        // Connect to "activate" for RETURN (which the entry's internal controller
-                        // stops before our bubble-phase EventControllerKey sees it).
-                        let sa = shared_cb.clone();
-                        let _ = self.inner.connect_activate(Box::new(move |_entry: *mut std::os::raw::c_void| {
-                            if let Some(ref mut f) = *sa.borrow_mut() {
-                                f(0xFF0D, 0); // VK_RETURN
-                            }
-                        }));
+                        // NOTE: The application-level connect_activate callback in gui_backend.rs
+                        // is retained as a secondary fallback.  With CAPTURE phase we handle RETURN
+                        // directly and stop propagation, so "activate" is never emitted — but if
+                        // the CAPTURE controller somehow doesn't fire (e.g., older GTK), the
+                        // connect_activate path still works.
                     } else {
                         // GTK3 path: connect to raw "key-press-event" signal
                         let l = loader.clone();
@@ -412,44 +529,71 @@ mod gtk_adapter {
         Ok(Menu(m))
     }
 
-    // ---- Context menu (right-click) ----
-
-    /// A `GtkMenu` whose items are backed directly by closures. Unlike [`Menu`]
-    /// it needs no application action group, so it can be popped up anywhere.
-    pub struct ContextMenu(pub gtk_dynamic_loader::ContextMenu);
-
-    impl ContextMenu {
-        /// Append an item; `cb` runs when it is activated.
-        pub fn append_item(&mut self, label: &str, cb: Box<dyn FnMut()>) {
-            self.0.append_item(label, cb);
-        }
-
-        /// Pop the menu up at the pointer of `event`, anchored to `widget`.
-        pub fn popup_at_pointer(
-            &self,
-            widget: *mut std::ffi::c_void,
-            event: *mut std::ffi::c_void,
-        ) -> Result<(), Error> {
-            self.0
-                .popup_at_pointer(widget, event)
-                .map_err(|e| Error::Backend(format!("{}", e)))
-        }
-    }
-
-    pub fn create_context_menu() -> Result<ContextMenu, Error> {
-        let loader = crate::backends::gtk::loader()
-            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
-        gtk_dynamic_loader::ContextMenu::new(loader)
-            .map(ContextMenu)
-            .map_err(|e| Error::Backend(format!("{}", e)))
-    }
-
     #[repr(transparent)]
     pub struct MenuBar(pub gtk_dynamic_loader::MenuBar);
 
     impl Clone for MenuBar { fn clone(&self) -> Self { MenuBar(self.0.clone()) } }
     impl Widget for MenuBar { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
     impl AsRef<*mut c_void> for MenuBar { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+    impl MenuBar {
+        pub fn activate_submenu_by_mnemonic(&self, keyval: u32) -> bool {
+            self.0.activate_submenu_by_mnemonic(keyval)
+        }
+        /// Open the submenu whose mnemonic is `keyval` at a screen position.
+        ///
+        /// Used by the sheet-tab context menu: a right-click on a tab should
+        /// drop the Sheet menu under the pointer (LibreOffice Calc behaviour),
+        /// not under the menu bar. Falls back to the unpositioned open on GTK4.
+        pub fn popup_submenu_by_mnemonic_at(&self, keyval: u32, screen_x: i32, screen_y: i32) -> bool {
+            self.0.popup_submenu_by_mnemonic_at(keyval, screen_x, screen_y)
+        }
+        /// `popup_submenu_by_mnemonic_at` with the caller's widget-relative
+        /// point resolved to screen coordinates here.
+        ///
+        /// The GTK3 path keeps its existing positioning (it hands GTK the point
+        /// and lets GTK flip off-screen edges itself); GTK4 has no equivalent
+        /// hook and falls back to the unpositioned open, as before.
+        pub fn popup_at(&self, label: &str, anchor: &Canvas, x: f64, y: f64) -> bool {
+            let keyval = match label.chars().next() {
+                Some(c) => c as u32,
+                None => return false,
+            };
+            match anchor.screen_origin() {
+                Some((ox, oy)) => {
+                    self.popup_submenu_by_mnemonic_at(keyval, ox + x as i32, oy + y as i32)
+                }
+                None => self.activate_submenu_by_mnemonic(keyval),
+            }
+        }
+        pub fn activate_submenu_item_by_mnemonic(&self, keyval: u32) -> bool {
+            self.0.activate_submenu_item_by_mnemonic(keyval)
+        }
+        pub unsafe fn insert_action_group(&self, name: &str, group_ptr: *mut std::os::raw::c_void) {
+            self.0.insert_action_group(name, group_ptr);
+        }
+        pub fn handle_mnemonic_key(&self, keyval: u32) -> bool {
+            self.0.handle_mnemonic_key(keyval)
+        }
+        pub fn handle_menu_key(&self, keyval: u32, modifiers: u32) -> bool {
+            self.0.handle_menu_key(keyval, modifiers)
+        }
+
+        /// [`handle_menu_key`](Self::handle_menu_key) with the typed character
+        /// supplied separately (see `common::MenuBar::handle_menu_key_char`).
+        /// GTK keyvals are X11 keysyms, not characters (GDK_KEY_KP_0 is
+        /// 0xffb0), so `ch` is the more faithful input where a caller has it;
+        /// GTK's own mnemonics are handled natively, so this stays a forward.
+        pub fn handle_menu_key_char(&self, keyval: u32, ch: char, modifiers: u32) -> bool {
+            let _ = ch;
+            self.0.handle_menu_key(keyval, modifiers)
+        }
+        pub fn menu_active(&self) -> bool {
+            self.0.menu_active()
+        }
+        pub fn menu_close(&self) {
+            self.0.menu_close();
+        }
+    }
 
     /// # Safety
     /// `action_group` must be a valid GActionGroup pointer or null.
@@ -509,8 +653,10 @@ mod gtk_adapter {
 
     impl Dialog {
         pub fn set_title(&self, title: &str) { self.0.set_title(title); }
+        pub fn set_transient_for(&self, parent: *mut c_void) { self.0.set_transient_for(parent); }
         pub fn set_default_size(&self, w: i32, h: i32) { self.0.set_default_size(w, h); }
         pub fn add_button(&self, text: &str, response_id: i32) { self.0.add_button(text, response_id); }
+        pub fn set_default_response(&self, response_id: i32) { self.0.set_default_response(response_id); }
         pub fn get_content_area(&self) -> *mut c_void { self.0.get_content_area() }
         pub fn append_content_area(&self, child: &impl AsRef<*mut c_void>) { self.0.append_content_area(child); }
         pub fn present(&self) { self.0.present(); }
@@ -518,6 +664,18 @@ mod gtk_adapter {
             self.0.connect_response(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
         pub fn close(&self) { self.0.close(); }
+        /// Measure the dialog without mapping it; see the loader's
+        /// `layout_dialog`. A caller attaching a custom view needs the size
+        /// settled before the window opens.
+        pub fn layout_dialog(&self) { self.0.layout_dialog(); }
+        /// Hide or show without destroying. `close` would destroy a
+        /// `GtkDialog`, so this is a different operation, not an alias.
+        pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
+        /// Run the nested main loop and return the response id. Falls back to
+        /// present-and-return-0 when `gtk_dialog_run` is unavailable.
+        pub fn run(&self) -> i32 { self.0.run() }
+        pub fn mark_destroyed(&self) { self.0.mark_destroyed(); }
+
     }
 
     pub fn create_dialog() -> Result<Dialog, Error> {
@@ -536,6 +694,19 @@ mod gtk_adapter {
         pub fn set_active(&self, index: Option<u32>) {
             if let Some(idx) = index { self.0.set_active(idx); }
         }
+        pub fn grab_focus(&self) { self.0.grab_focus(); }
+        /// (visible, mapped, alloc_w, alloc_h, has_parent) diagnostic.
+        pub fn diagnostics(&self) -> (bool, bool, i32, i32, bool) { self.0.diagnostics() }
+        /// True when the GTK4 DropDown backend is in use (vs GTK3 combo).
+        ///
+        /// Delegates to the loader, which decides the backend ONCE in
+        /// `DropDown::new` and records it on the widget. It used to be
+        /// recomputed per call from `symbols.gtk_drop_down_new.is_some()`, and
+        /// on Linux that probe said "GTK4" for a `GtkComboBoxText` -- libgtk-3
+        /// exports `gtk_drop_down_new` as a 3.24 forwarder. Every caller
+        /// branched on GTK4 behaviour it never got.
+        pub fn is_gtk4(&self) -> bool { self.0.is_gtk4() }
+        pub fn has_size_request_symbol(&self) -> bool { self.0.has_size_request_symbol() }
         pub fn get_active(&self) -> i32 { self.0.get_active() }
         pub fn connect_changed<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
             self.0.connect_changed(f).map_err(|e| Error::Backend(format!("{}", e)))
@@ -544,6 +715,12 @@ mod gtk_adapter {
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
+        /// Offset within an overlay parent, in widget pixels.
+        pub fn set_offset(&self, x: i32, y: i32) {
+            self.0.set_align_start();
+            self.0.set_margin_start(x);
+            self.0.set_margin_top(y);
+        }
     }
 
     pub fn create_dropdown(items: &[&str]) -> Result<DropDown, Error> {
@@ -585,6 +762,7 @@ mod gtk_adapter {
     impl RadioButton {
         pub fn is_active(&self) -> bool { self.0.is_active() }
         pub fn set_active(&self, active: bool) { self.0.set_active(active); }
+        pub fn grab_focus(&self) { self.0.grab_focus(); }
         pub fn connect_toggled<F: FnMut() + 'static>(&self, f: F) -> Result<u64, Error> {
             self.0.connect_toggled(f).map_err(|e| Error::Backend(format!("{}", e)))
         }
@@ -615,100 +793,30 @@ mod gtk_adapter {
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
         pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
-
-        /// Run `cb` on a `button-press-event`, passing the mouse button number
-        /// (1 = left, 3 = right), the (x, y) coordinates in widget space, and
-        /// the raw `GdkEvent` pointer (needed to anchor a context-menu popup).
-        /// Used to open a context menu on right-click.
-        pub fn connect_button_press_event(
-            &self,
-            mut cb: impl FnMut(u32, f64, f64, *mut std::ffi::c_void) + 'static,
-        ) -> Result<u64, Error> {
-            let loader = crate::backends::gtk::loader()
-                .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
-            let widget = *self.0.as_ref();
-            let cb_loader = loader.clone();
-            let wrapper: Box<dyn FnMut(*mut std::ffi::c_void)> = Box::new(move |event| {
-                if event.is_null() {
-                    return;
-                }
-                let button = unsafe {
-                    gtk_dynamic_loader::gdk_event_get_button(&cb_loader, event)
-                }
-                .unwrap_or(0);
-                let (x, y) = unsafe {
-                    gtk_dynamic_loader::gdk_event_get_coords(&cb_loader, event)
-                }
-                .unwrap_or((0.0, 0.0));
-                cb(button, x, y, event);
-            });
-            let id = unsafe {
-                gtk_dynamic_loader::connect_widget_button_press_event(&loader, widget, wrapper)
-            }
-            .map_err(|e| Error::Backend(format!("{}", e)))?;
-            Ok(id)
-        }
-
-        /// The 0-based line of text at widget coordinates `(x, y)`, or `None`
-        /// if it cannot be determined. Used to find the row under a right-click.
-        pub fn line_at(&self, x: f64, y: f64) -> Option<i32> {
-            let loader = crate::backends::gtk::loader()?;
-            let widget = *self.0.as_ref();
-            unsafe { gtk_dynamic_loader::text_view_line_at_location(&loader, widget, x, y) }
-        }
-
-        /// Make this text view a drag source carrying file URIs and plain text.
-        ///
-        /// `payload` is called when a drop target asks for the data; it should
-        /// return the `(uris, text)` to hand over, or `None` to refuse. The app
-        /// decides *what* is being dragged (e.g. the row recorded at press
-        /// time), since the `drag-data-get` signal carries no start position.
-        pub fn enable_uri_drag_source(
-            &self,
-            mut payload: impl FnMut() -> Option<(Vec<String>, String)> + 'static,
-        ) -> Result<(), Error> {
-            let loader = crate::backends::gtk::loader()
-                .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
-            let widget = *self.0.as_ref();
-            unsafe {
-                gtk_dynamic_loader::widget_enable_uri_drag_source(&loader, widget)
-            }
-            .map_err(|e| Error::Backend(format!("{}", e)))?;
-            let cb_loader = loader.clone();
-            unsafe {
-                gtk_dynamic_loader::connect_widget_drag_data_get(
-                    &loader,
-                    widget,
-                    move |selection_data, target| {
-                        let Some((uris, text)) = payload() else { return };
-                        // GTK passes the requested target name, so we only
-                        // fill in the form this drop asked for.
-                        let r = if target.contains("uri-list") {
-                            gtk_dynamic_loader::drag_set_uris(&cb_loader, selection_data, &uris)
-                        } else {
-                            gtk_dynamic_loader::drag_set_text(&cb_loader, selection_data, &text)
-                        };
-                        let _ = r;
-                    },
-                )
-            }
-            .map_err(|e| Error::Backend(format!("{}", e)))?;
-            Ok(())
-        }
-
-        /// Copy `text` to the system clipboard.
-        pub fn clipboard_set_text(&self, text: &str) -> Result<(), Error> {
-            let loader = crate::backends::gtk::loader()
-                .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
-            unsafe { gtk_dynamic_loader::clipboard_set_text(&loader, text) }
-                .map_err(|e| Error::Backend(format!("{}", e)))
-        }
+        /// Append a line without rebuilding the buffer (see the loader's
+        /// `TextView::append_text`). Needed by any append-only log pane.
+        pub fn append_text(&self, text: &str) { self.0.append_text(text); }
     }
 
     pub fn create_textview() -> Result<TextView, Error> {
         let t = crate::backends::gtk::create_textview().map_err(|e| Error::Backend(format!("{}", e)))?;
         Ok(TextView(t))
     }
+
+    /// Run `f` once after `ms` milliseconds (see backends::gtk::timeout_add_once).
+    pub fn timeout_add_once(ms: u32, f: Box<dyn FnOnce()>) -> Result<(), Error> {
+        crate::backends::gtk::timeout_add_once(ms, f).map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
+    /// Run `f` every `ms` milliseconds until it returns `false`
+    /// (see backends::gtk::timeout_add_repeating). Used by apps that need a
+    /// periodic tick (e.g. polling an append-only log for another window's
+    /// revisions); the GTK main context keeps calling it with no input.
+    pub fn timeout_add_repeating(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), Error> {
+        crate::backends::gtk::timeout_add_repeating(ms, f)
+            .map_err(|e| Error::Backend(format!("{}", e)))
+    }
+
 
     // ---- Canvas (cross-platform drawing surface) ----
 
@@ -742,7 +850,13 @@ mod gtk_adapter {
             self.cc.set_source_rgba(r, g, b, a);
             self.cc.select_font_face(font, slant, weight);
             self.cc.set_font_size(size);
-            self.cc.move_to(x, y);
+            // Cairo's move_to(x, y) treats y as the text BASELINE.
+            // The callers pass y as the TEXT TOP (matching GDI semantics).
+            // Convert: baseline = top - y_bearing (y_bearing is negative,
+            // so this ADDS the ascent to top).
+            let e = self.cc.text_extents(text);
+            let baseline = y - e.y_bearing;
+            self.cc.move_to(x, baseline);
             self.cc.show_text(text);
             self.cc.restore();
         }
@@ -767,6 +881,13 @@ mod gtk_adapter {
             self.cc.rectangle(x, y, w, h);
             self.cc.clip();
         }
+        /// Blit an RGBA8 image. Straight-alpha in, premultiplied internally:
+        /// see `gtk_dynamic_loader::wrappers::CairoContext::draw_rgba_image`,
+        /// which does the conversion, because Cairo's ARGB32 is premultiplied
+        /// and the two are not interchangeable.
+        fn draw_rgba_image(&mut self, x: f64, y: f64, pixels: &[u8], width: u32, height: u32, scale: f64) -> bool {
+            self.cc.draw_rgba_image(x, y, pixels, width, height, scale)
+        }
     }
 
     /// Canvas wraps a DrawingArea into the cross-platform Canvas API.
@@ -774,10 +895,114 @@ mod gtk_adapter {
     /// the constructor scope (GTK4 controllers are freed if dropped).
     /// Also stores a copy of the draw callback for the `force_draw` fallback
     /// that renders directly to the window surface (bypassing the frame clock).
+    /// The click callbacks registered on one GTK3 canvas, and the single
+    /// `button-press-event` connection that drives them.
+    ///
+    /// See [`Canvas::click_handlers`] for why these live together rather than
+    /// each owning a signal connection. `installed` is what makes the first
+    /// registration connect the signal and later ones just fill in a slot.
+    #[derive(Default)]
+    struct PressHandlers {
+        plain: Option<Box<dyn FnMut(f64, f64)>>,
+        with_button: Option<Box<dyn FnMut(f64, f64, u32, u32)>>,
+        /// Canonical gesture stream, fed from the same three native signals as
+        /// the other callbacks so a caller can use one handler instead of three.
+        gesture: Option<Box<dyn FnMut(crate::core::Gesture)>>,
+        installed: bool,
+    }
+
+    impl PressHandlers {
+        /// Map a GDK button number to the portable `Button` enum.
+        ///
+        /// GDK numbers 1/2/3 are left/middle/right, as everywhere else; the
+        /// rest are passed through so a caller can still see 4..n.
+        fn map_button(b: u32) -> crate::core::Button {
+            match b {
+                1 => crate::core::Button::Primary,
+                2 => crate::core::Button::Middle,
+                3 => crate::core::Button::Secondary,
+                other => crate::core::Button::Other(other.min(255) as u8),
+            }
+        }
+
+        /// Decode a GDK modifier mask into the portable `Modifiers`.
+        ///
+        /// The bits are gdk-sys' GdkModifierType: shift 1 << 0, lock 1 << 1,
+        /// control 1 << 2, mod1 (alt) 1 << 3, and the super/command key is
+        /// mod4 (1 << 6) on X11/Wayland and on Windows.
+        fn map_state(state: u32) -> crate::core::Modifiers {
+            crate::core::Modifiers {
+                shift: state & (1 << 0) != 0,
+                ctrl: state & (1 << 2) != 0,
+                alt: state & (1 << 3) != 0,
+                meta: state & (1 << 6) != 0,
+            }
+        }
+
+        /// Whether any mouse button is down, per the GDK state mask.
+        ///
+        /// The button mask bits are 1 << 8 (button 1) through 1 << 12
+        /// (button 5), so bits 8..=12 set means a drag rather than a hover.
+        /// `on_motion` is documented as firing for both, and this is how the two
+        /// are told apart without a second native handler.
+        fn button_held(state: u32) -> bool {
+            (state >> 8) & 0b1_1111 != 0
+        }
+
+        /// Feed the gesture stream, if one is registered.
+        fn dispatch_gesture(&mut self, g: crate::core::Gesture) {
+            if let Some(cb) = self.gesture.as_mut() {
+                cb(g);
+            }
+        }
+
+        /// Invoke whichever callbacks are registered, and report whether the
+        /// press should be consumed.
+        ///
+        /// The button-aware callback is called first when both are present, so
+        /// it sees the raw button number before the plain callback can decide
+        /// anything. The press is always consumed once at least one callback
+        /// ran — the historical `on_click` behaviour, which callers rely on.
+        fn dispatch(&mut self, x: f64, y: f64, button: u32, state: u32) -> bool {
+            if let Some(with_button) = self.with_button.as_mut() {
+                with_button(x, y, button, state);
+            }
+            // `on_click` is the *primary* click, so it only fires for button 1.
+            //
+            // It used to be connected to `button-press-event` and called for
+            // every button, which was invisible until the tab strip wanted a
+            // right-click *and* a left-click on the same widget: the right-click
+            // still ran the left-click path (switching sheets and queueing
+            // redraws), and that redraw raced the context menu the right-click
+            // had just opened, leaving the menu shown but not clickable.
+            if button == 1 {
+                if let Some(plain) = self.plain.as_mut() {
+                    plain(x, y);
+                }
+            }
+            self.with_button.is_some() || self.plain.is_some()
+        }
+    }
+
     pub struct Canvas {
         pub drawing_area: gtk_dynamic_loader::DrawingArea,
         draw_cb: Rc<RefCell<Option<Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>>>>,
         _controllers: Rc<RefCell<Vec<Box<dyn std::any::Any>>>>,
+        /// The GTK3 `button-press-event` callbacks for this widget.
+        ///
+        /// `on_click` and `on_click_button` both want the same signal, and GTK3
+        /// stops signal emission at the first handler that returns `TRUE`. Two
+        /// independent connections therefore cannot both run: whichever is
+        /// connected first consumes the press and the other silently never
+        /// fires (observed directly — `on_click` connected first, so
+        /// `on_click_button`'s handler never ran).
+        ///
+        /// So both registrations fill this one record instead of connecting
+        /// separately, and a single installed handler invokes whichever are
+        /// present. That is the only arrangement in which the tab strip — which
+        /// registers both — sees the button number *and* keeps its plain
+        /// left-click switch.
+        click_handlers: Rc<RefCell<PressHandlers>>,
     }
 
     impl Clone for Canvas {
@@ -786,6 +1011,7 @@ mod gtk_adapter {
                 drawing_area: self.drawing_area.clone(),
                 draw_cb: self.draw_cb.clone(),
                 _controllers: self._controllers.clone(),
+                click_handlers: self.click_handlers.clone(),
             }
         }
     }
@@ -961,7 +1187,416 @@ mod gtk_adapter {
             self.drawing_area.set_content_height(h);
         }
 
+        /// Click with the button number and modifier state.
+        ///
+        /// `button` is the GDK button (1 = left, 2 = middle, 3 = right); `state`
+        /// is the `GdkModifierType` mask (bit 0 Shift, bit 2 Control, bit 3 Alt).
+        ///
+        /// Added alongside [`Self::on_click`] rather than replacing it: `on_click`
+        /// is called by every backend's adapter and by corro, and a signature
+        /// change there would touch all eight backends including the mobile ones
+        /// that cannot report a button at all. Callers that need to distinguish a
+        /// right-click use this; everything else keeps `on_click`.
+        ///
+        /// On GTK4 the `GestureClick` "pressed" signal already carries the button
+        /// number, and its `current_button` property gives the state mask; on
+        /// GTK3 both come off the event with `gdk_event_get_button` /
+        /// `gdk_event_get_state`.
+        pub fn on_click_button(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            let loader = crate::backends::gtk::loader()
+                .expect("GTK loader not initialized after Canvas creation");
+            let symbols = &loader.symbols;
+            let inner = *self.drawing_area.as_ref();
+            let is_gtk4 = symbols.gtk_drawing_area_set_draw_func.is_some();
+            if is_gtk4 {
+                if let Ok(gesture) = gtk_dynamic_loader::GestureClick::new(loader.clone()) {
+                    let mut cb = cb;
+                    let _ = gesture.connect_pressed(Box::new(
+                        move |n: i32, x: f64, y: f64| {
+                            // GTK4 reports the button as 0 for "no button" in
+                            // some synthesised presses; fall back to left.
+                            let button = if n > 0 { n as u32 } else { 1 };
+                            cb(x, y, button, 0);
+                        },
+                    ));
+                    gesture.add_to_widget(&self.drawing_area);
+                    self._controllers.borrow_mut().push(Box::new(gesture));
+                }
+                return;
+            }
+            // GDK event masks. Values are from gdk-sys 0.18 (GdkEventMask):
+            // press 256, release 512, plain motion 4, motion-with-button1 32.
+            //
+            // BUTTON1_MOTION is the one a drag needs: plain POINTER_MOTION is
+            // only delivered with no button held, so requesting it alone gave a
+            // strip that saw presses but no motion in between, i.e. no drag.
+            // `gtk_widget_add_events` only ever *adds* bits, so calling it from
+            // several of these methods is safe.
+            const GDK_BUTTON_PRESS_MASK: i32 = 256;
+            const GDK_BUTTON_RELEASE_MASK: i32 = 512;
+            const GDK_POINTER_MOTION_MASK: i32 = 4;
+            const GDK_BUTTON1_MOTION_MASK: i32 = 32;
+            unsafe {
+                gtk_dynamic_loader::widget_add_events(
+                    &loader,
+                    inner,
+                    GDK_BUTTON_PRESS_MASK
+                        | GDK_BUTTON_RELEASE_MASK
+                        | GDK_POINTER_MOTION_MASK
+                        | GDK_BUTTON1_MOTION_MASK,
+                );
+            }
+            let install = {
+                let mut h = self.click_handlers.borrow_mut();
+                h.with_button = Some(cb);
+                if h.installed {
+                    false
+                } else {
+                    h.installed = true;
+                    true
+                }
+            };
+            if !install {
+                return;
+            }
+            // One connection drives both this and any later `on_click`.
+            let handlers = self.click_handlers.clone();
+            let l2 = loader.clone();
+            let l3 = l2.clone();
+            unsafe {
+                let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                    &l3,
+                    inner,
+                    "button-press-event",
+                    Box::new(move |ev: *mut c_void| -> i32 {
+                        let Some((x, y)) = gtk_dynamic_loader::gdk_event_get_coords(&l2, ev) else {
+                            return 0;
+                        };
+                        let button = gtk_dynamic_loader::gdk_event_get_button(&l2, ev).unwrap_or(1);
+                        let state = gtk_dynamic_loader::gdk_event_get_state(&l2, ev).unwrap_or(0);
+                        let consumed = {
+                            let mut h = handlers.borrow_mut();
+                            h.dispatch_gesture(crate::core::Gesture::Button {
+                                button: PressHandlers::map_button(button),
+                                pressed: true,
+                                x,
+                                y,
+                                mods: PressHandlers::map_state(state),
+                            });
+                            h.dispatch(x, y, button, state)
+                        };
+                        if consumed { 1 } else { 0 }
+                    }),
+                );
+            }
+        }
+
+        /// The canonical gesture stream: one callback for hover, drag, buttons
+        /// and (with `on_scroll` installed by the host) scroll.
+        ///
+        /// This is the recommended way to handle pointer input on a canvas.
+        /// The older `on_click` / `on_motion` / `on_release` remain for callers
+        /// that want the raw numbers, but a caller that needs a drag has to
+        /// reassemble one from three separate signals by hand -- including
+        /// working out the click-versus-drag threshold, which is the part
+        /// that is easy to get subtly wrong. Feeding everything into one
+        /// `Gesture` and letting [`crate::core::DragTracker`] do that is why
+        /// this exists.
+        ///
+        /// Shares the single signal connection the other callbacks use, so
+        /// registering it does not add a second connection per widget.
+        pub fn on_gesture(&self, cb: Box<dyn FnMut(crate::core::Gesture)>) {
+            let loader = crate::backends::gtk::loader()
+                .expect("GTK loader not initialized after Canvas creation");
+            let inner = *self.drawing_area.as_ref();
+            if loader.symbols.gtk_drawing_area_set_draw_func.is_some() {
+                // GTK4 uses event controllers rather than widget signals; the
+                // existing click path handles that and the motion path does
+                // not yet (see `on_motion`). Not a silent no-op: the caller
+                // gets no events on GTK4 rather than wrong ones.
+                return;
+            }
+            // press 256, release 512, motion 4, button1-motion 32. The drag
+            // needs 32: plain POINTER_MOTION is only delivered with no button
+            // held. `gtk_widget_add_events` only adds bits, so this is safe to
+            // call alongside the other registrations.
+            const GDK_BUTTON_PRESS_MASK: i32 = 256;
+            const GDK_BUTTON_RELEASE_MASK: i32 = 512;
+            const GDK_POINTER_MOTION_MASK: i32 = 4;
+            const GDK_BUTTON1_MOTION_MASK: i32 = 32;
+            unsafe {
+                gtk_dynamic_loader::widget_add_events(
+                    &loader,
+                    inner,
+                    GDK_BUTTON_PRESS_MASK
+                        | GDK_BUTTON_RELEASE_MASK
+                        | GDK_POINTER_MOTION_MASK
+                        | GDK_BUTTON1_MOTION_MASK,
+                );
+            }
+            {
+                let mut h = self.click_handlers.borrow_mut();
+                h.gesture = Some(cb);
+            }
+
+            // Install the connections that feed the stream. This is the part
+            // that is easy to omit: registering the callback and adding the
+            // event masks is not enough, because a widget only delivers
+            // `motion-notify-event` to a handler that is actually connected to
+            // it. `on_click_button`/`on_motion`/`on_release` each connect their
+            // own signal; on_gesture has to connect too, or it silently never
+            // fires -- which is exactly what the first version of this did.
+            self.install_scroll_gesture();
+
+            let handlers = self.click_handlers.clone();
+            let l2 = loader.clone();
+            let l3 = l2.clone();
+
+            unsafe {
+                let h = l2.clone();
+                let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                    &l3,
+                    inner,
+                    "motion-notify-event",
+                    Box::new(move |ev: *mut c_void| -> i32 {
+                        let Some((x, y)) = gtk_dynamic_loader::gdk_event_get_coords(&h, ev) else {
+                            return 0;
+                        };
+                        let state = gtk_dynamic_loader::gdk_event_get_state(&h, ev).unwrap_or(0);
+                        let g = if PressHandlers::button_held(state) {
+                            crate::core::Gesture::Drag { x, y, mods: PressHandlers::map_state(state) }
+                        } else {
+                            crate::core::Gesture::Hover { x, y, mods: PressHandlers::map_state(state) }
+                        };
+                        handlers.borrow_mut().dispatch_gesture(g);
+                        0
+                    }),
+                );
+            }
+
+            let handlers = self.click_handlers.clone();
+            let l2 = loader.clone();
+            let l3 = l2.clone();
+            unsafe {
+                let h = l2.clone();
+                let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                    &l3,
+                    inner,
+                    "button-press-event",
+                    Box::new(move |ev: *mut c_void| -> i32 {
+                        let Some((x, y)) = gtk_dynamic_loader::gdk_event_get_coords(&h, ev) else {
+                            return 0;
+                        };
+                        let button = gtk_dynamic_loader::gdk_event_get_button(&h, ev).unwrap_or(1);
+                        let state = gtk_dynamic_loader::gdk_event_get_state(&h, ev).unwrap_or(0);
+                        handlers.borrow_mut().dispatch_gesture(crate::core::Gesture::Button {
+                            button: PressHandlers::map_button(button),
+                            pressed: true,
+                            x,
+                            y,
+                            mods: PressHandlers::map_state(state),
+                        });
+                        0
+                    }),
+                );
+            }
+
+            let handlers = self.click_handlers.clone();
+            let l2 = loader.clone();
+            let l3 = l2.clone();
+            unsafe {
+                let h = l2.clone();
+                let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                    &l3,
+                    inner,
+                    "button-release-event",
+                    Box::new(move |ev: *mut c_void| -> i32 {
+                        let Some((x, y)) = gtk_dynamic_loader::gdk_event_get_coords(&h, ev) else {
+                            return 0;
+                        };
+                        let button = gtk_dynamic_loader::gdk_event_get_button(&h, ev).unwrap_or(1);
+                        let state = gtk_dynamic_loader::gdk_event_get_state(&h, ev).unwrap_or(0);
+                        handlers.borrow_mut().dispatch_gesture(crate::core::Gesture::Button {
+                            button: PressHandlers::map_button(button),
+                            pressed: false,
+                            x,
+                            y,
+                            mods: PressHandlers::map_state(state),
+                        });
+                        0
+                    }),
+                );
+            }
+        }
+
+        /// Connect the wheel / touchpad scroll signal to the gesture stream.
+        ///
+        /// Called by `on_gesture`; exposed separately so a host that wants a
+        /// scroll handler without the rest can install just this one.
+        fn install_scroll_gesture(&self) {
+            let loader = crate::backends::gtk::loader()
+                .expect("GTK loader not initialized after Canvas creation");
+            let inner = *self.drawing_area.as_ref();
+            if loader.symbols.gtk_drawing_area_set_draw_func.is_some() {
+                return; // GTK4: as `on_gesture`.
+            }
+            // GDK_SCROLL_MASK = 1 << 21 (2097152).
+            const GDK_SCROLL_MASK: i32 = 1 << 21;
+            unsafe {
+                gtk_dynamic_loader::widget_add_events(&loader, inner, GDK_SCROLL_MASK);
+            }
+            let handlers = self.click_handlers.clone();
+            let l2 = loader.clone();
+            let l3 = l2.clone();
+            unsafe {
+                let h = l2.clone();
+                let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                    &l3,
+                    inner,
+                    "scroll-event",
+                    Box::new(move |ev: *mut c_void| -> i32 {
+                        let Some((dx, dy)) = gtk_dynamic_loader::gdk_event_get_scroll_deltas(&h, ev)
+                        else {
+                            return 0;
+                        };
+                        // Horizontal deltas are carried through: the `Gesture`
+                        // type distinguishes them, and `ZoomState` is the thing
+                        // that decides to ignore them. Deciding here would make
+                        // a horizontal pan impossible.
+                        let (x, y) =
+                            gtk_dynamic_loader::gdk_event_get_coords(&h, ev).unwrap_or((0.0, 0.0));
+                        let state = gtk_dynamic_loader::gdk_event_get_state(&h, ev).unwrap_or(0);
+                        handlers.borrow_mut().dispatch_gesture(crate::core::Gesture::Scroll {
+                            delta: crate::core::ScrollDelta { dx, dy },
+                            x,
+                            y,
+                            mods: PressHandlers::map_state(state),
+                        });
+                        1 // consumed: a wheel over the canvas should not scroll the page
+                    }),
+                );
+            }
+        }
+
+        /// Pointer motion over the canvas, whether or not a button is held.
+        ///
+        /// `state` is the modifier mask; the GDK button mask bits
+        /// (`GDK_BUTTON1_MASK` = 1 << 8, `GDK_BUTTON3_MASK` = 1 << 10) say which
+        /// button is down, which is how a caller distinguishes "hovering" from
+        /// "dragging with the left button".
+        pub fn on_motion(&self, cb: Box<dyn FnMut(f64, f64, u32)>) {
+            let loader = crate::backends::gtk::loader()
+                .expect("GTK loader not initialized after Canvas creation");
+            let inner = *self.drawing_area.as_ref();
+            if loader.symbols.gtk_drawing_area_set_draw_func.is_some() {
+                // GTK4 uses event controllers; a motion controller is a separate
+                // object type from GestureClick, so this path is left to the
+                // GTK3 backend until a GTK4 host needs it (the desktop GUI runs
+                // GTK3 by default - see `GTK_DLOPEN_PREFER_GTK3`).
+                return;
+            }
+            // Plain motion (4, no button held) plus motion-with-button1 (32,
+            // a drag). See `on_click_button` for the mask values.
+            const GDK_POINTER_MOTION_MASK: i32 = 4;
+            const GDK_BUTTON1_MOTION_MASK: i32 = 32;
+            unsafe {
+                gtk_dynamic_loader::widget_add_events(
+                    &loader,
+                    inner,
+                    GDK_POINTER_MOTION_MASK | GDK_BUTTON1_MOTION_MASK,
+                );
+            }
+            // The shared handler, so the gesture stream is fed from the same
+            // single signal connection the other callbacks use rather than a
+            // second one.
+            let gesture_handlers = self.click_handlers.clone();
+            let mut cb = cb;
+            let l2 = loader.clone();
+            let l3 = l2.clone();
+            unsafe {
+                let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                    &l3,
+                    inner,
+                    "motion-notify-event",
+                    Box::new(move |ev: *mut c_void| -> i32 {
+                        if let Some((x, y)) = gtk_dynamic_loader::gdk_event_get_coords(&l2, ev) {
+                            let state =
+                                gtk_dynamic_loader::gdk_event_get_state(&l2, ev).unwrap_or(0);
+                            {
+                                let mut h = gesture_handlers.borrow_mut();
+                                let g = if PressHandlers::button_held(state) {
+                                    crate::core::Gesture::Drag { x, y, mods: PressHandlers::map_state(state) }
+                                } else {
+                                    crate::core::Gesture::Hover { x, y, mods: PressHandlers::map_state(state) }
+                                };
+                                h.dispatch_gesture(g);
+                            }
+                            cb(x, y, state);
+                            return 0; // do not consume: hover must not block others
+                        }
+                        0
+                    }),
+                );
+            }
+        }
+
+        /// Pointer release: ends a drag. `button` as in [`Self::on_click_button`].
+        pub fn on_release(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            let loader = crate::backends::gtk::loader()
+                .expect("GTK loader not initialized after Canvas creation");
+            let symbols = &loader.symbols;
+            let inner = *self.drawing_area.as_ref();
+            if symbols.gtk_drawing_area_set_draw_func.is_some() {
+                return; // GTK4: see `on_motion`
+            }
+            const GDK_BUTTON_RELEASE_MASK: i32 = 512;
+            unsafe { gtk_dynamic_loader::widget_add_events(&loader, inner, GDK_BUTTON_RELEASE_MASK); }
+            // The shared handler, so the gesture stream is fed from the same
+            // single signal connection the other callbacks use rather than a
+            // second one.
+            let gesture_handlers = self.click_handlers.clone();
+            let mut cb = cb;
+            let l2 = loader.clone();
+            let l3 = l2.clone();
+            unsafe {
+                let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                    &l3,
+                    inner,
+                    "button-release-event",
+                    Box::new(move |ev: *mut c_void| -> i32 {
+                        if let Some((x, y)) = gtk_dynamic_loader::gdk_event_get_coords(&l2, ev) {
+                            let button =
+                                gtk_dynamic_loader::gdk_event_get_button(&l2, ev).unwrap_or(1);
+                            let state =
+                                gtk_dynamic_loader::gdk_event_get_state(&l2, ev).unwrap_or(0);
+                            {
+                                let mut h = gesture_handlers.borrow_mut();
+                                h.dispatch_gesture(crate::core::Gesture::Button {
+                                    button: PressHandlers::map_button(button),
+                                    pressed: false,
+                                    x,
+                                    y,
+                                    mods: PressHandlers::map_state(state),
+                                });
+                            }
+                            cb(x, y, button, state);
+                        }
+                        // Do NOT consume the release: a popup menu opened over
+                        // this widget completes its row activation on the
+                        // button release, and returning 1 here swallowed that
+                        // (the menu appeared at the right place, but no row
+                        // ever activated).
+                        0
+                    }),
+                );
+            }
+        }
+
         pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
+            // Minimal click contract: every backend implements this. The
+            // button/modifier-aware variant is `on_click_button`; when both are
+            // registered they share one GTK3 signal connection (see
+            // `Canvas::click_handlers`) rather than racing for the press.
             let loader = crate::backends::gtk::loader()
                 .expect("GTK loader not initialized after Canvas creation");
             let symbols = &loader.symbols;
@@ -978,26 +1613,54 @@ mod gtk_adapter {
                     gesture.add_to_widget(&self.drawing_area);
                     self._controllers.borrow_mut().push(Box::new(gesture));
                 }
-            } else {
-                // GTK3: use button-press-event signal (no controller lifetime issue)
-                let mask = 1 << 8; // GDK_BUTTON_PRESS_MASK
-                unsafe { gtk_dynamic_loader::widget_add_events(&loader, inner, mask); }
-                let mut cb = cb;
-                let l2 = loader.clone();
-                let l3 = l2.clone();
-                unsafe {
-                    let _ = gtk_dynamic_loader::widget_connect_signal_bool(
-                        &l3, inner, "button-press-event",
-                        Box::new(move |ev: *mut c_void| -> i32 {
-                            if let Some((x, y)) = gtk_dynamic_loader::gdk_event_get_coords(&l2, ev) {
-                                cb(x, y);
-                                return 1;
-                            }
-                            0
-                        }),
-                    );
-                }
+                return;
             }
+            let install = {
+                let mut h = self.click_handlers.borrow_mut();
+                h.plain = Some(cb);
+                if h.installed {
+                    false
+                } else {
+                    h.installed = true;
+                    true
+                }
+            };
+            if !install {
+                return;
+            }
+            // Only the plain callback is registered: ask for the press mask and
+            // connect the shared handler. A later `on_click_button` will find
+            // `installed == true` and just fill its slot.
+            let mask = 256; // GDK_BUTTON_PRESS_MASK (gdk-sys: GdkEventMask)
+            unsafe { gtk_dynamic_loader::widget_add_events(&loader, inner, mask); }
+            let handlers = self.click_handlers.clone();
+            let l2 = loader.clone();
+            let l3 = l2.clone();
+            unsafe {
+                let _ = gtk_dynamic_loader::widget_connect_signal_bool(
+                    &l3, inner, "button-press-event",
+                    Box::new(move |ev: *mut c_void| -> i32 {
+                        let Some((x, y)) = gtk_dynamic_loader::gdk_event_get_coords(&l2, ev) else {
+                            return 0;
+                        };
+                        let button = gtk_dynamic_loader::gdk_event_get_button(&l2, ev).unwrap_or(1);
+                        let state = gtk_dynamic_loader::gdk_event_get_state(&l2, ev).unwrap_or(0);
+                        if handlers.borrow_mut().dispatch(x, y, button, state) { 1 } else { 0 }
+                    }),
+                );
+            }
+        }
+
+
+        /// This canvas's top-left in screen coordinates, for placing a context
+        /// menu at a widget-relative click point.
+        ///
+        /// `None` before the widget is realized or when the GTK4 path lacks the
+        /// origin symbols; callers then fall back to an unpositioned popup.
+        pub fn screen_origin(&self) -> Option<(i32, i32)> {
+            let loader = crate::backends::gtk::loader()?;
+            let inner = *self.drawing_area.as_ref();
+            unsafe { gtk_dynamic_loader::widget_screen_origin(&loader, inner) }
         }
 
         pub fn on_key(&self, cb: Box<dyn FnMut(u32, u32) -> bool>) {
@@ -1013,6 +1676,7 @@ mod gtk_adapter {
                     let _ = ctrl.connect_key_pressed(Box::new(move |keyval: u32, state: u32| -> i32 {
                         if cb(keyval, state) { 1 } else { 0 }
                     }));
+                    swallow_key_releases_gtk4(&ctrl);
                     ctrl.add_to_widget(&self.drawing_area);
                     self._controllers.borrow_mut().push(Box::new(ctrl));
                 }
@@ -1045,6 +1709,22 @@ mod gtk_adapter {
         pub fn set_can_focus(&self, can: bool) {
             self.drawing_area.set_can_focus(can);
         }
+
+        pub fn set_visible(&self, visible: bool) {
+            self.drawing_area.set_visible(visible);
+        }
+        /// Whether the canvas may take extra horizontal space.
+        ///
+        /// Missing until now, so a `Canvas` inside a `ScrolledWindow` could not
+        /// be told to fill it: the viewer had to fall back to a fixed
+        /// `set_size_request`, which does not follow the window being resized.
+        /// The loader already binds `gtk_widget_set_hexpand`.
+        pub fn set_hexpand(&self, expand: bool) { self.drawing_area.set_hexpand(expand); }
+        pub fn set_vexpand(&self, expand: bool) { self.drawing_area.set_vexpand(expand); }
+        /// Outer spacing in pixels; `start`/`end` are the logical-direction
+        /// (left/right) names, so they follow the locale's text direction.
+        pub fn set_margin_top(&self, px: i32) { self.drawing_area.set_margin_top(px); }
+        pub fn set_margin_start(&self, px: i32) { self.drawing_area.set_margin_start(px); }
     }
 
     pub fn create_canvas() -> Result<Canvas, Error> {
@@ -1053,6 +1733,7 @@ mod gtk_adapter {
             drawing_area: da,
             draw_cb: Rc::new(RefCell::new(None)),
             _controllers: Rc::new(RefCell::new(Vec::new())),
+            click_handlers: Rc::new(RefCell::new(PressHandlers::default())),
         })
     }
 
@@ -1070,6 +1751,84 @@ mod gtk_adapter {
         pub fn set_policy(&self, hscroll: u32, vscroll: u32) {
             self.0.set_policy(hscroll, vscroll);
         }
+        /// Configure both scrollbar adjustments atomically:
+        /// (value, upper, page) with lower 0 and step 1. Lower/upper define
+        /// the scroll domain, page the thumb size, value the position.
+        /// Backend-agnostic scrollbar model shared with the nwg backend:
+        /// value tracks an item index (row/col), not pixels.
+        pub fn scroll_to(&self, hval: f64, hupper: f64, hpage: f64, vval: f64, vupper: f64, vpage: f64) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let symbols = &loader.symbols;
+                let (Some(get_h), Some(get_v), Some(configure)) = (
+                    symbols.gtk_scrolled_window_get_hadjustment,
+                    symbols.gtk_scrolled_window_get_vadjustment,
+                    symbols.gtk_adjustment_configure,
+                ) else { return; };
+                unsafe {
+                    let sw = *self.0.as_ref();
+                    if sw.is_null() {
+                        return;
+                    }
+                    let hadj = get_h(sw);
+                    let vadj = get_v(sw);
+                    if !hadj.is_null() {
+                        configure(hadj, hval, 0.0, hupper.max(1.0), 1.0, hpage.max(1.0), hpage.max(1.0));
+                    }
+                    if !vadj.is_null() {
+                        configure(vadj, vval, 0.0, vupper.max(1.0), 1.0, vpage.max(1.0), vpage.max(1.0));
+                    }
+                }
+            }
+        }
+        /// Notify on user scrollbar interaction: `cb(vertical, value)`.
+        /// Fires for thumb drags and trough clicks (both route through the
+        /// adjustment's value-changed signal).
+        /// Notify on user scrollbar interaction: `cb(vertical, value)`.
+        /// Fires for thumb drags and trough clicks (both route through the
+        /// adjustment's value-changed signal). One shared callback serves
+        /// both adjustments; connect_signal frees it via destroy notify.
+        pub fn on_scroll(&self, cb: Box<dyn FnMut(bool, f64)>) {
+            if let Some(loader) = crate::backends::gtk::loader() {
+                let symbols = &loader.symbols;
+                let (Some(get_h), Some(get_v), Some(get_val)) = (
+                    symbols.gtk_scrolled_window_get_hadjustment,
+                    symbols.gtk_scrolled_window_get_vadjustment,
+                    symbols.gtk_adjustment_get_value,
+                ) else { return; };
+                let sw = *self.0.as_ref();
+                if sw.is_null() { return; }
+                let shared: std::rc::Rc<std::cell::RefCell<Box<dyn FnMut(bool, f64)>>> =
+                    std::rc::Rc::new(std::cell::RefCell::new(cb));
+                unsafe {
+                    let hadj = get_h(sw);
+                    if !hadj.is_null() {
+                        let sc = shared.clone();
+                        let _ = gtk_dynamic_loader::connect_signal(
+                            symbols, hadj, "value-changed",
+                            Box::new(move || {
+                                if let Ok(mut f) = sc.try_borrow_mut() {
+                                    f(false, get_val(hadj));
+                                }
+                            }),
+                            0,
+                        );
+                    }
+                    let vadj = get_v(sw);
+                    if !vadj.is_null() {
+                        let sc = shared.clone();
+                        let _ = gtk_dynamic_loader::connect_signal(
+                            symbols, vadj, "value-changed",
+                            Box::new(move || {
+                                if let Ok(mut f) = sc.try_borrow_mut() {
+                                    f(true, get_val(vadj));
+                                }
+                            }),
+                            0,
+                        );
+                    }
+                }
+            }
+        }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
@@ -1086,205 +1845,6 @@ mod gtk_adapter {
         Ok(ScrolledWindow(sw))
     }
 
-    // ---- Expander (labelled disclosure / "advanced options" foldout) ----
-
-    #[repr(transparent)]
-    pub struct Expander(pub gtk_dynamic_loader::Expander);
-
-    impl Clone for Expander { fn clone(&self) -> Self { Expander(self.0.clone()) } }
-
-    impl Expander {
-        /// Show or hide the expander's child.
-        pub fn set_expanded(&self, expanded: bool) { self.0.set_expanded(expanded); }
-        pub fn is_expanded(&self) -> bool { self.0.is_expanded() }
-        pub fn set_label(&self, label: &str) { self.0.set_label(label); }
-        /// Set the single child the expander reveals.
-        pub fn set_child(&self, child: &impl AsRef<*mut c_void>) { self.0.set_child(child); }
-        pub fn set_visible(&self, visible: bool) { self.0.set_visible(visible); }
-        pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
-        pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
-        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
-    }
-
-    impl AsRef<*mut c_void> for Expander { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
-    impl Widget for Expander { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
-
-    pub fn create_expander(label: &str) -> Result<Expander, Error> {
-        let loader = crate::backends::gtk::loader()
-            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
-        let e = gtk_dynamic_loader::Expander::new(loader, label)
-            .map_err(|e| Error::Backend(format!("{}", e)))?;
-        Ok(Expander(e))
-    }
-
-    // ---- TreeView (multi-column list) ----
-
-    #[repr(transparent)]
-    pub struct TreeView(pub gtk_dynamic_loader::TreeView);
-
-    impl Clone for TreeView { fn clone(&self) -> Self { TreeView(self.0.clone()) } }
-
-    /// A cell value: text, or a themed icon loaded from the icon theme.
-    pub enum CellValue {
-        Text(String),
-        /// An icon by theme name, with a fallback name if the theme lacks it.
-        Icon { name: String, fallback: String },
-    }
-
-    impl TreeView {
-        /// Create a tree view with `columns`: `(title, is_icon)`.
-        pub fn new(&self, columns: &[(&str, bool, bool)]) -> Result<TreeView, Error> {
-            let loader = crate::backends::gtk::loader()
-                .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
-            let specs: Vec<(&str, &str, bool, bool)> = columns
-                .iter()
-                .map(|(title, is_icon, sortable)| {
-                    (*title, if *is_icon { "pixbuf" } else { "text" }, *is_icon, *sortable)
-                })
-                .collect();
-            gtk_dynamic_loader::TreeView::new(loader, &specs)
-                .map(TreeView)
-                .map_err(|e| Error::Backend(format!("{}", e)))
-        }
-
-        /// Replace the rows. Each row's values line up with the columns.
-        pub fn set_rows(&self, rows: &[Vec<CellValue>]) {
-            self.0.clear();
-            for row in rows {
-                let mut vals = Vec::with_capacity(row.len());
-                // Keep any icon pixbufs alive for the duration of the append; GTK
-                // sinks its own reference into the store.
-                for v in row {
-                    match v {
-                        CellValue::Text(t) => vals.push(gtk_dynamic_loader::CellValue::Str(t.clone())),
-                        CellValue::Icon { name, fallback } => {
-                            let loader = crate::backends::gtk::loader();
-                            let pixbuf = match loader {
-                                Some(l) => unsafe {
-                                    gtk_dynamic_loader::icon_theme_load_icon_with_fallback(
-                                        &l, name, fallback, 16,
-                                    )
-                                },
-                                None => std::ptr::null_mut(),
-                            };
-                            vals.push(gtk_dynamic_loader::CellValue::Pixbuf(pixbuf));
-                        }
-                    }
-                }
-                self.0.append_row(&vals);
-            }
-        }
-
-        /// The full path of the selected row (column `path_column`), if any.
-        pub fn selected_path(&self, path_column: usize) -> Option<String> {
-            self.0.selected_path(path_column)
-        }
-
-        /// Wrap in a scrolled window and return it.
-        /// The 0-based row under widget coordinates `(x, y)`, if any.
-        pub fn row_at(&self, x: f64, y: f64) -> Option<i32> {
-            self.0.row_at(x, y)
-        }
-
-        /// Select the row at `index` (0-based).
-        pub fn select_row(&self, index: i32) {
-            self.0.select_row(index);
-        }
-
-        /// Run `cb` on a `button-press-event` with `(button, x, y, event)`.
-        pub fn connect_button_press_event(
-            &self,
-            mut cb: impl FnMut(u32, f64, f64, *mut std::ffi::c_void) + 'static,
-        ) -> Result<u64, Error> {
-            let loader = crate::backends::gtk::loader()
-                .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
-            let widget = *self.0.as_ref();
-            let cb_loader = loader.clone();
-            let wrapper: Box<dyn FnMut(*mut std::ffi::c_void)> = Box::new(move |event| {
-                if event.is_null() {
-                    return;
-                }
-                let button = unsafe { gtk_dynamic_loader::gdk_event_get_button(&cb_loader, event) }
-                    .unwrap_or(0);
-                let (x, y) = unsafe { gtk_dynamic_loader::gdk_event_get_coords(&cb_loader, event) }
-                    .unwrap_or((0.0, 0.0));
-                cb(button, x, y, event);
-            });
-            let id = unsafe {
-                gtk_dynamic_loader::connect_widget_button_press_event(&loader, widget, wrapper)
-            }
-            .map_err(|e| Error::Backend(format!("{}", e)))?;
-            Ok(id)
-        }
-
-        /// Make the list a drag source carrying the payload returned by
-        /// `payload` (file URIs plus plain text) when a drop target asks.
-        pub fn enable_uri_drag_source(
-            &self,
-            mut payload: impl FnMut() -> Option<(Vec<String>, String)> + 'static,
-        ) -> Result<(), Error> {
-            let loader = crate::backends::gtk::loader()
-                .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
-            let widget = *self.0.as_ref();
-            unsafe { gtk_dynamic_loader::widget_enable_uri_drag_source(&loader, widget) }
-                .map_err(|e| Error::Backend(format!("{}", e)))?;
-            let cb_loader = loader.clone();
-            let connect = loader.clone();
-            unsafe {
-                gtk_dynamic_loader::connect_widget_drag_data_get(
-                    &connect,
-                    widget,
-                    move |selection_data, target| {
-                        let Some((uris, text)) = payload() else { return };
-                        let r = if target.contains("uri-list") {
-                            gtk_dynamic_loader::drag_set_uris(&cb_loader, selection_data, &uris)
-                        } else {
-                            gtk_dynamic_loader::drag_set_text(&cb_loader, selection_data, &text)
-                        };
-                        let _ = r;
-                    },
-                )
-            }
-            .map_err(|e| Error::Backend(format!("{}", e)))?;
-            Ok(())
-        }
-
-        pub fn into_scrolled(&self) -> Result<crate::backends_gtk_adapter::ScrolledWindow, Error> {
-            let loader = crate::backends::gtk::loader()
-                .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
-            self.0
-                .wrap_scroll(&loader)
-                .map(|sw| crate::backends_gtk_adapter::ScrolledWindow(sw))
-                .map_err(|e| Error::Backend(format!("{}", e)))
-        }
-    }
-
-    impl AsRef<*mut c_void> for TreeView { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
-    impl Widget for TreeView { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
-
-    /// Put `text` on the system clipboard. Free function: the clipboard is
-    /// process-wide, not per-widget, so anything can use it.
-    pub fn clipboard_set_text(text: &str) -> Result<(), Error> {
-        let loader = crate::backends::gtk::loader()
-            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
-        unsafe { gtk_dynamic_loader::clipboard_set_text(&loader, text) }
-            .map_err(|e| Error::Backend(format!("{}", e)))
-    }
-
-    pub fn create_treeview(columns: &[(&str, bool, bool)]) -> Result<TreeView, Error> {
-        let loader = crate::backends::gtk::loader()
-            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
-        let specs: Vec<(&str, &str, bool, bool)> = columns
-            .iter()
-            .map(|(title, is_icon, sortable)| {
-                (*title, if *is_icon { "pixbuf" } else { "text" }, *is_icon, *sortable)
-            })
-            .collect();
-        gtk_dynamic_loader::TreeView::new(loader, &specs)
-            .map(TreeView)
-            .map_err(|e| Error::Backend(format!("{}", e)))
-    }
-
     // ---- Overlay (cross-platform stacking container) ----
 
     #[repr(transparent)]
@@ -1298,8 +1858,31 @@ mod gtk_adapter {
         pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
             self.0.set_child(child);
         }
+        /// Add an overlay child. The child is wrapped in a `GtkFixed` so it
+        /// can be positioned absolutely **and** gets the size it requests —
+        /// a bare overlay child is allocated its minimum (observed 1x1),
+        /// which made the in-grid dropdown invisible.
         pub fn add_overlay(&self, child: &impl AsRef<*mut c_void>) {
-            self.0.add_overlay(child);
+            match gtk_dynamic_loader::Fixed::new(
+                crate::backends::gtk::loader().expect("gtk loader"),
+            ) {
+                Ok(fixed) => {
+                    fixed.set_size_request(1, 1);
+                    fixed.put(*child.as_ref(), 0, 0);
+                    // GTK3: a child added to an already-visible container
+                    // must be shown explicitly, or it stays unmapped (1x1).
+                    fixed.show_child(*child.as_ref());
+                    self.0.add_overlay(&fixed);
+                    // Keep the Fixed alive: GTK owns it once added, but the
+                    // wrapper must not drop its Rust bookkeeping early.
+                    std::mem::forget(fixed);
+                }
+                Err(_) => {
+                    // No GtkFixed available: fall back to a plain overlay
+                    // child (positioning then degrades to stacked layout).
+                    self.0.add_overlay(child);
+                }
+            }
         }
         pub fn set_overlay_pass_through(&self, child: &impl AsRef<*mut c_void>, pass: bool) {
             self.0.set_overlay_pass_through(child, pass);
@@ -1313,6 +1896,37 @@ mod gtk_adapter {
         pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
         pub fn set_hexpand(&self, expand: bool) { self.0.set_hexpand(expand); }
         pub fn set_vexpand(&self, expand: bool) { self.0.set_vexpand(expand); }
+    }
+
+    // ---- Fixed (absolute positioning) ----
+
+    #[repr(transparent)]
+    pub struct Fixed(pub gtk_dynamic_loader::Fixed);
+
+    impl Clone for Fixed { fn clone(&self) -> Self { Fixed(self.0.clone()) } }
+    impl AsRef<*mut c_void> for Fixed { fn as_ref(&self) -> &*mut c_void { self.0.as_ref() } }
+    impl Widget for Fixed { fn raw_handle(&self) -> *mut c_void { *self.0.as_ref() } }
+
+    impl Fixed {
+        /// Place `child` at `(x, y)` with the given size. `GtkFixed` honours
+        /// the child's size request, so an absolutely-positioned child (the
+        /// in-grid dropdown) gets the rectangle it asked for.
+        pub fn put(&self, child: &impl AsRef<*mut c_void>, x: i32, y: i32) {
+            self.0.put(*child.as_ref(), x, y);
+        }
+        pub fn set_size_request(&self, w: i32, h: i32) { self.0.set_size_request(w, h); }
+        pub fn set_hexpand(&self, e: bool) { self.0.set_hexpand(e); }
+        pub fn set_vexpand(&self, e: bool) { self.0.set_vexpand(e); }
+        pub fn show_all(&self) {}
+    }
+
+    /// Creates a new GTK Fixed container.
+    pub fn create_fixed() -> Result<Fixed, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+        let f = gtk_dynamic_loader::Fixed::new(loader.clone())
+            .map_err(|e| Error::Backend(format!("{}", e)))?;
+        Ok(Fixed(f))
     }
 
     /// Creates a new GTK Overlay widget.
@@ -1340,9 +1954,39 @@ mod gtk_adapter {
 
     /// Opens a file save dialog and returns the selected file path.
     pub fn save_file(title: &str) -> Result<Option<String>, Error> {
+        save_file_filtered(title, &[], "")
+    }
+
+    /// Save dialog with file-type filters (`(name, patterns)` with patterns
+    /// like `*.corro`) and an optional suggested filename. No filters (or
+    /// missing loader symbols) degrades to the plain dialog; empty
+    /// suggested name leaves the entry blank.
+    pub fn save_file_filtered(title: &str, filters: &[(&str, &[&str])], current_name: &str) -> Result<Option<String>, Error> {
         let loader = crate::backends::gtk::loader()
             .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
         if let Ok(chooser) = unsafe { gtk_dynamic_loader::FileChooserNative::save(loader.clone(), title, std::ptr::null_mut()) } {
+            for (name, pats) in filters {
+                chooser.add_filter(name, pats);
+            }
+            if !current_name.is_empty() {
+                chooser.set_current_name(current_name);
+            }
+            if chooser.run() == -3 {
+                return Ok(chooser.get_filename());
+            }
+        }
+        Ok(None)
+    }
+
+    /// Open dialog with file-type filters (same semantics as
+    /// [`Self::save_file_filtered`], minus the suggested name).
+    pub fn open_file_filtered(title: &str, filters: &[(&str, &[&str])]) -> Result<Option<String>, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK loader not initialized".into()))?;
+        if let Ok(chooser) = unsafe { gtk_dynamic_loader::FileChooserNative::open(loader.clone(), title, std::ptr::null_mut()) } {
+            for (name, pats) in filters {
+                chooser.add_filter(name, pats);
+            }
             if chooser.run() == -3 {
                 return Ok(chooser.get_filename());
             }
@@ -1419,42 +2063,6 @@ mod gtk_adapter {
         crate::backends::gtk::quit_main_loop().map_err(|e| Error::Backend(format!("{}", e)))
     }
 
-    /// A handle to a scheduled repeating timer, so it can be cancelled.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct TimerHandle(u32);
-
-    /// Schedule `cb` every `interval_ms` on the GTK main loop.
-    ///
-    /// `cb` returns `true` to keep going, `false` to stop after this call. This is
-    /// the primitive a debounced "search as you type" needs: there is no way to
-    /// read a clock or post a delayed callback otherwise, and doing the work inline
-    /// on every keystroke would block the UI.
-    ///
-    /// Returns `Err` when this build's libglib has no `g_timeout_add_full`, so a
-    /// caller cannot mistake "did not schedule" for "scheduled". `G_SOURCE_CONTINUE`
-    /// is glib's `1`.
-    pub fn timeout_add(interval_ms: u32, cb: Box<dyn FnMut() -> bool>) -> Result<TimerHandle, Error> {
-        let loader = crate::backends::gtk::loader()
-            .ok_or_else(|| Error::Backend("no GTK loader".into()))?;
-        // SAFETY: `timeout_add` moves the boxed closure onto the main loop and frees
-        // it via glib's `notify` hook; the callback runs on the main thread, so it
-        // never aliases.
-        unsafe { gtk_dynamic_loader::timeout_add(&loader, interval_ms, cb) }
-            .map(TimerHandle)
-            .ok_or_else(|| Error::Backend("g_timeout_add_full unavailable in this libglib".into()))
-    }
-
-    /// Cancel a timer from [`Self::timeout_add`].
-    ///
-    /// Tolerates a stale handle: a timer that stopped itself is already gone, and
-    /// removing it again is harmless.
-    pub fn cancel_timer(handle: TimerHandle) {
-        if let Some(loader) = crate::backends::gtk::loader() {
-            // SAFETY: `source_remove` ignores tags it does not know.
-            unsafe { gtk_dynamic_loader::source_remove(&loader, handle.0) };
-        }
-    }
-
     /// Pump the GTK main context for `count` iterations.
     /// All iterations use blocking waits so poll() returns as soon as
     /// the X11 server or frame clock timer fires.  This ensures frame
@@ -1471,6 +2079,12 @@ mod gtk_adapter {
                 if let Ok(iter_fn) = unsafe { glib_lib.get::<Iteration>(b"g_main_context_iteration") } {
                     let iter = *iter_fn;
                     unsafe {
+                        // All blocking iterations: on virtual displays (WSLg, Xvfb)
+                        // the frame clock timer only fires during blocking waits.
+                        // Non-blocking iterations return immediately and skip timer
+                        // sources, so the draw callback never fires.  500 blocking
+                        // iterations = ~8s max wait at 16ms/tick, which covers even
+                        // the slowest virtual compositors.
                         for _ in 0..count {
                             iter(std::ptr::null_mut(), 1);
                         }
@@ -1480,10 +2094,49 @@ mod gtk_adapter {
         }
     }
 
+    #[cfg(test)]
+    mod key_release_filter_tests {
+        use super::*;
+
+        /// The GTK4 release filter must exist as a callable helper.
+        ///
+        /// `gui_backend.rs` no longer carries any press/release dedup state: it
+        /// relies entirely on this filter consuming GTK4's `key-released`
+        /// signal. If the helper is removed, hosts silently regress to seeing
+        /// every key twice — invisible on GTK3/nwg/wasm, visible only on
+        /// GTK4/WSLg.
+        #[test]
+        fn release_filter_helper_is_present() {
+            let f: fn(&gtk_dynamic_loader::EventControllerKey) = swallow_key_releases_gtk4;
+            let _ = f;
+        }
+
+        /// Every GTK4 key registration must be paired with the release filter.
+        ///
+        /// Counting call sites is crude, but it is exactly the invariant that
+        /// matters: N `connect_key_pressed` sites need N filters, or the
+        /// unfiltered one double-fires. A source-level assertion keeps this
+        /// honest without needing a GTK4 display.
+        #[test]
+        fn key_registrations_install_the_release_filter() {
+            let src = include_str!("backends_gtk_adapter_impl.rs");
+            let pressed = src.matches("connect_key_pressed(Box::new").count();
+            let filtered = src.matches("swallow_key_releases_gtk4(&ctrl)").count();
+            assert_eq!(
+                pressed, filtered,
+                "every connect_key_pressed needs a swallow_key_releases_gtk4 \
+                 (pressed={pressed}, filtered={filtered})"
+            );
+            assert!(pressed >= 3, "expected window/entry/canvas sites, found {pressed}");
+        }
+    }
+
 }
 
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+
+#[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
 pub use gtk_adapter::*;
 
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+#[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
 pub use gtk_dynamic_loader::Orientation;
+

@@ -7,20 +7,36 @@ edition = "2021"
 once_cell = "1.19"
 thiserror = "1.0"
 libloading = "0.8"
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
 rustyline = { version = "14", optional = true }
-
-[target.'cfg(unix)'.dependencies]
 gtk_dynamic_loader = { path = "../gtk_dynamic_loader", optional = true }
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
+unicode-width = "0.2"
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-native-windows-gui = { version = "1.0", features = ["flexbox", "menu", "combobox", "textbox", "scroll-bar"] }
+# default-features = false is REQUIRED for Win95: upstream's default `all`
+# enables the `file-dialog` feature, whose Win7+ IFileDialog COM path imports
+# SHELL32!SHCreateItemFromParsingName — absent on Win95, and a single missing
+# static import makes the whole exe refuse to load. The feature list below is
+# exactly what backends_nwg_adapter.rs uses (see vendor/native-windows-gui/
+# README-WIN95.md).
+native-windows-gui = { version = "1.0", default-features = false, features = ["flexbox", "menu", "combobox", "textbox", "scroll-bar", "frame", "notice", "file-dialog"] }
 winapi = { version = "0.3", features = ["winuser", "windef", "processenv", "winbase", "wincon", "handleapi"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.21", default-features = false, features = ["invocation"] }
 ndk = "0.9"
 ndk-context = "0.1"
+
+# iOS needs NO crates: the backend reaches UIKit/Core Graphics through the
+# Objective-C runtime with a handful of typed `objc_msgSend` wrappers (see
+# backends/ios.rs). That is deliberate — the armv7s / iOS 7 build path in
+# docs/IOS_GUIDELINES.md §9 runs with an old SDK and a pinned old rustc, which
+# is exactly where a heavy ObjC binding stack (or its build script) breaks.
+# Only `objc`/`CoreGraphics` system frameworks are linked, and only for iOS.
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
@@ -34,33 +50,120 @@ web-sys = { version = "0.3", features = [
   "HtmlOptionElement", "HtmlFormElement",   "HtmlHeadingElement", "HtmlBrElement",
   "MouseEvent", "KeyboardEvent", "Event", "FocusEvent",
   "CanvasRenderingContext2d", "CssStyleDeclaration", "DomTokenList",
+  "HtmlCanvasElement", "TextMetrics",
   "HtmlCollection", "Window",
   "Text",
-  "TextMetrics",
+  # B5/B15: Canvas::text_extents_styled needs measure_text (TextMetrics), and
+  # MenuBar::popup_submenu_by_mnemonic_at needs a bounding box to turn the
+  # caller's screen coordinates into a position inside the bar.
+  "TextMetrics", "DomRect", "NodeList",
+  # DrawContext::draw_rgba_image needs ImageData to stage the pixels.
+  # (drawImage needs no extra feature: the overload taking a scaled
+  # destination rect is on CanvasRenderingContext2d itself.)
+  "ImageData",
+  # The file picker: a hidden <input type=file>, FileList/File to read the
+  # chosen file's name, and FileReader to turn it into a String.
+  "HtmlInputElement", "File", "FileList", "FileReader",
+  # The save path: a Blob plus the DOM plumbing to click a synthetic
+  # <a download> and hand the browser a real file.
+  "Blob", "BlobPropertyBag", "Url", "HtmlAnchorElement",
+  # The gesture stream: PointerEvent carries button, buttons-held and all four
+  # modifiers on one event, and WheelEvent carries the scroll delta.
+  "PointerEvent", "WheelEvent",
 ] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-pancurses = { version = "0.17", optional = true, features = ["wide"] }
+pancurses = { version = "0.17", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# TRUE gtk3-rs backend for DEBUGGING: the official crate, statically
+# linked (no unsafe dlopen). This is the safe reference implementation
+# used to debug the production gtk_dynamic_loader backend.
+gtk3 = { package = "gtk", version = "0.18", optional = true }
+gtk4-static = { package = "gtk4", version = "0.9", optional = true }
+libc = "0.2"
 
 [features]
+default = ["gtk"]
 gtk = ["dep:gtk_dynamic_loader"]
 pancurses = ["dep:pancurses"]
-zork = ["dep:rustyline"]
+zork = ["dep:rustyline", "dep:serde", "dep:serde_json"]
+# TRUE official-crate backends (statically linked, safe) for debugging the
+# dlopen-based production backends. Not the default. The local-path gtk4-rs
+# dlopen stack was removed: it pointed at an unshipped /root/tmp checkout
+# and broke every CI build (cargo metadata resolves all optional path deps).
+gtk3-rs = ["dep:gtk3"]
+gtk4-rs-static = ["dep:gtk4-static"]
+ratatui = ["dep:ratatui", "dep:crossterm"]
+headless = []
+# iOS: selects the UIKit backend. The backend is cfg-gated on
+# `target_os = "ios"`, so this feature exists for symmetry with `gtk` and so
+# a host crate can write the same `features = [...]` line everywhere; a host
+# that depends on rswidgets with `default-features = false` plus this feature
+# builds against UIKit and nothing else.
+ios = []
 
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# macOS: selects the AppKit backend. Same shape as `ios` (the backend is
+# cfg-gated on `target_os = "macos"`; the feature exists for symmetry and for
+# host crates that name their backend explicitly). The AppKit adapter builds on
+# the *shared* Apple runtime module (`backends/apple.rs`), which the `ios`
+# feature also uses — no new dependencies either way.
+macos = []
+
+[dev-dependencies]
 proptest = "1.6"
+serde_json = "1.0"
 
-# Vendored snapshot: first-party lint standards do not apply inside it.
-# This ceiling keeps workspace-wide `cargo build`/`clippy` signal-clean
-# without touching a line of vendored source. Revisit only if the vendored
-# copy is ever synced with upstream.
-[lints.rust]
-unexpected_cfgs = "allow"
-dead_code = "allow"
-unused_unsafe = "allow"
-[lints.rustdoc]
-missing_docs = "allow"
-[lints.clippy]
-needless_return = "allow"
-derivable_impl = "allow"
-unused_unit = "allow"
+# Windows-only integration tests (fx_bar_nwg_cram, nwg_menu_dispatch,
+# nwg_combo_dropdown_geometry) read native rects / menu handles and pump the
+# message loop directly.
+[target.'cfg(windows)'.dev-dependencies]
+winapi = { version = "0.3", features = ["winuser", "windef"] }
+native-windows-gui = "1.0"
+
+[[example]]
+name = "g-demo"
+required-features = ["gtk"]
+
+[[example]]
+name = "g-spreadsheet-canvas"
+required-features = ["gtk"]
+
+[[example]]
+name = "g-spreadsheet"
+required-features = ["gtk"]
+
+[[example]]
+name = "gtk-lifecycle-stress"
+required-features = ["gtk"]
+
+[[example]]
+name = "x-sheet"
+required-features = ["gtk"]
+
+# The zork surface needs the zork backend, so it is gated on the feature the
+# way the GTK examples are gated on `gtk`. Without this, `cargo build
+# --examples` under any other feature set fails on an unresolved import — the
+# same "a feature nobody builds" class of rot that backends.yml exists to
+# catch, one level down.
+[[example]]
+name = "zork-sheet"
+required-features = ["zork"]
+
+[[example]]
+name = "zork-demo"
+required-features = ["zork"]
+
+# Editing demo for the zork spreadsheet surface. Gated on `zork` like the
+# other zork examples: without the feature the adapter it drives does not
+# exist, and `cargo build --examples` under any other set would fail on it.
+[[example]]
+name = "zork-edit"
+required-features = ["zork"]
+
+# A sheet-less model handed to the REPL, used as a fixture by
+# `tests/zork_repl_says_why.rs`. Gated on `zork` like the rest: the adapter
+# and the REPL it hands off to do not exist without the feature.
+[[example]]
+name = "zork-repl"
+required-features = ["zork"]

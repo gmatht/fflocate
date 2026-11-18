@@ -36,11 +36,23 @@ mod pancurses_adapter {
             crate::backends::pancurses::set_child(self.id, child_id);
         }
 
+        pub fn set_child_box(&self, child: &BoxWidget) {
+            self.set_child(child);
+        }
+
         pub fn present(&self) {}
 
         pub fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
 
         pub fn set_default_size(&self, _width: i32, _height: i32) {}
+
+        /// No-op: a character terminal has no window to resize. The size
+        /// comes from the tty (and from `CORRO_TERM_COLS`/`CORRO_TERM_ROWS`
+        /// for a scripted run - see `core::terminal_size_with_override`), so
+        /// a `resize` here would have to be ignored anyway, and honouring it
+        /// would mean the widget tree and the terminal disagreed about the
+        /// surface being drawn on.
+        pub fn resize(&self, _w: i32, _h: i32) {}
 
         pub fn hwnd(&self) -> *mut c_void {
             std::ptr::null_mut()
@@ -123,10 +135,25 @@ mod pancurses_adapter {
         pub fn set_visible(&self, visible: bool) {
             crate::backends::pancurses::set_label_visible(self.id, visible);
         }
+        /// Pin the label's laid-out width so changing its text never shifts
+        /// the widgets packed after it. `w` is in character cells (the unit
+        /// the terminal layout works in); `None` restores shrink-to-fit.
+        pub fn set_fixed_width(&self, w: Option<i32>) {
+            crate::backends::pancurses::set_label_fixed_width(self.id, w);
+        }
         pub fn set_xalign(&self, _x: f32) {}
-        /// Enable or disable the widget (no visual effect here; the
-        /// control simply keeps its value).
-        pub fn set_sensitive(&self, _sensitive: bool) {}
+        /// Left inset of the label's text. A no-op in the terminal: the box
+        /// layout there is cell-based and `set_fixed_width` already holds the
+        /// slot, so there is no sub-cell margin to speak of. Present so the
+        /// cross-backend `Label` surface matches the GUI backends.
+        pub fn set_margin_start(&self, _px: i32) {}
+        /// No-op: a character cell has no inset. The terminal backends align
+        /// their own columns instead, and the shared renderer's margins are
+        /// expressed in whole characters.
+        pub fn set_margin_top(&self, _px: i32) {}
+        pub fn raw_handle(&self) -> *mut c_void {
+            &self.id as *const usize as *mut c_void
+        }
     }
 
     // -- BoxWidget --
@@ -149,6 +176,10 @@ mod pancurses_adapter {
         }
     }
 
+    impl Clone for BoxWidget {
+        fn clone(&self) -> Self { BoxWidget { id: self.id, orientation: self.orientation, spacing: self.spacing } }
+    }
+
     impl BoxWidget {
         pub fn append(&self, child: &impl AsRef<*mut c_void>) {
             let child_ptr = *child.as_ref();
@@ -162,6 +193,14 @@ mod pancurses_adapter {
 
         pub fn set_child_vexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
         pub fn set_child_hexpand(&self, _child: &impl AsRef<*mut c_void>, _expand: bool) {}
+        pub fn set_hexpand(&self, _expand: bool) {}
+
+        /// See `backends::pancurses::set_size_request`: a real size on the
+        /// node, not a discarded argument.
+        pub fn set_size_request(&self, w: i32, h: i32) {
+            crate::backends::pancurses::set_size_request(self.id, w, h);
+        }
+
         pub fn set_vexpand(&self, _expand: bool) {}
     }
 
@@ -223,6 +262,8 @@ mod pancurses_adapter {
             Ok(0)
         }
 
+        pub fn set_hexpand(&self, _expand: bool) {}
+        pub fn set_vexpand(&self, _expand: bool) {}
         pub fn set_halign(&self, _align: i32) {}
         pub fn set_valign(&self, _align: i32) {}
         pub fn set_visible(&self, _visible: bool) {}
@@ -232,7 +273,30 @@ mod pancurses_adapter {
         pub fn set_margin_top(&self, _margin: i32) {}
         pub fn add_class(&self, _class_name: &str) {}
         pub fn remove_class(&self, _class_name: &str) {}
-        pub fn grab_focus(&self) {}
+        /// Focus this entry (sets the widget tree's single `focus_id`).
+        pub fn grab_focus(&self) {
+            crate::backends::pancurses::entry_grab_focus(self.id);
+        }
+
+        /// The caret's byte offset, which the widget maintains as the user
+        /// types. Exposing it means a host no longer needs a parallel copy.
+        pub fn get_position(&self) -> Option<usize> {
+            crate::backends::pancurses::get_entry_cursor(self.id)
+        }
+
+        /// Move the caret (clamped to a char boundary by the backend).
+        pub fn set_position(&self, pos: usize) {
+            crate::backends::pancurses::set_entry_cursor(self.id, pos);
+        }
+
+        /// Whether this entry currently holds focus.
+        pub fn has_focus(&self) -> bool {
+            crate::backends::pancurses::entry_has_focus(self.id)
+        }
+        /// No pointer clicks on terminal entries: accept and never fire.
+        pub fn connect_button_press(&self, _f: impl FnMut() + 'static) -> Result<u64, Error> {
+            Ok(0)
+        }
         pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
 
         pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
@@ -252,17 +316,16 @@ mod pancurses_adapter {
             crate::backends::pancurses::add_callback(self.id, Box::new(move || { f(std::ptr::null_mut()); }));
             Ok(0)
         }
-        /// Enable or disable the widget (no visual effect here; the
-        /// control simply keeps its value).
-        pub fn set_sensitive(&self, _sensitive: bool) {}
     }
 
     // -- Menu --
 
+    /// Backend-agnostic menu model: a list of items (actions or submenus).
+    /// The same model is used by every rswidgets backend, so an application
+    /// can build one menu and hand it to any backend's `create_menubar`.
     pub struct Menu {
         pub(crate) id: usize,
-        pub(crate) items: std::cell::RefCell<Vec<(String, String)>>,
-        submenu_data: std::cell::RefCell<Vec<(String, Vec<(String, String)>)>>,
+        pub(crate) items: std::cell::RefCell<Vec<crate::MenuItem>>,
     }
 
     impl AsRef<*mut c_void> for Menu {
@@ -273,25 +336,78 @@ mod pancurses_adapter {
 
     impl Menu {
         pub fn append(&self, label: &str, action_name: &str) {
-            self.items.borrow_mut().push((label.to_string(), action_name.to_string()));
+            self.items.borrow_mut().push(crate::MenuItem::Action {
+                label: label.into(),
+                action: action_name.to_string(),
+                shortcut: None,
+            });
+        }
+        pub fn append_with_shortcut(&self, label: &str, action_name: &str, shortcut: &str) {
+            self.items.borrow_mut().push(crate::MenuItem::Action {
+                label: label.into(),
+                action: action_name.to_string(),
+                shortcut: Some(shortcut.to_string()),
+            });
+        }
+        pub fn append_separator(&self) {
+            self.items.borrow_mut().push(crate::MenuItem::Separator);
+        }
+        pub fn append_check(&self, label: &str, action_name: &str, checked: bool) {
+            self.items.borrow_mut().push(crate::MenuItem::Check {
+                label: label.into(),
+                action: action_name.to_string(),
+                checked,
+            });
+        }
+        pub fn append_radio(&self, label: &str, action_name: &str, group: u32) {
+            self.items.borrow_mut().push(crate::MenuItem::Radio {
+                label: label.into(),
+                action: action_name.to_string(),
+                group,
+            });
         }
         pub fn append_submenu(&self, label: &str, submenu: &Menu) {
+            self.append_submenu_with_shortcut(label, "", submenu);
+        }
+        pub fn append_submenu_with_shortcut(&self, label: &str, shortcut: &str, submenu: &Menu) {
             let sub_items = submenu.items.borrow().clone();
-            self.submenu_data.borrow_mut().push((label.to_string(), sub_items));
+            self.items.borrow_mut().push(crate::MenuItem::Submenu {
+                label: label.into(),
+                items: sub_items,
+                shortcut: if shortcut.is_empty() { None } else { Some(shortcut.to_string()) },
+            });
+        }
+        /// Append an action whose label is a deferred translation key
+        /// (resolved at render time via the installed translator).
+        pub fn append_key(&self, key: &'static str, action_name: &str) {
+            self.items.borrow_mut().push(crate::MenuItem::Action {
+                label: crate::Label::Key(key),
+                action: action_name.to_string(),
+                shortcut: None,
+            });
+        }
+        pub fn append_submenu_key(&self, key: &'static str, submenu: &Menu) {
+            let sub_items = submenu.items.borrow().clone();
+            self.items.borrow_mut().push(crate::MenuItem::Submenu {
+                label: crate::Label::Key(key),
+                items: sub_items,
+                shortcut: None,
+            });
         }
         pub fn append_item(&self, _label: &str, _action: &SimpleAction) {}
         pub fn append_section(&self, _label: &str) {}
     }
 
-    pub(crate) fn collect_menu_items(menu: &Menu) -> (Vec<String>, Vec<Vec<(String, String)>>) {
-        let submenus = menu.submenu_data.borrow();
-        let mut labels = Vec::new();
-        let mut items_list = Vec::new();
-        for (label, items) in submenus.iter() {
-            labels.push(label.clone());
-            items_list.push(items.clone());
-        }
-        (labels, items_list)
+    /// Extract the menubar model: (root label, items) for each root menu.
+    pub(crate) fn collect_menu_items(menu: &Menu) -> Vec<(crate::Label, Vec<crate::MenuItem>)> {
+        menu.items
+            .borrow()
+            .iter()
+            .filter_map(|item| match item {
+                crate::MenuItem::Submenu { label, items, .. } => Some((label.clone(), items.clone())),
+                _ => None,
+            })
+            .collect()
     }
 
     // -- MenuBar --
@@ -312,6 +428,55 @@ mod pancurses_adapter {
         }
     }
 
+    impl Clone for Menu {
+        fn clone(&self) -> Self {
+            Menu {
+                id: self.id,
+                items: std::cell::RefCell::new(self.items.borrow().clone()),
+            }
+        }
+    }
+
+    impl Clone for MenuBar {
+        fn clone(&self) -> Self { MenuBar { id: self.id } }
+    }
+
+    impl Clone for SimpleAction {
+        fn clone(&self) -> Self { SimpleAction { id: self.id } }
+    }
+
+    impl MenuBar {
+        pub fn activate_submenu_by_mnemonic(&self, _keyval: u32) -> bool { false }
+
+        /// Open the submenu whose mnemonic is `keyval` at a screen position.
+        ///
+        /// Only the GTK backend can do this (its `GtkMenu` takes a position
+        /// callback); elsewhere the menu system has no programmatic
+        /// popup-at-position call, so this reports `false` instead of
+        /// pretending. The caller surfaces that as an "unavailable" status.
+        pub fn popup_submenu_by_mnemonic_at(&self, _keyval: u32, _x: i32, _y: i32) -> bool {
+            false
+        }
+        /// No positionable popup on this backend, so `anchor` and the point are
+        /// unused and the call reports "not opened". This is the same answer
+        /// `popup_submenu_by_mnemonic_at` already gave here -- `popup_at` just
+        /// makes that explicit in one place instead of leaving each caller to
+        /// discover it.
+        pub fn popup_at(&self, _label: &str, _anchor: &Canvas, _x: f64, _y: f64) -> bool {
+            false
+        }        pub fn activate_submenu_item_by_mnemonic(&self, _keyval: u32) -> bool { false }
+        pub fn insert_action_group(&self, _name: &str, _group_ptr: *mut c_void) {}
+        pub fn handle_mnemonic_key(&self, _keyval: u32) -> bool { false }
+        pub fn handle_menu_key(&self, _keyval: u32, _mod: u32) -> bool { false }
+        /// [`handle_menu_key`](Self::handle_menu_key) with the typed character
+        /// supplied separately; this backend's key codes are already characters.
+        pub fn handle_menu_key_char(&self, keyval: u32, _ch: char, modifiers: u32) -> bool {
+            self.handle_menu_key(keyval, modifiers)
+        }
+        pub fn menu_active(&self) -> bool { false }
+        pub fn menu_close(&self) {}
+    }
+
     // -- SimpleAction --
 
     pub struct SimpleAction {
@@ -327,6 +492,11 @@ mod pancurses_adapter {
     impl SimpleAction {
         pub fn on_activate(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
             crate::backends::pancurses::add_callback(self.id, Box::new(f));
+            Ok(0)
+        }
+        pub fn connect_activate<F: FnMut(*mut c_void) + 'static>(&self, f: F) -> Result<u64, Error> {
+            let mut f = f;
+            crate::backends::pancurses::add_callback(self.id, Box::new(move || f(std::ptr::null_mut())));
             Ok(0)
         }
     }
@@ -358,6 +528,8 @@ mod pancurses_adapter {
             crate::backends::pancurses::set_window_title(self.id, title);
         }
         pub fn set_default_size(&self, _w: i32, _h: i32) {}
+        /// Terminal dialogs have no window parenting; no-op.
+        pub fn set_transient_for(&self, _parent: *mut c_void) {}
         pub fn append_content_area(&self, child: &impl AsRef<*mut c_void>) {
             let child_ptr = *child.as_ref();
             let child_id = child_ptr as usize;
@@ -367,6 +539,57 @@ mod pancurses_adapter {
         pub fn connect_response(&self, _f: impl FnMut(i32) + 'static) -> Result<u64, Error> { Ok(0) }
         pub fn present(&self) {}
         pub fn close(&self) {}
+
+        /// The dialog's content area. A terminal dialog has no separate
+        /// content widget -- `append_content_area` hands its child straight to
+        /// `set_child`, so the content *is* the first child. Returns null when
+        /// nothing has been appended, which is the honest "no content area
+        /// yet" rather than a dangling id.
+        pub fn get_content_area(&self) -> *mut c_void {
+            match crate::backends::pancurses::first_child(self.id) {
+                Some(c) => c as *mut c_void,
+                None => std::ptr::null_mut(),
+            }
+        }
+
+        /// Lay out the dialog's content and button row.
+        ///
+        /// A no-op for the same reason `set_transient_for` above is: a
+        /// terminal has no window to measure, and the shared GUI calls this to
+        /// settle a size before showing. `set_default_size` is likewise inert
+        /// here. Stated rather than silently missing so the call site compiles
+        /// and the reason is on the record.
+        pub fn layout_dialog(&self) {}
+
+        /// Show or hide without destroying.
+        ///
+        /// Distinct from `close`, which is GTK's "destroy the window" and
+        /// cannot be undone. See
+        /// `backends::pancurses::set_visible` for what this actually changes.
+        pub fn set_visible(&self, visible: bool) {
+            crate::backends::pancurses::set_visible(self.id, visible);
+        }
+
+        /// The response id a dismiss reports when no button was chosen.
+        ///
+        /// The dialog code calls this to mark which button a plain dismissal
+        /// (no button click) should answer as. GTK's equivalent is
+        /// `GTK_RESPONSE_CANCEL`; recorded on the node so it is not simply
+        /// discarded, which is what a bare no-op would mean for a value the
+        /// caller has already computed.
+        pub fn set_default_response(&self, response_id: i32) {
+            crate::backends::pancurses::set_dialog_default_response(self.id, response_id);
+        }
+
+        /// Run the dialog's nested loop and return the response id.
+        ///
+        /// The terminal backend's `Dialog` is not a modal loop: `present` and
+        /// `connect_response` are both inert, so there is no response to wait
+        /// for. Returns 0, which is not a valid GTK response id (those start
+        /// at 1), so a caller gets an unambiguous "none" rather than a
+        /// plausible-looking wrong answer. Same as
+        /// `backends_nwg_adapter.rs`.
+        pub fn run(&self) -> i32 { 0 }
     }
 
     // -- DropDown --
@@ -392,11 +615,30 @@ mod pancurses_adapter {
     }
 
     impl DropDown {
+        /// Terminal dropdowns take no GTK-style focus; no-op.
+        pub fn grab_focus(&self) {}
+        /// Terminal dropdowns are not pixel-positioned; no-op.
+        pub fn set_offset(&self, _x: i32, _y: i32) {}
+        /// Terminal dropdowns take no GTK-style flex expansion; no-op.
+        ///
+        /// The dialog code sets this on the in-dialog dropdown so it fills the
+        /// dialog's width on GTK. A terminal dialog is drawn as text, so there
+        /// is no width to expand into.
+        pub fn set_hexpand(&self, _expand: bool) {}
         pub fn set_items(&self, items: &[&str]) {
             crate::backends::pancurses::set_dropdown_items(self.id, items);
         }
-        pub fn set_active(&self, idx: i32) {
-            crate::backends::pancurses::set_dropdown_selected(self.id, idx);
+        /// `Option<u32>`, as on every other backend: `None` is "nothing
+        /// selected", which this backend's own `set_dropdown_selected` already
+        /// represents as a `None` on the node. The signature was `i32` here
+        /// and nowhere else, so a caller passing `Some(i)` -- what GTK, NWG,
+        /// zork and wasm all take -- did not compile against the terminal
+        /// backend at all.
+        pub fn set_active(&self, index: Option<u32>) {
+            crate::backends::pancurses::set_dropdown_selected(
+                self.id,
+                index.map(|i| i as i32).unwrap_or(-1),
+            );
         }
         pub fn get_active(&self) -> i32 {
             crate::backends::pancurses::get_dropdown_selected(self.id)
@@ -516,41 +758,15 @@ mod pancurses_adapter {
         }
         pub fn set_wrap_mode(&self, _mode: i32) {}
         pub fn set_size_request(&self, _w: i32, _h: i32) {}
-
-        /// No button-press events on this backend: the context menu is
-        /// unavailable. Returns a dummy handler id.
-        pub fn connect_button_press_event(
-            &self,
-            _cb: impl FnMut(u32, f64, f64, *mut std::ffi::c_void) + 'static,
-        ) -> Result<u64, Error> {
-            Ok(0)
-        }
-
-        /// No drag-and-drop on this backend.
-        pub fn enable_uri_drag_source(
-            &self,
-            _payload: impl FnMut() -> Option<(Vec<String>, String)> + 'static,
-        ) -> Result<(), Error> {
-            Ok(())
-        }
-
-        /// No pixel coordinates on this backend.
-        pub fn line_at(&self, _x: f64, _y: f64) -> Option<i32> {
-            None
-        }
-
-        /// No drag-and-drop on this backend: there is no other window to
-        /// drop into.
-        pub fn enable_uri_drag_source(
-            &self,
-            _payload: impl FnMut() -> Option<(Vec<String>, String)> + 'static,
-        ) -> Result<(), Error> {
-            Ok(())
-        }
-
-        /// No system clipboard on this backend.
-        pub fn clipboard_set_text(&self, _text: &str) -> Result<(), Error> {
-            Err(Error::Backend("clipboard not supported on this backend".into()))
+            /// Append a line to the buffer.
+        ///
+        /// Read-modify-write: this backend has no incremental insert, so the text is
+        /// fetched, extended and written back. Correct, but O(document) per call.
+        /// A high-rate log pane should reimplement this against the native handle.
+        pub fn append_text(&self, text: &str) {
+        let mut buf = self.get_text().unwrap_or_default();
+        buf.push_str(text);
+        self.set_text(&buf);
         }
     }
 
@@ -602,8 +818,56 @@ mod pancurses_adapter {
         pub fn set_size_request(&self, _w: i32, _h: i32) {}
         pub fn set_content_size(&self, _w: i32, _h: i32) {}
         pub fn queue_redraw(&self) {}
-        pub fn set_draw_callback(&self, _cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {}
-        pub fn on_click(&self, _cb: Box<dyn FnMut(f64, f64)>) {}
+        /// Register a draw callback — the same contract every GUI canvas
+        /// implements. The callback gets a `DrawContext` backed by a terminal
+        /// cell grid; the backend reduces that grid to ANSI and flushes it on
+        /// each redraw, so a canvas-painted UI works on a character display.
+        pub fn set_draw_callback(&self, cb: Box<dyn FnMut(&mut dyn crate::core::DrawContext, i32, i32)>) {
+            crate::backends::pancurses::canvas_set_draw_callback(self.id, cb);
+        }
+        /// Register a plain click handler — the same contract the GTK/NWG
+        /// canvases implement. The toolkit converts the terminal's cell hit
+        /// into the pixel-space coordinates `DrawContext` uses, so a host's
+        /// click math is backend-independent.
+        pub fn on_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
+            crate::backends::pancurses::canvas_on_click(self.id, cb);
+        }
+
+        /// Button/modifier-aware click. See the GTK backend's
+        /// `on_click_button`: kept alongside `on_click` so both can be
+        /// registered (as on GTK, where they share one signal connection).
+        /// `button` is 1-based; the terminal reports the primary button as 1.
+        pub fn on_click_button(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            crate::backends::pancurses::canvas_on_click_button(self.id, cb);
+        }
+
+        /// Pointer motion over the canvas; see the GTK backend's `on_motion`.
+        /// Terminals only report motion while a button is held (or as bare
+        /// position reports); both arrive here, with `button` = 0 for the
+        /// no-button case.
+        pub fn on_motion(&self, cb: Box<dyn FnMut(f64, f64, u32)>) {
+            crate::backends::pancurses::canvas_on_motion(self.id, cb);
+        }
+
+        /// This canvas's top-left in screen coordinates, or `None` when the
+        /// backend cannot report one. Callers then open a context menu
+        /// unpositioned rather than guessing. See the GTK backend's
+        /// `screen_origin`.
+        pub fn screen_origin(&self) -> Option<(i32, i32)> {
+            None
+        }
+
+        /// Drop this canvas's draw callback.
+        pub fn clear_draw_callback(&self) {
+            crate::backends::pancurses::canvas_clear_draw_callback(self.id);
+        }
+
+        /// Pointer release; see the GTK backend's `on_release`.
+        pub fn on_release(&self, _cb: Box<dyn FnMut(f64, f64, u32, u32)>) {
+            // No-op: terminal canvases have no buttons or pointer.
+        }
+        /// No-op: terminal canvases are virtual; visibility is meaningless.
+        pub fn set_visible(&self, _v: bool) {}
         pub fn on_key(&self, _cb: Box<dyn FnMut(u32) -> bool>) {}
         pub fn on_key_raw(&self, _cb: Box<dyn FnMut(u32, u32) -> bool>) {}
         pub fn grab_focus(&self) {}
@@ -652,6 +916,7 @@ mod pancurses_adapter {
 
     // -- ScrolledWindow --
 
+    #[derive(Clone)]
     pub struct ScrolledWindow {
         pub(crate) id: usize,
     }
@@ -710,6 +975,11 @@ mod pancurses_adapter {
         }
         pub fn set_editing(&self, editing: bool, edit_buf: &str, edit_pos: usize) {
             crate::backends::pancurses::spreadsheet_set_edit_state(self.id, editing, edit_buf, edit_pos);
+        }
+        /// Current edit state (generic mechanism for hosts that splice text
+        /// into an in-progress edit, e.g. a picker commit).
+        pub fn edit_state(&self) -> (bool, String, usize) {
+            crate::backends::pancurses::spreadsheet_get_edit_state(self.id)
         }
         pub fn set_grid_config(&self, margin_cols: u32, main_cols: u32) {
             crate::backends::pancurses::spreadsheet_set_grid_config(self.id, margin_cols, main_cols);
@@ -787,42 +1057,14 @@ mod pancurses_adapter {
             .map_err(|e| Error::Backend(format!("{}", e)))
     }
 
-    // -- Context menu (right-click) --
-
-    /// Context-menu placeholder for backends without a pointer: items can be added
-    /// but there is nothing to pop them up against, so `popup_at_pointer` is a
-    /// no-op. Kept so the same `ff-gui` code compiles on every backend.
-    pub struct ContextMenu {
-        _items: Vec<(String, Box<dyn FnMut()>)>,
-    }
-
-    impl ContextMenu {
-        pub fn append_item(&mut self, label: &str, cb: Box<dyn FnMut()>) {
-            self._items.push((label.to_string(), cb));
-        }
-
-        pub fn popup_at_pointer(
-            &mut self,
-            _widget: *mut std::ffi::c_void,
-            _event: *mut std::ffi::c_void,
-        ) -> Result<(), Error> {
-            Ok(())
-        }
-    }
-
-    pub fn create_context_menu() -> Result<ContextMenu, Error> {
-        Ok(ContextMenu { _items: Vec::new() })
-    }
-
     pub fn create_menu() -> Result<Menu, Error> {
         crate::backends::pancurses::create_menu()
-            .map(|id| Menu { id, items: std::cell::RefCell::new(vec![]), submenu_data: std::cell::RefCell::new(vec![]) })
+            .map(|id| Menu { id, items: std::cell::RefCell::new(vec![]) })
             .map_err(|e| Error::Backend(format!("{}", e)))
     }
 
     pub fn create_menubar(model: &Menu, _action_group: *mut c_void) -> Result<MenuBar, Error> {
-        let (labels, itemss) = collect_menu_items(model);
-        let submenu_items: Vec<(String, Vec<(String, String)>)> = labels.into_iter().zip(itemss.into_iter()).collect();
+        let submenu_items = collect_menu_items(model);
         let id = unsafe { crate::backends::pancurses::create_menubar(submenu_items, _action_group) }
             .map_err(|e| Error::Backend(format!("{}", e)))?;
         Ok(MenuBar { id })
@@ -883,88 +1125,6 @@ mod pancurses_adapter {
             .map_err(|e| Error::Backend(format!("{}", e)))
     }
 
-    pub struct Expander {
-        pub(crate) id: usize,
-    }
-
-    impl AsRef<*mut c_void> for Expander {
-        fn as_ref(&self) -> &*mut c_void {
-            unsafe { &*(&self.id as *const usize as *const *mut c_void) }
-        }
-    }
-
-    impl Widget for Expander {
-        fn raw_handle(&self) -> *mut c_void {
-            &self.id as *const usize as *mut c_void
-        }
-    }
-
-    impl Clone for Expander {
-        fn clone(&self) -> Self { Expander { id: self.id } }
-    }
-
-    impl Expander {
-        pub fn set_expanded(&self, _expanded: bool) {}
-        pub fn is_expanded(&self) -> bool { false }
-        pub fn set_label(&self, _label: &str) {}
-        pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
-            let child_id = *child.as_ref() as usize;
-            crate::backends::pancurses::set_child(self.id, child_id);
-        }
-        pub fn set_visible(&self, _visible: bool) {}
-        pub fn set_hexpand(&self, _expand: bool) {}
-        pub fn set_vexpand(&self, _expand: bool) {}
-        pub fn set_size_request(&self, _w: i32, _h: i32) {}
-    }
-
-        // ---- TreeView (multi-column list) ----
-
-        /// A cell value: text, or an icon by theme name.
-        pub enum CellValue {
-            Text(String),
-            Icon { name: String, fallback: String },
-        }
-
-        /// No multi-column list on this backend; the rows are rendered as text.
-        pub struct TreeView {
-            _id: usize,
-        }
-
-        impl Clone for TreeView {
-            fn clone(&self) -> Self { TreeView { _id: self._id } }
-        }
-
-        impl TreeView {
-            pub fn set_rows(&self, _rows: &[Vec<CellValue>]) {}
-            pub fn selected_path(&self, _path_column: usize) -> Option<String> { None }
-        pub fn row_at(&self, _x: f64, _y: f64) -> Option<i32> { None }
-        pub fn select_row(&self, _index: i32) {}
-        pub fn connect_button_press_event(
-            &self,
-            _cb: impl FnMut(u32, f64, f64, *mut std::ffi::c_void) + 'static,
-        ) -> Result<u64, Error> {
-            Ok(0)
-        }
-        }
-
-        impl Widget for TreeView {
-            fn raw_handle(&self) -> *mut c_void { &self._id as *const usize as *mut c_void }
-        }
-
-        impl AsRef<*mut c_void> for TreeView {
-            fn as_ref(&self) -> &*mut c_void {
-                unsafe { &*(&self._id as *const usize as *const *mut c_void) }
-            }
-        }
-
-        pub fn create_treeview(_columns: &[(&str, bool, bool)]) -> Result<TreeView, Error> {
-            Ok(TreeView { _id: 0 })
-        }
-
-    pub fn create_expander(_label: &str) -> Result<Expander, Error> {
-        Ok(Expander { id: crate::backends::pancurses::create_scrolled_window() })
-    }
-
     pub fn create_scrolled_window() -> Result<ScrolledWindow, Error> {
         crate::backends::pancurses::create_scrolled_window()
             .map(|id| ScrolledWindow { id })
@@ -981,6 +1141,9 @@ mod pancurses_adapter {
 
     pub fn add_key_callback(key: char, cb: Box<dyn FnMut()>) {
         crate::backends::pancurses::add_key_callback(key, cb);
+    }
+    pub fn add_goto_callback<F: FnMut() + 'static>(f: F) {
+        crate::backends::pancurses::spreadsheet_add_goto_callback(f);
     }
 
     pub fn add_cursor_move_callback<F: FnMut(u32, u32) + 'static>(f: F) {

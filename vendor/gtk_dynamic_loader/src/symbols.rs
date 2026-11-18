@@ -2,48 +2,62 @@ use crate::error::Error;
 use crate::loader::RawLib as Library;
 use std::ffi::c_void;
 
-// Minimal subset of function pointer types we need
+/// Every `char*` in these signatures is spelled `*const u8` / `*mut u8`.
+///
+/// The C type is `const char*` / `char*`, whose Rust spelling is
+/// `*const c_char` / `*mut c_char` — and `c_char` is **platform-dependent**:
+/// `i8` on x86 and every ARM, `u8` on PowerPC/s390x/other BSDs. Writing `i8`
+/// out by hand made this crate fail to typecheck on exactly those platforms
+/// (76 errors on `aarch64-linux-android`), while compiling fine on
+/// `x86_64-linux-android` because there `c_char` happens to be `u8` — the
+/// emulator ABI hid the bug and a real device would not.
+///
+/// `u8` is the right choice for two reasons, and the second is the important
+/// one:
+///
+/// 1. It is the type of `CString::as_ptr()` and `CStr::as_ptr()`
+///    unconditionally, so every call site here typechecks on every target
+///    without a cast.
+/// 2. It does not actually change the ABI. These are `extern "C"` function
+///    pointers, so the *pointed-to* element type is not part of the calling
+///    convention — a pointer to a signed byte and a pointer to an unsigned byte
+///    are passed in the same register on every ABI. Only the pointee's
+///    alignment and signedness differ, and C string literals are never
+///    dereferenced through a signedness-sensitive operation here.
+///
+/// The alternative, `*const c_char`, would be the pedantically correct
+/// spelling but would need a `as *const c_char` at each of the ~60 call
+/// sites, and would be wrong on the targets where `c_char` is not `u8`
+/// anyway. So: `u8`, with this comment as the record of why.
 pub type GMainLoopNew = unsafe extern "C" fn(context: *mut c_void, is_running: i32) -> *mut c_void;
 pub type GMainLoopRun = unsafe extern "C" fn(loop_: *mut c_void);
 pub type GMainLoopQuit = unsafe extern "C" fn(loop_: *mut c_void);
-
-/// `GSourceFunc`: returns TRUE (non-zero) to be called again, FALSE to stop.
-///
-/// This is the callback type for both `g_timeout_add` and `g_idle_add`. A boxed
-/// Rust closure is passed as the `data` pointer and freed when the source stops
-/// (or, for `g_idle_add`, after its single call).
-pub type GSourceFunc = unsafe extern "C" fn(data: *mut c_void) -> i32;
-pub type GTimeoutAdd = unsafe extern "C" fn(interval_ms: u32, func: GSourceFunc, data: *mut c_void) -> u32;
-pub type GTimeoutAddFull = unsafe extern "C" fn(
-    priority: i32,
-    interval_ms: u32,
-    func: GSourceFunc,
-    data: *mut c_void,
-    notify: Option<unsafe extern "C" fn(data: *mut c_void)>,
-) -> u32;
-pub type GIdleAdd = unsafe extern "C" fn(func: GSourceFunc, data: *mut c_void) -> u32;
-pub type GIdleAddFull = unsafe extern "C" fn(
-    priority: i32,
-    func: GSourceFunc,
-    data: *mut c_void,
-    notify: Option<unsafe extern "C" fn(data: *mut c_void)>,
-) -> u32;
-pub type GSourceRemove = unsafe extern "C" fn(tag: u32) -> i32;
 
 pub type GObjectRef = unsafe extern "C" fn(obj: *mut c_void) -> *mut c_void;
 pub type GObjectUnref = unsafe extern "C" fn(obj: *mut c_void);
 pub type GObjectRefSink = unsafe extern "C" fn(obj: *mut c_void) -> *mut c_void;
 
-pub type GSignalConnectData = unsafe extern "C" fn(instance: *mut c_void, detailed_signal: *const i8, c_handler: *mut c_void, data: *mut c_void, destroy_data: Option<unsafe extern "C" fn(data: *mut c_void, closure: *mut c_void)>, connect_flags: u32) -> u64;
-pub type GSignalConnect = unsafe extern "C" fn(instance: *mut c_void, detailed_signal: *const i8, c_handler: *mut c_void, data: *mut c_void) -> u64;
-pub type GSignalEmitByName = unsafe extern "C" fn(instance: *mut c_void, detailed_signal: *const i8) -> u64;
+pub type GSignalConnectData = unsafe extern "C" fn(instance: *mut c_void, detailed_signal: *const u8, c_handler: *mut c_void, data: *mut c_void, destroy_data: Option<unsafe extern "C" fn(data: *mut c_void, closure: *mut c_void)>, connect_flags: u32) -> u64;
+pub type GSignalConnect = unsafe extern "C" fn(instance: *mut c_void, detailed_signal: *const u8, c_handler: *mut c_void, data: *mut c_void) -> u64;
+pub type GSignalEmitByName = unsafe extern "C" fn(instance: *mut c_void, detailed_signal: *const u8) -> u64;
+/// `g_signal_emit_by_name` for `GtkEventControllerKey::key-pressed` /
+/// `key-released`, whose C signature is (keyval, keycode, state) -> bool.
+/// The symbol itself is variadic, so the same pointer is reinterpreted with
+/// the three-argument shape rather than declared twice.
+pub type GSignalEmitKeyByName = unsafe extern "C" fn(
+    instance: *mut c_void,
+    detailed_signal: *const u8,
+    keyval: u32,
+    keycode: u32,
+    state: u32,
+) -> u64;
 
 pub type GtkWindowNew = unsafe extern "C" fn(window_type: i32) -> *mut c_void;
-pub type GtkWindowSetTitle = unsafe extern "C" fn(window: *mut c_void, title: *const i8);
-pub type GtkButtonNewWithLabel = unsafe extern "C" fn(label: *const i8) -> *mut c_void;
-pub type GtkLabelNew = unsafe extern "C" fn(str: *const i8) -> *mut c_void;
-pub type GtkLabelSetText = unsafe extern "C" fn(label: *mut c_void, str: *const i8);
-pub type GtkLabelGetText = unsafe extern "C" fn(label: *mut c_void) -> *const i8;
+pub type GtkWindowSetTitle = unsafe extern "C" fn(window: *mut c_void, title: *const u8);
+pub type GtkButtonNewWithLabel = unsafe extern "C" fn(label: *const u8) -> *mut c_void;
+pub type GtkLabelNew = unsafe extern "C" fn(str: *const u8) -> *mut c_void;
+pub type GtkLabelSetText = unsafe extern "C" fn(label: *mut c_void, str: *const u8);
+pub type GtkLabelGetText = unsafe extern "C" fn(label: *mut c_void) -> *const u8;
 pub type GtkBoxNew = unsafe extern "C" fn(orientation: i32, spacing: i32) -> *mut c_void;
 
 pub type GtkBoxAppend = unsafe extern "C" fn(box_: *mut c_void, child: *mut c_void);
@@ -51,124 +65,81 @@ pub type GtkBoxPackStart = unsafe extern "C" fn(box_: *mut c_void, child: *mut c
 pub type GtkContainerAdd = unsafe extern "C" fn(container: *mut c_void, widget: *mut c_void);
 pub type GtkContainerRemove = unsafe extern "C" fn(container: *mut c_void, widget: *mut c_void);
 pub type GtkWindowSetChild = unsafe extern "C" fn(window: *mut c_void, child: *mut c_void);
+/// `void gtk_widget_show(GtkWidget*)` (GTK3; in GTK4 this is deprecated but
+/// still present as a no-op, so calling it is safe on both).
+pub type GtkWidgetShow = unsafe extern "C" fn(widget: *mut c_void);
+pub type GtkWidgetHide = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWidgetShowAll = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWindowPresent = unsafe extern "C" fn(window: *mut c_void);
 pub type GtkInit = unsafe extern "C" fn(argc: *mut libc::c_int, argv: *mut *mut *mut libc::c_char);
-pub type GtkLabelSetMarkup = unsafe extern "C" fn(label: *mut c_void, markup: *const i8);
+pub type GtkLabelSetMarkup = unsafe extern "C" fn(label: *mut c_void, markup: *const u8);
 pub type GtkWidgetSetVisible = unsafe extern "C" fn(widget: *mut c_void, visible: i32);
-pub type GtkWidgetSetSensitive = unsafe extern "C" fn(widget: *mut c_void, sensitive: i32);
 pub type GtkWidgetGrabFocus = unsafe extern "C" fn(widget: *mut c_void);
+pub type GtkWidgetHasFocus = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkWidgetGetStyleContext = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
-pub type GtkStyleContextAddClass = unsafe extern "C" fn(context: *mut c_void, class_name: *const i8);
-pub type GtkStyleContextRemoveClass = unsafe extern "C" fn(context: *mut c_void, class_name: *const i8);
+pub type GtkStyleContextAddClass = unsafe extern "C" fn(context: *mut c_void, class_name: *const u8);
+pub type GtkStyleContextRemoveClass = unsafe extern "C" fn(context: *mut c_void, class_name: *const u8);
 pub type GtkCssProviderNew = unsafe extern "C" fn() -> *mut c_void;
-pub type GtkCssProviderLoadFromData = unsafe extern "C" fn(provider: *mut c_void, data: *const i8, length: isize, error: *mut *mut c_void) -> i32;
+pub type GtkCssProviderLoadFromData = unsafe extern "C" fn(provider: *mut c_void, data: *const u8, length: isize, error: *mut *mut c_void) -> i32;
 pub type GtkStyleContextAddProvider = unsafe extern "C" fn(context: *mut c_void, provider: *mut c_void, priority: u32);
 // GApplication / GMenu / Actions (gio)
-pub type GtkApplicationNew = unsafe extern "C" fn(application_id: *const i8, flags: u32) -> *mut c_void;
-pub type GApplicationRun = unsafe extern "C" fn(application: *mut c_void, argc: i32, argv: *mut *mut i8) -> i32;
+pub type GtkApplicationNew = unsafe extern "C" fn(application_id: *const u8, flags: u32) -> *mut c_void;
+pub type GApplicationRun = unsafe extern "C" fn(application: *mut c_void, argc: i32, argv: *mut *mut u8) -> i32;
 pub type GApplicationRegister = unsafe extern "C" fn(application: *mut c_void, cancellable: *mut c_void, error: *mut *mut c_void) -> i32;
-pub type GSimpleActionNew = unsafe extern "C" fn(name: *const i8, parameter_type: *mut c_void) -> *mut c_void;
+pub type GSimpleActionNew = unsafe extern "C" fn(name: *const u8, parameter_type: *mut c_void) -> *mut c_void;
+pub type GSimpleActionGroupNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GActionMapAddAction = unsafe extern "C" fn(map: *mut c_void, action: *mut c_void);
-pub type GActionGroupActivateAction = unsafe extern "C" fn(group: *mut c_void, action_name: *const i8, parameter: *mut c_void);
-pub type GActionMapLookupAction = unsafe extern "C" fn(map: *mut c_void, action_name: *const i8) -> *mut c_void;
+pub type GActionGroupActivateAction = unsafe extern "C" fn(group: *mut c_void, action_name: *const u8, parameter: *mut c_void);
+pub type GActionMapLookupAction = unsafe extern "C" fn(map: *mut c_void, action_name: *const u8) -> *mut c_void;
 pub type GActionActivate = unsafe extern "C" fn(action: *mut c_void, parameter: *mut c_void);
 pub type GMenuNew = unsafe extern "C" fn() -> *mut c_void;
-pub type GMenuAppend = unsafe extern "C" fn(menu: *mut c_void, label: *const i8, detailed_action: *const i8);
+pub type GMenuAppend = unsafe extern "C" fn(menu: *mut c_void, label: *const u8, detailed_action: *const u8);
 pub type GApplicationSetAppMenu = unsafe extern "C" fn(application: *mut c_void, menu: *mut c_void);
 pub type GApplicationSetMenubar = unsafe extern "C" fn(application: *mut c_void, menu: *mut c_void);
-pub type GMenuAppendSubmenu = unsafe extern "C" fn(menu: *mut c_void, label: *const i8, submenu: *mut c_void);
+pub type GMenuAppendSubmenu = unsafe extern "C" fn(menu: *mut c_void, label: *const u8, submenu: *mut c_void);
 pub type GtkPopoverMenuBarNewFromModel = unsafe extern "C" fn(model: *mut c_void) -> *mut c_void;
 // GTK3 menu bar
 pub type GtkMenuBarNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkMenuNew = unsafe extern "C" fn() -> *mut c_void;
-// GtkExpander: a labelled disclosure that shows/hides its single child. GTK3
-// sets the child through gtk_container_add (already bound); GTK4 would use
-// gtk_expander_set_child, bound below when present.
-pub type GtkExpanderNew = unsafe extern "C" fn(label: *const i8) -> *mut c_void;
-pub type GtkExpanderSetExpanded = unsafe extern "C" fn(expander: *mut c_void, expanded: i32);
-pub type GtkExpanderGetExpanded = unsafe extern "C" fn(expander: *mut c_void) -> i32;
-pub type GtkExpanderSetLabel = unsafe extern "C" fn(expander: *mut c_void, label: *const i8);
-pub type GtkExpanderSetChild = unsafe extern "C" fn(expander: *mut c_void, child: *mut c_void);
-// GtkTreeView / GtkListStore: a real multi-column list.
-pub type GtkTreeViewNew = unsafe extern "C" fn() -> *mut c_void;
-pub type GtkListStoreNew = unsafe extern "C" fn(n_columns: i32, ...) -> *mut c_void;
-pub type GtkListStoreAppend = unsafe extern "C" fn(store: *mut c_void, iter: *mut c_void);
-pub type GtkListStoreClear = unsafe extern "C" fn(store: *mut c_void);
-pub type GtkListStoreSetValuesv =
-    unsafe extern "C" fn(store: *mut c_void, iter: *mut c_void, columns: *mut i32, values: *mut c_void, n: i32);
-pub type GtkTreeViewSetModel = unsafe extern "C" fn(tree: *mut c_void, model: *mut c_void);
-pub type GtkTreeViewAppendColumn = unsafe extern "C" fn(tree: *mut c_void, column: *mut c_void) -> i32;
-// Varargs: (title, cell, attr_name_1, column_1, ..., NULL). Must be declared
-// variadic so the ABI passes the trailing NULL correctly.
-pub type GtkTreeViewColumnNewWithAttributes =
-    unsafe extern "C" fn(title: *const i8, cell: *mut c_void, ...) -> *mut c_void;
-pub type GtkTreeViewColumnSetResizable = unsafe extern "C" fn(column: *mut c_void, resizable: i32);
-pub type GtkTreeViewColumnSetExpand = unsafe extern "C" fn(column: *mut c_void, expand: i32);
-pub type GtkTreeViewColumnSetClickable = unsafe extern "C" fn(column: *mut c_void, clickable: i32);
-pub type GtkTreeViewColumnSetSortColumnId =
-    unsafe extern "C" fn(column: *mut c_void, sort_column_id: i32);
-// The model is a GtkTreeSortable (GtkListStore implements it), so it can sort
-// itself once a column is marked sortable.
-pub type GtkTreeSortableSetSortColumnId =
-    unsafe extern "C" fn(sortable: *mut c_void, sort_column_id: i32, order: i32);
-pub type GtkTreeViewSetHeadersVisible = unsafe extern "C" fn(tree: *mut c_void, visible: i32);
-pub type GtkCellRendererPixbufNew = unsafe extern "C" fn() -> *mut c_void;
-pub type GtkCellRendererTextNew = unsafe extern "C" fn() -> *mut c_void;
-// GtkTextIter is used as the row iterator for GtkListStore; the same opaque
-// buffer trick as the text view applies.
-pub type GtkTreeViewGetPathAtPos =
-    unsafe extern "C" fn(tree: *mut c_void, x: i32, y: i32, path: *mut *mut c_void, column: *mut *mut c_void, cell_x: *mut i32, cell_y: *mut i32) -> i32;
-pub type GtkTreeViewGetSelection = unsafe extern "C" fn(tree: *mut c_void) -> *mut c_void;
-pub type GtkTreePathGetIndices = unsafe extern "C" fn(path: *mut c_void) -> *mut i32;
-// Variadic: (first_index, ..., -1).
-pub type GtkTreePathNewFromIndices = unsafe extern "C" fn(first: i32, ...) -> *mut c_void;
-pub type GtkTreeSelectionSelectPath = unsafe extern "C" fn(selection: *mut c_void, path: *mut c_void);
-pub type GtkTreePathFree = unsafe extern "C" fn(path: *mut c_void);
-pub type GtkTreeSelectionGetSelected =
-    unsafe extern "C" fn(tree: *mut c_void, model: *mut *mut c_void, iter: *mut c_void) -> i32;
-// GObject values, for gtk_list_store_set_valuesv.
-pub type GValueInit = unsafe extern "C" fn(value: *mut c_void, g_type: usize);
-pub type GValueUnset = unsafe extern "C" fn(value: *mut c_void);
-pub type GValueSetString = unsafe extern "C" fn(value: *mut c_void, s: *const i8);
-pub type GValueSetObject = unsafe extern "C" fn(value: *mut c_void, obj: *mut c_void);
-pub type GValueGetString = unsafe extern "C" fn(value: *const c_void) -> *const i8;
-pub type GTypeFromName = unsafe extern "C" fn(name: *const i8) -> usize;
-// Icon theme.
-pub type GtkIconThemeGetDefault = unsafe extern "C" fn() -> *mut c_void;
-pub type GtkIconThemeLoadIcon = unsafe extern "C" fn(
-    theme: *mut c_void,
-    name: *const i8,
-    size: i32,
-    flags: i32,
-    error: *mut *mut c_void,
-) -> *mut c_void;
-pub type GtkMenuItemNewWithLabel = unsafe extern "C" fn(label: *const i8) -> *mut c_void;
+pub type GtkMenuItemNewWithLabel = unsafe extern "C" fn(label: *const u8) -> *mut c_void;
+pub type GtkMenuItemNewWithMnemonic = unsafe extern "C" fn(label: *const u8) -> *mut c_void;
 pub type GtkMenuShellAppend = unsafe extern "C" fn(shell: *mut c_void, child: *mut c_void);
 pub type GtkMenuItemSetSubmenu = unsafe extern "C" fn(item: *mut c_void, submenu: *mut c_void);
 pub type GtkWindowSetApplication = unsafe extern "C" fn(window: *mut c_void, application: *mut c_void);
 // Widget action group resolution (needed for GtkPopoverMenuBar to find actions)
-pub type GtkWidgetInsertActionGroup = unsafe extern "C" fn(widget: *mut c_void, name: *const i8, group: *mut c_void);
+pub type GtkWidgetInsertActionGroup = unsafe extern "C" fn(widget: *mut c_void, name: *const u8, group: *mut c_void);
 // GtkActionable (for setting action names on GTK3 menu items)
-pub type GtkActionableSetDetailedActionName = unsafe extern "C" fn(actionable: *mut c_void, detailed_action_name: *const i8);
+pub type GtkActionableSetDetailedActionName = unsafe extern "C" fn(actionable: *mut c_void, detailed_action_name: *const u8);
 // GMenuModel iteration (for GTK3 fallback)
 pub type GMenuModelGetNItems = unsafe extern "C" fn(model: *mut c_void) -> i32;
-pub type GMenuModelGetItemAttributeValue = unsafe extern "C" fn(model: *mut c_void, item_index: i32, attribute: *const i8, expected_type: *const c_void) -> *mut c_void;
-pub type GMenuModelGetItemLink = unsafe extern "C" fn(model: *mut c_void, item_index: i32, link: *const i8) -> *mut c_void;
-pub type GVariantGetString = unsafe extern "C" fn(value: *mut c_void, length: *mut usize) -> *const i8;
+pub type GMenuModelGetItemAttributeValue = unsafe extern "C" fn(model: *mut c_void, item_index: i32, attribute: *const u8, expected_type: *const c_void) -> *mut c_void;
+pub type GMenuModelGetItemLink = unsafe extern "C" fn(model: *mut c_void, item_index: i32, link: *const u8) -> *mut c_void;
+pub type GVariantGetString = unsafe extern "C" fn(value: *mut c_void, length: *mut usize) -> *const u8;
 pub type GVariantUnref = unsafe extern "C" fn(value: *mut c_void);
 
 // File chooser / native dialog
-pub type GtkFileChooserNativeNew = unsafe extern "C" fn(title: *const i8, parent: *mut c_void, action: i32, accept_label: *const i8, cancel_label: *const i8) -> *mut c_void;
+pub type GtkFileChooserNativeNew = unsafe extern "C" fn(title: *const u8, parent: *mut c_void, action: i32, accept_label: *const u8, cancel_label: *const u8) -> *mut c_void;
 pub type GtkNativeDialogRun = unsafe extern "C" fn(native: *mut c_void) -> i32;
-pub type GtkFileChooserGetFilename = unsafe extern "C" fn(chooser: *mut c_void) -> *const i8;
+pub type GtkFileChooserGetFilename = unsafe extern "C" fn(chooser: *mut c_void) -> *const u8;
+// File filters (GtkFileFilter + GtkFileChooser filter API, stable across
+// GTK 3.20+ and GTK 4): optional best-effort enhancement for save dialogs.
+pub type GtkFileFilterNew = unsafe extern "C" fn() -> *mut c_void;
+pub type GtkFileFilterSetName = unsafe extern "C" fn(filter: *mut c_void, name: *const u8);
+pub type GtkFileFilterAddPattern = unsafe extern "C" fn(filter: *mut c_void, pattern: *const u8);
+pub type GtkFileChooserAddFilter = unsafe extern "C" fn(chooser: *mut c_void, filter: *mut c_void);
+pub type GtkFileChooserSetFilter = unsafe extern "C" fn(chooser: *mut c_void, filter: *mut c_void);
+pub type GtkFileChooserSetCurrentName = unsafe extern "C" fn(chooser: *mut c_void, name: *const u8) -> i32;
 pub type GtkWidgetDestroy = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWindowClose = unsafe extern "C" fn(window: *mut c_void);
 pub type GFree = unsafe extern "C" fn(ptr: *mut c_void);
 // gdk event helpers
 pub type GdkEventGetKeyval = unsafe extern "C" fn(event: *mut c_void, keyval: *mut u32) -> i32;
 pub type GdkEventGetState = unsafe extern "C" fn(event: *mut c_void, state: *mut u32);
-pub type GdkKeyvalFromName = unsafe extern "C" fn(name: *const i8) -> u32;
+// GdkEventType discriminator: GDK_KEY_PRESS = 8, GDK_KEY_RELEASE = 9
+// (stable across GTK3/GTK4). Needed because the unfiltered "event" signal
+// also delivers releases, which are indistinguishable downstream.
+pub type GdkEventGetEventType = unsafe extern "C" fn(event: *const c_void) -> i32;
+pub type GdkKeyvalFromName = unsafe extern "C" fn(name: *const u8) -> u32;
 pub type GdkDisplayGetDefault = unsafe extern "C" fn() -> *mut c_void;
 pub type GdkScreenGetDefault = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkStyleContextAddProviderForDisplay = unsafe extern "C" fn(display: *mut c_void, provider: *mut c_void, priority: u32);
@@ -181,58 +152,55 @@ pub type GtkEventControllerSetPropagationPhase = unsafe extern "C" fn(controller
 pub type GtkScrolledWindowGetVadjustment = unsafe extern "C" fn(sw: *mut c_void) -> *mut c_void;
 pub type GtkScrolledWindowGetHadjustment = unsafe extern "C" fn(sw: *mut c_void) -> *mut c_void;
 pub type GtkAdjustmentGetValue = unsafe extern "C" fn(adj: *mut c_void) -> f64;
+// Atomically configure a GtkAdjustment (value/lower/upper/step/page). One
+// call keeps scrollbar range, thumb size and position consistent.
+pub type GtkAdjustmentConfigure = unsafe extern "C" fn(adj: *mut c_void, value: f64, lower: f64, upper: f64, step: f64, page: f64, page_size: f64);
 pub type GtkGestureClickNew = unsafe extern "C" fn() -> *mut c_void;
-// Context-menu (right-click) support: build a GtkMenu from the GMenuModel a
-// `ContextMenu` produces, and show it at the pointer. gtk_menu_attach_to_widget
-// ties the menu's lifetime (and action lookup) to a widget in the window.
-pub type GtkMenuNewFromModel = unsafe extern "C" fn(model: *mut c_void) -> *mut c_void;
-pub type GtkMenuPopupAtPointer = unsafe extern "C" fn(menu: *mut c_void, event: *mut c_void);
-pub type GtkMenuAttachToWidget = unsafe extern "C" fn(menu: *mut c_void, widget: *mut c_void, detacher: *mut c_void);
-// Clipboard: gtk_clipboard_get takes a GdkAtom (a *mut c_void in the C API).
-pub type GtkClipboardGet = unsafe extern "C" fn(selection: *mut c_void) -> *mut c_void;
-pub type GtkClipboardSetText = unsafe extern "C" fn(clipboard: *mut c_void, text: *const std::os::raw::c_char, len: i32);
-pub type GtkClipboardStore = unsafe extern "C" fn(clipboard: *mut c_void);
-// Which mouse button produced a GdkEventButton (1=left, 3=right).
-pub type GdkEventGetButton = unsafe extern "C" fn(event: *mut c_void) -> u32;
-// Drag-and-drop: make a widget a drag source carrying file URIs and text.
-// gtk_drag_source_set(widget, start_button_mask, targets, n_targets, actions)
-pub type GtkDragSourceSet = unsafe extern "C" fn(
-    widget: *mut c_void,
-    start_button_mask: i32,
-    targets: *const c_void,
-    n_targets: i32,
-    actions: i32,
-);
-pub type GtkDragSourceAddUriTargets = unsafe extern "C" fn(widget: *mut c_void);
-pub type GtkDragSourceAddTextTargets = unsafe extern "C" fn(widget: *mut c_void);
-// Fill the GtkSelectionData with the dragged payload. set_uris takes a
-// NULL-terminated array of URI strings.
-pub type GtkSelectionDataSetUris = unsafe extern "C" fn(selection_data: *mut c_void, uris: *const *const i8);
-pub type GtkSelectionDataSetText = unsafe extern "C" fn(selection_data: *mut c_void, text: *const i8, len: i32) -> i32;
-// Identify which target the drop is asking for.
-pub type GtkSelectionDataGetTarget = unsafe extern "C" fn(selection_data: *mut c_void) -> *mut c_void;
-pub type GdkAtomInternStaticString = unsafe extern "C" fn(name: *const i8) -> *mut c_void;
-pub type GdkAtomName = unsafe extern "C" fn(atom: *mut c_void) -> *mut i8;
 pub type GtkWidgetSetCanTarget = unsafe extern "C" fn(widget: *mut c_void, can_target: i32);
 pub type GtkWidgetSetHalign = unsafe extern "C" fn(widget: *mut c_void, align: i32);
 pub type GtkWidgetSetValign = unsafe extern "C" fn(widget: *mut c_void, align: i32);
+/// `gint gtk_widget_get_width_request(GtkWidget*)`.
+pub type GtkWidgetGetWidthRequest = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkWidgetGetAllocatedWidth = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkWidgetGetAllocatedHeight = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkWidgetGetMapped = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkWidgetGetDisplay = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
+
+// GtkPopoverMenuBarItem — get the popover from a bar item
+pub type GtkPopoverMenuBarItemGetPopover = unsafe extern "C" fn(item: *mut c_void) -> *mut c_void;
+// GtkPopover — get/set child widget
+pub type GtkPopoverGetChild = unsafe extern "C" fn(popover: *mut c_void) -> *mut c_void;
+pub type GtkPopoverNew = unsafe extern "C" fn() -> *mut c_void;
+pub type GtkPopoverSetChild = unsafe extern "C" fn(popover: *mut c_void, child: *mut c_void);
+
+// GtkMenuButton — for manual menu bar construction
+pub type GtkMenuButtonNew = unsafe extern "C" fn() -> *mut c_void;
+pub type GtkMenuButtonSetPopover = unsafe extern "C" fn(button: *mut c_void, popover: *mut c_void);
+pub type GtkMenuButtonSetLabel = unsafe extern "C" fn(button: *mut c_void, label: *const u8);
+pub type GtkMenuButtonGetPopover = unsafe extern "C" fn(button: *mut c_void) -> *mut c_void;
+pub type GtkMenuButtonSetHasFrame = unsafe extern "C" fn(button: *mut c_void, has_frame: i32);
+pub type GtkMenuButtonSetPrimary = unsafe extern "C" fn(button: *mut c_void, primary: i32);
+pub type GtkButtonSetHasFrame = unsafe extern "C" fn(button: *mut c_void, has_frame: i32);
+pub type GtkWidgetAddCssClass = unsafe extern "C" fn(widget: *mut c_void, css_class: *const u8);
+
+
+
+// GtkPopoverMenu — new from model (submenu-level)
+pub type GtkPopoverMenuNewFromModel = unsafe extern "C" fn(model: *mut c_void) -> *mut c_void;
 
 // Display sync — flushes pending display requests and waits for server round-trip
 pub type GdkDisplaySync = unsafe extern "C" fn(display: *mut c_void);
 
 // Dialog
 pub type GtkDialogNew = unsafe extern "C" fn() -> *mut c_void;
-pub type GtkDialogAddButton = unsafe extern "C" fn(dialog: *mut c_void, button_text: *const i8, response_id: i32) -> *mut c_void;
+pub type GtkDialogAddButton = unsafe extern "C" fn(dialog: *mut c_void, button_text: *const u8, response_id: i32) -> *mut c_void;
+pub type GtkDialogSetDefaultResponse = unsafe extern "C" fn(dialog: *mut c_void, response_id: i32);
 pub type GtkDialogGetContentArea = unsafe extern "C" fn(dialog: *mut c_void) -> *mut c_void;
 pub type GtkDialogRun = unsafe extern "C" fn(dialog: *mut c_void) -> i32;
 // Dropdown - GTK3 ComboBoxText
 pub type GtkComboBoxTextNew = unsafe extern "C" fn() -> *mut c_void;
-pub type GtkComboBoxTextAppendText = unsafe extern "C" fn(combo: *mut c_void, text: *const i8);
-pub type GtkComboBoxTextGetActiveText = unsafe extern "C" fn(combo: *mut c_void) -> *const i8;
+pub type GtkComboBoxTextAppendText = unsafe extern "C" fn(combo: *mut c_void, text: *const u8);
+pub type GtkComboBoxTextGetActiveText = unsafe extern "C" fn(combo: *mut c_void) -> *const u8;
 pub type GtkComboBoxSetActive = unsafe extern "C" fn(combo: *mut c_void, index_: i32);
 pub type GtkComboBoxGetActive = unsafe extern "C" fn(combo: *mut c_void) -> i32;
 
@@ -240,10 +208,10 @@ pub type GtkComboBoxGetActive = unsafe extern "C" fn(combo: *mut c_void) -> i32;
 pub type GtkDropDownNew = unsafe extern "C" fn(model: *mut c_void, expression: *mut c_void) -> *mut c_void;
 pub type GtkDropDownSetSelected = unsafe extern "C" fn(dropdown: *mut c_void, selected: u32);
 pub type GtkDropDownGetSelected = unsafe extern "C" fn(dropdown: *mut c_void) -> u32;
-pub type GtkStringListNew = unsafe extern "C" fn(strings: *const *const i8) -> *mut c_void;
+pub type GtkStringListNew = unsafe extern "C" fn(strings: *const *const u8) -> *mut c_void;
 
 // Checkbox / CheckButton
-pub type GtkCheckButtonNewWithLabel = unsafe extern "C" fn(label: *const i8) -> *mut c_void;
+pub type GtkCheckButtonNewWithLabel = unsafe extern "C" fn(label: *const u8) -> *mut c_void;
 pub type GtkCheckButtonGetActive = unsafe extern "C" fn(check_button: *mut c_void) -> i32;
 pub type GtkCheckButtonSetActive = unsafe extern "C" fn(check_button: *mut c_void, is_active: i32);
 pub type GtkCheckButtonSetGroup = unsafe extern "C" fn(check_button: *mut c_void, group: *mut c_void);
@@ -251,24 +219,25 @@ pub type GtkToggleButtonGetActive = unsafe extern "C" fn(toggle_button: *mut c_v
 pub type GtkToggleButtonSetActive = unsafe extern "C" fn(toggle_button: *mut c_void, is_active: i32);
 
 // RadioButton
-pub type GtkRadioButtonNewWithLabel = unsafe extern "C" fn(group: *mut c_void, label: *const i8) -> *mut c_void;
+pub type GtkRadioButtonNewWithLabel = unsafe extern "C" fn(group: *mut c_void, label: *const u8) -> *mut c_void;
+// Returns the GSList* group of a radio button (NOT a widget pointer: passing
+// a widget as the ctor's `group` arg segfaults inside GTK).
+pub type GtkRadioButtonGetGroup = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
 
 // TextView / TextArea
 pub type GtkTextViewNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkTextBufferNew = unsafe extern "C" fn(table: *mut c_void) -> *mut c_void;
 pub type GtkTextViewGetBuffer = unsafe extern "C" fn(text_view: *mut c_void) -> *mut c_void;
-pub type GtkTextBufferSetText = unsafe extern "C" fn(buffer: *mut c_void, text: *const i8, len: i32);
+pub type GtkTextBufferSetText = unsafe extern "C" fn(buffer: *mut c_void, text: *const u8, len: i32);
 pub type GtkTextBufferGetText = unsafe extern "C" fn(buffer: *mut c_void, start: *mut c_void, end: *mut c_void, include_hidden_chars: i32) -> *mut c_void;
 pub type GtkTextBufferGetStartIter = unsafe extern "C" fn(buffer: *mut c_void, iter: *mut c_void);
 pub type GtkTextBufferGetEndIter = unsafe extern "C" fn(buffer: *mut c_void, iter: *mut c_void);
+/// `gtk_text_buffer_insert_at_cursor(buffer, iter, text, len)`; the iterator
+/// is honoured, which is how `TextView::append_text` targets the end.
+pub type GtkTextBufferInsertAtCursor = unsafe extern "C" fn(buffer: *mut c_void, iter: *mut c_void, text: *const u8, len: i32);
 pub type GtkTextIterCopy = unsafe extern "C" fn(iter: *mut c_void) -> *mut c_void;
 pub type GtkTextIterFree = unsafe extern "C" fn(iter: *mut c_void);
 pub type GtkTextViewSetWrapMode = unsafe extern "C" fn(text_view: *mut c_void, wrap_mode: i32);
-// Map a click to a line: get_iter_at_location fills a caller-allocated
-// GtkTextIter for the (x, y) position; get_line reads its 0-based line number.
-pub type GtkTextViewGetIterAtLocation =
-    unsafe extern "C" fn(text_view: *mut c_void, iter: *mut c_void, x: i32, y: i32);
-pub type GtkTextIterGetLine = unsafe extern "C" fn(iter: *mut c_void) -> i32;
 
 // GtkWidget helper for visibility/event handling
 pub type GtkWidgetSetCanFocus = unsafe extern "C" fn(widget: *mut c_void, can_focus: i32);
@@ -278,23 +247,96 @@ pub type GtkWidgetGetHexpand = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 pub type GtkWidgetGetVexpand = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 
 // GtkEditable (GTK4 replacement for gtk_entry_get_text/set_text)
-pub type GtkEditableGetText = unsafe extern "C" fn(editable: *mut c_void) -> *const i8;
-pub type GtkEditableSetText = unsafe extern "C" fn(editable: *mut c_void, text: *const i8);
+pub type GtkEditableGetText = unsafe extern "C" fn(editable: *mut c_void) -> *const u8;
+pub type GtkEditableSetText = unsafe extern "C" fn(editable: *mut c_void, text: *const u8);
 pub type GtkEditableSetPosition = unsafe extern "C" fn(editable: *mut c_void, position: i32);
+/// `int gtk_editable_get_position(GtkEditable*)` (GTK3/GTK4).
+pub type GtkEditableGetPosition = unsafe extern "C" fn(editable: *mut c_void) -> i32;
 
 // GtkWidget parent handling
 pub type GtkWidgetUnparent = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWidgetGetParent = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
 
+// GtkWidget tree traversal
+/// `GList* gtk_container_get_children(GtkContainer*)` (GTK3). The returned list
+/// is owned by the caller and must be freed with `g_list_free`.
+pub type GtkContainerGetChildren = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
+/// `GtkWidget* gtk_menu_item_get_submenu(GtkMenuItem*)`.
+pub type GtkMenuItemGetSubmenu = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
+/// `gboolean gtk_widget_is_visible(GtkWidget*)`.
+pub type GtkWidgetIsVisible = unsafe extern "C" fn(*mut c_void) -> i32;
+/// `void g_list_free(GList*)`.
+pub type GListFree = unsafe extern "C" fn(*mut GListC);
+/// `void gtk_container_foreach(GtkContainer*, GtkCallback, gpointer)`.
+pub type GtkContainerForeach =
+    unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void, *mut c_void), *mut c_void);
+/// `void gtk_menu_item_activate(GtkMenuItem*)`.
+pub type GtkMenuItemActivate = unsafe extern "C" fn(*mut c_void);
+/// `gboolean gtk_widget_translate_coordinates(GtkWidget *src, GtkWidget *dest,
+/// gint src_x, gint src_y, gint *dest_x, gint *dest_y)`.
+pub type GtkWidgetTranslateCoordinates = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    i32,
+    i32,
+    *mut i32,
+    *mut i32,
+) -> i32;
+/// `GdkWindow *gtk_widget_get_window(GtkWidget*)`.
+pub type GtkWidgetGetWindow = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
+/// `gint gdk_window_get_origin(GdkWindow*, gint *x, gint *y)` — window origin
+/// in root/screen coordinates.
+pub type GdkWindowGetOrigin = unsafe extern "C" fn(*mut c_void, *mut i32, *mut i32) -> i32;
+
+/// `void gtk_menu_popup(GtkMenu*, GtkWidget*, GtkWidget*, GtkMenuPositionFunc,
+/// gpointer, guint, guint32)`.
+pub type GtkMenuPopup = unsafe extern "C" fn(
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    *mut c_void,
+    u32,
+    u32,
+);
+/// `GList`: `{ gpointer data; GList *next; GList *prev; }`.
+#[repr(C)]
+pub struct GListC {
+    pub data: *mut c_void,
+    pub next: *mut GListC,
+    pub prev: *mut GListC,
+}
+pub type GtkWidgetGetFirstChild = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
+pub type GtkWidgetGetNextSibling = unsafe extern "C" fn(widget: *mut c_void) -> *mut c_void;
+
+// GtkWidget activate (triggers the default action, e.g. opening a submenu popover)
+pub type GtkWidgetActivate = unsafe extern "C" fn(widget: *mut c_void);
+
+// GtkWidget get_visible — checks the widget's visible flag
+pub type GtkWidgetGetVisible = unsafe extern "C" fn(widget: *mut c_void) -> i32;
+
+// GtkWidget activate_action — activates a named action on a widget
+pub type GtkWidgetActivateAction = unsafe extern "C" fn(widget: *mut c_void, detailed_name: *const u8, parameter: *mut c_void);
+
+// GtkMenuButton (GTK4 submenu opener)
+pub type GtkMenuButtonGetLabel = unsafe extern "C" fn(button: *mut c_void) -> *const u8;
+pub type GtkMenuButtonSetActive = unsafe extern "C" fn(button: *mut c_void, active: i32);
+
 // GtkWindow default size
+/// `void gtk_window_set_transient_for(GtkWindow*, GtkWindow*)`.
+pub type GtkWindowSetTransientFor = unsafe extern "C" fn(window: *mut c_void, parent: *mut c_void);
+/// `void gtk_window_set_position(GtkWindow*, GtkWindowPosition)`.
+pub type GtkWindowSetPosition = unsafe extern "C" fn(window: *mut c_void, position: i32);
 pub type GtkWindowSetDefaultSize = unsafe extern "C" fn(window: *mut c_void, width: i32, height: i32);
+pub type GtkWindowResize = unsafe extern "C" fn(window: *mut c_void, width: i32, height: i32);
+pub type GtkWindowMove = unsafe extern "C" fn(window: *mut c_void, x: i32, y: i32);
 
 // Grid/Entry related
 pub type GtkGridNew = unsafe extern "C" fn() -> *mut c_void;
 pub type GtkGridAttach = unsafe extern "C" fn(grid: *mut c_void, child: *mut c_void, left: i32, top: i32, width: i32, height: i32);
 pub type GtkEntryNew = unsafe extern "C" fn() -> *mut c_void;
-pub type GtkEntrySetText = unsafe extern "C" fn(entry: *mut c_void, text: *const i8);
-pub type GtkEntryGetText = unsafe extern "C" fn(entry: *mut c_void) -> *const i8;
+pub type GtkEntrySetText = unsafe extern "C" fn(entry: *mut c_void, text: *const u8);
+pub type GtkEntryGetText = unsafe extern "C" fn(entry: *mut c_void) -> *const u8;
 pub type GtkEntrySetWidthChars = unsafe extern "C" fn(entry: *mut c_void, n_chars: i32);
 pub type GtkWidgetSetSizeRequest = unsafe extern "C" fn(widget: *mut c_void, width: i32, height: i32);
 pub type GtkEntrySetHasFrame = unsafe extern "C" fn(entry: *mut c_void, has_frame: i32);
@@ -305,11 +347,18 @@ pub type GtkOverlayAddOverlay = unsafe extern "C" fn(overlay: *mut c_void, widge
 pub type GtkOverlaySetOverlayPassThrough = unsafe extern "C" fn(overlay: *mut c_void, widget: *mut c_void, pass_through: i32);
 pub type GtkOverlaySetChild = unsafe extern "C" fn(overlay: *mut c_void, child: *mut c_void);
 pub type GtkWidgetSetMarginStart = unsafe extern "C" fn(widget: *mut c_void, margin: i32);
+/// `GtkWidget* gtk_fixed_new(void)`.
+pub type GtkFixedNew = unsafe extern "C" fn() -> *mut c_void;
+/// `void gtk_fixed_put(GtkFixed*, GtkWidget*, gint x, gint y)`.
+pub type GtkFixedPut = unsafe extern "C" fn(fixed: *mut c_void, child: *mut c_void, x: i32, y: i32);
+/// `void gtk_fixed_move(GtkFixed*, GtkWidget*, gint x, gint y)`.
+pub type GtkFixedMove = unsafe extern "C" fn(fixed: *mut c_void, child: *mut c_void, x: i32, y: i32);
 pub type GtkWidgetSetMarginTop = unsafe extern "C" fn(widget: *mut c_void, margin: i32);
 pub type GtkWidgetAddEvents = unsafe extern "C" fn(widget: *mut c_void, events: i32);
 
 // ScrolledWindow
 pub type GtkScrolledWindowNew = unsafe extern "C" fn(hadjustment: *mut c_void, vadjustment: *mut c_void) -> *mut c_void;
+pub type GtkScrolledWindowSetOverlayScrolling = unsafe extern "C" fn(sw: *mut c_void, overlay: i32);
 pub type GtkScrolledWindowSetPolicy = unsafe extern "C" fn(scrolled: *mut c_void, h_policy: u32, v_policy: u32);
 pub type GtkScrolledWindowSetChild = unsafe extern "C" fn(scrolled: *mut c_void, child: *mut c_void);
 
@@ -325,7 +374,7 @@ pub type GdkFrameClockBeginUpdating = unsafe extern "C" fn(clock: *mut c_void);
 pub type GdkFrameClockEndUpdating = unsafe extern "C" fn(clock: *mut c_void);
 
 // Cairo additions
-pub type CairoTextExtents = unsafe extern "C" fn(cr: *mut c_void, utf8: *const i8, extents: *mut c_void);
+pub type CairoTextExtents = unsafe extern "C" fn(cr: *mut c_void, utf8: *const u8, extents: *mut c_void);
 pub type CairoSave = unsafe extern "C" fn(cr: *mut c_void);
 pub type CairoRestore = unsafe extern "C" fn(cr: *mut c_void);
 pub type CairoClip = unsafe extern "C" fn(cr: *mut c_void);
@@ -360,12 +409,6 @@ pub struct Symbols {
     pub g_main_loop_new: Option<GMainLoopNew>,
     pub g_main_loop_run: Option<GMainLoopRun>,
     pub g_main_loop_quit: Option<GMainLoopQuit>,
-    /// Timer scheduling. Optional: a build against a libglib without these still
-    /// loads, and callers degrade (see `rustxwidgets`'s `timeout_add`). Idle
-    /// scheduling already has `g_idle_add` above.
-    pub g_timeout_add: Option<GTimeoutAdd>,
-    pub g_timeout_add_full: Option<GTimeoutAddFull>,
-    pub g_source_remove: Option<GSourceRemove>,
 
     // gobject
     pub g_object_ref: Option<GObjectRef>,
@@ -388,6 +431,8 @@ pub struct Symbols {
     pub gtk_container_remove: Option<GtkContainerRemove>,
     pub gtk_window_set_child: Option<GtkWindowSetChild>,
     pub gtk_widget_show_all: Option<GtkWidgetShowAll>,
+    pub gtk_widget_show: Option<GtkWidgetShow>,
+    pub gtk_widget_hide: Option<GtkWidgetHide>,
     pub gtk_window_present: Option<GtkWindowPresent>,
     pub gtk_window_set_application: Option<GtkWindowSetApplication>,
     pub gtk_widget_insert_action_group: Option<GtkWidgetInsertActionGroup>,
@@ -404,8 +449,8 @@ pub struct Symbols {
     pub gtk_drawing_area_new: Option<GtkDrawingAreaNew>,
     pub gtk_label_set_markup: Option<GtkLabelSetMarkup>,
     pub gtk_widget_set_visible: Option<GtkWidgetSetVisible>,
-    pub gtk_widget_set_sensitive: Option<GtkWidgetSetSensitive>,
     pub gtk_widget_grab_focus: Option<GtkWidgetGrabFocus>,
+    pub gtk_widget_has_focus: Option<GtkWidgetHasFocus>,
     pub gtk_widget_get_style_context: Option<GtkWidgetGetStyleContext>,
     pub gtk_style_context_add_class: Option<GtkStyleContextAddClass>,
     pub gtk_style_context_remove_class: Option<GtkStyleContextRemoveClass>,
@@ -417,11 +462,23 @@ pub struct Symbols {
     pub gtk_overlay_set_overlay_pass_through: Option<GtkOverlaySetOverlayPassThrough>,
     pub gtk_overlay_set_child: Option<GtkOverlaySetChild>,
     pub gtk_widget_set_margin_start: Option<GtkWidgetSetMarginStart>,
+    pub gtk_fixed_new: Option<GtkFixedNew>,
+    pub gtk_fixed_put: Option<GtkFixedPut>,
+    pub gtk_fixed_move: Option<GtkFixedMove>,
     pub gtk_widget_set_margin_top: Option<GtkWidgetSetMarginTop>,
     pub gtk_widget_add_events: Option<GtkWidgetAddEvents>,
+    pub gtk_widget_activate: Option<GtkWidgetActivate>,
+    pub gtk_widget_get_visible: Option<GtkWidgetGetVisible>,
+    pub gtk_widget_activate_action: Option<GtkWidgetActivateAction>,
     pub gtk_file_chooser_native_new: Option<GtkFileChooserNativeNew>,
     pub gtk_native_dialog_run: Option<GtkNativeDialogRun>,
     pub gtk_file_chooser_get_filename: Option<GtkFileChooserGetFilename>,
+    pub gtk_file_filter_new: Option<GtkFileFilterNew>,
+    pub gtk_file_filter_set_name: Option<GtkFileFilterSetName>,
+    pub gtk_file_filter_add_pattern: Option<GtkFileFilterAddPattern>,
+    pub gtk_file_chooser_add_filter: Option<GtkFileChooserAddFilter>,
+    pub gtk_file_chooser_set_filter: Option<GtkFileChooserSetFilter>,
+    pub gtk_file_chooser_set_current_name: Option<GtkFileChooserSetCurrentName>,
     pub gtk_widget_destroy: Option<GtkWidgetDestroy>,
     pub gtk_window_close: Option<GtkWindowClose>,
     pub g_free: Option<GFree>,
@@ -431,12 +488,14 @@ pub struct Symbols {
     pub gtk_style_context_add_provider_for_screen: Option<GtkStyleContextAddProviderForScreen>,
     pub gdk_event_get_keyval: Option<GdkEventGetKeyval>,
     pub gdk_event_get_state: Option<GdkEventGetState>,
+    pub gdk_event_get_event_type: Option<GdkEventGetEventType>,
     pub gdk_keyval_from_name: Option<GdkKeyvalFromName>,
     // application/menu/action
     pub gtk_application_new: Option<GtkApplicationNew>,
     pub g_application_run: Option<GApplicationRun>,
     pub g_application_register: Option<GApplicationRegister>,
     pub g_simple_action_new: Option<GSimpleActionNew>,
+    pub g_simple_action_group_new: Option<GSimpleActionGroupNew>,
     pub g_action_map_add_action: Option<GActionMapAddAction>,
     pub g_action_group_activate_action: Option<GActionGroupActivateAction>,
     pub g_action_map_lookup_action: Option<GActionMapLookupAction>,
@@ -449,51 +508,17 @@ pub struct Symbols {
     pub gtk_popover_menu_bar_new_from_model: Option<GtkPopoverMenuBarNewFromModel>,
     pub gtk_menu_bar_new: Option<GtkMenuBarNew>,
     pub gtk_menu_new: Option<GtkMenuNew>,
-    pub gtk_expander_new: Option<GtkExpanderNew>,
-    pub gtk_expander_set_expanded: Option<GtkExpanderSetExpanded>,
-    pub gtk_expander_get_expanded: Option<GtkExpanderGetExpanded>,
-    pub gtk_expander_set_label: Option<GtkExpanderSetLabel>,
-    pub gtk_expander_set_child: Option<GtkExpanderSetChild>,
-    pub gtk_tree_view_new: Option<GtkTreeViewNew>,
-    pub gtk_list_store_new: Option<GtkListStoreNew>,
-    pub gtk_list_store_append: Option<GtkListStoreAppend>,
-    pub gtk_list_store_clear: Option<GtkListStoreClear>,
-    pub gtk_list_store_set_valuesv: Option<GtkListStoreSetValuesv>,
-    pub gtk_tree_view_set_model: Option<GtkTreeViewSetModel>,
-    pub gtk_tree_view_append_column: Option<GtkTreeViewAppendColumn>,
-    pub gtk_tree_view_column_new_with_attributes: Option<GtkTreeViewColumnNewWithAttributes>,
-    pub gtk_tree_view_column_set_resizable: Option<GtkTreeViewColumnSetResizable>,
-    pub gtk_tree_view_column_set_expand: Option<GtkTreeViewColumnSetExpand>,
-    pub gtk_tree_view_column_set_clickable: Option<GtkTreeViewColumnSetClickable>,
-    pub gtk_tree_view_column_set_sort_column_id: Option<GtkTreeViewColumnSetSortColumnId>,
-    pub gtk_tree_sortable_set_sort_column_id: Option<GtkTreeSortableSetSortColumnId>,
-    pub gtk_tree_view_set_headers_visible: Option<GtkTreeViewSetHeadersVisible>,
-    pub gtk_cell_renderer_pixbuf_new: Option<GtkCellRendererPixbufNew>,
-    pub gtk_cell_renderer_text_new: Option<GtkCellRendererTextNew>,
-    pub gtk_tree_view_get_path_at_pos: Option<GtkTreeViewGetPathAtPos>,
-    pub gtk_tree_view_get_selection: Option<GtkTreeViewGetSelection>,
-    pub gtk_tree_path_get_indices: Option<GtkTreePathGetIndices>,
-    pub gtk_tree_path_free: Option<GtkTreePathFree>,
-    pub gtk_tree_path_new_from_indices: Option<GtkTreePathNewFromIndices>,
-    pub gtk_tree_selection_select_path: Option<GtkTreeSelectionSelectPath>,
-    pub gtk_tree_selection_get_selected: Option<GtkTreeSelectionGetSelected>,
-    pub g_value_init: Option<GValueInit>,
-    pub g_value_unset: Option<GValueUnset>,
-    pub g_value_set_string: Option<GValueSetString>,
-    pub g_value_set_object: Option<GValueSetObject>,
-    pub g_value_get_string: Option<GValueGetString>,
-    pub g_type_from_name: Option<GTypeFromName>,
-    pub gtk_icon_theme_get_default: Option<GtkIconThemeGetDefault>,
-    pub gtk_icon_theme_load_icon: Option<GtkIconThemeLoadIcon>,
     pub gtk_menu_item_new_with_label: Option<GtkMenuItemNewWithLabel>,
+    pub gtk_menu_item_new_with_mnemonic: Option<GtkMenuItemNewWithMnemonic>,
     pub gtk_menu_shell_append: Option<GtkMenuShellAppend>,
     pub gtk_menu_item_set_submenu: Option<GtkMenuItemSetSubmenu>,
     pub gtk_init: Option<GtkInit>,
     pub g_signal_emit_by_name: Option<GSignalEmitByName>,
     pub g_idle_add: Option<unsafe extern "C" fn(func: Option<unsafe extern "C" fn(*mut c_void) -> i32>, data: *mut c_void) -> u32>,
+    pub g_timeout_add: Option<unsafe extern "C" fn(interval_ms: u32, func: Option<unsafe extern "C" fn(*mut c_void) -> i32>, data: *mut c_void) -> u32>,
     // pango (optional)
     pub pango_layout_new: Option<unsafe extern "C" fn(context: *mut c_void) -> *mut c_void>,
-    pub pango_layout_set_text: Option<unsafe extern "C" fn(layout: *mut c_void, text: *const i8, len: i32)>,
+    pub pango_layout_set_text: Option<unsafe extern "C" fn(layout: *mut c_void, text: *const u8, len: i32)>,
     pub pango_layout_get_size: Option<unsafe extern "C" fn(layout: *mut c_void, width: *mut i32, height: *mut i32)>,
     // cairo surface/context helpers
     pub cairo_create: Option<unsafe extern "C" fn(surface: *mut c_void) -> *mut c_void>,
@@ -501,13 +526,26 @@ pub struct Symbols {
     pub cairo_move_to: Option<unsafe extern "C" fn(cr: *mut c_void, x: f64, y: f64)>,
     pub cairo_set_source_rgb: Option<unsafe extern "C" fn(cr: *mut c_void, r: f64, g: f64, b: f64)>,
     pub cairo_set_source_rgba: Option<unsafe extern "C" fn(cr: *mut c_void, r: f64, g: f64, b: f64, a: f64)>,
+    // Image blitting, for `DrawContext::draw_rgba_image`.
+    pub cairo_image_surface_create: Option<unsafe extern "C" fn(format: i32, width: i32, height: i32) -> *mut c_void>,
+    pub cairo_image_surface_create_for_data: Option<unsafe extern "C" fn(data: *mut u8, format: i32, width: i32, height: i32, stride: i32) -> *mut c_void>,
+    pub cairo_image_surface_get_data: Option<unsafe extern "C" fn(surface: *mut c_void) -> *mut u8>,
+    pub cairo_image_surface_get_stride: Option<unsafe extern "C" fn(surface: *mut c_void) -> i32>,
+    pub cairo_image_surface_mark_dirty: Option<unsafe extern "C" fn(surface: *mut c_void)>,
+    pub cairo_surface_destroy: Option<unsafe extern "C" fn(surface: *mut c_void)>,
+    pub cairo_set_source_surface: Option<unsafe extern "C" fn(cr: *mut c_void, surface: *mut c_void, x: f64, y: f64)>,
+    pub cairo_pattern_create_for_surface: Option<unsafe extern "C" fn(surface: *mut c_void) -> *mut c_void>,
+    pub cairo_pattern_set_filter: Option<unsafe extern "C" fn(pattern: *mut c_void, filter: i32)>,
+    pub cairo_set_source_pattern: Option<unsafe extern "C" fn(cr: *mut c_void, pattern: *mut c_void)>,
+    pub cairo_pattern_destroy: Option<unsafe extern "C" fn(pattern: *mut c_void)>,
+    pub cairo_scale: Option<unsafe extern "C" fn(cr: *mut c_void, sx: f64, sy: f64)>,
     pub cairo_rectangle: Option<unsafe extern "C" fn(cr: *mut c_void, x: f64, y: f64, w: f64, h: f64)>,
     pub cairo_fill: Option<unsafe extern "C" fn(cr: *mut c_void)>,
     pub cairo_stroke: Option<unsafe extern "C" fn(cr: *mut c_void)>,
     pub cairo_set_line_width: Option<unsafe extern "C" fn(cr: *mut c_void, w: f64)>,
-    pub cairo_select_font_face: Option<unsafe extern "C" fn(cr: *mut c_void, family: *const i8, slant: i32, weight: i32)>,
+    pub cairo_select_font_face: Option<unsafe extern "C" fn(cr: *mut c_void, family: *const u8, slant: i32, weight: i32)>,
     pub cairo_set_font_size: Option<unsafe extern "C" fn(cr: *mut c_void, size: f64)>,
-    pub cairo_show_text: Option<unsafe extern "C" fn(cr: *mut c_void, utf8: *const i8)>,
+    pub cairo_show_text: Option<unsafe extern "C" fn(cr: *mut c_void, utf8: *const u8)>,
     // widget helpers
     pub gtk_widget_queue_draw: Option<unsafe extern "C" fn(widget: *mut c_void)>,
     pub gtk_widget_set_can_focus: Option<GtkWidgetSetCanFocus>,
@@ -520,6 +558,7 @@ pub struct Symbols {
     pub gtk_widget_set_halign: Option<GtkWidgetSetHalign>,
     pub gtk_widget_set_valign: Option<GtkWidgetSetValign>,
     pub gtk_widget_get_allocated_width: Option<GtkWidgetGetAllocatedWidth>,
+    pub gtk_widget_get_width_request: Option<GtkWidgetGetWidthRequest>,
     pub gtk_widget_get_allocated_height: Option<GtkWidgetGetAllocatedHeight>,
     pub gtk_widget_get_mapped: Option<GtkWidgetGetMapped>,
     pub gtk_widget_get_display: Option<GtkWidgetGetDisplay>,
@@ -529,27 +568,14 @@ pub struct Symbols {
     pub gdk_frame_clock_begin_updating: Option<GdkFrameClockBeginUpdating>,
     pub gdk_frame_clock_end_updating: Option<GdkFrameClockEndUpdating>,
     pub gtk_gesture_click_new: Option<GtkGestureClickNew>,
-    pub gtk_menu_new_from_model: Option<GtkMenuNewFromModel>,
-    pub gtk_menu_popup_at_pointer: Option<GtkMenuPopupAtPointer>,
-    pub gtk_menu_attach_to_widget: Option<GtkMenuAttachToWidget>,
-    pub gtk_clipboard_get: Option<GtkClipboardGet>,
-    pub gtk_clipboard_set_text: Option<GtkClipboardSetText>,
-    pub gtk_clipboard_store: Option<GtkClipboardStore>,
-    pub gdk_event_get_button: Option<GdkEventGetButton>,
-    pub gtk_drag_source_set: Option<GtkDragSourceSet>,
-    pub gtk_drag_source_add_uri_targets: Option<GtkDragSourceAddUriTargets>,
-    pub gtk_drag_source_add_text_targets: Option<GtkDragSourceAddTextTargets>,
-    pub gtk_selection_data_set_uris: Option<GtkSelectionDataSetUris>,
-    pub gtk_selection_data_set_text: Option<GtkSelectionDataSetText>,
-    pub gtk_selection_data_get_target: Option<GtkSelectionDataGetTarget>,
-    pub gdk_atom_intern_static_string: Option<GdkAtomInternStaticString>,
-    pub gdk_atom_name: Option<GdkAtomName>,
     pub gtk_scrolled_window_new: Option<GtkScrolledWindowNew>,
+    pub gtk_scrolled_window_set_overlay_scrolling: Option<GtkScrolledWindowSetOverlayScrolling>,
     pub gtk_scrolled_window_set_policy: Option<GtkScrolledWindowSetPolicy>,
     pub gtk_scrolled_window_set_child: Option<GtkScrolledWindowSetChild>,
     pub gtk_scrolled_window_get_vadjustment: Option<GtkScrolledWindowGetVadjustment>,
     pub gtk_scrolled_window_get_hadjustment: Option<GtkScrolledWindowGetHadjustment>,
     pub gtk_adjustment_get_value: Option<GtkAdjustmentGetValue>,
+    pub gtk_adjustment_configure: Option<GtkAdjustmentConfigure>,
     // GMenuModel iteration (for GTK3 fallback)
     pub g_menu_model_get_n_items: Option<GMenuModelGetNItems>,
     pub g_menu_model_get_item_attribute_value: Option<GMenuModelGetItemAttributeValue>,
@@ -560,6 +586,7 @@ pub struct Symbols {
     // Dialog
     pub gtk_dialog_new: Option<GtkDialogNew>,
     pub gtk_dialog_add_button: Option<GtkDialogAddButton>,
+    pub gtk_dialog_set_default_response: Option<GtkDialogSetDefaultResponse>,
     pub gtk_dialog_get_content_area: Option<GtkDialogGetContentArea>,
     pub gtk_dialog_run: Option<GtkDialogRun>,
 
@@ -586,6 +613,7 @@ pub struct Symbols {
 
     // RadioButton
     pub gtk_radio_button_new_with_label: Option<GtkRadioButtonNewWithLabel>,
+    pub gtk_radio_button_get_group: Option<GtkRadioButtonGetGroup>,
 
     // TextView / TextArea
     pub gtk_text_view_new: Option<GtkTextViewNew>,
@@ -595,11 +623,10 @@ pub struct Symbols {
     pub gtk_text_buffer_get_text: Option<GtkTextBufferGetText>,
     pub gtk_text_buffer_get_start_iter: Option<GtkTextBufferGetStartIter>,
     pub gtk_text_buffer_get_end_iter: Option<GtkTextBufferGetEndIter>,
+    pub gtk_text_buffer_insert_at_cursor: Option<GtkTextBufferInsertAtCursor>,
     pub gtk_text_iter_copy: Option<GtkTextIterCopy>,
     pub gtk_text_iter_free: Option<GtkTextIterFree>,
     pub gtk_text_view_set_wrap_mode: Option<GtkTextViewSetWrapMode>,
-    pub gtk_text_view_get_iter_at_location: Option<GtkTextViewGetIterAtLocation>,
-    pub gtk_text_iter_get_line: Option<GtkTextIterGetLine>,
 
     // Widget helpers
     pub gtk_widget_set_hexpand: Option<GtkWidgetSetHexpand>,
@@ -611,13 +638,80 @@ pub struct Symbols {
     pub gtk_editable_get_text: Option<GtkEditableGetText>,
     pub gtk_editable_set_text: Option<GtkEditableSetText>,
     pub gtk_editable_set_position: Option<GtkEditableSetPosition>,
+    pub gtk_editable_get_position: Option<GtkEditableGetPosition>,
 
     // GtkWidget parent handling
     pub gtk_widget_unparent: Option<GtkWidgetUnparent>,
     pub gtk_widget_get_parent: Option<GtkWidgetGetParent>,
 
+    // GtkWidget tree traversal
+    pub gtk_widget_get_first_child: Option<GtkWidgetGetFirstChild>,
+    /// GTK3 equivalent of `gtk_widget_get_first_child`: the dynamic child list
+    /// of a `GtkContainer`. GTK3 has no `gtk_widget_get_first_child` at all
+    /// (verified: `nm -D libgtk-3.so.0` does not export it), so anything that
+    /// walks a widget's children must use this on GTK3 or fail outright.
+    /// `GtkWidget* gtk_menu_item_get_submenu(GtkMenuItem*)`.
+    pub gtk_menu_item_get_submenu: Option<GtkMenuItemGetSubmenu>,
+    /// `gboolean gtk_widget_is_visible(GtkWidget*)`.
+    pub gtk_widget_is_visible: Option<GtkWidgetIsVisible>,
+    pub gtk_container_get_children: Option<GtkContainerGetChildren>,
+    /// `void g_list_free(GList*)` — `gtk_container_get_children` returns an
+    /// owned list.
+    pub g_list_free: Option<GListFree>,
+    /// `void gtk_container_foreach(GtkContainer*, GtkCallback, gpointer)` — the
+    /// way to iterate a GTK3 container without freeing a GList.
+    pub gtk_container_foreach: Option<GtkContainerForeach>,
+    /// `void gtk_menu_item_activate(GtkMenuItem*)` — opens a submenu. GTK3's
+    /// `GtkMenuBar` children are `GtkMenuItem`s; there is no
+    /// `gtk_menu_shell_activate_item` shortcut for a mnemonic.
+    /// `void gtk_menu_popup(GtkMenu*, GtkWidget*, GtkWidget*, GtkMenuPositionFunc,
+    /// gpointer, guint button, guint32 activate_time)` — the GTK3 way to open a
+    /// menu programmatically.
+    ///
+    /// `gtk_menu_item_activate` does NOT do this, which is worth stating plainly
+    /// because it looks like it should: verified in a 20-line C program against
+    /// this machine's GTK3, activating a `GtkMenuItem` that has a submenu leaves
+    /// that submenu `visible=0 mapped=0` - nothing appears on screen and no
+    /// error is raised. `gtk_menu_popup` on the same menu gives `1/1`.
+    pub gtk_menu_popup: Option<GtkMenuPopup>,
+    /// Coordinates of a widget's top-left in screen space. Used to place a
+    /// context menu (a right-click on a sheet tab) at the pointer.
+    pub gtk_widget_translate_coordinates: Option<GtkWidgetTranslateCoordinates>,
+    pub gtk_widget_get_window: Option<GtkWidgetGetWindow>,
+    pub gdk_window_get_origin: Option<GdkWindowGetOrigin>,
+    pub gtk_menu_item_activate: Option<GtkMenuItemActivate>,
+    pub gtk_widget_get_next_sibling: Option<GtkWidgetGetNextSibling>,
+
+    // GtkPopoverMenuBarItem
+    pub gtk_popover_menu_bar_item_get_popover: Option<GtkPopoverMenuBarItemGetPopover>,
+    // GtkPopover
+    pub gtk_popover_get_child: Option<GtkPopoverGetChild>,
+    pub gtk_popover_new: Option<GtkPopoverNew>,
+    pub gtk_popover_set_child: Option<GtkPopoverSetChild>,
+
+    // GtkMenuButton — manual menu bar construction
+    pub gtk_menu_button_new: Option<GtkMenuButtonNew>,
+    pub gtk_menu_button_set_popover: Option<GtkMenuButtonSetPopover>,
+    pub gtk_menu_button_set_label: Option<GtkMenuButtonSetLabel>,
+        pub gtk_menu_button_set_has_frame: Option<GtkMenuButtonSetHasFrame>,
+    pub gtk_menu_button_set_primary: Option<GtkMenuButtonSetPrimary>,
+    pub gtk_button_set_has_frame: Option<GtkButtonSetHasFrame>,
+    pub gtk_widget_add_css_class: Option<GtkWidgetAddCssClass>,
+    pub gtk_menu_button_get_popover: Option<GtkMenuButtonGetPopover>,
+
+    // GtkPopoverMenu — new from model
+    pub gtk_popover_menu_new_from_model: Option<GtkPopoverMenuNewFromModel>,
+
+    // GtkMenuButton
+    pub gtk_menu_button_get_label: Option<GtkMenuButtonGetLabel>,
+    pub gtk_menu_button_set_active: Option<GtkMenuButtonSetActive>,
+
     // GtkWindow default size
+    pub gtk_window_resize: Option<GtkWindowResize>,
+    pub gtk_window_move: Option<GtkWindowMove>,
     pub gtk_window_set_default_size: Option<GtkWindowSetDefaultSize>,
+    pub gtk_window_set_transient_for: Option<GtkWindowSetTransientFor>,
+    pub gtk_window_set_position: Option<GtkWindowSetPosition>,
 
     // DrawingArea canvas (GTK4)
     pub gtk_drawing_area_set_draw_func: Option<GtkDrawingAreaSetDrawFunc>,
@@ -648,6 +742,10 @@ pub struct Symbols {
 }
 
 impl Symbols {
+    pub fn empty() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+
     pub fn load(libs: &std::collections::HashMap<String, std::sync::Arc<Library>>) -> Result<Self, Error> {
         // helper to lookup in libgtk first then glib/gobject as appropriate
         let gtk = libs.get("libgtk").expect("libgtk missing");
@@ -671,12 +769,6 @@ impl Symbols {
         let g_main_loop_new = unsafe { sym::<GMainLoopNew>(glib, "g_main_loop_new") };
         let g_main_loop_run = unsafe { sym::<GMainLoopRun>(glib, "g_main_loop_run") };
         let g_main_loop_quit = unsafe { sym::<GMainLoopQuit>(glib, "g_main_loop_quit") };
-        // Timer/idle scheduling (glib). `*_full` variants take a `notify`
-        // destructor so a boxed Rust closure can be freed deterministically; the
-        // plain ones leak it, so we prefer `_full` and fall back.
-        let g_timeout_add = unsafe { sym::<GTimeoutAdd>(glib, "g_timeout_add") };
-        let g_timeout_add_full = unsafe { sym::<GTimeoutAddFull>(glib, "g_timeout_add_full") };
-        let g_source_remove = unsafe { sym::<GSourceRemove>(glib, "g_source_remove") };
 
         // gobject
         let g_object_ref = unsafe { sym::<GObjectRef>(gobject, "g_object_ref") };
@@ -699,11 +791,19 @@ impl Symbols {
         let gtk_container_remove = unsafe { sym::<GtkContainerRemove>(gtk, "gtk_container_remove") };
         let gtk_window_set_child = unsafe { sym::<GtkWindowSetChild>(gtk, "gtk_window_set_child") };
         let gtk_widget_show_all = unsafe { sym::<GtkWidgetShowAll>(gtk, "gtk_widget_show_all") };
+        let gtk_widget_show = unsafe { sym::<GtkWidgetShow>(gtk, "gtk_widget_show") };
+        let gtk_widget_hide = unsafe { sym::<GtkWidgetHide>(gtk, "gtk_widget_hide") };
         let gtk_window_present = unsafe { sym::<GtkWindowPresent>(gtk, "gtk_window_present") };
         let _gtk_window_set_application = unsafe { sym::<GtkWindowSetApplication>(gtk, "gtk_window_set_application") };
         let gtk_file_chooser_native_new = open_sym_try!(libs, "libgio", GtkFileChooserNativeNew, "gtk_file_chooser_native_new").or_else(|| unsafe { sym::<GtkFileChooserNativeNew>(gtk, "gtk_file_chooser_native_new") });
         let gtk_native_dialog_run = open_sym_try!(libs, "libgio", GtkNativeDialogRun, "gtk_native_dialog_run").or_else(|| unsafe { sym::<GtkNativeDialogRun>(gtk, "gtk_native_dialog_run") });
         let gtk_file_chooser_get_filename = open_sym_try!(libs, "libgio", GtkFileChooserGetFilename, "gtk_file_chooser_get_filename").or_else(|| unsafe { sym::<GtkFileChooserGetFilename>(gtk, "gtk_file_chooser_get_filename") });
+        let gtk_file_filter_new = open_sym_try!(libs, "libgio", GtkFileFilterNew, "gtk_file_filter_new").or_else(|| unsafe { sym::<GtkFileFilterNew>(gtk, "gtk_file_filter_new") });
+        let gtk_file_filter_set_name = open_sym_try!(libs, "libgio", GtkFileFilterSetName, "gtk_file_filter_set_name").or_else(|| unsafe { sym::<GtkFileFilterSetName>(gtk, "gtk_file_filter_set_name") });
+        let gtk_file_filter_add_pattern = open_sym_try!(libs, "libgio", GtkFileFilterAddPattern, "gtk_file_filter_add_pattern").or_else(|| unsafe { sym::<GtkFileFilterAddPattern>(gtk, "gtk_file_filter_add_pattern") });
+        let gtk_file_chooser_add_filter = open_sym_try!(libs, "libgio", GtkFileChooserAddFilter, "gtk_file_chooser_add_filter").or_else(|| unsafe { sym::<GtkFileChooserAddFilter>(gtk, "gtk_file_chooser_add_filter") });
+        let gtk_file_chooser_set_filter = open_sym_try!(libs, "libgio", GtkFileChooserSetFilter, "gtk_file_chooser_set_filter").or_else(|| unsafe { sym::<GtkFileChooserSetFilter>(gtk, "gtk_file_chooser_set_filter") });
+        let gtk_file_chooser_set_current_name = open_sym_try!(libs, "libgio", GtkFileChooserSetCurrentName, "gtk_file_chooser_set_current_name").or_else(|| unsafe { sym::<GtkFileChooserSetCurrentName>(gtk, "gtk_file_chooser_set_current_name") });
         let gtk_widget_destroy = unsafe { sym::<GtkWidgetDestroy>(gtk, "gtk_widget_destroy") };
         let gtk_window_close = unsafe { sym::<GtkWindowClose>(gtk, "gtk_window_close") };
         let g_free = unsafe { sym::<GFree>(glib, "g_free") };
@@ -713,6 +813,7 @@ impl Symbols {
         let gtk_style_context_add_provider_for_screen = unsafe { sym::<GtkStyleContextAddProviderForScreen>(gtk, "gtk_style_context_add_provider_for_screen") };
         let gdk_event_get_keyval = open_sym_try!(libs, "libgdk", GdkEventGetKeyval, "gdk_event_get_keyval").or_else(|| unsafe { sym::<GdkEventGetKeyval>(gtk, "gdk_event_get_keyval") });
         let gdk_event_get_state = open_sym_try!(libs, "libgdk", GdkEventGetState, "gdk_event_get_state").or_else(|| unsafe { sym::<GdkEventGetState>(gtk, "gdk_event_get_state") });
+        let gdk_event_get_event_type = open_sym_try!(libs, "libgdk", GdkEventGetEventType, "gdk_event_get_event_type").or_else(|| unsafe { sym::<GdkEventGetEventType>(gtk, "gdk_event_get_event_type") });
         let gdk_keyval_from_name = open_sym_try!(libs, "libgdk", GdkKeyvalFromName, "gdk_keyval_from_name").or_else(|| unsafe { sym::<GdkKeyvalFromName>(gtk, "gdk_keyval_from_name") });
         let gtk_grid_new = unsafe { sym::<GtkGridNew>(gtk, "gtk_grid_new") };
         let gtk_grid_attach = unsafe { sym::<GtkGridAttach>(gtk, "gtk_grid_attach") };
@@ -726,8 +827,11 @@ impl Symbols {
         let gtk_drawing_area_new = unsafe { sym::<GtkDrawingAreaNew>(gtk, "gtk_drawing_area_new") };
         let gtk_label_set_markup = unsafe { sym::<GtkLabelSetMarkup>(gtk, "gtk_label_set_markup") };
         let gtk_widget_set_visible = unsafe { sym::<GtkWidgetSetVisible>(gtk, "gtk_widget_set_visible") };
-        let gtk_widget_set_sensitive = unsafe { sym::<GtkWidgetSetSensitive>(gtk, "gtk_widget_set_sensitive") };
         let gtk_widget_grab_focus = unsafe { sym::<GtkWidgetGrabFocus>(gtk, "gtk_widget_grab_focus") };
+        // Optional: a missing symbol stays None (load never fails on it)
+        // and reads as "never focused" — every caller treats None as
+        // false, so exotic builds keep today's behavior.
+        let gtk_widget_has_focus = unsafe { sym::<GtkWidgetHasFocus>(gtk, "gtk_widget_has_focus") };
         let gtk_widget_get_style_context = unsafe { sym::<GtkWidgetGetStyleContext>(gtk, "gtk_widget_get_style_context") };
         let gtk_style_context_add_class = unsafe { sym::<GtkStyleContextAddClass>(gtk, "gtk_style_context_add_class") };
         let gtk_style_context_remove_class = unsafe { sym::<GtkStyleContextRemoveClass>(gtk, "gtk_style_context_remove_class") };
@@ -739,11 +843,18 @@ impl Symbols {
         let gtk_overlay_set_overlay_pass_through = unsafe { sym::<GtkOverlaySetOverlayPassThrough>(gtk, "gtk_overlay_set_overlay_pass_through") };
         let gtk_overlay_set_child = unsafe { sym::<GtkOverlaySetChild>(gtk, "gtk_overlay_set_child") };
         let gtk_widget_set_margin_start = unsafe { sym::<GtkWidgetSetMarginStart>(gtk, "gtk_widget_set_margin_start") };
+        let gtk_fixed_new = unsafe { sym::<GtkFixedNew>(gtk, "gtk_fixed_new") };
+        let gtk_fixed_put = unsafe { sym::<GtkFixedPut>(gtk, "gtk_fixed_put") };
+        let gtk_fixed_move = unsafe { sym::<GtkFixedMove>(gtk, "gtk_fixed_move") };
         let gtk_widget_set_margin_top = unsafe { sym::<GtkWidgetSetMarginTop>(gtk, "gtk_widget_set_margin_top") };
         let gtk_widget_add_events = unsafe { sym::<GtkWidgetAddEvents>(gtk, "gtk_widget_add_events") };
+        let gtk_widget_activate = unsafe { sym::<GtkWidgetActivate>(gtk, "gtk_widget_activate") };
+        let gtk_widget_get_visible = unsafe { sym::<GtkWidgetGetVisible>(gtk, "gtk_widget_get_visible") };
+        let gtk_widget_activate_action = unsafe { sym::<GtkWidgetActivateAction>(gtk, "gtk_widget_activate_action") };
         let gtk_init = unsafe { sym::<GtkInit>(gtk, "gtk_init") };
         let g_signal_emit_by_name = unsafe { sym::<GSignalEmitByName>(gobject, "g_signal_emit_by_name") };
         let g_idle_add = unsafe { sym::<unsafe extern "C" fn(func: Option<unsafe extern "C" fn(*mut c_void) -> i32>, data: *mut c_void) -> u32>(glib, "g_idle_add") };
+        let g_timeout_add = unsafe { sym::<unsafe extern "C" fn(interval_ms: u32, func: Option<unsafe extern "C" fn(*mut c_void) -> i32>, data: *mut c_void) -> u32>(glib, "g_timeout_add") };
         // pango symbols are optional; we try to resolve them from the gtk lib too (some symbols may be available)
         let pango_layout_new = None;
         let pango_layout_set_text = None;
@@ -756,12 +867,27 @@ impl Symbols {
         let cairo_set_source_rgb = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, f64, f64, f64), "cairo_set_source_rgb").or_else(|| None);
         let cairo_set_source_rgba = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, f64, f64, f64, f64), "cairo_set_source_rgba").or_else(|| None);
         let cairo_rectangle = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, f64, f64, f64, f64), "cairo_rectangle").or_else(|| None);
+        // Image blitting for `DrawContext::draw_rgba_image`. All optional: an
+        // older libcairo without them just means the blit reports `false` and
+        // the caller falls back to vector drawing.
+        let cairo_image_surface_create = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(i32, i32, i32) -> *mut c_void, "cairo_image_surface_create").or_else(|| None);
+        let cairo_image_surface_create_for_data = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut u8, i32, i32, i32, i32) -> *mut c_void, "cairo_image_surface_create_for_data").or_else(|| None);
+        let cairo_image_surface_get_data = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void) -> *mut u8, "cairo_image_surface_get_data").or_else(|| None);
+        let cairo_image_surface_get_stride = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void) -> i32, "cairo_image_surface_get_stride").or_else(|| None);
+        let cairo_image_surface_mark_dirty = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void), "cairo_image_surface_mark_dirty").or_else(|| None);
+        let cairo_surface_destroy = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void), "cairo_surface_destroy").or_else(|| None);
+        let cairo_set_source_surface = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, *mut c_void, f64, f64), "cairo_set_source_surface").or_else(|| None);
+        let cairo_pattern_create_for_surface = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void) -> *mut c_void, "cairo_pattern_create_for_surface").or_else(|| None);
+        let cairo_pattern_set_filter = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, i32), "cairo_pattern_set_filter").or_else(|| None);
+        let cairo_set_source_pattern = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, *mut c_void), "cairo_set_source_pattern").or_else(|| None);
+        let cairo_pattern_destroy = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void), "cairo_pattern_destroy").or_else(|| None);
+        let cairo_scale = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, f64, f64), "cairo_scale").or_else(|| None);
         let cairo_fill = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void), "cairo_fill").or_else(|| None);
         let cairo_stroke = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void), "cairo_stroke").or_else(|| None);
         let cairo_set_line_width = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, f64), "cairo_set_line_width").or_else(|| None);
-        let cairo_select_font_face = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, *const i8, i32, i32), "cairo_select_font_face").or_else(|| None);
+        let cairo_select_font_face = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, *const u8, i32, i32), "cairo_select_font_face").or_else(|| None);
         let cairo_set_font_size = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, f64), "cairo_set_font_size").or_else(|| None);
-        let cairo_show_text = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, *const i8), "cairo_show_text").or_else(|| None);
+        let cairo_show_text = open_sym_try!(libs, "libcairo", unsafe extern "C" fn(*mut c_void, *const u8), "cairo_show_text").or_else(|| None);
         let cairo_text_extents = open_sym_try!(libs, "libcairo", CairoTextExtents, "cairo_text_extents").or_else(|| None);
         let cairo_save = open_sym_try!(libs, "libcairo", CairoSave, "cairo_save").or_else(|| None);
         let cairo_restore = open_sym_try!(libs, "libcairo", CairoRestore, "cairo_restore").or_else(|| None);
@@ -787,10 +913,10 @@ impl Symbols {
         let gtk_event_controller_focus_new = unsafe { sym::<GtkEventControllerFocusNew>(gtk, "gtk_event_controller_focus_new") };
         let gtk_widget_add_controller = unsafe { sym::<GtkWidgetAddController>(gtk, "gtk_widget_add_controller") };
         let gtk_event_controller_set_propagation_phase = unsafe { sym::<GtkEventControllerSetPropagationPhase>(gtk, "gtk_event_controller_set_propagation_phase") };
-        let gtk_widget_set_can_target = unsafe { sym::<GtkWidgetSetCanTarget>(gtk, "gtk_widget_set_can_target") };
         let gtk_widget_set_halign = unsafe { sym::<GtkWidgetSetHalign>(gtk, "gtk_widget_set_halign") };
         let gtk_widget_set_valign = unsafe { sym::<GtkWidgetSetValign>(gtk, "gtk_widget_set_valign") };
         let gtk_widget_get_allocated_width = unsafe { sym::<GtkWidgetGetAllocatedWidth>(gtk, "gtk_widget_get_allocated_width") };
+        let gtk_widget_get_width_request = unsafe { sym::<GtkWidgetGetWidthRequest>(gtk, "gtk_widget_get_width_request") };
         let gtk_widget_get_allocated_height = unsafe { sym::<GtkWidgetGetAllocatedHeight>(gtk, "gtk_widget_get_allocated_height") };
         let gtk_widget_get_mapped = unsafe { sym::<GtkWidgetGetMapped>(gtk, "gtk_widget_get_mapped") };
         let gtk_widget_get_display = unsafe { sym::<GtkWidgetGetDisplay>(gtk, "gtk_widget_get_display") };
@@ -800,27 +926,14 @@ impl Symbols {
         let gdk_frame_clock_begin_updating = unsafe { sym::<GdkFrameClockBeginUpdating>(gtk, "gdk_frame_clock_begin_updating") };
         let gdk_frame_clock_end_updating = unsafe { sym::<GdkFrameClockEndUpdating>(gtk, "gdk_frame_clock_end_updating") };
         let gtk_gesture_click_new = unsafe { sym::<GtkGestureClickNew>(gtk, "gtk_gesture_click_new") };
-        let gtk_menu_new_from_model = unsafe { sym::<GtkMenuNewFromModel>(gtk, "gtk_menu_new_from_model") };
-        let gtk_menu_popup_at_pointer = unsafe { sym::<GtkMenuPopupAtPointer>(gtk, "gtk_menu_popup_at_pointer") };
-        let gtk_menu_attach_to_widget = unsafe { sym::<GtkMenuAttachToWidget>(gtk, "gtk_menu_attach_to_widget") };
-        let gtk_clipboard_get = unsafe { sym::<GtkClipboardGet>(gtk, "gtk_clipboard_get") };
-        let gtk_clipboard_set_text = unsafe { sym::<GtkClipboardSetText>(gtk, "gtk_clipboard_set_text") };
-        let gtk_clipboard_store = unsafe { sym::<GtkClipboardStore>(gtk, "gtk_clipboard_store") };
-        let gdk_event_get_button = open_sym_try!(libs, "libgdk", GdkEventGetButton, "gdk_event_get_button").or_else(|| unsafe { sym::<GdkEventGetButton>(gtk, "gdk_event_get_button") });
-        let gtk_drag_source_set = unsafe { sym::<GtkDragSourceSet>(gtk, "gtk_drag_source_set") };
-        let gtk_drag_source_add_uri_targets = unsafe { sym::<GtkDragSourceAddUriTargets>(gtk, "gtk_drag_source_add_uri_targets") };
-        let gtk_drag_source_add_text_targets = unsafe { sym::<GtkDragSourceAddTextTargets>(gtk, "gtk_drag_source_add_text_targets") };
-        let gtk_selection_data_set_uris = unsafe { sym::<GtkSelectionDataSetUris>(gtk, "gtk_selection_data_set_uris") };
-        let gtk_selection_data_set_text = unsafe { sym::<GtkSelectionDataSetText>(gtk, "gtk_selection_data_set_text") };
-        let gtk_selection_data_get_target = unsafe { sym::<GtkSelectionDataGetTarget>(gtk, "gtk_selection_data_get_target") };
-        let gdk_atom_intern_static_string = open_sym_try!(libs, "libgdk", GdkAtomInternStaticString, "gdk_atom_intern_static_string").or_else(|| unsafe { sym::<GdkAtomInternStaticString>(gtk, "gdk_atom_intern_static_string") });
-        let gdk_atom_name = open_sym_try!(libs, "libgdk", GdkAtomName, "gdk_atom_name").or_else(|| unsafe { sym::<GdkAtomName>(gtk, "gdk_atom_name") });
         let gtk_scrolled_window_new = unsafe { sym::<GtkScrolledWindowNew>(gtk, "gtk_scrolled_window_new") };
+        let gtk_scrolled_window_set_overlay_scrolling = unsafe { sym::<GtkScrolledWindowSetOverlayScrolling>(gtk, "gtk_scrolled_window_set_overlay_scrolling") };
         let gtk_scrolled_window_set_policy = unsafe { sym::<GtkScrolledWindowSetPolicy>(gtk, "gtk_scrolled_window_set_policy") };
         let gtk_scrolled_window_set_child = unsafe { sym::<GtkScrolledWindowSetChild>(gtk, "gtk_scrolled_window_set_child") };
         let gtk_scrolled_window_get_vadjustment = unsafe { sym::<GtkScrolledWindowGetVadjustment>(gtk, "gtk_scrolled_window_get_vadjustment") };
         let gtk_scrolled_window_get_hadjustment = unsafe { sym::<GtkScrolledWindowGetHadjustment>(gtk, "gtk_scrolled_window_get_hadjustment") };
         let gtk_adjustment_get_value = unsafe { sym::<GtkAdjustmentGetValue>(gtk, "gtk_adjustment_get_value") };
+        let gtk_adjustment_configure = unsafe { sym::<GtkAdjustmentConfigure>(gtk, "gtk_adjustment_configure") };
 
         // application/menu/action symbols (try glib/gio)
         // try gio first then glib for the app/menu symbols
@@ -828,6 +941,7 @@ impl Symbols {
         let g_application_run = open_sym_try!(libs, "libgio", GApplicationRun, "g_application_run").or_else(|| unsafe { sym::<GApplicationRun>(glib, "g_application_run") });
         let g_application_register = open_sym_try!(libs, "libgio", GApplicationRegister, "g_application_register").or_else(|| unsafe { sym::<GApplicationRegister>(glib, "g_application_register") });
         let g_simple_action_new = open_sym_try!(libs, "libgio", GSimpleActionNew, "g_simple_action_new").or_else(|| unsafe { sym::<GSimpleActionNew>(glib, "g_simple_action_new") });
+        let g_simple_action_group_new = open_sym_try!(libs, "libgio", GSimpleActionGroupNew, "g_simple_action_group_new").or_else(|| unsafe { sym::<GSimpleActionGroupNew>(glib, "g_simple_action_group_new") });
         let g_action_map_add_action = open_sym_try!(libs, "libgio", GActionMapAddAction, "g_action_map_add_action").or_else(|| unsafe { sym::<GActionMapAddAction>(glib, "g_action_map_add_action") });
         let g_action_group_activate_action = open_sym_try!(libs, "libgio", GActionGroupActivateAction, "g_action_group_activate_action").or_else(|| unsafe { sym::<GActionGroupActivateAction>(glib, "g_action_group_activate_action") });
         let g_action_map_lookup_action = open_sym_try!(libs, "libgio", GActionMapLookupAction, "g_action_map_lookup_action").or_else(|| unsafe { sym::<GActionMapLookupAction>(glib, "g_action_map_lookup_action") });
@@ -840,43 +954,8 @@ impl Symbols {
         let gtk_popover_menu_bar_new_from_model = unsafe { sym::<GtkPopoverMenuBarNewFromModel>(gtk, "gtk_popover_menu_bar_new_from_model") };
         let gtk_menu_bar_new = unsafe { sym::<GtkMenuBarNew>(gtk, "gtk_menu_bar_new") };
         let gtk_menu_new = unsafe { sym::<GtkMenuNew>(gtk, "gtk_menu_new") };
-        let gtk_expander_new = unsafe { sym::<GtkExpanderNew>(gtk, "gtk_expander_new") };
-        let gtk_expander_set_expanded = unsafe { sym::<GtkExpanderSetExpanded>(gtk, "gtk_expander_set_expanded") };
-        let gtk_expander_get_expanded = unsafe { sym::<GtkExpanderGetExpanded>(gtk, "gtk_expander_get_expanded") };
-        let gtk_expander_set_label = unsafe { sym::<GtkExpanderSetLabel>(gtk, "gtk_expander_set_label") };
-        let gtk_expander_set_child = unsafe { sym::<GtkExpanderSetChild>(gtk, "gtk_expander_set_child") };
-        let gtk_tree_view_new = unsafe { sym::<GtkTreeViewNew>(gtk, "gtk_tree_view_new") };
-        let gtk_list_store_new = unsafe { sym::<GtkListStoreNew>(gtk, "gtk_list_store_new") };
-        let gtk_list_store_append = unsafe { sym::<GtkListStoreAppend>(gtk, "gtk_list_store_append") };
-        let gtk_list_store_clear = unsafe { sym::<GtkListStoreClear>(gtk, "gtk_list_store_clear") };
-        let gtk_list_store_set_valuesv = unsafe { sym::<GtkListStoreSetValuesv>(gtk, "gtk_list_store_set_valuesv") };
-        let gtk_tree_view_set_model = unsafe { sym::<GtkTreeViewSetModel>(gtk, "gtk_tree_view_set_model") };
-        let gtk_tree_view_append_column = unsafe { sym::<GtkTreeViewAppendColumn>(gtk, "gtk_tree_view_append_column") };
-        let gtk_tree_view_column_new_with_attributes = unsafe { sym::<GtkTreeViewColumnNewWithAttributes>(gtk, "gtk_tree_view_column_new_with_attributes") };
-        let gtk_tree_view_column_set_resizable = unsafe { sym::<GtkTreeViewColumnSetResizable>(gtk, "gtk_tree_view_column_set_resizable") };
-        let gtk_tree_view_column_set_expand = unsafe { sym::<GtkTreeViewColumnSetExpand>(gtk, "gtk_tree_view_column_set_expand") };
-        let gtk_tree_view_column_set_clickable = unsafe { sym::<GtkTreeViewColumnSetClickable>(gtk, "gtk_tree_view_column_set_clickable") };
-        let gtk_tree_view_column_set_sort_column_id = unsafe { sym::<GtkTreeViewColumnSetSortColumnId>(gtk, "gtk_tree_view_column_set_sort_column_id") };
-        let gtk_tree_sortable_set_sort_column_id = unsafe { sym::<GtkTreeSortableSetSortColumnId>(gtk, "gtk_tree_sortable_set_sort_column_id") };
-        let gtk_tree_view_set_headers_visible = unsafe { sym::<GtkTreeViewSetHeadersVisible>(gtk, "gtk_tree_view_set_headers_visible") };
-        let gtk_cell_renderer_pixbuf_new = unsafe { sym::<GtkCellRendererPixbufNew>(gtk, "gtk_cell_renderer_pixbuf_new") };
-        let gtk_cell_renderer_text_new = unsafe { sym::<GtkCellRendererTextNew>(gtk, "gtk_cell_renderer_text_new") };
-        let gtk_tree_view_get_path_at_pos = unsafe { sym::<GtkTreeViewGetPathAtPos>(gtk, "gtk_tree_view_get_path_at_pos") };
-        let gtk_tree_view_get_selection = unsafe { sym::<GtkTreeViewGetSelection>(gtk, "gtk_tree_view_get_selection") };
-        let gtk_tree_path_get_indices = unsafe { sym::<GtkTreePathGetIndices>(gtk, "gtk_tree_path_get_indices") };
-        let gtk_tree_path_free = unsafe { sym::<GtkTreePathFree>(gtk, "gtk_tree_path_free") };
-        let gtk_tree_path_new_from_indices = unsafe { sym::<GtkTreePathNewFromIndices>(gtk, "gtk_tree_path_new_from_indices") };
-        let gtk_tree_selection_select_path = unsafe { sym::<GtkTreeSelectionSelectPath>(gtk, "gtk_tree_selection_select_path") };
-        let gtk_tree_selection_get_selected = unsafe { sym::<GtkTreeSelectionGetSelected>(gtk, "gtk_tree_selection_get_selected") };
-        let g_value_init = unsafe { sym::<GValueInit>(gobject, "g_value_init") };
-        let g_value_unset = unsafe { sym::<GValueUnset>(gobject, "g_value_unset") };
-        let g_value_set_string = unsafe { sym::<GValueSetString>(gobject, "g_value_set_string") };
-        let g_value_set_object = unsafe { sym::<GValueSetObject>(gobject, "g_value_set_object") };
-        let g_value_get_string = unsafe { sym::<GValueGetString>(gobject, "g_value_get_string") };
-        let g_type_from_name = unsafe { sym::<GTypeFromName>(gobject, "g_type_from_name") };
-        let gtk_icon_theme_get_default = unsafe { sym::<GtkIconThemeGetDefault>(gtk, "gtk_icon_theme_get_default") };
-        let gtk_icon_theme_load_icon = unsafe { sym::<GtkIconThemeLoadIcon>(gtk, "gtk_icon_theme_load_icon") };
         let gtk_menu_item_new_with_label = unsafe { sym::<GtkMenuItemNewWithLabel>(gtk, "gtk_menu_item_new_with_label") };
+        let gtk_menu_item_new_with_mnemonic = unsafe { sym::<GtkMenuItemNewWithMnemonic>(gtk, "gtk_menu_item_new_with_mnemonic") };
         let gtk_menu_shell_append = unsafe { sym::<GtkMenuShellAppend>(gtk, "gtk_menu_shell_append") };
         let gtk_menu_item_set_submenu = unsafe { sym::<GtkMenuItemSetSubmenu>(gtk, "gtk_menu_item_set_submenu") };
         let gtk_window_set_application = unsafe { sym::<GtkWindowSetApplication>(gtk, "gtk_window_set_application") };
@@ -891,6 +970,7 @@ impl Symbols {
         // Dialog
         let gtk_dialog_new = unsafe { sym::<GtkDialogNew>(gtk, "gtk_dialog_new") };
         let gtk_dialog_add_button = unsafe { sym::<GtkDialogAddButton>(gtk, "gtk_dialog_add_button") };
+        let gtk_dialog_set_default_response = unsafe { sym::<GtkDialogSetDefaultResponse>(gtk, "gtk_dialog_set_default_response") };
         let gtk_dialog_get_content_area = unsafe { sym::<GtkDialogGetContentArea>(gtk, "gtk_dialog_get_content_area") };
         let gtk_dialog_run = unsafe { sym::<GtkDialogRun>(gtk, "gtk_dialog_run") };
 
@@ -917,6 +997,7 @@ impl Symbols {
 
         // RadioButton
         let gtk_radio_button_new_with_label = unsafe { sym::<GtkRadioButtonNewWithLabel>(gtk, "gtk_radio_button_new_with_label") };
+        let gtk_radio_button_get_group = unsafe { sym::<GtkRadioButtonGetGroup>(gtk, "gtk_radio_button_get_group") };
 
         // TextView / TextArea
         let gtk_text_view_new = unsafe { sym::<GtkTextViewNew>(gtk, "gtk_text_view_new") };
@@ -926,11 +1007,10 @@ impl Symbols {
         let gtk_text_buffer_get_text = unsafe { sym::<GtkTextBufferGetText>(gtk, "gtk_text_buffer_get_text") };
         let gtk_text_buffer_get_start_iter = unsafe { sym::<GtkTextBufferGetStartIter>(gtk, "gtk_text_buffer_get_start_iter") };
         let gtk_text_buffer_get_end_iter = unsafe { sym::<GtkTextBufferGetEndIter>(gtk, "gtk_text_buffer_get_end_iter") };
+        let gtk_text_buffer_insert_at_cursor = unsafe { sym::<GtkTextBufferInsertAtCursor>(gtk, "gtk_text_buffer_insert_at_cursor") };
         let gtk_text_iter_copy = unsafe { sym::<GtkTextIterCopy>(gtk, "gtk_text_iter_copy") };
         let gtk_text_iter_free = unsafe { sym::<GtkTextIterFree>(gtk, "gtk_text_iter_free") };
         let gtk_text_view_set_wrap_mode = unsafe { sym::<GtkTextViewSetWrapMode>(gtk, "gtk_text_view_set_wrap_mode") };
-        let gtk_text_view_get_iter_at_location = unsafe { sym::<GtkTextViewGetIterAtLocation>(gtk, "gtk_text_view_get_iter_at_location") };
-        let gtk_text_iter_get_line = unsafe { sym::<GtkTextIterGetLine>(gtk, "gtk_text_iter_get_line") };
 
         // Widget helpers
         let gtk_widget_set_hexpand = unsafe { sym::<GtkWidgetSetHexpand>(gtk, "gtk_widget_set_hexpand") };
@@ -942,51 +1022,102 @@ impl Symbols {
         let gtk_editable_get_text = unsafe { sym::<GtkEditableGetText>(gtk, "gtk_editable_get_text") };
         let gtk_editable_set_text = unsafe { sym::<GtkEditableSetText>(gtk, "gtk_editable_set_text") };
         let gtk_editable_set_position = unsafe { sym::<GtkEditableSetPosition>(gtk, "gtk_editable_set_position") };
+        let gtk_editable_get_position = unsafe { sym::<GtkEditableGetPosition>(gtk, "gtk_editable_get_position") };
 
         // GtkWidget parent handling
         let gtk_widget_unparent = unsafe { sym::<GtkWidgetUnparent>(gtk, "gtk_widget_unparent") };
         let gtk_widget_get_parent = unsafe { sym::<GtkWidgetGetParent>(gtk, "gtk_widget_get_parent") };
 
+        // GtkWidget tree traversal
+        let gtk_widget_get_first_child = unsafe { sym::<GtkWidgetGetFirstChild>(gtk, "gtk_widget_get_first_child") };
+        let gtk_container_get_children = unsafe { sym::<GtkContainerGetChildren>(gtk, "gtk_container_get_children") };
+        let gtk_menu_item_get_submenu = unsafe { sym::<GtkMenuItemGetSubmenu>(gtk, "gtk_menu_item_get_submenu") };
+        let gtk_widget_is_visible = unsafe { sym::<GtkWidgetIsVisible>(gtk, "gtk_widget_is_visible") };
+        let g_list_free = unsafe { sym::<GListFree>(gtk, "g_list_free") };
+        let gtk_container_foreach = unsafe { sym::<GtkContainerForeach>(gtk, "gtk_container_foreach") };
+        let gtk_menu_item_activate = unsafe { sym::<GtkMenuItemActivate>(gtk, "gtk_menu_item_activate") };
+        let gtk_menu_popup = unsafe { sym::<GtkMenuPopup>(gtk, "gtk_menu_popup") };
+        let gtk_widget_get_next_sibling = unsafe { sym::<GtkWidgetGetNextSibling>(gtk, "gtk_widget_get_next_sibling") };
+        // Screen-space placement of a context menu. `gtk_widget_get_window`
+        // and `gdk_window_get_origin` live in different libraries, like the
+        // other Gdk calls, so each is resolved with a fallback.
+        let gtk_widget_translate_coordinates =
+            unsafe { sym::<GtkWidgetTranslateCoordinates>(gtk, "gtk_widget_translate_coordinates") };
+        let gtk_widget_get_window = unsafe { sym::<GtkWidgetGetWindow>(gtk, "gtk_widget_get_window") };
+        // All three resolve from libgtk-3 (verified with nm -D): GTK3 links
+        // against GDK directly, so there is no separate libgdk to search.
+        let gdk_window_get_origin = unsafe { sym::<GdkWindowGetOrigin>(gtk, "gdk_window_get_origin") };
+
+        // GtkPopoverMenuBarItem
+        let gtk_popover_menu_bar_item_get_popover = unsafe { sym::<GtkPopoverMenuBarItemGetPopover>(gtk, "gtk_popover_menu_bar_item_get_popover") };
+        // GtkPopover
+        let gtk_popover_get_child = unsafe { sym::<GtkPopoverGetChild>(gtk, "gtk_popover_get_child") };
+        let gtk_popover_new = unsafe { sym::<GtkPopoverNew>(gtk, "gtk_popover_new") };
+        let gtk_popover_set_child = unsafe { sym::<GtkPopoverSetChild>(gtk, "gtk_popover_set_child") };
+
+        // GtkMenuButton — manual menu bar construction
+        let gtk_menu_button_new = unsafe { sym::<GtkMenuButtonNew>(gtk, "gtk_menu_button_new") };
+        let gtk_menu_button_set_popover = unsafe { sym::<GtkMenuButtonSetPopover>(gtk, "gtk_menu_button_set_popover") };
+        let gtk_menu_button_set_label = unsafe { sym::<GtkMenuButtonSetLabel>(gtk, "gtk_menu_button_set_label") };
+                let gtk_menu_button_set_has_frame = unsafe { sym::<GtkMenuButtonSetHasFrame>(gtk, "gtk_menu_button_set_has_frame") };
+        let gtk_menu_button_set_primary = unsafe { sym::<GtkMenuButtonSetPrimary>(gtk, "gtk_menu_button_set_primary") };
+        let gtk_button_set_has_frame = unsafe { sym::<GtkButtonSetHasFrame>(gtk, "gtk_button_set_has_frame") };
+        let gtk_widget_add_css_class = unsafe { sym::<GtkWidgetAddCssClass>(gtk, "gtk_widget_add_css_class") };
+        let gtk_menu_button_get_popover = unsafe { sym::<GtkMenuButtonGetPopover>(gtk, "gtk_menu_button_get_popover") };
+        let gtk_widget_set_can_target = unsafe { sym::<GtkWidgetSetCanTarget>(gtk, "gtk_widget_set_can_target") };
+
+        // GtkPopoverMenu — new from model
+        let gtk_popover_menu_new_from_model = unsafe { sym::<GtkPopoverMenuNewFromModel>(gtk, "gtk_popover_menu_new_from_model") };
+
+        // GtkMenuButton
+        let gtk_menu_button_get_label = unsafe { sym::<GtkMenuButtonGetLabel>(gtk, "gtk_menu_button_get_label") };
+        let gtk_menu_button_set_active = unsafe { sym::<GtkMenuButtonSetActive>(gtk, "gtk_menu_button_set_active") };
+
         // GtkWindow default size
+        let gtk_window_resize = unsafe { sym::<GtkWindowResize>(gtk, "gtk_window_resize") };
+        let gtk_window_move = unsafe { sym::<GtkWindowMove>(gtk, "gtk_window_move") };
         let gtk_window_set_default_size = unsafe { sym::<GtkWindowSetDefaultSize>(gtk, "gtk_window_set_default_size") };
+        let gtk_window_set_transient_for = unsafe { sym::<GtkWindowSetTransientFor>(gtk, "gtk_window_set_transient_for") };
+        let gtk_window_set_position = unsafe { sym::<GtkWindowSetPosition>(gtk, "gtk_window_set_position") };
 
         Ok(Symbols {
             g_main_loop_new, g_main_loop_run, g_main_loop_quit,
-            g_timeout_add, g_timeout_add_full, g_source_remove,
             g_object_ref, g_object_unref, g_object_ref_sink, g_signal_connect_data, g_signal_connect,
             gtk_window_new, gtk_window_set_title, gtk_button_new_with_label, gtk_label_new, gtk_label_set_text,
             gtk_box_new, gtk_box_append, gtk_box_pack_start, gtk_container_add, gtk_container_remove, gtk_window_set_child,
-            gtk_widget_show_all, gtk_window_present,
+            gtk_widget_show_all, gtk_widget_show, gtk_widget_hide, gtk_window_present,
             gtk_grid_new, gtk_grid_attach, gtk_entry_new, gtk_entry_set_text, gtk_entry_get_text,
             gtk_entry_set_width_chars, gtk_widget_set_size_request, gtk_entry_set_has_frame,
-            gtk_label_set_markup, gtk_widget_set_visible, gtk_widget_set_sensitive, gtk_widget_grab_focus,
+            gtk_label_set_markup, gtk_widget_set_visible, gtk_widget_grab_focus, gtk_widget_has_focus,
             gtk_widget_get_style_context, gtk_style_context_add_class, gtk_style_context_remove_class,
             gtk_css_provider_new, gtk_css_provider_load_from_data, gtk_style_context_add_provider,
             gtk_overlay_new, gtk_overlay_add_overlay, gtk_overlay_set_overlay_pass_through, gtk_overlay_set_child,
             gtk_widget_set_margin_start, gtk_widget_set_margin_top, gtk_widget_add_events,
+            gtk_fixed_new, gtk_fixed_put, gtk_fixed_move,
+            gtk_widget_activate, gtk_widget_get_visible, gtk_widget_activate_action,
             gtk_init,
             g_signal_emit_by_name,
             gtk_label_get_text,
             gtk_entry_set_editable,
             gtk_drawing_area_new,
-            g_idle_add,
+            g_idle_add, g_timeout_add,
             pango_layout_new, pango_layout_set_text, pango_layout_get_size,
             cairo_create, cairo_font_face_destroy,
             cairo_move_to, cairo_set_source_rgb, cairo_set_source_rgba, cairo_rectangle, cairo_fill, cairo_stroke, cairo_set_line_width, cairo_select_font_face, cairo_set_font_size, cairo_show_text,
+            cairo_image_surface_create, cairo_image_surface_create_for_data, cairo_image_surface_get_data, cairo_image_surface_get_stride, cairo_image_surface_mark_dirty, cairo_surface_destroy, cairo_set_source_surface, cairo_pattern_create_for_surface, cairo_pattern_set_filter, cairo_set_source_pattern, cairo_pattern_destroy, cairo_scale,
             gtk_widget_queue_draw,
             gtk_widget_set_can_focus,
-            gtk_file_chooser_native_new, gtk_native_dialog_run, gtk_file_chooser_get_filename, gtk_widget_destroy, gtk_window_close, g_free, gdk_display_get_default, gdk_screen_get_default, gtk_style_context_add_provider_for_display, gtk_style_context_add_provider_for_screen, gdk_event_get_keyval, gdk_event_get_state, gdk_keyval_from_name,
-            gtk_application_new, g_application_run, g_application_register, g_simple_action_new, g_action_map_add_action, g_action_group_activate_action, g_action_map_lookup_action, g_action_activate,
-            g_menu_new, g_menu_append, g_application_set_app_menu, g_application_set_menubar, g_menu_append_submenu, gtk_popover_menu_bar_new_from_model, gtk_menu_bar_new, gtk_menu_new, gtk_expander_new, gtk_expander_set_expanded, gtk_expander_get_expanded, gtk_expander_set_label, gtk_expander_set_child, gtk_tree_view_new, gtk_list_store_new, gtk_list_store_append, gtk_list_store_clear, gtk_list_store_set_valuesv, gtk_tree_view_set_model, gtk_tree_view_append_column, gtk_tree_view_column_new_with_attributes, gtk_tree_view_column_set_resizable, gtk_tree_view_column_set_expand, gtk_tree_view_column_set_clickable, gtk_tree_view_column_set_sort_column_id, gtk_tree_sortable_set_sort_column_id, gtk_tree_view_set_headers_visible, gtk_cell_renderer_pixbuf_new, gtk_cell_renderer_text_new, gtk_tree_view_get_path_at_pos, gtk_tree_view_get_selection, gtk_tree_path_get_indices, gtk_tree_path_free, gtk_tree_path_new_from_indices, gtk_tree_selection_select_path, gtk_tree_selection_get_selected, g_value_init, g_value_unset, g_value_set_string, g_value_set_object, g_value_get_string, g_type_from_name, gtk_icon_theme_get_default, gtk_icon_theme_load_icon, gtk_menu_item_new_with_label, gtk_menu_shell_append, gtk_menu_item_set_submenu, gtk_window_set_application, gtk_widget_insert_action_group, gtk_actionable_set_detailed_action_name, g_menu_model_get_n_items, g_menu_model_get_item_attribute_value, g_menu_model_get_item_link, g_variant_get_string, g_variant_unref,
+            gtk_file_chooser_native_new, gtk_native_dialog_run, gtk_file_chooser_get_filename, gtk_file_filter_new, gtk_file_filter_set_name, gtk_file_filter_add_pattern, gtk_file_chooser_add_filter, gtk_file_chooser_set_filter, gtk_file_chooser_set_current_name, gtk_widget_destroy, gtk_window_close, g_free, gdk_display_get_default, gdk_screen_get_default, gtk_style_context_add_provider_for_display, gtk_style_context_add_provider_for_screen, gdk_event_get_keyval, gdk_event_get_state, gdk_event_get_event_type, gdk_keyval_from_name,
+            gtk_application_new, g_application_run, g_application_register, g_simple_action_new, g_simple_action_group_new, g_action_map_add_action, g_action_group_activate_action, g_action_map_lookup_action, g_action_activate,
+            g_menu_new, g_menu_append, g_application_set_app_menu, g_application_set_menubar, g_menu_append_submenu, gtk_popover_menu_bar_new_from_model, gtk_menu_bar_new, gtk_menu_new, gtk_menu_item_new_with_label, gtk_menu_item_new_with_mnemonic, gtk_menu_shell_append, gtk_menu_item_set_submenu, gtk_window_set_application, gtk_widget_insert_action_group, gtk_actionable_set_detailed_action_name, g_menu_model_get_n_items, g_menu_model_get_item_attribute_value, g_menu_model_get_item_link, g_variant_get_string, g_variant_unref,
             gtk_label_set_xalign,
             gtk_event_controller_key_new,
             gtk_event_controller_focus_new,
             gtk_widget_add_controller,
             gtk_event_controller_set_propagation_phase,
-            gtk_widget_set_can_target,
             gtk_widget_set_halign,
             gtk_widget_set_valign,
-            gtk_widget_get_allocated_width,
+            gtk_widget_get_allocated_width, gtk_widget_get_width_request,
             gtk_widget_get_allocated_height,
             gtk_widget_get_mapped,
             gtk_widget_get_display,
@@ -996,38 +1127,35 @@ impl Symbols {
             gdk_frame_clock_begin_updating,
             gdk_frame_clock_end_updating,
             gtk_gesture_click_new,
-            gtk_menu_new_from_model,
-            gtk_menu_popup_at_pointer,
-            gtk_menu_attach_to_widget,
-            gtk_clipboard_get,
-            gtk_clipboard_set_text,
-            gtk_clipboard_store,
-            gdk_event_get_button,
-            gtk_drag_source_set,
-            gtk_drag_source_add_uri_targets,
-            gtk_drag_source_add_text_targets,
-            gtk_selection_data_set_uris,
-            gtk_selection_data_set_text,
-            gtk_selection_data_get_target,
-            gdk_atom_intern_static_string,
-            gdk_atom_name,
-            gtk_scrolled_window_new,
+            gtk_scrolled_window_new, gtk_scrolled_window_set_overlay_scrolling,
             gtk_scrolled_window_set_policy,
             gtk_scrolled_window_set_child,
             gtk_scrolled_window_get_vadjustment,
             gtk_scrolled_window_get_hadjustment,
-            gtk_adjustment_get_value,
-            gtk_dialog_new, gtk_dialog_add_button, gtk_dialog_get_content_area, gtk_dialog_run,
+            gtk_adjustment_get_value, gtk_adjustment_configure,
+            gtk_dialog_new, gtk_dialog_add_button, gtk_dialog_set_default_response, gtk_dialog_get_content_area, gtk_dialog_run,
             gtk_combo_box_text_new, gtk_combo_box_text_append_text, gtk_combo_box_text_get_active_text, gtk_combo_box_set_active, gtk_combo_box_get_active,
             gtk_drop_down_new, gtk_drop_down_set_selected, gtk_drop_down_get_selected, gtk_string_list_new,
             gtk_check_button_new_with_label, gtk_check_button_get_active, gtk_check_button_set_active, gtk_check_button_set_group, gtk_toggle_button_get_active, gtk_toggle_button_set_active,
-            gtk_radio_button_new_with_label,
-            gtk_text_view_new, gtk_text_buffer_new, gtk_text_view_get_buffer, gtk_text_buffer_set_text, gtk_text_buffer_get_text, gtk_text_buffer_get_start_iter, gtk_text_buffer_get_end_iter, gtk_text_iter_copy, gtk_text_iter_free, gtk_text_view_set_wrap_mode, gtk_text_view_get_iter_at_location, gtk_text_iter_get_line,
+            gtk_radio_button_new_with_label, gtk_radio_button_get_group,
+            gtk_text_view_new, gtk_text_buffer_new, gtk_text_view_get_buffer, gtk_text_buffer_set_text, gtk_text_buffer_get_text, gtk_text_buffer_get_start_iter, gtk_text_buffer_get_end_iter, gtk_text_buffer_insert_at_cursor, gtk_text_iter_copy, gtk_text_iter_free, gtk_text_view_set_wrap_mode,
             gtk_widget_set_hexpand, gtk_widget_set_vexpand,
             gtk_widget_get_hexpand, gtk_widget_get_vexpand,
             gtk_editable_get_text, gtk_editable_set_text, gtk_editable_set_position,
+            gtk_editable_get_position,
             gtk_widget_unparent, gtk_widget_get_parent,
-            gtk_window_set_default_size,
+            gtk_widget_get_first_child, gtk_widget_get_next_sibling,
+            gtk_container_get_children, gtk_container_foreach, gtk_menu_item_activate, g_list_free, gtk_menu_item_get_submenu, gtk_widget_is_visible, gtk_menu_popup,
+            gtk_widget_translate_coordinates, gtk_widget_get_window, gdk_window_get_origin,
+            gtk_popover_menu_bar_item_get_popover, gtk_popover_get_child, gtk_popover_new, gtk_popover_set_child,
+            gtk_menu_button_get_label, gtk_menu_button_set_active,
+            gtk_menu_button_new, gtk_menu_button_set_popover, gtk_menu_button_set_label,
+            gtk_menu_button_set_has_frame, gtk_menu_button_set_primary,
+            gtk_button_set_has_frame, gtk_widget_add_css_class,
+            gtk_menu_button_get_popover, gtk_widget_set_can_target,
+            gtk_popover_menu_new_from_model,
+            gtk_window_resize, gtk_window_move, gtk_window_set_default_size,
+            gtk_window_set_transient_for, gtk_window_set_position,
             gtk_drawing_area_set_draw_func, gtk_drawing_area_set_content_width, gtk_drawing_area_set_content_height,
             gtk_native_get_surface, gdk_surface_create_cairo_context, gdk_surface_get_width, gdk_surface_get_height,
             gdk_surface_begin_draw_frame, gdk_surface_end_draw_frame, gdk_draw_context_get_cairo_context,

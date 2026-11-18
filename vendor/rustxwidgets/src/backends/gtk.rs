@@ -1,12 +1,12 @@
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+#[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
 mod gtk_backend {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::error::Error as StdError;
-    use once_cell::sync::OnceCell;
     use gtk_dynamic_loader::Loader;
 
-    static LOADER: OnceCell<Arc<Loader>> = OnceCell::new();
-    static MAIN_LOOP: OnceCell<usize> = OnceCell::new();
+    static LOADER: std::sync::OnceLock<Arc<Loader>> = std::sync::OnceLock::new();
+    static MAIN_LOOP: AtomicUsize = AtomicUsize::new(0);
 
     pub struct GtkApp {
         loader: Arc<Loader>,
@@ -30,18 +30,36 @@ mod gtk_backend {
     impl crate::backends::BackendApp for GtkApp {
         fn run(self: Box<Self>) -> Result<(), Box<dyn StdError + Send + Sync>> {
             let symbols = &self.loader.symbols;
-            let loop_new = symbols.g_main_loop_new.ok_or("missing g_main_loop_new")?;
             let loop_run = symbols.g_main_loop_run.ok_or("missing g_main_loop_run")?;
-            unsafe {
-                let loop_ptr = loop_new(std::ptr::null_mut(), 0);
-                let _ = MAIN_LOOP.set(loop_ptr as usize);
-                loop_run(loop_ptr);
+            // Always create a fresh main loop here.  The pre-created loop
+            // (from gui_backend warm-up) may have had quit_main_loop called
+            // on it before run() — reusing a quit loop causes g_main_loop_run
+            // to return immediately without processing any events, producing
+            // WINDOW_DRAWN=true but no output because keystrokes are never
+            // dispatched.  Creating a fresh loop avoids this entirely.
+            let loop_new = symbols.g_main_loop_new.ok_or("missing g_main_loop_new")?;
+            let loop_ptr = unsafe { loop_new(std::ptr::null_mut(), 0) };
+            if loop_ptr.is_null() {
+                return Err("g_main_loop_new returned null".into());
             }
+            // Update both MAIN_LOOP and loader.main_loop so quit_main_loop
+            // finds this fresh loop regardless of when it's called.
+            MAIN_LOOP.store(loop_ptr as usize, Ordering::SeqCst);
+            *self.loader.main_loop.lock().unwrap() = loop_ptr as usize;
+            unsafe { loop_run(loop_ptr); }
             Ok(())
         }
     }
 
     pub fn init() -> Result<Box<dyn crate::backends::BackendApp>, Box<dyn StdError + Send + Sync>> {
+        let _backend = std::env::var("BACKEND").unwrap_or_default();
+        #[cfg(feature = "gtk4-rs")]
+        if _backend == "gtk4" {
+            match gtk_dynamic_loader::Loader::new_gtk4rs() {
+                Ok(loader) => return GtkApp::new_with_loader(loader).map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync>),
+                Err(e) => { eprintln!("gtk4-rs backend failed: {e}, falling back to dlopen"); }
+            }
+        }
         match GtkApp::new_default() {
             Ok(b) => Ok(b),
             Err(e) => Err(Box::new(e)),
@@ -121,6 +139,51 @@ mod gtk_backend {
         gtk_dynamic_loader::TextView::new(loader.clone())
     }
 
+    /// Run `f` once after `ms` milliseconds on the main loop (generic
+    /// mechanism for deferring work past asynchronous teardown, e.g.
+    /// focusing a widget after its dialog finishes closing — a synchronous
+    /// grab races the destroy's focus restore and loses). One-shot.
+    pub fn timeout_add_once(ms: u32, f: Box<dyn FnOnce()>) -> Result<(), gtk_dynamic_loader::Error> {
+        use std::os::raw::c_void;
+        unsafe extern "C" fn trampoline(data: *mut c_void) -> i32 {
+            let b = Box::from_raw(data as *mut Box<dyn FnOnce()>);
+            (*b)();
+            0
+        }
+        let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
+        let timeout = loader.symbols.g_timeout_add.ok_or(gtk_dynamic_loader::Error::Other("g_timeout_add missing".into()))?;
+        let boxed: Box<Box<dyn FnOnce()>> = Box::new(Box::new(f));
+        let raw = Box::into_raw(boxed) as *mut c_void;
+        unsafe { timeout(ms, Some(trampoline), raw); }
+        Ok(())
+    }
+
+
+    /// Run `f` every `ms` milliseconds until it returns `false`.
+    ///
+    /// Repeating counterpart of [`timeout_add_once`]: the trampoline returns
+    /// `G_SOURCE_CONTINUE` (1) to stay registered, and only `G_SOURCE_REMOVE`
+    /// (0) once the callback asks to stop (freeing the boxed closure then, and
+    /// only then, so there is exactly one owner).
+    pub fn timeout_add_repeating(ms: u32, f: Box<dyn FnMut() -> bool>) -> Result<(), gtk_dynamic_loader::Error> {
+        use std::os::raw::c_void;
+        unsafe extern "C" fn trampoline(data: *mut c_void) -> i32 {
+            let b = &mut *(data as *mut Box<dyn FnMut() -> bool>);
+            if (*b)() {
+                1
+            } else {
+                drop(Box::from_raw(data as *mut Box<dyn FnMut() -> bool>));
+                0
+            }
+        }
+        let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
+        let timeout = loader.symbols.g_timeout_add.ok_or(gtk_dynamic_loader::Error::Other("g_timeout_add missing".into()))?;
+        let boxed: Box<Box<dyn FnMut() -> bool>> = Box::new(Box::new(f));
+        let raw = Box::into_raw(boxed) as *mut c_void;
+        unsafe { timeout(ms, Some(trampoline), raw); }
+        Ok(())
+    }
+
     pub fn create_drawing_area() -> Result<gtk_dynamic_loader::DrawingArea, gtk_dynamic_loader::Error> {
         let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
         gtk_dynamic_loader::DrawingArea::new(loader.clone())
@@ -143,7 +206,17 @@ mod gtk_backend {
 
     pub fn quit_main_loop() -> Result<(), gtk_dynamic_loader::Error> {
         let loader = LOADER.get().ok_or(gtk_dynamic_loader::Error::Other("loader not initialized".into()))?;
-        let loop_ptr = MAIN_LOOP.get().copied().ok_or(gtk_dynamic_loader::Error::Other("main loop not running".into()))?;
+        let loop_ptr = MAIN_LOOP.load(Ordering::SeqCst);
+        let loop_ptr = if loop_ptr != 0 {
+            loop_ptr
+        } else {
+            *loader.main_loop.lock().unwrap()
+        };
+        let _ = std::fs::write("/tmp/corro_quit_loop.txt", &format!("loop_ptr={:#x} loader_val={:#x}\n",
+            loop_ptr, *loader.main_loop.lock().unwrap()));
+        if loop_ptr == 0 {
+            return Err(gtk_dynamic_loader::Error::Other("main loop not running".into()));
+        }
         let loop_quit = loader.symbols.g_main_loop_quit.ok_or(gtk_dynamic_loader::Error::MissingSymbol("g_main_loop_quit".into()))?;
         unsafe {
             loop_quit(loop_ptr as *mut std::ffi::c_void);
@@ -152,5 +225,5 @@ mod gtk_backend {
     }
 }
 
-#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
-pub use gtk_backend::{init, create_window, create_button, create_label, create_box, create_grid, create_entry, create_menu, create_simple_action, create_menubar, create_dialog, create_dropdown, create_checkbutton, create_radiobutton, create_textview, create_drawing_area, create_overlay, create_scrolled_window, loader, quit_main_loop};
+#[cfg(any(feature = "gtk4-rs", all(feature = "gtk", target_os = "linux", not(feature = "zork"), not(feature = "gtk4-rs"))))]
+pub use gtk_backend::{init, create_window, create_button, create_label, create_box, create_grid, create_entry, create_menu, create_simple_action, create_menubar, create_dialog, create_dropdown, create_checkbutton, create_radiobutton, create_textview, create_drawing_area, create_overlay, create_scrolled_window, loader, quit_main_loop, timeout_add_once, timeout_add_repeating};

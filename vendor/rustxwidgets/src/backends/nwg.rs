@@ -1,13 +1,39 @@
+// Win95/rust9x custom target_family gates are intentional
+#![cfg_attr(windows, allow(unexpected_cfgs))]
+
 #[cfg(windows)]
 mod nwg_backend {
     use native_windows_gui as nwg;
     use std::cell::RefCell;
     use std::os::raw::c_void;
     use std::rc::Rc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     pub struct NwgApp {
+        #[allow(dead_code)]
         pub(crate) current_parent: Rc<RefCell<Option<*mut c_void>>>,
+    }
+
+    // TEMPORARY Win95 diagnosis: raw file marker (std::fs broken on 9x).
+    #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+    unsafe fn mark95nwg(s: &[u8]) {
+        use std::os::raw::c_void as CV;
+        unsafe extern "system" {
+            fn CreateFileA(name: *const u8, access: u32, share: u32, sa: *mut CV,
+                disp: u32, flags: u32, tmpl: *mut CV) -> *mut CV;
+            fn SetFilePointer(h: *mut CV, lo: i32, hi: *mut i32, how: u32) -> u32;
+            fn WriteFile(h: *mut CV, buf: *const u8, len: u32, w: *mut u32, ov: *mut CV) -> i32;
+            fn CloseHandle(h: *mut CV) -> i32;
+        }
+        let h = CreateFileA(b"c:\\gcorro.log\0".as_ptr(), 0x4000_0000, 1,
+            std::ptr::null_mut(), 4, 0x80, std::ptr::null_mut());
+        if h.is_null() || h as isize == -1 {
+            return;
+        }
+        SetFilePointer(h, 0, std::ptr::null_mut(), 2);
+        let mut w = 0u32;
+        WriteFile(h, s.as_ptr(), s.len() as u32, &mut w, std::ptr::null_mut());
+        CloseHandle(h);
     }
 
     impl NwgApp {
@@ -46,6 +72,31 @@ mod nwg_backend {
 
     impl crate::backends::BackendApp for NwgApp {
         fn run(self: Box<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            // TEMPORARY Win95 diagnosis.
+            #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+            unsafe { mark95nwg(b"nwg-run\n"); }
+            // TEMPORARY Win95 diagnosis: is anything queued before we block?
+            // If the queue is empty yet GetMessageW returns 0 (WM_QUIT), the
+            // call itself misbehaves on Win95 and we must poll instead.
+            #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+            unsafe {
+                use winapi::um::winuser::{PeekMessageW, MSG, PM_NOREMOVE};
+                use std::mem;
+                let mut peek: MSG = mem::zeroed();
+                if PeekMessageW(&mut peek, std::ptr::null_mut(), 0, 0, PM_NOREMOVE) != 0 {
+                    // Log low byte of the message id as two hex chars.
+                    let m = peek.message as u32;
+                    let hx = b"0123456789abcdef";
+                    let mut s = *b"peek-....\n";
+                    s[5] = hx[((m >> 12) & 0xf) as usize];
+                    s[6] = hx[((m >> 8) & 0xf) as usize];
+                    s[7] = hx[((m >> 4) & 0xf) as usize];
+                    s[8] = hx[(m & 0xf) as usize];
+                    mark95nwg(&s);
+                } else {
+                    mark95nwg(b"peek-empty\n");
+                }
+            }
             // Reset quit flag so a re-run works
             QUIT_REQUESTED.store(false, Ordering::SeqCst);
             // Custom message loop: same as nwg::dispatch_thread_events() but
@@ -53,15 +104,45 @@ mod nwg_backend {
             // control's raw event handler instead of being consumed.
             unsafe {
                 use winapi::um::winuser::{GetMessageW, TranslateMessage, DispatchMessageW, MSG, PM_REMOVE, PeekMessageW};
+                // TEMPORARY Win95 diagnosis: blocking GetMessageW returns 0
+                // (WM_QUIT) immediately on an empty queue, so poll instead.
+                #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                use winapi::um::winuser::{MsgWaitForMultipleObjects, QS_ALLINPUT, WM_QUIT};
                 use std::mem;
                 let mut msg: MSG = mem::zeroed();
+                #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                loop {
+                    if PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                        if msg.message == WM_QUIT {
+                            mark95nwg(b"poll-quit\n");
+                            break;
+                        }
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    } else {
+                        MsgWaitForMultipleObjects(0, std::ptr::null_mut(), 0, 50, QS_ALLINPUT);
+                    }
+                    if QUIT_REQUESTED.load(Ordering::SeqCst) {
+                        mark95nwg(b"poll-flag\n");
+                        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                            TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                        break;
+                    }
+                }
+                #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
                 loop {
                     let ret = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
                     if ret == 0 {
+                        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                        unsafe { mark95nwg(b"msg-quit\n"); }
                         break; // WM_QUIT received
                     }
                     if ret == -1 {
                         // Error — exit loop
+                        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+                        unsafe { mark95nwg(b"msg-err\n"); }
                         break;
                     }
                     TranslateMessage(&msg);
@@ -94,10 +175,14 @@ mod nwg_backend {
 
     pub fn create_window(parent_cell: &Rc<RefCell<Option<*mut c_void>>>) -> Result<(nwg::Window, nwg::EventHandler), nwg::NwgError> {
         let mut win = nwg::Window::default();
-        nwg::Window::builder()
-            .flags(nwg::WindowFlags::MAIN_WINDOW | nwg::WindowFlags::VISIBLE)
-            .size((700, 400))
-            .build(&mut win)?;
+        let b = nwg::Window::builder()
+            .flags(nwg::WindowFlags::MAIN_WINDOW | nwg::WindowFlags::VISIBLE);
+        // TEMPORARY Win95 diagnosis: fit the 640x480 VM screen.
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        let b = b.size((620, 400)).position((5, 5));
+        #[cfg(not(all(target_family = "rust9x", target_env = "msvc")))]
+        let b = b.size((700, 400));
+        b.build(&mut win)?;
         let hwnd = win.handle.hwnd().unwrap_or(std::ptr::null_mut());
         *parent_cell.borrow_mut() = Some(hwnd as *mut c_void);
         let handler = nwg::bind_event_handler(
@@ -148,15 +233,21 @@ mod nwg_backend {
     pub fn create_entry(
         parent: *mut c_void,
     ) -> Result<(nwg::TextInput, Rc<RefCell<Option<Box<dyn FnMut()>>>>, nwg::EventHandler), nwg::NwgError> {
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        unsafe { mark95nwg(b"n-e0\n"); }
         let mut entry = nwg::TextInput::default();
         nwg::TextInput::builder()
             .text("")
             .flags(nwg::TextInputFlags::VISIBLE | nwg::TextInputFlags::TAB_STOP | nwg::TextInputFlags::AUTO_SCROLL)
             .parent(&nwg::ControlHandle::Hwnd(parent as _))
             .build(&mut entry)?;
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        unsafe { mark95nwg(b"n-e1\n"); }
         let changed_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
         let cb = changed_cb.clone();
         let hwnd = entry.handle.hwnd().unwrap();
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        unsafe { mark95nwg(b"n-e2\n"); }
         let parent_h = nwg::ControlHandle::Hwnd(parent as _);
         let handler = nwg::bind_event_handler(
             &nwg::ControlHandle::Hwnd(hwnd), &parent_h,
@@ -166,7 +257,74 @@ mod nwg_backend {
                 }
             },
         );
+        #[cfg(all(target_family = "rust9x", target_env = "msvc"))]
+        unsafe { mark95nwg(b"n-e3\n"); }
         Ok((entry, changed_cb, handler))
+    }
+
+    // -- WM_COMMAND notification plumbing --
+    //
+    // NWG 1.0.13 translates `WM_COMMAND` only from its `WM_MENUSELECT` arm
+    // (see `win32/window.rs`: the `match &class_name` dispatch for
+    // "Button"/"Edit"/"ComboBox" is nested inside `WM_MENUSELECT =>`), so the
+    // high-level `nwg::Event::OnComboxBoxSelection` / `OnButtonClick` events
+    // a ComboBox click would otherwise produce are never reached: a combo
+    // click is a plain `WM_COMMAND` to its *parent*, not a `WM_MENUSELECT`.
+    // That is why `create_dropdown`/`create_checkbox`/`create_radiobutton`
+    // used to bind an empty closure and drop the callback on the floor.
+    //
+    // So we decode the notification ourselves, on the parent's HWND, and fire
+    // the stored callback. Two details are load-bearing:
+    //
+    //   * The handler id MUST be > 0xFFFF. NWG reserves the low range and
+    //     `bind_raw_event_handler` panics on it (see `Window::
+    //     start_repeating_timer`, which documents the same constraint).
+    //   * `WM_COMMAND` carries every child's notifications, so the `lParam`
+    //     child HWND must be matched or the callback fires for the wrong
+    //     widget. `lParam` is zero for a menu/accelerator command, which the
+    //     null check below rejects.
+    static NOTIFY_HANDLER_ID: AtomicUsize = AtomicUsize::new(0x9000_0000);
+
+    /// Bind a `WM_COMMAND` handler on `parent` that fires `cb` when `child`
+    /// reports notification code `code` (e.g. `CBN_SELCHANGE`).
+    ///
+    /// Returns the handler so the caller can keep it alive for the control's
+    /// lifetime: dropping an `nwg::RawEventHandler` unbinds the subclass.
+    fn bind_command_notify(
+        parent: *mut c_void,
+        child: *mut c_void,
+        code: u16,
+        cb: Rc<RefCell<Option<Box<dyn FnMut()>>>>,
+    ) -> Option<nwg::RawEventHandler> {
+        if parent.is_null() || child.is_null() {
+            return None;
+        }
+        let id = NOTIFY_HANDLER_ID.fetch_add(1, Ordering::SeqCst);
+        nwg::bind_raw_event_handler(
+            &nwg::ControlHandle::Hwnd(parent as _),
+            id,
+            move |_h, msg, w, l| {
+                if msg != winapi::um::winuser::WM_COMMAND {
+                    return None;
+                }
+                // HIWORD(w) is the notification code, LOWORD(w) the control id.
+                if (winapi::shared::minwindef::HIWORD(w as u32) as u16) != code {
+                    return None;
+                }
+                // lParam is the child HWND that sent the notification; a
+                // menu/accelerator command carries 0 and must not match.
+                if (l as *mut c_void) != child {
+                    return None;
+                }
+                if let Some(ref mut f) = *cb.borrow_mut() {
+                    f();
+                }
+                // None => DefSubclassProc; a notification must still reach the
+                // control so the selection state is committed.
+                None
+            },
+        )
+        .ok()
     }
 
     // -- DropDown (ComboBox) --
@@ -174,7 +332,7 @@ mod nwg_backend {
     pub fn create_dropdown(
         parent: *mut c_void,
         items: &[&str],
-    ) -> Result<(nwg::ComboBox<String>, nwg::EventHandler), nwg::NwgError> {
+    ) -> Result<(nwg::ComboBox<String>, Rc<RefCell<Option<Box<dyn FnMut()>>>>, Option<nwg::RawEventHandler>), nwg::NwgError> {
         let mut cb = nwg::ComboBox::<String>::default();
         nwg::ComboBox::builder()
             .flags(nwg::ComboBoxFlags::VISIBLE | nwg::ComboBoxFlags::TAB_STOP)
@@ -183,12 +341,14 @@ mod nwg_backend {
             .parent(&nwg::ControlHandle::Hwnd(parent as _))
             .build(&mut cb)?;
         let hwnd = cb.handle.hwnd().unwrap();
-        let parent_h = nwg::ControlHandle::Hwnd(parent as _);
-        let handler = nwg::bind_event_handler(
-            &nwg::ControlHandle::Hwnd(hwnd), &parent_h,
-            |_evt, _data, _handle| {},
+        let changed_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+        let notify = bind_command_notify(
+            parent,
+            hwnd as *mut c_void,
+            winapi::um::winuser::CBN_SELCHANGE,
+            changed_cb.clone(),
         );
-        Ok((cb, handler))
+        Ok((cb, changed_cb, notify))
     }
 
     // -- CheckBox --
@@ -196,7 +356,7 @@ mod nwg_backend {
     pub fn create_checkbox(
         parent: *mut c_void,
         text: &str,
-    ) -> Result<(nwg::CheckBox, nwg::EventHandler), nwg::NwgError> {
+    ) -> Result<(nwg::CheckBox, Rc<RefCell<Option<Box<dyn FnMut()>>>>, Option<nwg::RawEventHandler>), nwg::NwgError> {
         let mut chk = nwg::CheckBox::default();
         nwg::CheckBox::builder()
             .text(text)
@@ -205,12 +365,14 @@ mod nwg_backend {
             .parent(&nwg::ControlHandle::Hwnd(parent as _))
             .build(&mut chk)?;
         let hwnd = chk.handle.hwnd().unwrap();
-        let parent_h = nwg::ControlHandle::Hwnd(parent as _);
-        let handler = nwg::bind_event_handler(
-            &nwg::ControlHandle::Hwnd(hwnd), &parent_h,
-            |_evt, _data, _handle| {},
+        let toggled_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+        let notify = bind_command_notify(
+            parent,
+            hwnd as *mut c_void,
+            winapi::um::winuser::BN_CLICKED,
+            toggled_cb.clone(),
         );
-        Ok((chk, handler))
+        Ok((chk, toggled_cb, notify))
     }
 
     // -- RadioButton --
@@ -219,7 +381,7 @@ mod nwg_backend {
         parent: *mut c_void,
         text: &str,
         is_group_start: bool,
-    ) -> Result<(nwg::RadioButton, nwg::EventHandler), nwg::NwgError> {
+    ) -> Result<(nwg::RadioButton, Rc<RefCell<Option<Box<dyn FnMut()>>>>, Option<nwg::RawEventHandler>), nwg::NwgError> {
         let mut rb = nwg::RadioButton::default();
         let mut flags = nwg::RadioButtonFlags::VISIBLE | nwg::RadioButtonFlags::TAB_STOP;
         if is_group_start {
@@ -231,12 +393,14 @@ mod nwg_backend {
             .parent(&nwg::ControlHandle::Hwnd(parent as _))
             .build(&mut rb)?;
         let hwnd = rb.handle.hwnd().unwrap();
-        let parent_h = nwg::ControlHandle::Hwnd(parent as _);
-        let handler = nwg::bind_event_handler(
-            &nwg::ControlHandle::Hwnd(hwnd), &parent_h,
-            |_evt, _data, _handle| {},
+        let toggled_cb: Rc<RefCell<Option<Box<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+        let notify = bind_command_notify(
+            parent,
+            hwnd as *mut c_void,
+            winapi::um::winuser::BN_CLICKED,
+            toggled_cb.clone(),
         );
-        Ok((rb, handler))
+        Ok((rb, toggled_cb, notify))
     }
 
     // -- TextBox (multi-line) --
@@ -268,7 +432,7 @@ mod nwg_backend {
     // -- Dialog (window with button callbacks) --
 
     pub fn create_dialog(
-        parent_cell: &Rc<RefCell<Option<*mut c_void>>>,
+        _parent_cell: &Rc<RefCell<Option<*mut c_void>>>,
         _button_cb: Rc<RefCell<Option<Box<dyn FnMut(i32)>>>>,
     ) -> Result<(nwg::Window, Vec<(nwg::Button, nwg::EventHandler)>, nwg::EventHandler), nwg::NwgError> {
         let mut win = nwg::Window::default();
@@ -277,7 +441,12 @@ mod nwg_backend {
             .size((450, 500))
             .build(&mut win)?;
         let hwnd = win.handle.hwnd().unwrap_or(std::ptr::null_mut());
-        *parent_cell.borrow_mut() = Some(hwnd as *mut c_void);
+        // NOTE: deliberately does NOT overwrite parent_cell (unlike
+        // create_window): dialogs are transient siblings, not the widget
+        // parent. Later new_entry/new_box calls keep the main window as
+        // parent until append_content_area reparents them into the dialog.
+        // Overwriting here orphaned subsequently created widgets onto dead
+        // dialogs.
         let handler = nwg::bind_event_handler(
             &nwg::ControlHandle::Hwnd(hwnd),
             &nwg::ControlHandle::Hwnd(hwnd),
@@ -307,6 +476,10 @@ mod nwg_backend {
             move |evt, _data, _handle| {
                 if let nwg::Event::OnButtonClick = evt {
                     if let Some(ref mut f) = *cb2.borrow_mut() { f(rid); }
+                    // Dismiss like the Escape path: confirming must close.
+                    unsafe {
+                        winapi::um::winuser::ShowWindow(parent as _, winapi::um::winuser::SW_HIDE);
+                    }
                 }
             },
         );
@@ -382,7 +555,7 @@ mod nwg_backend {
     pub fn create_scrolled_window(parent: *mut c_void) -> Result<ScrolledWindowParts, nwg::NwgError> {
         let mut frame = nwg::Frame::default();
         nwg::Frame::builder()
-            .flags(nwg::FrameFlags::NONE)
+            .flags(nwg::FrameFlags::VISIBLE)
             .parent(&nwg::ControlHandle::Hwnd(parent as _))
             .build(&mut frame)?;
 

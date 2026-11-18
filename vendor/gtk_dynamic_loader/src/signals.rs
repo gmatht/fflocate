@@ -1,6 +1,22 @@
 use std::ffi::CString;
 use std::os::raw::c_void;
 
+/// Log a panic caught at the GTK FFI boundary (where unwinding into C
+/// would abort the process with no message). Returns so callers can supply
+/// a safe default and keep the app alive.
+fn log_trampoline_panic(what: &str, err: Box<dyn std::any::Any + Send>) {
+    let msg = if let Some(s) = err.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = err.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    };
+    let line = format!("corro: panic in GTK callback ({what}): {msg}\n");
+    let _ = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/corro-panic.log").and_then(|mut f| { use std::io::Write as _; writeln!(f, "{line}") });
+    eprintln!("{line}");
+}
+
 // Trampoline and destroy notify for clicked handler
 // We'll define a small C-ABI trampoline that converts user_data pointer into a Box<dyn FnMut()>
 
@@ -11,8 +27,13 @@ pub extern "C" fn gtk_compat_trampoline_2(_instance: *mut c_void, user_data: *mu
         if user_data.is_null() { return; }
         let inner_ptr = user_data as *mut Box<dyn FnMut()>;
         if inner_ptr.is_null() { return; }
-        let closure_ref: &mut dyn FnMut() = &mut **inner_ptr;
-        closure_ref();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let closure_ref: &mut dyn FnMut() = &mut **inner_ptr;
+            closure_ref();
+        }));
+        if let Err(err) = r {
+            log_trampoline_panic("trampoline_2", err);
+        }
     }
 }
 
@@ -23,8 +44,17 @@ pub extern "C" fn gtk_compat_trampoline_focus(_instance: *mut c_void, user_data:
         if user_data.is_null() { return 0; }
         let inner_ptr = user_data as *mut Box<dyn FnMut(*mut c_void) -> i32>;
         if inner_ptr.is_null() { return 0; }
-        let closure_ref: &mut dyn FnMut(*mut c_void) -> i32 = &mut **inner_ptr;
-        closure_ref(std::ptr::null_mut())
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let closure_ref: &mut dyn FnMut(*mut c_void) -> i32 = &mut **inner_ptr;
+            closure_ref(std::ptr::null_mut())
+        }));
+        match r {
+            Ok(v) => v,
+            Err(err) => {
+                log_trampoline_panic("trampoline_focus", err);
+                0
+            }
+        }
     }
 }
 
@@ -41,8 +71,13 @@ pub extern "C" fn gtk_compat_trampoline_3(_instance: *mut c_void, _param: *mut c
         if user_data.is_null() { return; }
         let inner_ptr = user_data as *mut Box<dyn FnMut()>;
         if inner_ptr.is_null() { return; }
-        let closure_ref: &mut dyn FnMut() = &mut **inner_ptr;
-        closure_ref();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let closure_ref: &mut dyn FnMut() = &mut **inner_ptr;
+            closure_ref();
+        }));
+        if let Err(err) = r {
+            log_trampoline_panic("trampoline_3", err);
+        }
     }
 }
 
@@ -65,8 +100,13 @@ pub extern "C" fn gtk_compat_trampoline_param(_instance: *mut c_void, param: *mu
         if user_data.is_null() { return; }
         let inner_ptr = user_data as *mut Box<dyn FnMut(*mut c_void)>;
         if inner_ptr.is_null() { return; }
-        let closure_ref: &mut dyn FnMut(*mut c_void) = &mut **inner_ptr;
-        closure_ref(param);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let closure_ref: &mut dyn FnMut(*mut c_void) = &mut **inner_ptr;
+            closure_ref(param);
+        }));
+        if let Err(err) = r {
+            log_trampoline_panic("trampoline_param", err);
+        }
     }
 }
 
@@ -86,8 +126,17 @@ pub extern "C" fn gtk_compat_trampoline_bool(_instance: *mut c_void, param: *mut
         if user_data.is_null() { return 0; }
         let inner_ptr = user_data as *mut Box<dyn FnMut(*mut c_void) -> i32>;
         if inner_ptr.is_null() { return 0; }
-        let closure_ref: &mut dyn FnMut(*mut c_void) -> i32 = &mut **inner_ptr;
-        closure_ref(param)
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let closure_ref: &mut dyn FnMut(*mut c_void) -> i32 = &mut **inner_ptr;
+            closure_ref(param)
+        }));
+        match r {
+            Ok(v) => v,
+            Err(err) => {
+                log_trampoline_panic("trampoline_bool", err);
+                0
+            }
+        }
     }
 }
 
@@ -114,14 +163,14 @@ pub unsafe fn connect_signal(lib_symbols: &crate::symbols::Symbols, instance: *m
             _ => gtk_compat_trampoline_2 as *const () as *mut c_void,
         };
         let destroy_ptr = Some(gtk_compat_destroy_notify as unsafe extern "C" fn(*mut c_void, *mut c_void));
-        let id = gscd(instance, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
+        let id = gscd(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw, destroy_ptr, 0);
         Ok(id)
     } else if let Some(gsc) = lib_symbols.g_signal_connect {
         let handler_ptr = match arity {
             3 => gtk_compat_trampoline_3 as *const () as *mut c_void,
             _ => gtk_compat_trampoline_2 as *const () as *mut c_void,
         };
-        let id = gsc(instance, sig_name.as_ptr(), handler_ptr, raw);
+        let id = gsc(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw);
         // We didn't register a destroy notify; closure will leak. It's acceptable for the demo.
         Ok(id)
     } else {
@@ -138,11 +187,11 @@ pub unsafe fn connect_signal_param(lib_symbols: &crate::symbols::Symbols, instan
     if let Some(gscd) = lib_symbols.g_signal_connect_data {
         let handler_ptr = gtk_compat_trampoline_param as *const () as *mut c_void;
         let destroy_ptr = Some(gtk_compat_destroy_notify_param as unsafe extern "C" fn(*mut c_void, *mut c_void));
-        let id = gscd(instance, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
+        let id = gscd(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw, destroy_ptr, 0);
         Ok(id)
     } else if let Some(gsc) = lib_symbols.g_signal_connect {
         let handler_ptr = gtk_compat_trampoline_param as *const () as *mut c_void;
-        let id = gsc(instance, sig_name.as_ptr(), handler_ptr, raw);
+        let id = gsc(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw);
         Ok(id)
     } else { Err("no g_signal_connect available".into()) }
 }
@@ -175,11 +224,11 @@ pub unsafe fn connect_signal_gesture(lib_symbols: &crate::symbols::Symbols, inst
     if let Some(gscd) = lib_symbols.g_signal_connect_data {
         let handler_ptr = gtk_compat_trampoline_gesture as *const () as *mut c_void;
         let destroy_ptr = Some(gtk_compat_destroy_notify_gesture as unsafe extern "C" fn(*mut c_void, *mut c_void));
-        let id = gscd(instance, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
+        let id = gscd(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw, destroy_ptr, 0);
         Ok(id)
     } else if let Some(gsc) = lib_symbols.g_signal_connect {
         let handler_ptr = gtk_compat_trampoline_gesture as *const () as *mut c_void;
-        let id = gsc(instance, sig_name.as_ptr(), handler_ptr, raw);
+        let id = gsc(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw);
         Ok(id)
     } else { Err("no g_signal_connect available".into()) }
 }
@@ -212,71 +261,13 @@ pub unsafe fn connect_signal_motion(lib_symbols: &crate::symbols::Symbols, insta
     if let Some(gscd) = lib_symbols.g_signal_connect_data {
         let handler_ptr = gtk_compat_trampoline_motion as *const () as *mut c_void;
         let destroy_ptr = Some(gtk_compat_destroy_notify_motion as unsafe extern "C" fn(*mut c_void, *mut c_void));
-        let id = gscd(instance, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
+        let id = gscd(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw, destroy_ptr, 0);
         Ok(id)
     } else if let Some(gsc) = lib_symbols.g_signal_connect {
         let handler_ptr = gtk_compat_trampoline_motion as *const () as *mut c_void;
-        let id = gsc(instance, sig_name.as_ptr(), handler_ptr, raw);
+        let id = gsc(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw);
         Ok(id)
     } else { Err("no g_signal_connect available".into()) }
-}
-
-// Trampoline for drag signals, e.g. GtkWidget::drag-data-get with
-// (widget, drag_context, selection_data, info, time, user_data). The drag
-// context and selection data are passed straight through to the closure; info
-// and time identify which target was requested and the event timestamp.
-#[no_mangle]
-pub extern "C" fn gtk_compat_trampoline_drag(
-    _instance: *mut c_void,
-    drag_context: *mut c_void,
-    selection_data: *mut c_void,
-    info: u32,
-    time: u32,
-    user_data: *mut c_void,
-) {
-    unsafe {
-        if user_data.is_null() { return; }
-        let inner_ptr = user_data as *mut Box<dyn FnMut(*mut c_void, *mut c_void, u32, u32)>;
-        if inner_ptr.is_null() { return; }
-        let closure_ref: &mut dyn FnMut(*mut c_void, *mut c_void, u32, u32) = &mut **inner_ptr;
-        closure_ref(drag_context, selection_data, info, time);
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn gtk_compat_destroy_notify_drag(data: *mut c_void, _closure: *mut c_void) {
-    unsafe {
-        if data.is_null() { return; }
-        let inner_ptr = data as *mut Box<dyn FnMut(*mut c_void, *mut c_void, u32, u32)>;
-        let _boxed: Box<Box<dyn FnMut(*mut c_void, *mut c_void, u32, u32)>> = Box::from_raw(inner_ptr);
-    }
-}
-
-/// Connect a drag signal whose handler receives
-/// `(drag_context, selection_data, info, time)` — notably `drag-data-get`.
-pub unsafe fn connect_signal_drag(
-    lib_symbols: &crate::symbols::Symbols,
-    instance: *mut c_void,
-    signal_name: &str,
-    cb: Box<dyn FnMut(*mut c_void, *mut c_void, u32, u32)>,
-) -> Result<u64, String> {
-    let boxed: Box<Box<dyn FnMut(*mut c_void, *mut c_void, u32, u32)>> = Box::new(Box::new(cb));
-    let raw = Box::into_raw(boxed) as *mut c_void;
-    let sig_name = CString::new(signal_name).unwrap();
-    if let Some(gscd) = lib_symbols.g_signal_connect_data {
-        let handler_ptr = gtk_compat_trampoline_drag as *const () as *mut c_void;
-        let destroy_ptr = Some(
-            gtk_compat_destroy_notify_drag as unsafe extern "C" fn(*mut c_void, *mut c_void),
-        );
-        let id = gscd(instance, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
-        Ok(id)
-    } else if let Some(gsc) = lib_symbols.g_signal_connect {
-        let handler_ptr = gtk_compat_trampoline_drag as *const () as *mut c_void;
-        let id = gsc(instance, sig_name.as_ptr(), handler_ptr, raw);
-        Ok(id)
-    } else {
-        Err("no g_signal_connect available".into())
-    }
 }
 
 // Connect a signal that expects a gboolean/int return from the handler
@@ -287,11 +278,11 @@ pub unsafe fn connect_signal_bool(lib_symbols: &crate::symbols::Symbols, instanc
     if let Some(gscd) = lib_symbols.g_signal_connect_data {
         let handler_ptr = gtk_compat_trampoline_bool as *const () as *mut c_void;
         let destroy_ptr = Some(gtk_compat_destroy_notify_bool as unsafe extern "C" fn(*mut c_void, *mut c_void));
-        let id = gscd(instance, sig_name.as_ptr(), handler_ptr, raw, destroy_ptr, 0);
+        let id = gscd(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw, destroy_ptr, 0);
         Ok(id)
     } else if let Some(gsc) = lib_symbols.g_signal_connect {
         let handler_ptr = gtk_compat_trampoline_bool as *const () as *mut c_void;
-        let id = gsc(instance, sig_name.as_ptr(), handler_ptr, raw);
+        let id = gsc(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw);
         Ok(id)
     } else { Err("no g_signal_connect available".into()) }
 }
@@ -320,13 +311,13 @@ pub extern "C" fn gtk_compat_destroy_notify_draw_gtk3(data: *mut c_void, _closur
 // trampoline for GTK4 GtkEventControllerKey::key-pressed signal
 // passes (keyval, keycode, state) as u32 triple — NOT an event pointer
 #[no_mangle]
-pub extern "C" fn gtk_compat_trampoline_key_pressed(_instance: *mut c_void, keyval: u32, _keycode: u32, state: u32, user_data: *mut c_void) -> i32 {
+pub extern "C" fn gtk_compat_trampoline_key_pressed(_instance: *mut c_void, keyval: u32, _keycode: u32, _state: u32, user_data: *mut c_void) -> i32 {
     unsafe {
         if user_data.is_null() { return 0; }
-        let inner_ptr = user_data as *mut Box<dyn FnMut(u32, u32) -> i32>;
+        let inner_ptr = user_data as *mut Box<dyn FnMut(u32) -> i32>;
         if inner_ptr.is_null() { return 0; }
-        let closure_ref: &mut dyn FnMut(u32, u32) -> i32 = &mut **inner_ptr;
-        closure_ref(keyval, state)
+        let closure_ref: &mut dyn FnMut(u32) -> i32 = &mut **inner_ptr;
+        closure_ref(keyval)
     }
 }
 
@@ -334,8 +325,38 @@ pub extern "C" fn gtk_compat_trampoline_key_pressed(_instance: *mut c_void, keyv
 pub extern "C" fn gtk_compat_destroy_notify_key_pressed(data: *mut c_void, _closure: *mut c_void) {
     unsafe {
         if data.is_null() { return; }
-        let inner_ptr = data as *mut Box<dyn FnMut(u32, u32) -> i32>;
-        let _boxed: Box<Box<dyn FnMut(u32, u32) -> i32>> = Box::from_raw(inner_ptr);
+        let inner_ptr = data as *mut Box<dyn FnMut(u32) -> i32>;
+        let _boxed: Box<Box<dyn FnMut(u32) -> i32>> = Box::from_raw(inner_ptr);
+    }
+}
+
+// trampoline for GTK4 GtkEventControllerKey::key-released.
+//
+// Same signature as `key-pressed` (GtkEventControllerKey emits both from the
+// same controller), and needed because GTK4 delivers a physical key as BOTH a
+// `key-pressed` and a `key-released` signal. Without a handler for the release
+// signal, a host that only hooks `key-pressed` sees each key twice on the
+// versions/display servers where the release is routed through the same
+// handler — the bug `gui_backend.rs` used to paper over with consecutive-keyval
+// heuristics. Connecting this separately lets the adapter swallow releases and
+// hand the host a pure press stream.
+#[no_mangle]
+pub extern "C" fn gtk_compat_trampoline_key_released(_instance: *mut c_void, keyval: u32, _keycode: u32, _state: u32, user_data: *mut c_void) -> i32 {
+    unsafe {
+        if user_data.is_null() { return 0; }
+        let inner_ptr = user_data as *mut Box<dyn FnMut(u32) -> i32>;
+        if inner_ptr.is_null() { return 0; }
+        let closure_ref: &mut dyn FnMut(u32) -> i32 = &mut **inner_ptr;
+        closure_ref(keyval)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gtk_compat_destroy_notify_key_released(data: *mut c_void, _closure: *mut c_void) {
+    unsafe {
+        if data.is_null() { return; }
+        let inner_ptr = data as *mut Box<dyn FnMut(u32) -> i32>;
+        let _boxed: Box<Box<dyn FnMut(u32) -> i32>> = Box::from_raw(inner_ptr);
     }
 }
 
@@ -357,5 +378,43 @@ pub extern "C" fn gtk_compat_destroy_notify_draw_gtk4(data: *mut c_void, _closur
         if data.is_null() { return; }
         let inner_ptr = data as *mut Box<dyn FnMut(*mut c_void, i32, i32)>;
         let _boxed: Box<Box<dyn FnMut(*mut c_void, i32, i32)>> = Box::from_raw(inner_ptr);
+    }
+}
+
+#[cfg(test)]
+mod key_release_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// The `key-released` trampoline must deliver the keyval to the closure.
+    ///
+    /// This is the contract the GTK4 release filter relies on: the adapter
+    /// connects `key-released` and returns GDK_EVENT_STOP without touching the
+    /// host, so if the trampoline ever stopped delivering the keyval the
+    /// filter would silently become a no-op and hosts would see double keys
+    /// again (the bug it exists to prevent).
+    #[test]
+    fn key_released_trampoline_delivers_the_keyval() {
+        let seen: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
+        let s = seen.clone();
+        let cb: Box<dyn FnMut(u32) -> i32> = Box::new(move |kv: u32| {
+            s.borrow_mut().push(kv);
+            1
+        });
+        let raw = Box::into_raw(Box::new(cb)) as *mut c_void;
+        let rc = gtk_compat_trampoline_key_released(std::ptr::null_mut(), 0xff52, 0, 0, raw);
+        assert_eq!(1, rc, "trampoline returns the closure's value");
+        assert_eq!(vec![0xff52], *seen.borrow());
+        // The destroy notify must free the box without double-freeing: run it
+        // once (the trampoline itself must not consume the box).
+        gtk_compat_destroy_notify_key_released(raw, std::ptr::null_mut());
+    }
+
+    /// A null user_data must not crash (GObject can deliver to a dropped
+    /// closure during teardown).
+    #[test]
+    fn key_released_trampoline_tolerates_null() {
+        assert_eq!(0, gtk_compat_trampoline_key_released(std::ptr::null_mut(), 0x41, 0, 0, std::ptr::null_mut()));
     }
 }

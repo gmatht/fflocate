@@ -20,8 +20,9 @@ path = "src/main.rs"
 # feature, so a macOS build selects `zork` through the target-specific
 # dependency below: `ff --gui` still works there, but it is the display-free
 # backend, not a native window.
-default = ["gtk"]
+default = ["gtk", "macos"]
 gtk = ["rswidgets/gtk"]
+macos = ["rswidgets/macos"]
 zork = ["rswidgets/zork"]
 
 [dependencies]
@@ -39,10 +40,6 @@ serde_json.workspace = true
 # Cargo reporting the dependency normally).
 rswidgets = { package = "rustxwidgets", path = "../../vendor/rustxwidgets", default-features = false }
 
-# macOS: no AppKit in the vendored snapshot, so the GUI uses the display-free
-# `zork` backend there (see the feature comment above).
-[target.'cfg(target_os = "macos")'.dependencies]
-rswidgets = { package = "rustxwidgets", path = "../../vendor/rustxwidgets", default-features = false, features = ["zork"] }
 
 [dev-dependencies]
 tempfile.workspace = true
