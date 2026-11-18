@@ -61,9 +61,15 @@ mod macos_adapter {
     macro_rules! raw_send {
         ($obj:expr, $sel:expr, $sig:ty, ($($arg:expr),* $(,)?)) => {{
             let msg = crate::backends::apple::msg_shim();
+            // This macro is expanded both inside `unsafe` blocks and outside
+            // them, so the blocks here are required in one context and redundant
+            // in the other. Allow the lint instead of splitting the macro.
+            #[allow(unused_unsafe)]
             let send: $sig = unsafe { std::mem::transmute(msg) };
             let sel = crate::backends::apple::selector($sel);
-            unsafe { send($obj, sel $(, $arg)*) }
+            #[allow(unused_unsafe)]
+            let out = unsafe { send($obj, sel $(, $arg)*) };
+            out
         }};
     }
 
@@ -390,6 +396,10 @@ mod macos_adapter {
             if self.0.is_null() {
                 return;
             }
+            // The target class is built at runtime; without AppKit (or on a
+            // host that never loaded it) it stays absent and this degrades to
+            // the logged skip below.
+            ensure_runtime_classes();
             let shim = cls("CorroMacTarget");
             if shim.is_null() {
                 crate::backends::macos::log_macos("macos: CorroMacTarget shim missing; button inert");
@@ -1566,6 +1576,7 @@ mod macos_adapter {
         fn CGContextFillRect(ctx: *mut c_void, rect: CGRect);
         fn CGContextStrokeRect(ctx: *mut c_void, rect: CGRect);
         fn CGContextClipToRect(ctx: *mut c_void, rect: CGRect);
+        fn CGContextGetClipBoundingBox(ctx: *mut c_void) -> CGRect;
         fn CGContextSaveGState(ctx: *mut c_void);
         fn CGContextRestoreGState(ctx: *mut c_void);
     }
@@ -1692,20 +1703,14 @@ mod macos_adapter {
         }
 
         fn clear(&mut self, r: f64, g: f64, b: f64, a: f64) {
-            // `clear` in the shared API means "paint the whole surface this
-            // colour". Without the surface size in the context we cannot fill
-            // it; Core Graphics has `CGContextClearRect` with `CGRectInfinite`.
+            // `clear` means "paint the whole surface this colour". The clip
+            // bounding box *is* the surface the view handed us, which is more
+            // reliable than an infinite rectangle (whose behaviour is
+            // undefined once it reaches the backing store).
             unsafe {
+                let bounds = CGContextGetClipBoundingBox(self.ctx);
                 CGContextSetRGBFillColor(self.ctx, r, g, b, a);
-                CGContextFillRect(
-                    self.ctx,
-                    CGRect {
-                        x: 0.0,
-                        y: 0.0,
-                        width: f64::INFINITY,
-                        height: f64::INFINITY,
-                    },
-                );
+                CGContextFillRect(self.ctx, bounds);
             }
         }
 
@@ -1852,6 +1857,7 @@ mod macos_adapter {
     // `calloc`), so the matching free is `free` from libc.
     unsafe extern "C" {
         fn free(ptr: *mut c_void);
+        fn malloc(size: usize) -> *mut c_void;
     }
 
     // ------------------------------------------------------------------
@@ -2499,6 +2505,836 @@ mod macos_adapter {
     }
 
     // ------------------------------------------------------------------
+    // Runtime shim classes
+    // ------------------------------------------------------------------
+    //
+    // The AppKit host this adapter was written for compiled a few Objective-C
+    // classes (`CorroMacTarget`, `CorroMacMenuTarget`, `CorroSheetView`,
+    // `CorroMacContainer`) whose selectors carry the callbacks: a button's
+    // target/action, a menu item's action, the canvas view's `drawRect:` and
+    // mouse events. Nothing in this workspace compiles Objective-C, so on a
+    // plain Rust binary every one of those sends used to be a skip — buttons,
+    // menus and canvases did nothing.
+    //
+    // They are built at runtime here instead, with the primitives
+    // `backends/macos.rs` already uses for its NSTimer target:
+    // `objc_allocateClassPair` + `class_addMethod` + `objc_registerClassPair`,
+    // with `extern "C"` Rust functions as the implementations. The simpler
+    // shim selectors the adapter sends to *stock* AppKit views
+    // (`corroSetFlex:`, `corroSetPinnedWidth:`, …) are added to `NSView` the
+    // same way, so those sends resolve to real behaviour rather than a skip.
+
+    /// `CGPoint`, returned by value: two `CGFloat`s.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn objc_allocateClassPair(
+            superclass: *mut c_void,
+            name: *const std::os::raw::c_char,
+            extra_bytes: usize,
+        ) -> *mut c_void;
+        fn objc_registerClassPair(cls: *mut c_void);
+        fn class_addMethod(
+            cls: *mut c_void,
+            name: *mut c_void,
+            imp: *const c_void,
+            types: *const std::os::raw::c_char,
+        ) -> bool;
+        fn object_getClass(obj: *mut c_void) -> *mut c_void;
+        fn objc_getAssociatedObject(obj: *mut c_void, key: *const c_void) -> *mut c_void;
+        fn objc_setAssociatedObject(
+            obj: *mut c_void,
+            key: *const c_void,
+            value: *mut c_void,
+            policy: usize,
+        );
+        fn dlsym(handle: *mut c_void, symbol: *const std::os::raw::c_char) -> *mut c_void;
+    }
+
+    /// `OBJC_ASSOCIATION_ASSIGN`: the value is a plain integer or a pointer this
+    /// module owns, so the runtime must not `retain` it.
+    const OBJC_ASSIGN: usize = 0;
+    /// `OBJC_ASSOCIATION_RETAIN_NONATOMIC`: an `NSString` the target keeps.
+    const OBJC_RETAIN: usize = 1;
+
+    /// One associated-object key per payload kind.
+    static TARGET_KEY: u8 = 0;
+    static MENU_KEY: u8 = 0;
+    static CANVAS_KEY: u8 = 0;
+
+    fn key_addr(key: &'static u8) -> *const c_void {
+        key as *const u8 as *const c_void
+    }
+
+    /// `RTLD_DEFAULT`: search every loaded image. AppKit's `dlopen` brings in
+    /// Core Graphics, Core Text and Core Foundation, and this crate links only
+    /// libobjc, so `dlsym` is how those symbols are reached.
+    const RTLD_DEFAULT: *mut c_void = -2isize as *mut c_void;
+
+    fn sym_ptr(name: &str) -> *mut c_void {
+        let mut buf: Vec<u8> = name.as_bytes().to_vec();
+        buf.push(0);
+        // SAFETY: NUL-terminated name, default symbol scope.
+        unsafe { dlsym(RTLD_DEFAULT, buf.as_ptr() as *const std::os::raw::c_char) }
+    }
+
+    /// Dereference an exported **data** symbol: `kCTFontAttributeName` is a
+    /// `CFStringRef` constant, so `dlsym` yields the constant's address.
+    fn read_data_ptr(name: &str) -> *mut c_void {
+        let p = sym_ptr(name);
+        if p.is_null() {
+            std::ptr::null_mut()
+        } else {
+            // SAFETY: the symbol is a pointer-sized constant in a loaded image.
+            unsafe { *(p as *mut *mut c_void) }
+        }
+    }
+
+    /// `NSSize`: two `CGFloat`s, returned by value.
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct NSSize {
+        w: f64,
+        h: f64,
+    }
+
+    /// PostScript name for the portable family hint plus slant/weight.
+    fn ps_font_name(hint: &str, slant: i32, weight: i32) -> &'static str {
+        let mono = hint.contains("mono");
+        let bold = weight != 0;
+        let italic = slant != 0;
+        match (mono, bold, italic) {
+            (true, true, _) => "Menlo-Bold",
+            (true, false, true) => "Menlo-Italic",
+            (true, false, false) => "Menlo-Regular",
+            (false, true, _) => "Helvetica-Bold",
+            (false, false, true) => "Helvetica-Oblique",
+            (false, false, false) => "Helvetica",
+        }
+    }
+
+    /// The attribute dictionary AppKit text wants: `{NSFont, NSForegroundColor}`.
+    ///
+    /// Built at runtime because this crate carries no Foundation headers: the two
+    /// attribute-name constants are exported data symbols, and the font and
+    /// colour are ordinary message sends.
+    #[allow(clippy::too_many_arguments)]
+    fn text_attributes(
+        font: *mut c_void,
+        size: f64,
+        slant: i32,
+        weight: i32,
+        r: f64,
+        g: f64,
+        b: f64,
+        a: f64,
+    ) -> *mut c_void {
+        let font_cls = cls("NSFont");
+        let colour_cls = cls("NSColor");
+        let dict_cls = cls("NSDictionary");
+        let font_key = read_data_ptr("NSFontAttributeName");
+        let colour_key = read_data_ptr("NSForegroundColorAttributeName");
+        if font_cls.is_null()
+            || colour_cls.is_null()
+            || dict_cls.is_null()
+            || font_key.is_null()
+            || colour_key.is_null()
+        {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: every object below is autoreleased by AppKit and null-checked
+        // before use; the dictionary retains what it holds.
+        let hint = core_apple::nsstring_to_rust(font).unwrap_or_else(|| "sans".to_owned());
+        let name = nsstring(ps_font_name(&hint, slant, weight));
+        let mut ns_font = std::ptr::null_mut();
+        if !name.is_null() {
+            ns_font = raw_send!(
+                font_cls,
+                "fontWithName:size:",
+                unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, f64) -> *mut c_void,
+                (name, size)
+            );
+        }
+        if ns_font.is_null() {
+            ns_font = raw_send!(
+                font_cls,
+                "systemFontOfSize:",
+                unsafe extern "C" fn(*mut c_void, *mut c_void, f64) -> *mut c_void,
+                (size)
+            );
+        }
+        if ns_font.is_null() {
+            return std::ptr::null_mut();
+        }
+        let colour = raw_send!(
+            colour_cls,
+            "colorWithCalibratedRed:green:blue:alpha:",
+            unsafe extern "C" fn(*mut c_void, *mut c_void, f64, f64, f64, f64) -> *mut c_void,
+            (r, g, b, a)
+        );
+        if colour.is_null() {
+            return std::ptr::null_mut();
+        }
+        let objs = [ns_font, colour];
+        let keys = [font_key, colour_key];
+        raw_send!(
+            dict_cls,
+            "dictionaryWithObjects:forKeys:count:",
+            unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *const *mut c_void,
+                *const *mut c_void,
+                isize,
+            ) -> *mut c_void,
+            (objs.as_ptr(), keys.as_ptr(), 2isize)
+        )
+    }
+
+    /// `+[CorroMacText measure:font:size:slant:weight:]`: measure with AppKit's
+    /// own text system (`-[NSString sizeWithAttributes:]`) and hand back a
+    /// `malloc`ed `CGRect`, which is the contract `measure_text_via_host` reads.
+    extern "C" fn text_measure_imp(
+        _cls: *mut c_void,
+        _cmd: *mut c_void,
+        text: *mut c_void,
+        font: *mut c_void,
+        size: f64,
+        slant: i32,
+        weight: i32,
+    ) -> *mut c_void {
+        if text.is_null() || font.is_null() || size <= 0.0 {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: the attribute objects are autoreleased, and the returned
+        // buffer is malloc'd for the caller's `free`.
+        unsafe {
+            let attrs = text_attributes(font, size, slant, weight, 0.0, 0.0, 0.0, 1.0);
+            if attrs.is_null() {
+                return std::ptr::null_mut();
+            }
+            let sz: NSSize = raw_send!(
+                text,
+                "sizeWithAttributes:",
+                unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> NSSize,
+                (attrs)
+            );
+            let out = malloc(std::mem::size_of::<CGRect>()) as *mut CGRect;
+            if out.is_null() {
+                return std::ptr::null_mut();
+            }
+            *out = CGRect {
+                x: 0.0,
+                y: 0.0,
+                width: sz.w.max(0.0),
+                height: sz.h.max(0.0),
+            };
+            out as *mut c_void
+        }
+    }
+
+    /// `+[CorroMacText drawText:ctx:font:x:y:size:r:g:b:a:slant:weight:]`: draw
+    /// one line into the given `CGContext`. `y` is the baseline, matching the
+    /// Cairo backends, so the top-left AppKit wants is lifted by the ascender.
+    #[allow(clippy::too_many_arguments)]
+    extern "C" fn text_draw_imp(
+        _cls: *mut c_void,
+        _cmd: *mut c_void,
+        text: *mut c_void,
+        ctx: *mut c_void,
+        font: *mut c_void,
+        x: f64,
+        y: f64,
+        size: f64,
+        r: f64,
+        g: f64,
+        b: f64,
+        a: f64,
+        slant: i32,
+        weight: i32,
+    ) {
+        if text.is_null() || font.is_null() || ctx.is_null() || size <= 0.0 {
+            return;
+        }
+        let ctx_cls = cls("NSGraphicsContext");
+        if ctx_cls.is_null() {
+            return;
+        }
+        // SAFETY: a graphics context is created for this call, made current, and
+        // the previous one is restored; the point is in the flipped view space.
+        unsafe {
+            let gctx = raw_send!(
+                ctx_cls,
+                "graphicsContextWithCGContext:flipped:",
+                unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, bool) -> *mut c_void,
+                (ctx, true)
+            );
+            if gctx.is_null() {
+                return;
+            }
+            let attrs = text_attributes(font, size, slant, weight, r, g, b, a);
+            if attrs.is_null() {
+                return;
+            }
+            msg0v(ctx_cls, "saveGraphicsState");
+            msg1v(ctx_cls, "setCurrentContext:", gctx);
+            let point = CGPoint {
+                x,
+                y: y - size * 0.8,
+            };
+            raw_send!(
+                text,
+                "drawAtPoint:withAttributes:",
+                unsafe extern "C" fn(*mut c_void, *mut c_void, CGPoint, *mut c_void),
+                (point, attrs)
+            );
+            msg0v(ctx_cls, "restoreGraphicsState");
+        }
+    }
+
+    /// `-[CorroMacTarget corroFired:]`: a control delivered its action; run the
+    /// Rust closure registered for this target.
+    extern "C" fn fired_imp(obj: *mut c_void, _cmd: *mut c_void, _sender: *mut c_void) {
+        // SAFETY: associated-object lookup on an object we handed AppKit.
+        let raw = unsafe { objc_getAssociatedObject(obj, key_addr(&TARGET_KEY)) } as usize;
+        if raw != 0 {
+            core_apple::dispatch_callback(raw as u64);
+        }
+    }
+
+    /// `+[CorroMacTarget targetWithCallbackId:]`: the target a control keeps as
+    /// its `target`, carrying the id `register_callback` handed out.
+    extern "C" fn target_with_id_imp(
+        cls_ptr: *mut c_void,
+        _cmd: *mut c_void,
+        id: isize,
+    ) -> *mut c_void {
+        // SAFETY: `alloc`/`init` on our own NSObject subclass.
+        unsafe {
+            let obj = msg0(msg0(cls_ptr, "alloc"), "init");
+            if obj.is_null() {
+                return obj;
+            }
+            objc_setAssociatedObject(obj, key_addr(&TARGET_KEY), id as *mut c_void, OBJC_ASSIGN);
+            own(obj)
+        }
+    }
+
+    /// `+[CorroMacMenuTarget targetWithActionName:]`: a menu item's target,
+    /// carrying the name `SimpleAction::connect_activate` registered.
+    extern "C" fn menu_target_imp(
+        cls_ptr: *mut c_void,
+        _cmd: *mut c_void,
+        name: *mut c_void,
+    ) -> *mut c_void {
+        if name.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: `alloc`/`init` on our own NSObject subclass; the association
+        // retains the name, so the caller keeps ownership of its copy.
+        unsafe {
+            let obj = msg0(msg0(cls_ptr, "alloc"), "init");
+            if obj.is_null() {
+                return obj;
+            }
+            objc_setAssociatedObject(obj, key_addr(&MENU_KEY), name, OBJC_RETAIN);
+            own(obj)
+        }
+    }
+
+    /// `-[CorroMacMenuTarget corroFired:]`: dispatch the item's action into the
+    /// registry `connect_activate` filled in.
+    extern "C" fn menu_fired_imp(obj: *mut c_void, _cmd: *mut c_void, sender: *mut c_void) {
+        // SAFETY: associated-object lookup on our own target object.
+        let name = unsafe { objc_getAssociatedObject(obj, key_addr(&MENU_KEY)) };
+        if name.is_null() {
+            return;
+        }
+        if let Some(name) = core_apple::nsstring_to_rust(name) {
+            invoke_action(&name, sender);
+        }
+    }
+
+    /// `-[CorroSheetView corroSetCanvasId:]`: remember which draw/click registry
+    /// entries belong to this view.
+    extern "C" fn set_canvas_id_imp(obj: *mut c_void, _cmd: *mut c_void, id: isize) {
+        // SAFETY: associated-object store on our own view subclass.
+        unsafe {
+            objc_setAssociatedObject(obj, key_addr(&CANVAS_KEY), id as *mut c_void, OBJC_ASSIGN)
+        };
+    }
+
+    /// Canvas id of a view: the widget registry `create_canvas` filled in, or the
+    /// associated object the shim selector stored.
+    unsafe fn view_canvas_id(obj: *mut c_void) -> u64 {
+        let id = core_apple::canvas_id_for_view(obj);
+        if id != 0 {
+            return id;
+        }
+        unsafe { objc_getAssociatedObject(obj, key_addr(&CANVAS_KEY)) as usize as u64 }
+    }
+
+    /// `-[CorroSheetView isFlipped]`: y grows downwards, like every other
+    /// backend's canvas, so one draw closure serves GTK and AppKit.
+    extern "C" fn is_flipped_imp(_obj: *mut c_void, _cmd: *mut c_void) -> bool {
+        true
+    }
+
+    /// `-[CorroSheetView acceptsFirstResponder]`: the canvas takes focus, so
+    /// key events reach the results list once it is clicked.
+    extern "C" fn accepts_first_responder_imp(_obj: *mut c_void, _cmd: *mut c_void) -> bool {
+        true
+    }
+
+    /// `-[CorroSheetView drawRect:]`: replay the canvas closure against the
+    /// `CGContext` AppKit prepared for this pass.
+    extern "C" fn draw_rect_imp(obj: *mut c_void, _cmd: *mut c_void, _dirty: CGRect) {
+        // SAFETY: AppKit calls this on the main thread with a current context.
+        unsafe {
+            let canvas_id = view_canvas_id(obj);
+            if canvas_id == 0 {
+                return;
+            }
+            let bounds: CGRect = raw_send!(
+                obj,
+                "bounds",
+                unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
+                ()
+            );
+            core_apple::with_meta_mut(obj, |m| {
+                m.laid_out = (bounds.width as i32, bounds.height as i32);
+            });
+            let nsctx = msg0(cls("NSGraphicsContext"), "currentContext");
+            if nsctx.is_null() {
+                return;
+            }
+            let cgctx = msg0(nsctx, "CGContext");
+            if cgctx.is_null() {
+                return;
+            }
+            let ptr = {
+                let mut map = DRAW_CALLBACKS.lock().unwrap();
+                match map.get_mut(&canvas_id) {
+                    Some(SendDrawCallback(p)) => Some(*p),
+                    None => None,
+                }
+            };
+            if let Some(ptr) = ptr {
+                if let Some(mut dc) = CgDrawContext::new(cgctx) {
+                    let cb: &mut dyn FnMut(&mut dyn DrawContext, i32, i32) = &mut *ptr;
+                    cb(&mut dc, bounds.width as i32, bounds.height as i32);
+                }
+            }
+        }
+    }
+
+    /// Dispatch a press or release at the view's own coordinates.
+    ///
+    /// `locationInWindow` then `convertPoint:fromView:` is the AppKit way to get
+    /// a point in the view's (flipped) space; both return `CGPoint` by value.
+    unsafe fn sheet_fire_click(obj: *mut c_void, event: *mut c_void, press: bool) {
+        if event.is_null() {
+            return;
+        }
+        let canvas_id = unsafe { view_canvas_id(obj) };
+        if canvas_id == 0 {
+            return;
+        }
+        let in_window: CGPoint = raw_send!(
+            event,
+            "locationInWindow",
+            unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGPoint,
+            ()
+        );
+        let local: CGPoint = raw_send!(
+            obj,
+            "convertPoint:fromView:",
+            unsafe extern "C" fn(*mut c_void, *mut c_void, f64, f64, *mut c_void) -> CGPoint,
+            (in_window.x, in_window.y, std::ptr::null_mut())
+        );
+        let mods = unsafe { msg0i(event, "modifierFlags") } as u32;
+        // Left button, as the portable canvas reports it.
+        const BUTTON_LEFT: u32 = 1;
+        let plain = {
+            let mut map = CLICK_CALLBACKS.lock().unwrap();
+            map.get_mut(&canvas_id).map(|SendClickCallback(p)| *p)
+        };
+        let rich = {
+            let mut map = CLICK_BUTTON_CALLBACKS.lock().unwrap();
+            map.get_mut(&canvas_id).map(|SendClickButtonCallback(p)| *p)
+        };
+        let release = {
+            let mut map = RELEASE_CALLBACKS.lock().unwrap();
+            map.get_mut(&canvas_id).map(|SendClickButtonCallback(p)| *p)
+        };
+        if press {
+            if let Some(ptr) = rich {
+                // SAFETY: registry-owned closure, dispatched on the main thread.
+                unsafe { (*ptr)(local.x, local.y, BUTTON_LEFT, mods) };
+            }
+            if let Some(ptr) = plain {
+                // SAFETY: as above.
+                unsafe { (*ptr)(local.x, local.y) };
+            }
+        } else if let Some(ptr) = release {
+            // SAFETY: as above.
+            unsafe { (*ptr)(local.x, local.y, BUTTON_LEFT, mods) };
+        }
+    }
+
+    extern "C" fn mouse_down_imp(obj: *mut c_void, _cmd: *mut c_void, event: *mut c_void) {
+        // SAFETY: AppKit calls this on the main thread.
+        unsafe {
+            let window = msg0(obj, "window");
+            if !window.is_null() {
+                msg1v(window, "makeFirstResponder:", obj);
+            }
+            sheet_fire_click(obj, event, true);
+        }
+    }
+
+    extern "C" fn mouse_up_imp(obj: *mut c_void, _cmd: *mut c_void, event: *mut c_void) {
+        // SAFETY: as above.
+        unsafe { sheet_fire_click(obj, event, false) }
+    }
+
+    /// `-[NSView setContentHuggingPriority:forOrientation:]` for both axes.
+    ///
+    /// `NSLayoutPriority` is a C `float`, which is why this cannot reuse the
+    /// `CGFloat`-based send helpers.
+    unsafe fn set_hugging(obj: *mut c_void, priority: f32) {
+        raw_send!(
+            obj,
+            "setContentHuggingPriority:forOrientation:",
+            unsafe extern "C" fn(*mut c_void, *mut c_void, f32, isize),
+            (priority, 0)
+        );
+        raw_send!(
+            obj,
+            "setContentHuggingPriority:forOrientation:",
+            unsafe extern "C" fn(*mut c_void, *mut c_void, f32, isize),
+            (priority, 1)
+        );
+    }
+
+    /// `-[NSView corroSetFlex:]`: the shim's "this child takes the spare space"
+    /// flag, i.e. a low content-hugging priority (250 is AppKit's default).
+    extern "C" fn set_flex_imp(obj: *mut c_void, _cmd: *mut c_void, flex: bool) {
+        // SAFETY: sending to a live view.
+        unsafe { set_hugging(obj, if flex { 1.0 } else { 250.0 }) }
+    }
+
+    /// `-[NSView corroSetContentHugging:]`: the priority directly.
+    extern "C" fn set_hugging_imp(obj: *mut c_void, _cmd: *mut c_void, priority: isize) {
+        // SAFETY: sending to a live view.
+        unsafe { set_hugging(obj, priority as f32) }
+    }
+
+    /// Resize a view's frame width, keeping its height.
+    unsafe fn resize_width(obj: *mut c_void, w: f64) {
+        let bounds: CGRect = raw_send!(
+            obj,
+            "bounds",
+            unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
+            ()
+        );
+        raw_send!(
+            obj,
+            "setFrameSize:",
+            unsafe extern "C" fn(*mut c_void, *mut c_void, f64, f64),
+            (w, bounds.height)
+        );
+    }
+
+    /// `-[NSView corroSetMinWidth:]`: a minimum width on the frame, which is what
+    /// the manual-layout path used the selector for.
+    extern "C" fn set_min_width_imp(obj: *mut c_void, _cmd: *mut c_void, w: isize) {
+        if w <= 0 {
+            return;
+        }
+        // SAFETY: sending to a live view.
+        unsafe { resize_width(obj, w as f64) }
+    }
+
+    /// `-[NSView corroSetPinnedWidth:]`: a fixed width slot (`-1` releases it).
+    extern "C" fn set_pinned_width_imp(obj: *mut c_void, _cmd: *mut c_void, w: isize) {
+        if w < 0 {
+            return;
+        }
+        // SAFETY: sending to a live view.
+        unsafe { resize_width(obj, w as f64) }
+    }
+
+    /// Add `selname` to `cls_ptr`, with the given Objective-C type encoding.
+    unsafe fn add_method(cls_ptr: *mut c_void, selname: &str, imp: *const (), types: &str) {
+        let sel = core_apple::selector(selname);
+        let mut t: Vec<u8> = types.bytes().collect();
+        t.push(0);
+        // SAFETY: `imp` is an `extern "C"` function with the signature `types`
+        // describes, and `cls_ptr` is a class this module created or a stock
+        // AppKit class we are extending (adding, never overriding).
+        unsafe {
+            class_addMethod(
+                cls_ptr,
+                sel,
+                imp as *const c_void,
+                t.as_ptr() as *const std::os::raw::c_char,
+            );
+        }
+    }
+
+    /// [`add_method`] on the metaclass, i.e. a `+classMethod`.
+    unsafe fn add_class_method(cls_ptr: *mut c_void, selname: &str, imp: *const (), types: &str) {
+        // SAFETY: `object_getClass` on a class object yields its metaclass.
+        let meta = unsafe { object_getClass(cls_ptr) };
+        if !meta.is_null() {
+            // SAFETY: as in `add_method`.
+            unsafe { add_method(meta, selname, imp, types) };
+        }
+    }
+
+    /// Create the shim classes once per process.
+    ///
+    /// Idempotent, and a no-op without AppKit (headless boxes, host unit tests):
+    /// the adapter then keeps its logged-skip behaviour. A class that already
+    /// exists — a host that compiled the generated sources, or an earlier call —
+    /// is left alone.
+    pub fn ensure_runtime_classes() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            load_appkit();
+            let nsobject = cls("NSObject");
+            let nsview = cls("NSView");
+            if nsobject.is_null() || nsview.is_null() {
+                crate::backends::macos::log_macos(
+                    "macos: AppKit classes unavailable; shim classes not built",
+                );
+                return;
+            }
+            // SAFETY: each class is created once, and every IMP below is an
+            // `extern "C"` function with the encoding given beside it.
+            unsafe {
+                // A control's target: carries the `register_callback` id and
+                // dispatches `-corroFired:` when AppKit delivers the action.
+                if cls("CorroMacTarget").is_null() {
+                    let name = b"CorroMacTarget\0";
+                    let c = objc_allocateClassPair(
+                        nsobject,
+                        name.as_ptr() as *const std::os::raw::c_char,
+                        0,
+                    );
+                    if !c.is_null() {
+                        add_method(c, "corroFired:", fired_imp as *const (), "v@:@");
+                        add_class_method(
+                            c,
+                            "targetWithCallbackId:",
+                            target_with_id_imp as *const (),
+                            "@@:q",
+                        );
+                        objc_registerClassPair(c);
+                    }
+                }
+                // A menu item's target: carries the action name and dispatches
+                // into the registry `connect_activate` filled in.
+                if cls("CorroMacMenuTarget").is_null() {
+                    let name = b"CorroMacMenuTarget\0";
+                    let c = objc_allocateClassPair(
+                        nsobject,
+                        name.as_ptr() as *const std::os::raw::c_char,
+                        0,
+                    );
+                    if !c.is_null() {
+                        add_method(c, "corroFired:", menu_fired_imp as *const (), "v@:@");
+                        add_class_method(
+                            c,
+                            "targetWithActionName:",
+                            menu_target_imp as *const (),
+                            "@@:@",
+                        );
+                        objc_registerClassPair(c);
+                    }
+                }
+                // Text: measurement and drawing for `CgDrawContext`, which
+                // delegates both to the host's `CorroMacText` class.
+                if cls("CorroMacText").is_null() {
+                    let name = b"CorroMacText\0";
+                    let c = objc_allocateClassPair(
+                        nsobject,
+                        name.as_ptr() as *const std::os::raw::c_char,
+                        0,
+                    );
+                    if !c.is_null() {
+                        add_class_method(
+                            c,
+                            "measure:font:size:slant:weight:",
+                            text_measure_imp as *const (),
+                            "@@:@@dqq",
+                        );
+                        add_class_method(
+                            c,
+                            "drawText:ctx:font:x:y:size:r:g:b:a:slant:weight:",
+                            text_draw_imp as *const (),
+                            "v@:@@@dddddddqq",
+                        );
+                        objc_registerClassPair(c);
+                    }
+                }
+                // The canvas: a flipped `NSView` that replays the draw closure
+                // against Core Graphics and forwards mouse events by canvas id.
+                if cls("CorroSheetView").is_null() {
+                    let name = b"CorroSheetView\0";
+                    let c = objc_allocateClassPair(
+                        nsview,
+                        name.as_ptr() as *const std::os::raw::c_char,
+                        0,
+                    );
+                    if !c.is_null() {
+                        add_method(
+                            c,
+                            "drawRect:",
+                            draw_rect_imp as *const (),
+                            "v@:{CGRect={CGPoint=dd}{CGSize=dd}}",
+                        );
+                        add_method(c, "isFlipped", is_flipped_imp as *const (), "c@:");
+                        add_method(
+                            c,
+                            "acceptsFirstResponder",
+                            accepts_first_responder_imp as *const (),
+                            "c@:",
+                        );
+                        add_method(c, "corroSetCanvasId:", set_canvas_id_imp as *const (), "v@:q");
+                        add_method(c, "mouseDown:", mouse_down_imp as *const (), "v@:@");
+                        add_method(c, "mouseUp:", mouse_up_imp as *const (), "v@:@");
+                        objc_registerClassPair(c);
+                    }
+                }
+                // The shim selectors the adapter sends to *stock* views: adding
+                // them to `NSView` is what turns those sends from a logged skip
+                // into real AppKit behaviour — and every control is an `NSView`.
+                add_method(nsview, "corroSetFlex:", set_flex_imp as *const (), "v@:c");
+                add_method(
+                    nsview,
+                    "corroSetContentHugging:",
+                    set_hugging_imp as *const (),
+                    "v@:q",
+                );
+                add_method(nsview, "corroSetMinWidth:", set_min_width_imp as *const (), "v@:q");
+                add_method(
+                    nsview,
+                    "corroSetPinnedWidth:",
+                    set_pinned_width_imp as *const (),
+                    "v@:q",
+                );
+            }
+            if !cls("CorroSheetView").is_null() {
+                core_apple::set_sheet_view_class("CorroSheetView");
+            }
+        });
+    }
+
+    /// Render `view` offscreen and return its pixels as `(w, h, RGBA8)`.
+    ///
+    /// `displayRectIgnoringOpacity:inContext:` runs the view's real `drawRect:`
+    /// into a bitmap-backed context, so a headless machine (CI) can prove a
+    /// canvas paints instead of trusting that it would. Returns `None` when
+    /// AppKit is unavailable or the view will not draw.
+    pub fn render_view_rgba(
+        view: *mut c_void,
+        w: u32,
+        h: u32,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        if view.is_null() || w == 0 || h == 0 {
+            return None;
+        }
+        let rep_cls = cls("NSBitmapImageRep");
+        let ctx_cls = cls("NSGraphicsContext");
+        if rep_cls.is_null() || ctx_cls.is_null() {
+            return None;
+        }
+        // SAFETY: the bitmap rep owns its buffer, the context is scoped with
+        // save/restore, and every pointer is null-checked before use.
+        unsafe {
+            let rep = raw_send!(
+                raw_send!(
+                    rep_cls,
+                    "alloc",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void,
+                    ()
+                ),
+                "initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:",
+                unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *const *mut c_void,
+                    isize,
+                    isize,
+                    isize,
+                    isize,
+                    bool,
+                    bool,
+                    *mut c_void,
+                    isize,
+                    isize,
+                ) -> *mut c_void,
+                (
+                    std::ptr::null::<*mut c_void>(),
+                    w as isize,
+                    h as isize,
+                    8isize,
+                    4isize,
+                    true,
+                    false,
+                    nsstring("NSDeviceRGBColorSpace"),
+                    0isize,
+                    0isize,
+                )
+            );
+            if rep.is_null() {
+                return None;
+            }
+            let gctx = core_apple::msg1(ctx_cls, "graphicsContextWithBitmapImageRep:", rep);
+            if gctx.is_null() {
+                return None;
+            }
+            msg2cv(view, "setFrameSize:", w as f64, h as f64);
+            msg0v(ctx_cls, "saveGraphicsState");
+            msg1v(ctx_cls, "setCurrentContext:", gctx);
+            let rect = CGRect {
+                x: 0.0,
+                y: 0.0,
+                width: w as f64,
+                height: h as f64,
+            };
+            raw_send!(
+                view,
+                "displayRectIgnoringOpacity:inContext:",
+                unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect, *mut c_void),
+                (rect, gctx)
+            );
+            msg0v(ctx_cls, "restoreGraphicsState");
+            let data = msg0(rep, "bitmapData") as *const u8;
+            let row = msg0i(rep, "bytesPerRow") as usize;
+            let per_pixel = msg0i(rep, "samplesPerPixel") as usize;
+            if data.is_null() || row == 0 || per_pixel < 4 {
+                return None;
+            }
+            let bytes = std::slice::from_raw_parts(data, row * h as usize);
+            let mut out = Vec::with_capacity(w as usize * h as usize * 4);
+            for y in 0..h as usize {
+                let start = y * row;
+                out.extend_from_slice(&bytes[start..start + w as usize * 4]);
+            }
+            Some((w, h, out))
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Factories
     // ------------------------------------------------------------------
 
@@ -2945,9 +3781,131 @@ mod macos_adapter {
     }
 
     pub fn create_menubar(model: &Menu, _action_group: *mut c_void) -> Result<MenuBar, Error> {
+        ensure_runtime_classes();
+        // macOS is the one backend with a real `NSMenu`, so the model is turned
+        // into a genuine menu bar here instead of only being data the host may
+        // render. Each item's action goes to a `CorroMacMenuTarget`, whose
+        // `-corroFired:` dispatches into the registry `connect_activate`
+        // filled in — the same call sites, now with a working menu.
+        unsafe { install_main_menu(&model.items) };
         Ok(MenuBar {
             items: model.items.clone(),
         })
+    }
+
+    /// Build an `NSMenu` from the model and make it the app's main menu.
+    ///
+    /// The model stores each action as `app.<name>` (the GTK action-group
+    /// prefix) while `SimpleAction::connect_activate` registers the closure
+    /// under `<name>`, so the prefix is stripped here.
+    unsafe fn install_main_menu(items: &[MenuItem]) {
+        let nsapp_cls = cls("NSApplication");
+        let menu_cls = cls("NSMenu");
+        let item_cls = cls("NSMenuItem");
+        let target_cls = cls("CorroMacMenuTarget");
+        if nsapp_cls.is_null() || menu_cls.is_null() || item_cls.is_null() || target_cls.is_null() {
+            return;
+        }
+        // SAFETY: every object below is an AppKit menu class; null checks guard
+        // the sends, and the menu is retained by `NSApplication`.
+        unsafe {
+            let app = msg0(nsapp_cls, "sharedApplication");
+            if app.is_null() {
+                return;
+            }
+            let main = msg0(msg0(menu_cls, "alloc"), "init");
+            if main.is_null() {
+                return;
+            }
+            // An item is only as live as its target says: with auto-enabling on,
+            // AppKit validates each item and greys out anything it cannot
+            // confirm, and our targets implement `corroFired:` but no validator.
+            msg1bv(main, "setAutoenablesItems:", false);
+            for entry in items {
+                let MenuItem::Submenu { label, items } = entry else {
+                    continue;
+                };
+                let sub = msg0(msg0(menu_cls, "alloc"), "init");
+                if sub.is_null() {
+                    continue;
+                }
+                msg1bv(sub, "setAutoenablesItems:", false);
+                for it in items {
+                    if let MenuItem::Item { label, action } = it {
+                        append_menu_item(sub, item_cls, target_cls, label, action);
+                    }
+                }
+                let holder = new_menu_item(item_cls, label, std::ptr::null_mut());
+                if holder.is_null() {
+                    continue;
+                }
+                msg1v(holder, "setSubmenu:", sub);
+                msg1v(main, "addItem:", holder);
+            }
+            msg1v(app, "setMainMenu:", main);
+        }
+    }
+
+    /// `[[NSMenuItem alloc] initWithTitle:action:keyEquivalent:]`.
+    fn new_menu_item(
+        item_cls: *mut c_void,
+        label: &str,
+        action: *mut c_void,
+    ) -> *mut c_void {
+        let title = nsstring(label);
+        let empty = nsstring("");
+        if title.is_null() || empty.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: `initWithTitle:action:keyEquivalent:` is NSMenuItem's
+        // designated initialiser; a null action makes it a submenu holder.
+        raw_send!(
+            raw_send!(
+                item_cls,
+                "alloc",
+                unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void,
+                ()
+            ),
+            "initWithTitle:action:keyEquivalent:",
+            unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+                *mut c_void,
+            ) -> *mut c_void,
+            (title, action, empty)
+        )
+    }
+
+    /// Add one actionable item to `menu`, wired to its registered action.
+    unsafe fn append_menu_item(
+        menu: *mut c_void,
+        item_cls: *mut c_void,
+        target_cls: *mut c_void,
+        label: &str,
+        action: &str,
+    ) {
+        let name = action.strip_prefix("app.").unwrap_or(action);
+        let name_obj = nsstring(name);
+        if name_obj.is_null() {
+            return;
+        }
+        // SAFETY: the target class exists (checked by the caller) and retains
+        // `name_obj`; the item retains its target through `NSMenuItem`.
+        unsafe {
+            let target = core_apple::msg1(target_cls, "targetWithActionName:", name_obj);
+            if target.is_null() {
+                return;
+            }
+            let item = new_menu_item(item_cls, label, core_apple::selector("corroFired:"));
+            if item.is_null() {
+                return;
+            }
+            own(target);
+            msg1v(item, "setTarget:", target);
+            msg1v(menu, "addItem:", item);
+        }
     }
 
     pub fn create_simple_action(name: &str) -> Result<SimpleAction, Error> {
@@ -2957,10 +3915,11 @@ mod macos_adapter {
     }
 
     pub fn create_canvas() -> Result<Canvas, Error> {
-        // The host-registered sheet view when available (it knows how to
-        // funnel `drawRect:`/mouse/key events back into Rust), else a plain
-        // NSView: the tree stays valid either way. Mirrors the iOS and
-        // Android fallbacks.
+        // The sheet view class is built at runtime (it funnels `drawRect:` and
+        // mouse events back into Rust); if AppKit is up, it is registered here
+        // and the lookup below finds it. A plain NSView remains the fallback so
+        // the tree stays valid without a display.
+        ensure_runtime_classes();
         let canvas_id = core_apple::next_canvas_id();
         let class_name = core_apple::sheet_view_class().unwrap_or_else(|| "NSView".to_owned());
         let class = cls(&class_name);

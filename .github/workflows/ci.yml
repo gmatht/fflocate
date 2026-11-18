@@ -95,6 +95,26 @@ jobs:
           echo "::error title=GUI did not start (${RUNNER_OS})::session=${session} exit ${status}: $(log)"
           exit 1
 
+      # Launching is not the same as being interactive: this drives the real
+      # AppKit paths a user would -- `-performClick:` down to the Rust
+      # target/action callback, and a bitmap render of the sheet view's
+      # `drawRect:` -- and fails if either the callback does not fire or the
+      # canvas renders blank. The probe is a binary, not a test, so it runs on
+      # the main thread the way AppKit requires.
+      - name: GUI interactivity (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -o pipefail
+          ulimit -c 0 || true
+          if cargo run -p ff-gui --example macos_probe 2>&1 | tee probe.log; then
+            echo "::notice title=GUI interactivity (macOS)::$(grep '^probe:' probe.log | tr '\n' '|')"
+            exit 0
+          fi
+          msg=$(tail -c 1500 probe.log | tr -cd '[:print:]\n' | tr '\n' '|')
+          echo "::error title=GUI is not interactive (${RUNNER_OS})::${msg}"
+          exit 1
+
       # The FSEvents backend is cfg(target_os = "macos"), so its unit tests only
       # run here; this also proves a live stream follows create/rename/delete.
       # The script prints the daemon log and stats when it gives up, so the
