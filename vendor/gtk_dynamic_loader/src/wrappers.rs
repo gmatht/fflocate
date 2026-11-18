@@ -184,6 +184,32 @@ impl Window {
         }
     }
 
+    /// Set the window icon — what the taskbar and window switcher draw for
+    /// this window.
+    ///
+    /// `path` is a PNG on disk and `name` is its icon-theme name; each toolkit
+    /// takes the one it has. GTK3 has `gtk_window_set_icon_from_file` (the WM
+    /// publishes the pixels as `_NET_WM_ICON`); GTK4 dropped it and resolves
+    /// `gtk_window_set_icon_name` through the icon theme instead. The file is
+    /// preferred when both exist, because it needs no theme lookup at all.
+    /// No-op when neither symbol resolved (a GTK too old to have either).
+    pub fn set_icon(&self, path: &str, name: &str) {
+        guard_widget!(self, "Window", "set_icon");
+        if let Some(set_icon) = self.loader.symbols.gtk_window_set_icon_from_file {
+            if let Ok(c) = CString::new(path) {
+                // The GError** out-param is null: a missing file is reported
+                // by the return value, and there is nothing to free.
+                unsafe { set_icon(self.inner, c.as_ptr() as *const u8, std::ptr::null_mut()) };
+                return;
+            }
+        }
+        if let Some(set_icon_name) = self.loader.symbols.gtk_window_set_icon_name {
+            if let Ok(c) = CString::new(name) {
+                unsafe { set_icon_name(self.inner, c.as_ptr() as *const u8) };
+            }
+        }
+    }
+
     pub fn set_child(&self, child: &impl GtkWidget) {
         guard_widget!(self, "Window", "set_child");
         let symbols = &self.loader.symbols;

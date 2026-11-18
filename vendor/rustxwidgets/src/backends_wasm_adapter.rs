@@ -993,6 +993,10 @@ impl Window {
         self.elem.set_text_content(Some(title));
     }
 
+    /// A browser tab has a favicon, not a window icon; accepted as a no-op so
+    /// the portable call site compiles.
+    pub fn set_icon(&self, _path: &str, _name: &str, _png: &[u8]) {}
+
         pub fn set_child(&self, child: &impl AsElement) {
             while let Some(c) = self.elem.first_child() {
                 self.elem.remove_child(&c).ok();

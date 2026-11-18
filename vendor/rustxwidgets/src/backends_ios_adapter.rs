@@ -334,6 +334,10 @@ mod ios_adapter {
     impl Window {
         pub fn set_title(&self, _title: &str) {}
 
+        /// The icon of an iOS app comes from its bundle (`AppIcon`), not from
+        /// a window; accepted as a no-op so the portable call site compiles.
+        pub fn set_icon(&self, _path: &str, _name: &str, _png: &[u8]) {}
+
         pub fn set_default_size(&self, _w: i32, _h: i32) {}
 
         /// Force the window to a size, points.

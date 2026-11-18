@@ -42,7 +42,7 @@ use std::sync::Arc;
 use ff_gui::{
     box_change_clears, containing_dir, context_menu_target, effective_query, encode_request,
     render_count, rows_from_paths, scan_percent, search_label, searching_status_line,
-    step_max_distance, streaming_status_line, DaemonClient, GuiError,
+    step_max_distance, streaming_status_line, DaemonClient, GuiError, icon,
     MenuAction, PendingRequest, Progress, RowAction, SearchGate, SearchOptions, SearchOutcome,
     StartupPoll, StartupProbe,
     WheelStep, WireResponse, ADVANCED_SYNTAX_HELP, DEFAULT_MAX_DISTANCE,
@@ -124,6 +124,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("ff-gui {} (backend: {BACKEND})", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    // The icon's theme files must be on disk before GTK starts: GTK reads the
+    // icon theme while initialising, so an icon installed later would not be
+    // found by name. See `icon::prepare`.
+    let icon_path = icon::prepare();
+
     trace_step!("app init");
     let app = App::init().map_err(|e| GuiError::Backend(e.to_string()))?;
     let socket_path = DaemonClient::new().socket().to_path_buf();
@@ -132,6 +137,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let win = app.create_window()?;
     trace_step!("window title");
     win.set_title("fflocate");
+    // The fflocate mark as the window/taskbar icon (on macOS: the Dock icon).
+    // Best-effort — a backend with no icon support simply ignores it.
+    win.set_icon(&icon_path, icon::ICON_NAME, icon::ICON_PNG);
     // Roomy enough that all three columns are visible on launch.
     win.set_default_size(DEFAULT_WINDOW_W, DEFAULT_WINDOW_H);
 

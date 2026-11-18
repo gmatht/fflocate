@@ -227,6 +227,60 @@ mod macos_adapter {
             unsafe { msg1v(window, "setTitle:", s) };
         }
 
+        /// Set the **Dock** icon (and the window-switcher image).
+        ///
+        /// macOS has no per-window icon: the application owns one, so this sets
+        /// `NSApplication.applicationIconImage` from the PNG bytes rather than
+        /// decorating a window. It matters for a bare Rust binary, which has no
+        /// `.app` bundle to carry an `Info.plist` icon and would otherwise show
+        /// the generic executable icon in the Dock. `path`/`name` are for the
+        /// backends that decorate a window; unused here.
+        ///
+        /// No-op when AppKit is uninitialised, when there is no application (a
+        /// headless session), and when the PNG cannot be turned into an
+        /// `NSImage` — a missing icon must never take the GUI down.
+        pub fn set_icon(&self, _path: &str, _name: &str, png: &[u8]) {
+            if png.is_empty() {
+                return;
+            }
+            // SAFETY: `NSData`/`NSImage` are AppKit's own classes and every
+            // handle is null-checked. `NSData` copies the bytes, so the slice
+            // can be freed afterwards, and `setApplicationIconImage:` retains
+            // the image; no Rust-owned memory is handed to AppKit.
+            let app = unsafe { shared_app() };
+            if app.is_null() {
+                return;
+            }
+            let data_cls = cls("NSData");
+            let image_cls = cls("NSImage");
+            if data_cls.is_null() || image_cls.is_null() {
+                return;
+            }
+            let data = raw_send!(
+                data_cls,
+                "dataWithBytes:length:",
+                unsafe extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> *mut c_void,
+                (png.as_ptr(), png.len())
+            );
+            if data.is_null() {
+                return;
+            }
+            let image = alloc_init(image_cls);
+            if image.is_null() {
+                return;
+            }
+            let image = raw_send!(
+                image,
+                "initWithData:",
+                unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void,
+                (data)
+            );
+            if image.is_null() {
+                return;
+            }
+            unsafe { msg1v(app, "setApplicationIconImage:", image) };
+        }
+
         pub fn set_default_size(&self, _w: i32, _h: i32) {}
 
         /// Force the window to a size, in points.
@@ -490,18 +544,14 @@ mod macos_adapter {
                 Some(w) => {
                     // NSLayoutPriority: 1000 is "required", 999 one step
                     // below. Either beats the intrinsic 250.
-                    unsafe {
-                        msg1iv(self.0, "corroSetPinnedWidth:", w as isize);
-                        msg1iv(self.0, "corroSetContentHugging:", 1000);
-                    }
+                    shim_i(self.0, "corroSetPinnedWidth:", w as isize);
+                    shim_i(self.0, "corroSetContentHugging:", 1000);
                 }
                 None => {
                     // Release: drop the constraint and let the intrinsic size
                     // size the field again (hugging back to the default 250).
-                    unsafe {
-                        msg1iv(self.0, "corroSetPinnedWidth:", -1);
-                        msg1iv(self.0, "corroSetContentHugging:", 250);
-                    }
+                    shim_i(self.0, "corroSetPinnedWidth:", -1);
+                    shim_i(self.0, "corroSetContentHugging:", 250);
                 }
             }
             // The constraint is only meaningful once the view is in a
@@ -518,9 +568,14 @@ mod macos_adapter {
             if self.0.is_null() {
                 return;
             }
-            // `headIndent` is NSTextField's left inset (points), and unlike a
-            // constraint it needs no superview to take effect.
-            unsafe { msg1cv(self.0, "setHeadIndent:", px as f64) };
+            // `headIndent` is the left inset in points, and unlike a
+            // constraint it needs no superview to take effect. It is sent only
+            // when the view really has it: a selector this SDK does not
+            // implement would raise and abort, and the margin is already
+            // recorded in the widget's meta either way.
+            if responds(self.0, "setHeadIndent:") {
+                unsafe { msg1cv(self.0, "setHeadIndent:", px as f64) };
+            }
         }
 
         /// Top inset of the label's contents, in points.
@@ -655,7 +710,7 @@ mod macos_adapter {
                     // priority; the host shim reads the same flag through
                     // `corroFlexChild:`. Android does exactly this with
                     // LinearLayout weight (ANDROID_GUIDELINES.md §6).
-                    msg1bv(child_ptr, "corroSetFlex:", true);
+                    shim_bv(child_ptr, "corroSetFlex:", true);
                 }
             }
             // Minimum width for an empty entry: `set_width_chars` recorded a
@@ -663,7 +718,7 @@ mod macos_adapter {
             let min_chars = core_apple::view_min_chars(child_ptr);
             if min_chars > 0 {
                 let w = min_chars as f64 * EST_CHAR_W;
-                unsafe { msg1iv(child_ptr, "corroSetMinWidth:", w as isize) };
+                shim_i(child_ptr, "corroSetMinWidth:", w as isize);
             }
         }
 
@@ -2225,13 +2280,9 @@ mod macos_adapter {
                 return;
             }
             // `corroAddAction:` is implemented by the host's alert shim so one
-            // Rust call covers the addButton/runModal sequence.
-            raw_send!(
-                self.0,
-                "corroAddAction:",
-                unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> (),
-                (s)
-            );
+            // Rust call covers the addButton/runModal sequence; without it the
+            // button is added but the shim decides how the alert runs.
+            shim_v(self.0, "corroAddAction:", s);
         }
 
         pub fn present(&self) {
@@ -2242,12 +2293,7 @@ mod macos_adapter {
             // alert) or `beginSheetModalForWindow:` (a sheet on the host
             // window) depending on what the host has.
             match core_apple::view_controller() {
-                Some(vc) => raw_send!(
-                    vc,
-                    "corroPresentDialog:",
-                    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> (),
-                    (self.0)
-                ),
+                Some(vc) => shim_v(vc, "corroPresentDialog:", self.0),
                 None => {
                     // No controller: present modally on the alert itself.
                     unsafe { msg0v(self.0, "runModal") };
@@ -2489,6 +2535,65 @@ mod macos_adapter {
                 unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool,
                 (core_apple::selector(selname),)
             )
+        }
+    }
+
+    /// Send a host-shim selector only when the receiver implements it.
+    ///
+    /// Selectors named `corro*` are provided by the ObjC classes this backend
+    /// generates (`apple_generator`), not by AppKit: a real `NSStackView` or
+    /// `NSTextField` does not implement them. An unchecked send therefore
+    /// raises an exception that unwinds into Rust and aborts the process, which
+    /// is how `corroSetSpacing:` took the GUI down on its first box. Asking
+    /// first turns a missing shim into one logged skip, so the AppKit path
+    /// keeps stock behaviour instead of dying.
+    fn shim_sent(obj: *mut c_void, selname: &str) -> bool {
+        if obj.is_null() {
+            return false;
+        }
+        if responds(obj, selname) {
+            return true;
+        }
+        log_missing_shim(selname);
+        false
+    }
+
+    /// Report each missing shim selector once: a redraw loop would otherwise
+    /// bury the interesting line.
+    fn log_missing_shim(selname: &str) {
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+        let first = seen
+            .lock()
+            .map(|mut s| s.insert(selname.to_string()))
+            .unwrap_or(false);
+        if first {
+            crate::backends::macos::log_macos(&format!(
+                "macos: no host shim for {selname}; using stock AppKit behaviour"
+            ));
+        }
+    }
+
+    /// [`shim_sent`] followed by the send, for one object argument.
+    fn shim_v(obj: *mut c_void, selname: &str, arg: *mut c_void) {
+        if shim_sent(obj, selname) {
+            unsafe { msg1v(obj, selname, arg) }
+        }
+    }
+
+    /// [`shim_sent`] followed by the send, for one integer argument.
+    fn shim_i(obj: *mut c_void, selname: &str, arg: isize) {
+        if shim_sent(obj, selname) {
+            unsafe { msg1iv(obj, selname, arg) }
+        }
+    }
+
+    /// [`shim_sent`] followed by the send, for one `BOOL` argument.
+    fn shim_bv(obj: *mut c_void, selname: &str, arg: bool) {
+        if shim_sent(obj, selname) {
+            unsafe { msg1bv(obj, selname, arg) }
         }
     }
 
@@ -2790,11 +2895,8 @@ mod macos_adapter {
         // NSStackView (macOS 10.9+). The host shim provides the same
         // selectors on older systems (`corroAddArrangedSubview:`), so the
         // call sites below do not branch.
-        let class_name = if cls("NSStackView").is_null() {
-            "CorroMacContainer"
-        } else {
-            "NSStackView"
-        };
+        let appkit = !cls("NSStackView").is_null();
+        let class_name = if appkit { "NSStackView" } else { "CorroMacContainer" };
         let bx = new_widget(class_name, Kind::Box);
         if bx.is_null() {
             return Ok(BoxWidget(bx));
@@ -2803,9 +2905,14 @@ mod macos_adapter {
             // 0 = horizontal, 1 = vertical: NSUserInterfaceLayoutOrientation
             // and Android's LinearLayout constants agree.
             msg1iv(bx, "setOrientation:", orientation.as_int() as isize);
-            // `corroSetSpacing:` takes the integer spacing; keeping it as a
-            // selector avoids a CGFloat ABI branch here.
-            msg1iv(bx, "corroSetSpacing:", spacing as isize);
+        }
+        if appkit {
+            // `NSStackView` owns its spacing itself, and as a CGFloat — using
+            // the shim's integer selector here is a message AppKit does not
+            // implement, so the two paths cannot share one call.
+            unsafe { msg1cv(bx, "setSpacing:", spacing as f64) };
+        } else {
+            shim_i(bx, "corroSetSpacing:", spacing as isize);
         }
         Ok(BoxWidget(bx))
     }
@@ -2820,9 +2927,13 @@ mod macos_adapter {
             msg1bv(e, "setEditable:", true);
             msg1bv(e, "setBezeled:", true);
             msg1bv(e, "setDrawsBackground:", true);
-            // A formula bar must not be autocorrected/capitalised.
-            msg1iv(e, "setAutocorrectionType:", 0);
-            msg1iv(e, "setAutocapitalizationType:", 0);
+            // Autocorrection and autocapitalisation are *UIKit* text-input
+            // traits (`UITextInputTraits`); AppKit's `NSTextField` does not
+            // implement them, and sending either one raises an unrecognised
+            // selector that aborts the process. AppKit has no per-field
+            // equivalent either — a plain `NSTextField` is not capitalised or
+            // autocorrected as it is typed — so there is nothing to translate
+            // and the pair is simply not sent here.
             set_frame(e, 0.0, 0.0, 0.0, MIN_CTRL_PT);
         }
         Ok(Entry(e))
@@ -2873,8 +2984,9 @@ mod macos_adapter {
                     },
                 );
                 // Hand the canvas id to the view so `drawRect:`/events can
-                // name it in the Rust callbacks.
-                unsafe { msg1iv(obj, "corroSetCanvasId:", canvas_id as isize) };
+                // name it in the Rust callbacks (the host shim's selector; the
+                // registry above is the fallback).
+                shim_i(obj, "corroSetCanvasId:", canvas_id as isize);
                 obj
             }
         };

@@ -27,6 +27,10 @@ use fflocate::proto::{Request, Response};
 /// Re-exported because `PendingRequest::records` hands these back to the GUI.
 pub use fflocate::proto::Response as WireResponse;
 
+/// The application icon: the logo's mark with the wordmark cropped away, and
+/// how each backend is handed it.
+pub mod icon;
+
 /// Errors surfaced to the status line.
 #[derive(Debug)]
 pub enum GuiError {

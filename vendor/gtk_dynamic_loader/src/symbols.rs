@@ -71,6 +71,14 @@ pub type GtkWidgetShow = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWidgetHide = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWidgetShowAll = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWindowPresent = unsafe extern "C" fn(window: *mut c_void);
+
+/// `gtk_window_set_icon_from_file` (GTK3). GTK4 removed it: there the window
+/// icon is resolved from the icon theme by name, which is what
+/// `gtk_window_set_icon_name` is for. `Window::set_icon` uses whichever one
+/// the loaded library has, so the same caller works on both.
+pub type GtkWindowSetIconFromFile =
+    unsafe extern "C" fn(window: *mut c_void, filename: *const u8, error: *mut *mut c_void) -> i32;
+pub type GtkWindowSetIconName = unsafe extern "C" fn(window: *mut c_void, name: *const u8);
 pub type GtkInit = unsafe extern "C" fn(argc: *mut libc::c_int, argv: *mut *mut *mut libc::c_char);
 pub type GtkLabelSetMarkup = unsafe extern "C" fn(label: *mut c_void, markup: *const u8);
 pub type GtkWidgetSetVisible = unsafe extern "C" fn(widget: *mut c_void, visible: i32);
@@ -425,6 +433,8 @@ pub struct Symbols {
     // gtk
     pub gtk_window_new: Option<GtkWindowNew>,
     pub gtk_window_set_title: Option<GtkWindowSetTitle>,
+    pub gtk_window_set_icon_from_file: Option<GtkWindowSetIconFromFile>,
+    pub gtk_window_set_icon_name: Option<GtkWindowSetIconName>,
     pub gtk_button_new_with_label: Option<GtkButtonNewWithLabel>,
     pub gtk_label_new: Option<GtkLabelNew>,
     pub gtk_label_set_text: Option<GtkLabelSetText>,
@@ -789,6 +799,8 @@ impl Symbols {
         // gtk symbols
         let gtk_window_new = unsafe { sym::<GtkWindowNew>(gtk, "gtk_window_new") };
         let gtk_window_set_title = unsafe { sym::<GtkWindowSetTitle>(gtk, "gtk_window_set_title") };
+        let gtk_window_set_icon_from_file = unsafe { sym::<GtkWindowSetIconFromFile>(gtk, "gtk_window_set_icon_from_file") };
+        let gtk_window_set_icon_name = unsafe { sym::<GtkWindowSetIconName>(gtk, "gtk_window_set_icon_name") };
         let gtk_button_new_with_label = unsafe { sym::<GtkButtonNewWithLabel>(gtk, "gtk_button_new_with_label") };
         let gtk_label_new = unsafe { sym::<GtkLabelNew>(gtk, "gtk_label_new") };
         let gtk_label_set_text = unsafe { sym::<GtkLabelSetText>(gtk, "gtk_label_set_text") };
@@ -1094,7 +1106,8 @@ impl Symbols {
         Ok(Symbols {
             g_main_loop_new, g_main_loop_run, g_main_loop_quit,
             g_object_ref, g_object_unref, g_object_ref_sink, g_signal_connect_data, g_signal_connect,
-            gtk_window_new, gtk_window_set_title, gtk_button_new_with_label, gtk_label_new, gtk_label_set_text,
+            gtk_window_new, gtk_window_set_title, gtk_window_set_icon_from_file, gtk_window_set_icon_name,
+            gtk_button_new_with_label, gtk_label_new, gtk_label_set_text,
             gtk_box_new, gtk_box_append, gtk_box_pack_start, gtk_container_add, gtk_container_remove, gtk_window_set_child,
             gtk_widget_show_all, gtk_widget_show, gtk_widget_hide, gtk_window_present,
             gtk_grid_new, gtk_grid_attach, gtk_entry_new, gtk_entry_set_text, gtk_entry_get_text,

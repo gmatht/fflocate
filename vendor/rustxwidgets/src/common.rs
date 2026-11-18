@@ -119,6 +119,12 @@ macro_rules! common_types_mod {
 
         impl Window {
             pub fn set_title(&self, title: &str) { self.inner.set_title(title); }
+            /// Set the window/app icon. Each backend takes what it has: GTK
+            /// decorates the window (`path` = a PNG on disk, `name` = its
+            /// icon-theme name), macOS sets the Dock image from `png` itself,
+            /// and the headless/other backends do nothing. All three are
+            /// passed so one call site serves every backend.
+            pub fn set_icon(&self, path: &str, name: &str, png: &[u8]) { self.inner.set_icon(path, name, png); }
             pub fn set_default_size(&self, w: i32, h: i32) { self.inner.set_default_size(w, h); }
             /// Immediate resize. `set_default_size` is advisory under GTK and
             /// is not applied at all when no window manager is running (bare

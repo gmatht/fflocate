@@ -48,6 +48,14 @@ mod gtk_adapter {
             self.0.set_title(title);
         }
 
+        /// Window icon for the taskbar / window switcher. `path` is a PNG on
+        /// disk and `name` its icon-theme name; the loader picks whichever
+        /// this GTK version understands (see its `Window::set_icon`). `png` is
+        /// for backends that take the image itself (macOS); unused here.
+        pub fn set_icon(&self, path: &str, name: &str, _png: &[u8]) {
+            self.0.set_icon(path, name);
+        }
+
         pub fn set_default_size(&self, w: i32, h: i32) {
             self.0.set_default_size(w, h);
         }

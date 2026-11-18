@@ -552,6 +552,12 @@ mod nwg_adapter {
 
     impl Window {
         pub fn set_title(&self, title: &str) { self.inner.set_text(title); }
+
+        /// A Windows window icon has to be an `HICON` (an embedded resource or
+        /// `LoadImage`), not a PNG path, so this build has no icon to set and
+        /// accepts the call as a no-op. The PNG and the crop still apply: see
+        /// `crates/ff-gui/assets/`.
+        pub fn set_icon(&self, _path: &str, _name: &str, _png: &[u8]) {}
         pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
             let ptr = *child.as_ref();
             if !ptr.is_null() {
