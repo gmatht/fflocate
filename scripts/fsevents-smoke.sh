@@ -26,7 +26,15 @@ daemon=$!
 trap 'kill "$daemon" 2>/dev/null || true' EXIT
 
 count() {
-    ./target/release/ff --socket "$state/s.sock" --count "$1" 2>/dev/null || echo error
+    # `ff --count` exits 1 when nothing matches (locate semantics), so a
+    # non-zero status is not a failure by itself: the number on stdout is the
+    # answer. Only an empty or non-numeric answer means the socket could not be
+    # asked, and that is reported as `error` so it can never match a count.
+    out=$(./target/release/ff --socket "$state/s.sock" --count "$1" 2>/dev/null) || true
+    case $out in
+        '' | *[!0-9]*) echo error ;;
+        *) echo "$out" ;;
+    esac
 }
 
 # wait_for_count <needle> <expected> <seconds>

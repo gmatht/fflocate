@@ -61,6 +61,16 @@ jobs:
 
       # The FSEvents backend is cfg(target_os = "macos"), so its unit tests only
       # run here; this also proves a live stream follows create/rename/delete.
+      # The script prints the daemon log and stats when it gives up, so the
+      # failure is re-emitted as an annotation like the steps above.
       - name: Live FSEvents watcher
         if: runner.os == 'macOS'
-        run: sh scripts/fsevents-smoke.sh
+        shell: bash
+        run: |
+          set -o pipefail
+          if sh scripts/fsevents-smoke.sh 2>&1 | tee fsevents-smoke.log; then
+            exit 0
+          fi
+          msg=$(tail -c 3500 fsevents-smoke.log | tr '\n' '|')
+          echo "::error title=FSEvents smoke failure (${RUNNER_OS})::${msg}"
+          exit 1
