@@ -36,6 +36,22 @@ jobs:
           echo "::error title=test failure (${RUNNER_OS})::${msg}"
           exit 1
 
+      # The GUI *binary* does not build (its widget calls drifted from the
+      # vendored rustxWidgets snapshot: set_placeholder_text, connect_scroll_event,
+      # get_size/resize, ScrollDirection, insert_action_group). The GUI library
+      # holds the protocol client, filtering and parsing logic and needs no
+      # display, so that part is gated until the binary is fixed.
+      - name: GUI logic tests (headless)
+        shell: bash
+        run: |
+          set -o pipefail
+          if cargo test -p ff-gui --lib 2>&1 | tee gui-test.log; then
+            exit 0
+          fi
+          msg=$(grep -E '^(error|failures:)|panicked at|^ *---- ' gui-test.log | head -20 | tr '\n' '|' | cut -c1-3000)
+          echo "::error title=GUI logic test failure (${RUNNER_OS})::${msg}"
+          exit 1
+
       # The FSEvents backend is cfg(target_os = "macos"), so its unit tests only
       # run here; this also proves a live stream follows create/rename/delete.
       - name: Live FSEvents watcher
