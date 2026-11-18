@@ -505,8 +505,17 @@ impl WatchBackend for FseventsBackend {
 
     /// Whole-mount backend: this records the path → id mapping events are
     /// resolved with; there is no per-directory watch to install.
+    ///
+    /// FSEvents reports real paths (`/private/var/…` for `/var/…`), while the
+    /// index keeps the spelling it was configured with. Both are recorded:
+    /// with only the configured spelling, every event under a symlinked prefix
+    /// matched no directory and was dropped.
     fn watch_dir(&mut self, id: u32, path: &Path) -> io::Result<()> {
         self.dirs.insert(path.to_path_buf(), id);
+        let canonical = Self::canonical(path);
+        if canonical.as_path() != path {
+            self.dirs.insert(canonical, id);
+        }
         Ok(())
     }
 
@@ -678,5 +687,27 @@ mod tests {
         assert!(c.whole_mount);
         assert!(!c.atomic_rename);
         assert_eq!(b.name(), "fsevents");
+    }
+
+    #[test]
+    fn an_event_on_the_real_path_resolves_through_a_symlinked_watch() {
+        // FSEvents hands the callback real paths, so a directory watched under
+        // a symlinked spelling (`/var` → `/private/var`) must still resolve
+        // events reported for the target, or every event is silently dropped.
+        let tmp = std::env::temp_dir().join(format!("fx-fsevents-{}", std::process::id()));
+        let real = tmp.join("real");
+        let link = tmp.join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut b = FseventsBackend::new().unwrap();
+        b.watch_dir(9, &link).unwrap();
+
+        assert_eq!(
+            b.resolve(&real.join("a.txt")),
+            Some((9, b"a.txt".to_vec())),
+            "an event on the real path must resolve through a symlinked watch"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
