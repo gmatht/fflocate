@@ -73,13 +73,16 @@ jobs:
           # AppKit cannot open a window there at all.
           session=$(launchctl managername 2>&1 | tr -d '\n')
           cargo build -p ff-gui 2>&1 | tail -2
-          ./target/debug/ff-gui >gui-run.log 2>&1 &
+          # FF_GUI_TRACE names each construction step on stderr: a bad AppKit
+          # message send aborts with no Rust backtrace, so the last step is the
+          # only evidence of where it died.
+          FF_GUI_TRACE=1 ./target/debug/ff-gui >gui-run.log 2>&1 &
           pid=$!
           sleep 8
           # The log is echoed through a workflow command, which is readable
           # without a token; printable-only and short so it cannot upset the
           # runner's command parsing.
-          log() { head -c 900 gui-run.log | tr -cd '[:print:]\n' | tr '\n' '|'; }
+          log() { head -c 1600 gui-run.log | tr -cd '[:print:]\n' | tr '\n' '|'; }
           if kill -0 "$pid" 2>/dev/null && ! ps -o stat= -p "$pid" | grep -q '^ *Z'; then
             kill "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true

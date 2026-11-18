@@ -97,30 +97,61 @@ fn main() {
     }
 }
 
+/// Print a construction step to stderr when `FF_GUI_TRACE` is set.
+///
+/// Building the AppKit UI means raw message sends. A send to a selector that
+/// does not exist raises an Objective-C exception, which unwinds into the Rust
+/// frame that sent it and aborts the process (`Rust cannot catch foreign
+/// exceptions`) with no Rust backtrace and, since stdout is block-buffered,
+/// often with no output either. The last step printed is then the one that
+/// threw, which is the only handle a headless CI run has on such a crash.
+macro_rules! trace_step {
+    ($($arg:tt)*) => {
+        if trace_enabled() {
+            eprintln!("ff-gui: {}", format!($($arg)*));
+        }
+    };
+}
+
+fn trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FF_GUI_TRACE").is_some())
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("ff-gui {} (backend: {BACKEND})", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    trace_step!("app init");
     let app = App::init().map_err(|e| GuiError::Backend(e.to_string()))?;
     let socket_path = DaemonClient::new().socket().to_path_buf();
 
+    trace_step!("create window");
     let win = app.create_window()?;
+    trace_step!("window title");
     win.set_title("fflocate");
     // Roomy enough that all three columns are visible on launch.
     win.set_default_size(DEFAULT_WINDOW_W, DEFAULT_WINDOW_H);
 
+    trace_step!("query row box");
     let query_row = app.create_box(Orientation::Horizontal, 2)?;
+    trace_step!("query entry");
     let query = app.create_entry()?;
     query.set_text("");
     // The Basic box is literal-only (quoted before sending): say so, so a
     // user reaching for ext:/regex: learns where that syntax lives.
+    trace_step!("query placeholder");
     query.set_placeholder_text("filename — literal, no syntax (ext:/regex: go in Advanced search)");
     expand_query_entry(&query);
+    trace_step!("search button");
     let search = app.create_button("Search")?;
+    trace_step!("query row append");
     query_row.append(&query);
     query_row.append(&search);
     query_row.set_child_hexpand(&query, true);
+    trace_step!("status label");
     let status = app.create_label("type a query and press Search")?;
     // The results are a three-column list: icon, name, path. The compat
     // `TreeView` draws the header and rows on a canvas, hit-tests clicks and
@@ -128,6 +159,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // same code serves GTK and AppKit. (title, is_icon, sortable): the
     // `sortable` flag is accepted for source compatibility — the canvas list
     // has no click-to-sort headers.
+    trace_step!("results treeview");
     let results = app.create_treeview(&[
         ("", true, true),
         ("Name", false, true),
@@ -139,6 +171,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The list scrolls, and the scrolled container must expand with the window —
     // otherwise the results stay at their minimum height while the window grows.
     let results_scroll = {
+        trace_step!("results scrolled window");
         let sw = results.clone().into_scrolled()?;
         // The list takes the leftover height. Only the vertical flag is set:
         // `set_hexpand` belonged to the GTK adapter's scrolled window and is not
@@ -152,7 +185,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // query field (with the full syntax) plus real controls. Every control maps
     // to a daemon field — Case sensitive (case_sensitive), Fuzzy (fuzzy), Count
     // only (count), and the fuzzy maximum edit distance (max_distance).
+    trace_step!("advanced expander");
     let advanced = app.create_expander("Advanced search")?;
+    trace_step!("advanced entry");
     let advanced_query = app.create_entry()?;
     advanced_query.set_text("");
     // The syntax reminder lives inside the field as grey hint text: visible
@@ -160,15 +195,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // or is selected for typing.
     advanced_query.set_placeholder_text(ADVANCED_SYNTAX_HELP);
 
+    trace_step!("case checkbutton");
     let opt_case = app.create_checkbutton("Case sensitive")?;
     opt_case.set_active(false);
+    trace_step!("fuzzy checkbutton");
     let opt_fuzzy = app.create_checkbutton("Fuzzy matching")?;
     opt_fuzzy.set_active(false);
+    trace_step!("count checkbutton");
     let opt_count = app.create_checkbutton("Count only (skip the list)")?;
     opt_count.set_active(false);
 
     // The max edit distance only means anything with Fuzzy on, so it is
     // disabled until then rather than silently ignored.
+    trace_step!("distance row");
     let opt_distance = app.create_entry()?;
     opt_distance.set_text(DEFAULT_MAX_DISTANCE);
     let distance_row = app.create_box(Orientation::Horizontal, 2)?;
@@ -176,12 +215,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     distance_row.append(&distance_label);
     distance_row.append(&opt_distance);
 
+    trace_step!("advanced box");
     let advanced_box = app.create_box(Orientation::Vertical, 2)?;
     advanced_box.append(&advanced_query);
     advanced_box.append(&opt_case);
     advanced_box.append(&opt_fuzzy);
     advanced_box.append(&distance_row);
     advanced_box.append(&opt_count);
+    trace_step!("sensitive toggles");
     advanced.set_child(&advanced_box);
     advanced.set_expanded(false);
 
@@ -1045,6 +1086,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }),
         }
     };
+    trace_step!("menubar");
     let menubar = {
         let err = |e: rswidgets::Error| GuiError::Backend(e.to_string());
         // The action group must exist BEFORE any action is registered on it:
@@ -1083,6 +1125,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         menubar
     };
 
+    trace_step!("layout");
     let layout = app.create_box(Orientation::Vertical, 1)?;
     layout.set_vexpand(true);
     layout.set_hexpand(true);
@@ -1092,6 +1135,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     layout.append(&status);
     layout.append(&results_scroll);
 
+    trace_step!("attach + present");
     win.set_child(&layout);
     win.present();
 
@@ -1100,6 +1144,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // on an unmapped widget is a silent no-op in GTK, so this must come after.
     query.grab_focus();
 
+    trace_step!("run loop");
     println!("ff-gui — fflocate search browser (backend: {BACKEND})");
     println!("Enter a query in the entry, then invoke Search.");
     app.run()
