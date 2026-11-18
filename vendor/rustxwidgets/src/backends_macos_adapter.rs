@@ -2496,6 +2496,29 @@ mod macos_adapter {
         });
     }
 
+    /// Install a process-lifetime autorelease pool.
+    ///
+    /// AppKit autoreleases objects internally — a window's designated
+    /// initialiser certainly does — and sending `-autorelease` with no pool in
+    /// place is fatal, which is what turned this path into an abort. A GUI
+    /// binary has no `NSApplicationMain` to install one, and the main run loop
+    /// installs its own per-event pools, so one pool for start-up is enough. It
+    /// is deliberately never popped: that *is* the process's pool.
+    fn push_startup_pool() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            extern "C" {
+                fn objc_autoreleasePoolPush() -> *mut c_void;
+            }
+            // SAFETY: `objc_autoreleasePoolPush` is part of libobjc, which is
+            // always linked, and is safe to call from any thread.
+            unsafe {
+                objc_autoreleasePoolPush();
+            }
+        });
+    }
+
     /// The process's shared `NSApplication`, created on first use.
     ///
     /// AppKit expects `NSApplicationMain` — the app bundle's C entry point — to
@@ -2532,6 +2555,8 @@ mod macos_adapter {
         if existing != 0 {
             return existing as *mut c_void;
         }
+        step("0 autorelease pool");
+        push_startup_pool();
         step("1 sharedApplication");
         if unsafe { shared_app() }.is_null() {
             crate::backends::macos::log_macos("macos: no NSApplication (headless session?)");
