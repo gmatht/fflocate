@@ -5,6 +5,7 @@
 pub mod prelude;
 pub mod core;
 pub mod common;
+pub mod compat;
 // Shared backend-agnostic model types at the crate root (menu model,
 // events, actions, sizers, message boxes). Backends and apps refer to
 // these as `crate::MenuItem` etc.; never put app-specific content here.
