@@ -2529,15 +2529,14 @@ mod macos_adapter {
             return false;
         }
         // SAFETY: `-respondsToSelector:` is an NSObject method on any object we
-        // hold, and the BOOL return is a C `bool`.
-        unsafe {
-            raw_send!(
-                obj,
-                "respondsToSelector:",
-                unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool,
-                (core_apple::selector(selname),)
-            )
-        }
+        // hold, and the BOOL return is a C `bool`. `raw_send!` carries its own
+        // `unsafe` block, so this is not wrapped again.
+        raw_send!(
+            obj,
+            "respondsToSelector:",
+            unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool,
+            (core_apple::selector(selname),)
+        )
     }
 
     /// Send a host-shim selector only when the receiver implements it.
@@ -2700,14 +2699,12 @@ mod macos_adapter {
         }
         // SAFETY: `alloc` then the designated initialiser, each with its exact
         // AppKit signature (`CGRect` is four `CGFloat`s, passed in registers).
-        let window = unsafe {
-            raw_send!(
-                window_cls,
-                "alloc",
-                unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void,
-                ()
-            )
-        };
+        let window = raw_send!(
+            window_cls,
+            "alloc",
+            unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void,
+            ()
+        );
         if window.is_null() {
             return std::ptr::null_mut();
         }
@@ -2718,8 +2715,7 @@ mod macos_adapter {
             );
             return std::ptr::null_mut();
         }
-        let window = unsafe {
-            raw_send!(
+        let window = raw_send!(
                 window,
                 "initWithContentRect:styleMask:backing:defer:",
                 unsafe extern "C" fn(
@@ -2742,8 +2738,7 @@ mod macos_adapter {
                     BACKING_BUFFERED,
                     false
                 )
-            )
-        };
+            );
         if window.is_null() {
             crate::backends::macos::log_macos(
                 "macos: initWithContentRect: failed (no window server?)",

@@ -310,18 +310,36 @@ backend, which takes what it has: GTK3 the 512 px file,
 `gtk_window_set_icon_from_file`; GTK4 the theme name, since it dropped that
 function (`gtk_window_set_icon_name` is the only way left); macOS the PNG
 bytes, as `NSApplication.applicationIconImage` — a bare Rust binary has no
-`.app` bundle to carry an `Info.plist` icon. Windows needs an `HICON` resource,
-so NWG and the `zork` fallback accept the call as a no-op.
+`.app` bundle to carry an `Info.plist` icon.
+
+**Only those two adapters define `set_icon`.** Windows would need an `HICON`
+resource, and the zork fallback is a terminal, so rather than a no-op copy on
+every backend the call site itself is compiled out
+(`cfg(all(unix, not(feature = "zork")))` in `main.rs`) and `common::Window`
+carries no forward for it. `App::create_window` already returns each backend's
+own window type, so nothing in the portable layer has to know the method
+exists.
+
+A launcher or app grid does not read the window icon at all: it reads a
+`.desktop` entry. `prepare()` therefore also writes
+`$XDG_DATA_HOME/applications/fflocate.desktop` with `Icon=fflocate`,
+`StartupWMClass=ff-gui` (the window's `WM_CLASS`, which is how GNOME matches a
+running window to the entry — without it the window shows up as a second,
+iconless application) and `Exec=` the binary that is running, quoted per the
+spec when the path contains spaces. It is written only when its content would
+change, and only when the hicolor tree reached the *real* data directory: an
+entry whose `Icon=` resolves to nothing would list the app blank.
 
 Verified on Linux: the window of a real `ff-gui` carries the icon —
 `xprop -id <window> WM_HINTS` reports the `icon_pixmap`/`icon_mask` bitmap ids
-GTK3 set from the installed PNG. Two honest limits: GTK3 in this XWayland
-session publishes the icon as `WM_HINTS` legacy pixmaps and **not** as
-`_NET_WM_ICON` (a plain `Gtk.Window` behaves identically — it is GTK/GDK, not
-this call), and a Wayland/GNOME app grid takes the icon from a `.desktop`
-entry matched to the app, which this repository does not install. The macOS
-arm compiles (`cargo check --target aarch64-apple-darwin`) but was not run on
-a Mac here.
+GTK3 set from the installed PNG — and the installed entry passes
+`desktop-file-validate` (no errors or warnings; `Categories=Utility;FileTools;`
+keeps to one main category) with the running binary's absolute path in `Exec`.
+Three honest limits: GTK3 in this XWayland session publishes the icon as
+`WM_HINTS` legacy pixmaps and **not** as `_NET_WM_ICON` (a plain `Gtk.Window`
+behaves identically — it is GTK/GDK, not this call); the GNOME app grid itself
+was not inspected here, only the entry it reads; and the macOS arm compiles
+(`cargo check --target aarch64-apple-darwin`) but was not run on a Mac here.
 
 ### `locate` drop-in (`crates/fx/src/locate.rs`)
 
@@ -443,6 +461,21 @@ These are deliberate and small; each is noted so the design stays honest.
    glyph per file kind instead of a themed icon and its headers do not sort,
    the row context menu cannot be popped up (the status line says so) and
    drag-and-drop is unavailable. The daemon and CLI are unaffected.
+
+   On macOS the window is real: `ff-gui` creates its own `NSApplication` and
+   `NSWindow`, builds the whole widget tree and enters the AppKit run loop, and
+   the `GUI launches (macOS)` CI step proves it on a runner (`session=Aqua`, the
+   process still alive after 8 s). What is *not* live there yet is what the
+   generated Objective-C shim classes would provide — button targets/actions,
+   canvas drawing and the menu bar — because `apple_generator` emits that source
+   but nothing compiles it. The adapter therefore checks each shim selector with
+   `-respondsToSelector:` and logs the gap once (`no host shim for
+   corroSetFlex:`) instead of dying: window, controls and the status line work,
+   while clicks and the canvas stay inert until those classes are built at
+   runtime. This was debugged from CI output alone, which is why
+   `$FF_GUI_TRACE=1` now names every construction step: a bad AppKit message
+   send raises an Objective-C exception that unwinds into Rust and aborts with
+   no backtrace.
 
 7. **The system daemon's ownership sidecar can be stale, by design.** It is
    captured at crawl time and refreshed on rescan; a `chown`/`chmod` between

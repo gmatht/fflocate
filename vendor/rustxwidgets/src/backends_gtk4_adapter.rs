@@ -55,10 +55,6 @@ pub struct Window(pub gtk4::Window, CList);
 impl Window {
     pub fn new() -> Self { ensure_dlopen(); Window(gtk4::Window::new(), new_controllers()) }
     pub fn set_title(&self, title: &str) { self.0.set_title(Some(title)); }
-    /// The gtk4-rs backend has no icon path wired up (the dynamic-loader
-    /// backend, which is what `ff-gui` builds, does); accepted as a no-op so
-    /// the portable call site compiles.
-    pub fn set_icon(&self, _path: &str, _name: &str, _png: &[u8]) {}
     pub fn set_default_size(&self, w: i32, h: i32) { self.0.set_default_size(w, h); }
     pub fn present(&self) { self.0.present(); }
     pub unsafe fn insert_action_group(&self, name: &str, p: *mut std::ffi::c_void) {

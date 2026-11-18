@@ -42,7 +42,7 @@ use std::sync::Arc;
 use ff_gui::{
     box_change_clears, containing_dir, context_menu_target, effective_query, encode_request,
     render_count, rows_from_paths, scan_percent, search_label, searching_status_line,
-    step_max_distance, streaming_status_line, DaemonClient, GuiError, icon,
+    step_max_distance, streaming_status_line, DaemonClient, GuiError,
     MenuAction, PendingRequest, Progress, RowAction, SearchGate, SearchOptions, SearchOutcome,
     StartupPoll, StartupProbe,
     WheelStep, WireResponse, ADVANCED_SYNTAX_HELP, DEFAULT_MAX_DISTANCE,
@@ -126,8 +126,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     // The icon's theme files must be on disk before GTK starts: GTK reads the
     // icon theme while initialising, so an icon installed later would not be
-    // found by name. See `icon::prepare`.
-    let icon_path = icon::prepare();
+    // found by name. See `ff_gui::icon::prepare`.
+    //
+    // CFG: only GTK and macOS have an icon to set, so only they get the
+    // install and the `set_icon` call — the other backends have no such method.
+    #[cfg(all(unix, not(feature = "zork")))]
+    let icon_path = ff_gui::icon::prepare();
 
     trace_step!("app init");
     let app = App::init().map_err(|e| GuiError::Backend(e.to_string()))?;
@@ -137,11 +141,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let win = app.create_window()?;
     trace_step!("window title");
     win.set_title("fflocate");
-    // The fflocate mark as the window/taskbar icon (on macOS: the Dock icon).
-    // Best-effort — a backend with no icon support simply ignores it. Set
-    // before `present()`: GTK applies the icon it holds when the window is
-    // mapped, so one call here is enough.
-    win.set_icon(&icon_path, icon::ICON_NAME, icon::ICON_PNG);
+    // The fflocate mark: the window/taskbar icon on GTK, the Dock icon on
+    // macOS. Best-effort, and before `present()` — GTK applies the icon it
+    // holds when the window is mapped, so one call here is enough.
+    #[cfg(all(unix, not(feature = "zork")))]
+    win.set_icon(
+        &icon_path,
+        ff_gui::icon::ICON_NAME,
+        ff_gui::icon::ICON_PNG,
+    );
 
     // Roomy enough that all three columns are visible on launch.
     win.set_default_size(DEFAULT_WINDOW_W, DEFAULT_WINDOW_H);

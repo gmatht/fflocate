@@ -20,9 +20,21 @@ honouring `GDK_BACKEND`), so nothing is linked at build time.
 On macOS the GUI **defaults to AppKit** — a native `NSApplication` window,
 driven through the same hand-rolled Objective-C runtime the iOS backend uses
 (`vendor/rustxwidgets/src/backends/apple.rs`; no cacao/objc2 dependency).
-Unlike GTK, AppKit cannot be `dlopen`d: it needs a host that owns the
-`NSApplication` event loop, so `App::run()` hands off to it rather than
-blocking.
+A plain Rust binary is not an `.app` bundle and never calls
+`NSApplicationMain`, so the backend does that work itself: it `dlopen`s AppKit
+from libSystem, creates the shared `NSApplication` with the *regular* activation
+policy (an accessory app's window can never become key), installs the process's
+autorelease pool, builds an `NSWindow` around its content view, calls
+`finishLaunching`, and runs `-[NSApplication run]` when it owns the loop.
+CI opens that window on a macOS runner and checks the process is still alive
+seconds later — the only place this path can be exercised.
+
+What the AppKit arm does **not** have yet is the generated Objective-C shim
+classes (`apple_generator` emits them; nothing compiles them), so click
+targets/actions and canvas drawing stay inert. Every shim selector is checked
+with `-respondsToSelector:` and the gap is logged once (`no host shim for
+corroSetFlex:`) rather than aborting the process, and `$FF_GUI_TRACE=1` names
+each construction step on stderr.
 
 ```sh
 cargo run -p ff-gui                       # GTK on Linux, AppKit on macOS
@@ -189,10 +201,14 @@ depend on a checkout outside this repository.
   512 px file, GTK4 resolves the theme *name*), so the hicolor tree is
   installed under `$XDG_DATA_HOME/icons/hicolor/` before the toolkit starts.
   On macOS the same PNG becomes `NSApplication.applicationIconImage`, i.e. the
-  **Dock** icon — a bare Rust binary has no `.app` bundle to carry one. Windows
-  and the `zork` fallback accept the call and do nothing (a Windows icon has to
-  be an `HICON` resource); launchers on Linux still need a `.desktop` entry
-  with `Icon=fflocate` and `StartupWMClass=ff-gui` to show it in an app grid.
+  **Dock** icon — a bare Rust binary has no `.app` bundle to carry one. Only
+  those two backends have a `set_icon` at all: a Windows icon has to be an
+  `HICON` resource and the `zork` fallback is a terminal, so the call site is
+  compiled out there instead of every backend carrying a no-op. Launchers and
+  app grids read a `.desktop` entry rather than the window, so `prepare()` also
+  writes `~/.local/share/applications/fflocate.desktop` — `Icon=fflocate`,
+  `StartupWMClass=ff-gui` (the window's `WM_CLASS`) and `Exec=` the binary that
+  is running.
 * Query box + Search button + a status line and a results list, driven by
   `App::run()`.
 * The window opens at 1000x700 and the results area takes the leftover height. The

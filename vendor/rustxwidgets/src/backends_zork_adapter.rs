@@ -240,10 +240,6 @@ impl Window {
         crate::backends::zork::set_window_title(self.id, title);
     }
 
-    /// The terminal has no icon to set; accepted so the portable call site
-    /// (`common::Window::set_icon`) compiles against this backend.
-    pub fn set_icon(&self, _path: &str, _name: &str, _png: &[u8]) {}
-
     pub fn get_title(&self) -> Option<String> {
         crate::backends::zork::get_window_title(self.id)
     }
