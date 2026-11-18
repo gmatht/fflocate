@@ -22,12 +22,12 @@
 //!   calls [`init_with_root`] from `applicationDidFinishLaunching:` and then
 //!   `-[NSApp run]`. [`MacosApp::run`] returns immediately, exactly like
 //!   `IosApp::run`, because `NSApp` owns the loop; the app is leaked.
-//! * **Self-driven**: [`init_backend`] is still available for the
-//!   `backends::init()` contract, but note that a macOS GUI app *must* run
-//!   `NSApplicationMain`/`-[NSApp run]` on the main thread — there is no
-//!   useful "backend owns a blocking loop" variant that also gets AppKit
-//!   event delivery without an `NSApplication`. So `run()` stays a no-op and
-//!   the host is responsible for `[NSApp run]`, mirroring iOS.
+//! * **Self-driven** (a plain binary, which is what `ff-gui` is): the first
+//!   `create_window` finds no host root, so it creates the shared
+//!   `NSApplication` and an `NSWindow`, initialises the layer with that
+//!   window's content view, and orders it front. [`MacosApp::run`] then runs
+//!   `-[NSApplication run]` on the caller's thread and blocks there, the same
+//!   contract the GTK backend gives `g_main_loop_run`.
 //!
 //! See `rustxWidgets/docs/MACOS_GUIDELINES.md` and `rustxWidgets/docs/IOS_GUIDELINES.md`.
 
@@ -126,6 +126,15 @@ impl MacosApp {
 #[cfg(target_os = "macos")]
 impl crate::backends::BackendApp for MacosApp {
     fn run(self: Box<Self>) -> Result<(), Box<dyn StdError + Send + Sync>> {
+        // Self-driven shape (a plain binary such as `ff-gui`): the backend made
+        // its own `NSWindow`, so it owns `-[NSApplication run]` too, which blocks
+        // until the app terminates.
+        //
+        // Host-driven shape (an `.app` whose delegate calls `init_with_root`):
+        // the host runs `-[NSApp run]` itself, so this returns immediately.
+        if crate::backends_macos_adapter::owns_run_loop() {
+            unsafe { crate::backends_macos_adapter::run_app_loop() };
+        }
         Ok(())
     }
 }

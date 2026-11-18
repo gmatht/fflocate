@@ -82,6 +82,9 @@ jobs:
           fi
           if [ "$alive" = yes ]; then
             echo "ok: ff-gui stayed alive for 8s (pid $pid)"
+            # Readable without a token, like the failure annotations: shows what
+            # the GUI logged while the AppKit loop ran.
+            echo "::notice title=GUI log (macOS)::$(head -c 1200 gui-run.log | tr '\n' '|')"
             exit 0
           fi
           echo "::error title=GUI did not start (${RUNNER_OS})::exit ${status:-?}: $(tail -c 1500 gui-run.log | tr '\n' '|')"

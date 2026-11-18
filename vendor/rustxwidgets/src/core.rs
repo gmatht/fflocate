@@ -2821,6 +2821,8 @@ pub fn save_file_filtered(&self, _title: &str, _filters: &[(&str, &[&str])], _cu
         let _ = crate::backends_gtk_adapter::quit_main_loop();
         #[cfg(all(windows, not(feature = "zork")))]
         crate::backends_nwg_adapter::quit_main_loop();
+        #[cfg(all(target_os = "macos", not(feature = "zork")))]
+        crate::backends_macos_adapter::quit_app();
     }
 
     /// Like quit() but returns the backend error, if any.

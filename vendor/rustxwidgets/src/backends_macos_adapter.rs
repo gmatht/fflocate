@@ -44,6 +44,7 @@
 mod macos_adapter {
     use std::collections::HashMap;
     use std::os::raw::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use once_cell::sync::Lazy;
@@ -210,7 +211,21 @@ mod macos_adapter {
     }
 
     impl Window {
-        pub fn set_title(&self, _title: &str) {}
+        /// Set the window title.
+        ///
+        /// A host owns its own window and titles it; the self-driven window is
+        /// ours, so this is the one place the title actually lands.
+        pub fn set_title(&self, title: &str) {
+            let window = OWN_WINDOW.load(Ordering::Relaxed) as *mut c_void;
+            if window.is_null() {
+                return;
+            }
+            let s = nsstring(title);
+            if s.is_null() {
+                return;
+            }
+            unsafe { msg1v(window, "setTitle:", s) };
+        }
 
         pub fn set_default_size(&self, _w: i32, _h: i32) {}
 
@@ -2439,12 +2454,162 @@ mod macos_adapter {
     // Factories
     // ------------------------------------------------------------------
 
-    /// The window handle is the host window's content view: the app owns the
-    /// real `NSWindow` (see the `Window` comment).
+    /// The `NSWindow` this process made for itself, or 0 when a host owns the
+    /// window. It is also the answer to "who runs the AppKit loop".
+    static OWN_WINDOW: AtomicUsize = AtomicUsize::new(0);
+
+    /// `NSApplicationActivationPolicyRegular`. A binary that is not an `.app`
+    /// bundle is an *accessory* by default: its window never becomes key and
+    /// no menu bar appears, so a desktop app must ask for the regular policy.
+    const ACTIVATION_REGULAR: isize = 0;
+
+    /// `NSBackingStoreBuffered`.
+    const BACKING_BUFFERED: usize = 2;
+
+    /// `NSWindowStyleMaskTitled | Closable | Miniaturizable | Resizable`.
+    const WINDOW_STYLE: usize = 1 | 2 | 4 | 8;
+
+    /// The process's shared `NSApplication`, created on first use.
+    ///
+    /// AppKit expects `NSApplicationMain` — the app bundle's C entry point — to
+    /// create this. A plain Rust binary has no bundle and no delegate, so the
+    /// backend does it here, before any window exists.
+    unsafe fn shared_app() -> *mut c_void {
+        let app_cls = cls("NSApplication");
+        if app_cls.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: messaging the class object is how an AppKit app starts.
+        let app = unsafe { msg0(app_cls, "sharedApplication") };
+        if app.is_null() {
+            return std::ptr::null_mut();
+        }
+        unsafe { msg1iv(app, "setActivationPolicy:", ACTIVATION_REGULAR) };
+        app
+    }
+
+    /// Create the process's own `NSWindow`, hand its content view back as the
+    /// root the widget factories attach to, and show it.
+    ///
+    /// This is the standalone shape: `ff-gui` is a Rust binary, so there is no
+    /// host to make a window or call `-[NSApplication run]`. Doing it here is
+    /// what lets the same call sites work with or without a host — before this
+    /// a standalone app built every widget against no root at all and exited.
+    unsafe fn own_window() -> *mut c_void {
+        let existing = OWN_WINDOW.load(Ordering::Relaxed);
+        if existing != 0 {
+            return existing as *mut c_void;
+        }
+        if unsafe { shared_app() }.is_null() {
+            return std::ptr::null_mut();
+        }
+        let window_cls = cls("NSWindow");
+        if window_cls.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: `alloc` then the designated initialiser, each with its exact
+        // AppKit signature (`CGRect` is four `CGFloat`s, passed in registers).
+        let window = unsafe {
+            raw_send!(
+                window_cls,
+                "alloc",
+                unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void,
+                ()
+            )
+        };
+        if window.is_null() {
+            return std::ptr::null_mut();
+        }
+        let window = unsafe {
+            raw_send!(
+                window,
+                "initWithContentRect:styleMask:backingMask:defer:",
+                unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    f64,
+                    f64,
+                    f64,
+                    f64,
+                    usize,
+                    usize,
+                    bool,
+                ) -> *mut c_void,
+                (
+                    120.0,
+                    120.0,
+                    960.0,
+                    640.0,
+                    WINDOW_STYLE,
+                    BACKING_BUFFERED,
+                    false
+                )
+            )
+        };
+        if window.is_null() {
+            return std::ptr::null_mut();
+        }
+        let window = own(window);
+        let view = unsafe { msg0(window, "contentView") };
+        if view.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: every object below is the live window/app made above.
+        unsafe {
+            // A closed window must not free itself: this handle is the
+            // process's window for its whole life.
+            msg1bv(window, "setReleasedWhenClosed:", false);
+            let title = nsstring("ff-locate");
+            if !title.is_null() {
+                msg1v(window, "setTitle:", title);
+            }
+            // Wire the shared Apple layer to this view. Every widget factory is
+            // a no-op until a root exists, which is why the order matters here.
+            if let Err(e) = core_apple::init_with_root_impl(view, std::ptr::null_mut(), "macos") {
+                crate::backends::macos::log_macos(&format!("macos: window init failed: {e}"));
+            }
+            msg1v(window, "makeKeyAndOrderFront:", std::ptr::null_mut());
+            let app = shared_app();
+            if !app.is_null() {
+                msg1bv(app, "activateIgnoringOtherApps:", true);
+            }
+        }
+        OWN_WINDOW.store(window as usize, Ordering::Relaxed);
+        view
+    }
+
+    /// True when the backend created its own window and therefore must run the
+    /// AppKit loop itself.
+    pub fn owns_run_loop() -> bool {
+        OWN_WINDOW.load(Ordering::Relaxed) != 0
+    }
+
+    /// Run `-[NSApplication run]`: the AppKit equivalent of the GTK backend's
+    /// `g_main_loop_run`. Returns when the app terminates.
+    pub unsafe fn run_app_loop() {
+        let app = unsafe { shared_app() };
+        if app.is_null() {
+            return;
+        }
+        unsafe { msg0v(app, "run") };
+    }
+
+    /// `-[NSApplication terminate:]`: the AppKit quit (what Cmd-Q does).
+    pub fn quit_app() {
+        unsafe {
+            let app = shared_app();
+            if !app.is_null() {
+                msg1v(app, "terminate:", std::ptr::null_mut());
+            }
+        }
+    }
+
+    /// The window handle is the content view: a host hands us its own, and a
+    /// standalone process gets the one [`own_window`] just made.
     pub fn create_window() -> Result<Window, Error> {
         match root() {
             Some(view) => Ok(Window(view)),
-            None => Ok(Window(std::ptr::null_mut())),
+            None => Ok(Window(unsafe { own_window() })),
         }
     }
 
