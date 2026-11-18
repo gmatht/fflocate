@@ -17,7 +17,12 @@
 //! Either failure means the port is not interactive, so the process panics and
 //! the CI step turns that into a readable annotation.
 
-#[cfg(target_os = "macos")]
+// The AppKit backend only exists when rswidgets was built with it: `zork` wins
+// over every other backend, exactly as it does for `ff-gui` itself. Without this
+// gate the example would fail to compile for the documented
+// `--no-default-features --features zork` configuration — and `cargo test`
+// compiles examples, so that would break the build rather than the probe.
+#[cfg(all(target_os = "macos", feature = "macos", not(feature = "zork")))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use rswidgets::prelude::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -97,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", feature = "macos", not(feature = "zork"))))]
 fn main() {
-    println!("macos_probe: not a macOS host, nothing to probe");
+    println!("macos_probe: needs the AppKit backend (macOS, `macos` on, `zork` off)");
 }

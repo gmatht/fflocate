@@ -107,12 +107,17 @@ jobs:
         run: |
           set -o pipefail
           ulimit -c 0 || true
-          if cargo run -p ff-gui --example macos_probe 2>&1 | tee probe.log; then
+          # `set -o pipefail` is deliberately not used here: the exit status is
+          # captured explicitly so a build failure, a panic and a clean run are
+          # all reported, instead of a pipeline status that can hide one.
+          status=0
+          cargo run -p ff-gui --example macos_probe >probe.log 2>&1 || status=$?
+          if [ "$status" -eq 0 ]; then
             echo "::notice title=GUI interactivity (macOS)::$(grep '^probe:' probe.log | tr '\n' '|')"
             exit 0
           fi
-          msg=$(tail -c 1500 probe.log | tr -cd '[:print:]\n' | tr '\n' '|')
-          echo "::error title=GUI is not interactive (${RUNNER_OS})::${msg}"
+          msg=$(tail -c 1800 probe.log | tr -cd '[:print:]\n' | tr '\n' '|')
+          echo "::error title=GUI is not interactive (${RUNNER_OS})::exit ${status}: ${msg}"
           exit 1
 
       # The FSEvents backend is cfg(target_os = "macos"), so its unit tests only
