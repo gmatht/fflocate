@@ -97,6 +97,21 @@ mod ffi {
     pub type FSEventStreamCreateFlags = u32;
     pub type DispatchQueue = *mut c_void;
 
+    /// `FSEventStreamContext`. `FSEventStreamCreate` takes a pointer to this,
+    /// **not** the callback's info pointer, and copies it: the `info` below is
+    /// what the callback receives. `version` 0 means the three fields after
+    /// `info` are honoured; they are NULL, so CoreServices neither retains nor
+    /// releases the sink — the backend keeps it alive until every stream is
+    /// invalidated.
+    #[repr(C)]
+    pub struct FSEventStreamContext {
+        pub version: CFIndex,
+        pub info: *mut c_void,
+        pub retain: *const c_void,
+        pub release: *const c_void,
+        pub copy_description: *const c_void,
+    }
+
     pub type Callback = extern "C" fn(
         ConstFSEventStreamRef,
         *mut c_void,
@@ -111,7 +126,7 @@ mod ffi {
         pub fn FSEventStreamCreate(
             allocator: CFAllocatorRef,
             callback: Callback,
-            context: *mut c_void,
+            context: *const FSEventStreamContext,
             paths: CFArrayRef,
             since: u64,
             latency: f64,
@@ -221,10 +236,17 @@ impl FseventsBackend {
                 "root path contains NUL",
             ));
         }
-        // Context pointer must stay valid until every stream is stopped: the
-        // box lives in `self.sink` and is dropped only in `Drop`, after the
-        // streams are invalidated.
-        let info = self.sink.as_ref() as *const Sink as *mut c_void;
+        // The callback's `info` must stay valid until every stream is stopped:
+        // the box lives in `self.sink` and is dropped only in `Drop`, after the
+        // streams are invalidated. `FSEventStreamCreate` copies this struct, so
+        // a stack temporary is enough.
+        let context = ffi::FSEventStreamContext {
+            version: 0,
+            info: self.sink.as_ref() as *const Sink as *mut c_void,
+            retain: std::ptr::null(),
+            release: std::ptr::null(),
+            copy_description: std::ptr::null(),
+        };
         unsafe {
             let cf_path = ffi::CFStringCreateWithBytes(
                 std::ptr::null(),
@@ -250,7 +272,7 @@ impl FseventsBackend {
             let stream = ffi::FSEventStreamCreate(
                 std::ptr::null(),
                 callback,
-                info,
+                &context,
                 array,
                 SINCE_NOW,
                 0.15, // latency: below human perception, above event-storm rate
