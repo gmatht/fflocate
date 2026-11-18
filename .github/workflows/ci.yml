@@ -59,6 +59,34 @@ jobs:
           echo "::error title=GUI build/test failure (${RUNNER_OS})::${msg}"
           exit 1
 
+      # The GUI's macOS arm is AppKit, and only this runner can start it: the
+      # steps above build it, this one opens a window and checks the process is
+      # still alive seconds later, i.e. AppKit initialised without aborting.
+      # It is killed rather than closed; a zombie counts as gone.
+      - name: GUI launches (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build -p ff-gui 2>&1 | tail -2
+          ./target/debug/ff-gui >gui-run.log 2>&1 &
+          pid=$!
+          sleep 8
+          alive=no
+          if kill -0 "$pid" 2>/dev/null && ! ps -o stat= -p "$pid" | grep -q '^ *Z'; then
+            alive=yes
+            kill "$pid" 2>/dev/null || true
+          else
+            wait "$pid"
+            status=$?
+          fi
+          if [ "$alive" = yes ]; then
+            echo "ok: ff-gui stayed alive for 8s (pid $pid)"
+            exit 0
+          fi
+          echo "::error title=GUI did not start (${RUNNER_OS})::exit ${status:-?}: $(tail -c 1500 gui-run.log | tr '\n' '|')"
+          exit 1
+
       # The FSEvents backend is cfg(target_os = "macos"), so its unit tests only
       # run here; this also proves a live stream follows create/rename/delete.
       # The script prints the daemon log and stats when it gives up, so the

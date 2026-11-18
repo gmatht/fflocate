@@ -14,7 +14,7 @@ it is a status note.
 | §4 **native-filesystem defaults + mount-aware crawl** | done | `mount.rs` (`NATIVE_FSTYPES`, `default_root_candidates`), `roots.rs` (path-qualified entry names), `applier.rs` (mountpoint set, `may_descend`), `daemon.rs` (covered-root pruning), `config.rs` (`default_roots`); tests `tests/mount_boundary.rs` |
 | §3/§15 **system daemon** | done | `crates/fflocate/src/ownership.rs`, `server.rs` (`finish_query`), `crates/fflocated/src/net.rs` (`bind_system`, `peer_credentials`); tests `tests/system_access.rs`, `tests/system_live.rs` |
 | §5 Initial crawl | done | `crates/fflocate/src/crawl.rs`, `applier.rs` (`crawl_dir`) |
-| §6 Watcher backends | inotify + **fanotify-FID** + fake | `crates/fflocate/src/watch/{mod,inotify,fanotify,fake}.rs`, `watch/fidmap.rs`; tests `tests/fanotify_live.rs` |
+| §6 Watcher backends | inotify + **fanotify-FID** + fake + **FSEvents** (macOS, live-verified in CI) | `crates/fflocate/src/watch/{mod,inotify,fanotify,fake,fsevents}.rs`, `watch/fidmap.rs`; tests `tests/fanotify_live.rs`; `scripts/fsevents-smoke.sh` |
 | §7 Reconciliation, backoff, degraded mode | done | `crates/fflocate/src/pending.rs`, `applier.rs` |
 | §8 Cookie sync | done | `crates/fflocate/src/sync.rs`, `server.rs` (`handle_sync`) |
 | §9 Snapshot + journal + cursors + compaction | done | `crates/fflocate/src/{snapshot,journal,persist,cursor}.rs` |
@@ -380,16 +380,31 @@ These are deliberate and small; each is noted so the design stays honest.
    converts. A non-UTF-8 directory name is still indexed correctly, but a rescan
    of its subtree may not find it on disk.
 
-5. **The FSEvents backend is written but has never seen a real event.**
+5. **The FSEvents backend is live-verified by CI, on a macOS runner.**
    `crates/fflocate/src/watch/fsevents.rs` implements the `WatchBackend` trait
    (stream lifecycle, whole-mount caps, drop→rescan, rename resolution,
-   coalescing), and it typechecks with its unit tests for
-   `aarch64-apple-darwin`; but the module is `cfg(target_os = "macos")`, so on
-   this Linux host none of those tests execute, and no macOS run has verified
-   delivery, latency or the `NoDefer` flag behaviour. fanotify-FID *is*
-   implemented and live-verified (§6). Treat FSEvents as compiled-and-reviewed,
-   not proven: the trait and `BackendCaps` are what let it slot in without
-   touching the applier, and that boundary has held under typechecking only.
+   coalescing). The macOS job runs `scripts/fsevents-smoke.sh`, which starts the
+   daemon with `--backend fsevents`, requires its crawl to find a seeded file,
+   and then requires a create, a rename and a delete to converge the *index* —
+   failing unless `ff stats` reports the fsevents backend. Three bugs that only
+   a real Mac could show were fixed getting there:
+
+   * `FSEventStreamCreate` was handed the callback's info pointer where it wants
+     an `FSEventStreamContext`; CoreServices read `retain`/`release` out of the
+     sink's memory and the daemon died with SIGBUS on arm64 before indexing
+     anything;
+   * directories were recorded under the spelling the index uses (`/var/…`)
+     while FSEvents reports real paths (`/private/var/…`), so every live event
+     resolved to no directory and was dropped without a trace;
+   * the vanished side of a rename arrives as `Created|Renamed` (0x11900), and
+     treating `Created` as proof of existence upserted a name that was already
+     gone, leaving the old name in the index forever.
+
+   Deliberately **not** asserted: event latency and `NoDefer` behaviour (the
+   smoke test allows seconds per step, not fractions), and coalescing under
+   heavy bursts. `$FFLOCATE_FSEVENTS_TRACE=1` dumps the raw event stream and how
+   each event translated, which is how the rename fix was diagnosed from CI
+   output alone.
 
 6. **The GUI builds on Linux and macOS, but its list is canvas-drawn.** The merged
    rustxWidgets backends dropped `TreeView`, `Expander` and `ContextMenu`;
