@@ -303,8 +303,8 @@ mod macos_adapter {
             // AppKit needs both: a frame change is a layout change, and the
             // canvas will keep painting the old size until something asks for
             // a redraw.
-            unsafe { msg0v(self.0, "setNeedsLayout") };
-            unsafe { msg0v(self.0, "setNeedsDisplay") };
+            unsafe { msg1bv(self.0, "setNeedsLayout:", true) };
+            unsafe { msg1bv(self.0, "setNeedsDisplay:", true) };
         }
 
         /// # Safety
@@ -328,15 +328,15 @@ mod macos_adapter {
             // AppKit is told to lay out and draw what we added.
             if !self.0.is_null() {
                 unsafe {
-                    msg0v(self.0, "setNeedsLayout");
-                    msg0v(self.0, "setNeedsDisplay");
+                    msg1bv(self.0, "setNeedsLayout:", true);
+                    msg1bv(self.0, "setNeedsDisplay:", true);
                 }
             }
         }
 
         pub fn queue_redraw(&self) {
             if !self.0.is_null() {
-                unsafe { msg0v(self.0, "setNeedsDisplay") };
+                unsafe { msg1bv(self.0, "setNeedsDisplay:", true) };
             }
         }
 
@@ -415,7 +415,9 @@ mod macos_adapter {
         /// Simulate a click (`performClick:`), for tests and scripted hosts.
         pub fn emit_clicked(&self) -> Result<u64, Error> {
             if !self.0.is_null() {
-                unsafe { msg0v(self.0, "performClick:") };
+                // `-performClick:` takes the sender; the no-argument send
+                // would pass an undefined register as that argument.
+                unsafe { msg1v(self.0, "performClick:", std::ptr::null_mut()) };
             }
             Ok(0)
         }
@@ -556,7 +558,7 @@ mod macos_adapter {
             }
             // The constraint is only meaningful once the view is in a
             // hierarchy, so ask AppKit to re-run layout.
-            unsafe { msg0v(self.0, "setNeedsLayout") };
+            unsafe { msg1bv(self.0, "setNeedsLayout:", true) };
         }
 
         /// Left margin of the label's contents, in points. Pairs with
@@ -1210,7 +1212,7 @@ mod macos_adapter {
             // iOS and Android adapters.
             if !self.0.is_null() {
                 unsafe {
-                    msg0v(self.0, "setNeedsDisplay");
+                    msg1bv(self.0, "setNeedsDisplay:", true);
                 }
             }
             let mut map = DRAW_CALLBACKS.lock().unwrap();
@@ -1316,7 +1318,7 @@ mod macos_adapter {
         /// [`Canvas::queue_redraw`] (plus a display request).
         pub fn force_draw(&self, _window_ptr: *mut c_void, fallback_w: i32, fallback_h: i32) {
             if !self.0.is_null() {
-                unsafe { msg0v(self.0, "setNeedsDisplay") };
+                unsafe { msg1bv(self.0, "setNeedsDisplay:", true) };
             }
             let mut map = DRAW_CALLBACKS.lock().unwrap();
             if let Some(SendDrawCallback(ptr)) = map.get_mut(&self.canvas_id()) {
