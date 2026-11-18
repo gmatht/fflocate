@@ -59,8 +59,9 @@ Notes and limits:
   process with Full Disk Access.
 * APFS stores decomposed names; the index normalizes to NFC so a typed
   precomposed query still matches.
-* `ff --gui` builds on macOS with the display-free `zork` backend; there is no
-  AppKit backend in the vendored widget snapshot yet.
+* `ff --gui` does not build on macOS: it needs the AppKit backend, which the
+  vendored rustxWidgets snapshot does not include (and the GUI is currently
+  broken on Linux too, for unrelated widget-API drift). The CLI is unaffected.
 
 ## Quick start
 

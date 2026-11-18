@@ -380,11 +380,24 @@ These are deliberate and small; each is noted so the design stays honest.
    converts. A non-UTF-8 directory name is still indexed correctly, but a rescan
    of its subtree may not find it on disk.
 
-5. **FSEvents is not implemented** (v1.5 in the design). fanotify-FID *is* now
-   implemented and live-verified (§6); the `WatchBackend` trait and `BackendCaps`
-   are what let it slot in without touching the applier.
+5. **The FSEvents backend is written but has never seen a real event.**
+   `crates/fflocate/src/watch/fsevents.rs` implements the `WatchBackend` trait
+   (stream lifecycle, whole-mount caps, drop→rescan, rename resolution,
+   coalescing), and it typechecks with its unit tests for
+   `aarch64-apple-darwin`; but the module is `cfg(target_os = "macos")`, so on
+   this Linux host none of those tests execute, and no macOS run has verified
+   delivery, latency or the `NoDefer` flag behaviour. fanotify-FID *is*
+   implemented and live-verified (§6). Treat FSEvents as compiled-and-reviewed,
+   not proven: the trait and `BackendCaps` are what let it slot in without
+   touching the applier, and that boundary has held under typechecking only.
 
-6. **The system daemon's ownership sidecar can be stale, by design.** It is
+6. **There is no native macOS GUI.** The GUI needs rustxWidgets' AppKit
+   backend, which the vendored snapshot does not have; `ff-gui` therefore does
+   not build for macOS in this tree (nor on Linux, for unrelated pre-existing
+   API drift). The daemon and CLI are unaffected — the index, queries and
+   service management work without the GUI.
+
+7. **The system daemon's ownership sidecar can be stale, by design.** It is
    captured at crawl time and refreshed on rescan; a `chown`/`chmod` between
    rescans is not seen, because fanotify's namespace mask does not report metadata
    changes and adding `FAN_ATTRIB` would make every `touch` an event for no
