@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # ff-gui is excluded: it does not build in either tree (widget-API drift).
+      - name: Unit and integration tests
+        run: cargo test -p fflocate -p fflocated -p ff
+
+      # The FSEvents backend is cfg(target_os = "macos"), so its unit tests only
+      # run here; this also proves a live stream follows create/rename/delete.
+      - name: Live FSEvents watcher
+        if: runner.os == 'macOS'
+        run: sh scripts/fsevents-smoke.sh
