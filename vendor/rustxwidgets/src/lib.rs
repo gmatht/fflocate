@@ -25,3 +25,16 @@ pub mod backends_pancurses_adapter;
 pub mod backends_zork_adapter;
 
 pub use prelude::*;
+
+/// Normalize a delivered mouse button to the toolkit's canonical press.
+///
+/// GTK reports a middle-press as button 2; the widget API treats a middle
+/// click as a primary press (it picks the row under the pointer). Backends
+/// deliver this normalized value, and exporting the mapping keeps client
+/// tests honest about what actually arrives.
+pub fn normalize_press_button(button: u32) -> u32 {
+    match button {
+        2 => 1,
+        other => other,
+    }
+}

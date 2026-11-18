@@ -12,7 +12,10 @@
 //!   directory, with `IN_Q_OVERFLOW` → rescan and `IN_IGNORED`/`IN_UNMOUNT`
 //!   handling.
 //!
-//! fanotify-FID and FSEvents slot in behind the same trait (§17, v1.5).
+//! * [`fsevents::FseventsBackend`] — the real macOS backend, one stream per
+//!   root, with dropped-event escalation to a rescan.
+//!
+//! fanotify-FID slots in behind the same trait (§17, v1.5).
 
 use std::time::Duration;
 
@@ -38,11 +41,17 @@ pub mod fanotify;
 /// the mapping logic is testable without a kernel.
 pub mod fidmap;
 
+/// The real macOS backend (§6): FSEvents streams, whole-mount semantics.
+#[cfg(target_os = "macos")]
+pub mod fsevents;
+
 pub use fake::FakeBackend;
 #[cfg(target_os = "linux")]
 pub use fanotify::FanotifyBackend;
 #[cfg(target_os = "linux")]
 pub use inotify::InotifyBackend;
+#[cfg(target_os = "macos")]
+pub use fsevents::FseventsBackend;
 
 /// Capabilities a backend advertises, so the applier can adapt rather than
 /// special-case (§6: "encode this in backend capabilities instead of

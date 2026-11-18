@@ -50,7 +50,8 @@ impl Excludes {
     /// build outputs that are pure noise in a *name* index, and nothing that
     /// could surprise someone looking for a file they know exists.
     pub fn defaults() -> Excludes {
-        Excludes {
+        #[allow(unused_mut)]
+        let mut e = Excludes {
             names: vec![
                 b".git".to_vec(),
                 b"node_modules".to_vec(),
@@ -59,7 +60,26 @@ impl Excludes {
             ],
             suffixes: vec![],
             prefixes: vec![],
+        };
+        // macOS system metadata: never user files, and on a full-disk index
+        // they are pure noise (Spotlight's store alone can hold millions of
+        // entries). Filtering them is the difference between an index of the
+        // user's documents and an index of the machine's bookkeeping.
+        #[cfg(target_os = "macos")]
+        {
+            for name in [
+                b".Spotlight-V100".as_slice(),
+                b".fseventsd",
+                b".Trashes",
+                b".TemporaryItems",
+                b".DocumentRevisions-V100",
+                b".PKInstallSandboxManager",
+                b".MobileBackups",
+            ] {
+                e.names.push(name.to_vec());
+            }
         }
+        e
     }
 
     /// Parse a `FFLOCATE_EXCLUDE` value: comma- or separator-delimited names. An
@@ -117,6 +137,22 @@ impl Excludes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_defaults_skip_system_metadata() {
+        let e = Excludes::defaults();
+        for name in [
+            b".Spotlight-V100".as_slice(),
+            b".fseventsd",
+            b".Trashes",
+            b".DocumentRevisions-V100",
+        ] {
+            assert!(e.excludes_dir_name(name), "{name:?} must be excluded");
+        }
+        // ...but ordinary dot-directories still index.
+        assert!(!e.excludes_dir_name(b".config"));
+    }
 
     #[test]
     fn default_excludes_cover_vcs_and_vendored_dirs() {

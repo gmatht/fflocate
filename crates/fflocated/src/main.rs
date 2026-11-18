@@ -50,7 +50,7 @@ fn parse_args() -> Result<Config, String> {
             "--backend" => {
                 let b = it.next().ok_or("--backend needs a value")?;
                 cfg.backend = BackendChoice::parse(&b).ok_or_else(|| {
-                    format!("unknown backend: {b} (want fanotify|inotify|fake|auto)")
+                    format!("unknown backend: {b} (want fanotify|inotify|fsevents|fake|auto)")
                 })?;
             }
             "--system" => {
@@ -60,17 +60,13 @@ fn parse_args() -> Result<Config, String> {
                 let g = it.next().ok_or("--system-group needs a gid or name")?;
                 cfg.system_group = g
                     .parse::<u32>()
+                    .map_err(|_| ())
                     .or_else(|_| {
-                        // Resolve the name via /etc/group.
-                        let txt = std::fs::read_to_string("/etc/group").map_err(|_| "bad gid")?;
-                        txt.lines()
-                            .find_map(|l| {
-                                let f: Vec<&str> = l.split(':').collect();
-                                (f.len() > 2 && f[0] == g).then(|| f[2].parse::<u32>().ok())?
-                            })
-                            .ok_or("unknown group")
+                        // Resolve the name through the platform's account
+                        // database (getgrnam): macOS has no /etc/group.
+                        fflocate::ids::gid_for_name(&g).ok_or(())
                     })
-                    .map_err(|e: &str| format!("--system-group: {e}"))?;
+                    .map_err(|_| format!("--system-group: unknown group '{g}'"))?;
             }
             "--shared-store" => {
                 cfg = cfg.with_shared_store(true);
@@ -79,7 +75,7 @@ fn parse_args() -> Result<Config, String> {
             "--help" | "-h" => {
                 println!(
                     "fflocated [--socket PATH] [--state-dir DIR] [--root DIR]... \
-                     [--backend fanotify|inotify|fake|auto] [--shared-store] [--foreground]\n\
+                     [--backend fanotify|inotify|fsevents|fake|auto] [--shared-store] [--foreground]\n\
                      fflocated --system [--system-group GID|NAME] [--root DIR]... \
                      # system instance: /run/fflocated.sock, per-entry ownership"
                 );

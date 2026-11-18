@@ -12,21 +12,16 @@ path = "src/main.rs"
 
 [features]
 # Backend selection. On Linux the GUI defaults to the real widget toolkit
-# (GTK), which is what a user expects from `ff --gui`. On macOS it defaults
-# to the native AppKit backend. The `zork` backend is a display-free fallback:
-# it drives the same widget API from a REPL, so the GUI still runs over ssh or
-# in a container with no X server.
+# (GTK), which is what a user expects from `ff --gui`. The `zork` backend is a
+# display-free fallback: it drives the same widget API from a REPL, so the GUI
+# still runs over ssh or in a container with no X server.
 #
-# Cargo features cannot be target-conditional, so `gtk` is on everywhere; that
-# is harmless off Linux. rswidgets selects its backend by target as well as
-# feature (`cfg(target_os = "macos")` -> appkit, `cfg(windows)` -> nwg,
-# `cfg(target_arch = "wasm32")` -> wasm), and the gtk module itself is
-# `cfg(target_os = "linux")`, so on Windows/macOS/wasm the feature is inert
-# rather than wrong. Conversely the `macos` feature only activates the AppKit
-# backend on macOS; elsewhere it is inert.
-default = ["gtk", "macos"]
+# The vendored rustxWidgets snapshot has no AppKit backend and no `macos`
+# feature, so a macOS build selects `zork` through the target-specific
+# dependency below: `ff --gui` still works there, but it is the display-free
+# backend, not a native window.
+default = ["gtk"]
 gtk = ["rswidgets/gtk"]
-macos = ["rswidgets/macos"]
 zork = ["rswidgets/zork"]
 
 [dependencies]
@@ -42,7 +37,12 @@ serde_json.workspace = true
 # it silently swallows it into the dev-dependency set, so the library and binary
 # no longer link it (the symptom is "cannot find crate `rswidgets`" despite
 # Cargo reporting the dependency normally).
-rswidgets = { path = "../../vendor/rustxwidgets", default-features = false }
+rswidgets = { package = "rustxwidgets", path = "../../vendor/rustxwidgets", default-features = false }
+
+# macOS: no AppKit in the vendored snapshot, so the GUI uses the display-free
+# `zork` backend there (see the feature comment above).
+[target.'cfg(target_os = "macos")'.dependencies]
+rswidgets = { package = "rustxwidgets", path = "../../vendor/rustxwidgets", default-features = false, features = ["zork"] }
 
 [dev-dependencies]
 tempfile.workspace = true

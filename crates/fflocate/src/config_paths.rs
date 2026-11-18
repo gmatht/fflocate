@@ -27,7 +27,19 @@ pub fn runtime_dir() -> PathBuf {
         }
         state_dir()
     }
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), target_os = "macos"))]
+    {
+        // macOS has no /run and no XDG_RUNTIME_DIR. The per-user socket lives
+        // in Application Support, which is the platform's per-user state root
+        // and is not world-writable (unlike $TMPDIR itself).
+        if let Ok(h) = std::env::var("HOME") {
+            return PathBuf::from(h).join("Library/Application Support/fflocate");
+        }
+        // Last resort: the per-user temp dir ($TMPDIR on macOS is private to
+        // the user, unlike /tmp).
+        std::env::temp_dir().join("fflocate")
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         if let Ok(uid) = std::env::var("UID") {
             return PathBuf::from(format!("/run/user/{uid}"));
@@ -56,21 +68,38 @@ pub fn state_dir() -> PathBuf {
             }
         }
     }
-    if let Ok(h) = std::env::var("HOME") {
-        return PathBuf::from(h)
-            .join(".local/state/fflocate")
+    // macOS: the index is a cache — Caches is the platform-correct home for
+    // it (never backed up, purgeable), with the format version as a subdir so
+    // a bump starts a fresh store instead of corrupting the old one.
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(h) = std::env::var("HOME") {
+            return PathBuf::from(h)
+                .join("Library/Caches/fflocate")
+                .join(FORMAT_VERSION.to_string());
+        }
+        return std::env::temp_dir()
+            .join("fflocate")
             .join(FORMAT_VERSION.to_string());
     }
-    #[cfg(windows)]
+    #[cfg(not(target_os = "macos"))]
     {
-        // Last resort: temp dir (Git-Bash/MSYS set HOME, so this is rare).
-        std::env::temp_dir()
-            .join("fflocate")
-            .join(FORMAT_VERSION.to_string())
-    }
-    #[cfg(not(windows))]
-    {
-        PathBuf::from(format!("/var/lib/fflocate/{FORMAT_VERSION}"))
+        if let Ok(h) = std::env::var("HOME") {
+            return PathBuf::from(h)
+                .join(".local/state/fflocate")
+                .join(FORMAT_VERSION.to_string());
+        }
+        #[cfg(windows)]
+        {
+            // Last resort: temp dir (Git-Bash/MSYS set HOME, so this is rare).
+            std::env::temp_dir()
+                .join("fflocate")
+                .join(FORMAT_VERSION.to_string())
+        }
+        #[cfg(not(windows))]
+        {
+            PathBuf::from(format!("/var/lib/fflocate/{FORMAT_VERSION}"))
+        }
     }
 }
 
@@ -114,6 +143,27 @@ pub fn state_dir_from_env() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_paths_live_under_library() {
+        // The per-user socket and store follow macOS conventions rather than
+        // XDG paths that no macOS tool reads.
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        std::env::remove_var("XDG_STATE_HOME");
+        let s = socket_path();
+        assert!(
+            s.to_string_lossy()
+                .contains("Library/Application Support/fflocate"),
+            "macOS socket must live in Application Support: {s:?}"
+        );
+        let d = state_dir();
+        assert!(
+            d.to_string_lossy().contains("Library/Caches/fflocate"),
+            "macOS store must live in Caches: {d:?}"
+        );
+        assert!(d.to_string_lossy().contains(&FORMAT_VERSION.to_string()));
+    }
 
     #[test]
     fn socket_is_not_in_tmp() {

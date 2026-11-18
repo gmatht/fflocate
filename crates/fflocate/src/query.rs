@@ -191,6 +191,10 @@ impl Query {
     /// expression instead). It overrides smart-case: a lowercase term that
     /// would normally match case-insensitively is made case-sensitive too.
     pub fn compile_with_case(raw: &str, force_case: bool) -> Result<Query, String> {
+        // macOS: typed text is precomposed, indexed names are normalized to
+        // NFC at insert time as well — normalize here so both sides agree.
+        let normalized = crate::util::normalize_text(raw);
+        let raw = normalized.as_ref();
         let mut terms = parse_terms(raw)?;
         if force_case {
             for t in terms.iter_mut() {

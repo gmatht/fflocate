@@ -535,7 +535,12 @@ fn resolve_user(s: &str) -> Result<u32, CliError> {
     if let Ok(n) = s.parse() {
         return Ok(n);
     }
-    // Resolve a name via /etc/passwd (getpwnam without libc bindings here).
+    // Ask the platform's account database first (getpwnam): macOS serves
+    // users from OpenDirectory and usually has no /etc/passwd.
+    if let Some(uid) = fflocate::ids::uid_for_name(s) {
+        return Ok(uid);
+    }
+    // Fallback for exotic unix setups where libc lookup is unavailable.
     match std::fs::read_to_string("/etc/passwd") {
         Ok(txt) => {
             for line in txt.lines() {
@@ -557,6 +562,9 @@ fn resolve_group(s: &str) -> Result<u32, CliError> {
     if let Ok(n) = s.parse() {
         return Ok(n);
     }
+    if let Some(gid) = fflocate::ids::gid_for_name(s) {
+        return Ok(gid);
+    }
     match std::fs::read_to_string("/etc/group") {
         Ok(txt) => {
             for line in txt.lines() {
@@ -569,7 +577,7 @@ fn resolve_group(s: &str) -> Result<u32, CliError> {
             }
             Err(CliError::Usage(format!("find: unknown group '{s}'")))
         }
-        Err(_) => Err(CliError::Usage(format!("find: cannot resolve group '{s}'"))),
+        Err(_) => Err(CliError::Usage(format!("find: unknown group '{s}'"))),
     }
 }
 

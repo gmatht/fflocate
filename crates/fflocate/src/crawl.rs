@@ -42,12 +42,15 @@ pub fn enumerate(fs: &dyn FsView, abs: &Path) -> std::io::Result<Enumeration> {
         if crate::util::is_cookie(&it.name) {
             continue; // cookies are never indexed (§16)
         }
+        // macOS stores decomposed names; index the precomposed spelling so a
+        // typed NFC query matches (identity everywhere else).
+        let name = crate::util::normalize_name(&it.name).into_owned();
         if it.is_symlink {
-            e.symlinks.push(it.name);
+            e.symlinks.push(name);
         } else if it.is_dir {
-            e.dirs.push(it.name);
+            e.dirs.push(name);
         } else {
-            e.files.push(it.name);
+            e.files.push(name);
         }
     }
     Ok(e)

@@ -153,13 +153,13 @@ pub fn spawn_daemon(socket: &Path) -> Result<(), SpawnError> {
 
 /// The watcher backend to ask for when auto-spawning.
 ///
-/// inotify exists only on Linux; elsewhere the kernel watcher is not ported yet
-/// (FSEvents/FSEvents is v1.5), so the daemon runs with the fake backend, which
-/// still crawls, serves queries and reconciles on demand — it just does not get
-/// live events. `$FFLOCATE_BACKEND` overrides.
+/// Each platform gets its own kernel watcher: inotify on Linux, FSEvents on
+/// macOS. A platform with neither falls back to the fake backend, which still
+/// crawls, serves queries and reconciles on demand — it just gets no live
+/// events. `$FFLOCATE_BACKEND` overrides.
 fn default_backend_for_platform() -> &'static str {
     if let Ok(b) = std::env::var("FFLOCATE_BACKEND") {
-        if b == "inotify" || b == "fake" {
+        if matches!(b.as_str(), "inotify" | "fsevents" | "fake") {
             // Leak is fine: a single short-lived string for a process that is
             // about to exec a child.
             return Box::leak(b.into_boxed_str());
@@ -167,6 +167,8 @@ fn default_backend_for_platform() -> &'static str {
     }
     if cfg!(target_os = "linux") {
         "inotify"
+    } else if cfg!(target_os = "macos") {
+        "fsevents"
     } else {
         "fake"
     }
@@ -189,7 +191,7 @@ fn roots_from_env() -> Option<Vec<PathBuf>> {
 /// path — a symlink is deliberately *not* resolved, so a `ff` symlinked into
 /// `~/bin` finds a `fflocated` placed beside it), then the directory of
 /// `current_exe()` (which on Linux resolves the symlink target), then `$PATH`.
-fn daemon_binary_path() -> Result<PathBuf, SpawnError> {
+pub fn daemon_binary_path() -> Result<PathBuf, SpawnError> {
     if let Ok(p) = std::env::var("FFLOCATED_BIN") {
         return Ok(PathBuf::from(p));
     }
@@ -325,6 +327,19 @@ mod tests {
             assert_eq!(rc, 0, "test setup: exclusive lock must acquire");
             assert!(daemon_lock_held(&pidfile), "a held lock must read as held");
         }
+    }
+
+    #[test]
+    fn autospawn_asks_for_the_platform_watcher() {
+        // Never hand the daemon a backend this OS cannot open: on macOS that
+        // made the child exit immediately and `ff` report ECONNREFUSED.
+        if std::env::var_os("FFLOCATE_BACKEND").is_some() {
+            return; // the override is what the environment wants; skip
+        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(default_backend_for_platform(), "inotify");
+        #[cfg(target_os = "macos")]
+        assert_eq!(default_backend_for_platform(), "fsevents");
     }
 
     #[test]

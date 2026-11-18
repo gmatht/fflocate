@@ -57,10 +57,12 @@ pub fn probe_drive(path: &Path) -> Option<DriveId> {
     {
         probe_windows(path)
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
     {
-        // No prober ported here yet (macOS needs IOKit); identity stays
-        // unknown rather than guessed.
+        probe_macos(path)
+    }
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+    {
         let _ = path;
         None
     }
@@ -162,6 +164,68 @@ fn probe_linux(path: &Path) -> Option<DriveId> {
         Path::new("/dev/disk/by-uuid"),
         Path::new("/sys/block"),
     )
+}
+
+// ---------------------------------------------------------------------------
+// macOS: volume UUID via DiskArbitration's `diskutil` front end. There is no
+// stable *hardware* serial without IOKit entitlement work, so identity here is
+// the volume UUID (stable until reformat), which is exactly what §15 needs to
+// match a root across boots.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
+fn probe_macos(path: &Path) -> Option<DriveId> {
+    let dev = device_for(path)?;
+    let id = DriveId {
+        disk_serial: None,
+        volume_uuid: volume_uuid_for(&dev),
+    };
+    (!id.is_empty()).then_some(id)
+}
+
+/// The `/dev/diskXsY` device backing `path`, or `None` for volumes without a
+/// device (network mounts, synthesized filesystems).
+#[cfg(target_os = "macos")]
+fn device_for(path: &Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    let bytes: Vec<u8> = st
+        .f_mntfromname
+        .iter()
+        .take_while(|b| **b != 0)
+        .map(|b| *b as u8)
+        .collect();
+    let src = String::from_utf8_lossy(&bytes).into_owned();
+    src.starts_with("/dev/").then_some(src)
+}
+
+#[cfg(target_os = "macos")]
+fn volume_uuid_for(dev: &str) -> Option<String> {
+    let out = std::process::Command::new("/usr/sbin/diskutil")
+        .args(["info", "-plist", dev])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    plist_string(&String::from_utf8_lossy(&out.stdout), "VolumeUUID")
+}
+
+/// Pull `<key>KEY</key><string>VALUE</string>` out of a plist. Pure so the
+/// parse is testable without a Mac.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn plist_string(xml: &str, key: &str) -> Option<String> {
+    let needle = format!("<key>{key}</key>");
+    let at = xml.find(&needle)? + needle.len();
+    let rest = &xml[at..];
+    let start = rest.find("<string>")? + "<string>".len();
+    let end = rest[start..].find("</string>")? + start;
+    let value = rest[start..end].trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +377,30 @@ fn probe_windows(path: &Path) -> Option<DriveId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plist_string_reads_diskutil_output() {
+        let xml = r#"<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>DeviceIdentifier</key><string>disk3s1s1</string>
+  <key>VolumeUUID</key><string>12345678-ABCD-4321-8888-0123456789AB</string>
+  <key>VolumeName</key><string>Macintosh HD</string>
+</dict></plist>"#;
+        assert_eq!(
+            plist_string(xml, "VolumeUUID").as_deref(),
+            Some("12345678-ABCD-4321-8888-0123456789AB")
+        );
+        assert_eq!(plist_string(xml, "Missing"), None);
+        assert_eq!(plist_string("<key>Empty</key><string> </string>", "Empty"), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_root_has_a_volume_identity() {
+        // `/` is the boot volume; it must resolve to a device and a UUID.
+        let id = probe_drive(Path::new("/"));
+        assert!(id.is_some(), "the boot volume must be identifiable");
+    }
 
     #[test]
     fn matches_needs_one_agreeing_identifier() {

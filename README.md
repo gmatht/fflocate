@@ -26,8 +26,41 @@ cargo build --release
 # binaries: target/release/fflocated and target/release/ff
 ```
 
-Requires a recent stable Rust (edition 2021). Linux only for the v1 watcher
-backend; the core library is portable.
+Requires a recent stable Rust (edition 2021). The realtime backend is per
+platform: inotify/fanotify on Linux, FSEvents on macOS (see below).
+
+## macOS
+
+`ff` and `fflocated` run on macOS with an FSEvents watcher, selected
+automatically (`--backend fsevents` to force it), speaking the same NDJSON
+protocol as on Linux.
+
+```sh
+cargo build --release
+install -m 0755 target/release/fflocated target/release/ff /usr/local/bin/
+ff main.rs                        # auto-spawns fflocated with fsevents
+ff service install                # LaunchAgent plist, then:
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.fflocate.fflocated.plist
+```
+
+Paths follow macOS conventions instead of XDG: the per-user socket lives in
+`~/Library/Application Support/fflocate/`, the index in
+`~/Library/Caches/fflocate/<format>/`. A system instance
+(`fflocated --system --system-group fflocate`) uses `/var/run/fflocated.sock`
+and `/Library/Application Support/fflocate/`.
+
+Notes and limits:
+
+* FSEvents coalesces and can drop events; drops become an explicit subtree
+  rescan (`ff stats` reports the cause), never a silent gap.
+* Network volumes (SMB/NFS) are not watched reliably — index them explicitly
+  and use `ff update` to reconcile.
+* TCC-protected directories (Desktop, Documents, Mail, …) are only listed by a
+  process with Full Disk Access.
+* APFS stores decomposed names; the index normalizes to NFC so a typed
+  precomposed query still matches.
+* `ff --gui` builds on macOS with the display-free `zork` backend; there is no
+  AppKit backend in the vendored widget snapshot yet.
 
 ## Quick start
 

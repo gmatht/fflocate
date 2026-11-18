@@ -49,6 +49,56 @@ pub fn fnv1a64(data: &[u8]) -> u64 {
     h
 }
 
+/// NFC-normalize a file name for the index.
+///
+/// macOS hands back *decomposed* names (HFS+ stores NFD, and APFS preserves
+/// whatever it was given), while a user typing on a Mac produces *precomposed*
+/// text. Indexing and querying both go through this helper so "café" typed with
+/// one code point matches "café" stored as `e` + combining acute. Non-UTF-8
+/// names are passed through untouched: they cannot be normalized, and mangling
+/// them would make them unopenable.
+#[cfg(target_os = "macos")]
+pub fn normalize_name(name: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    use std::borrow::Cow;
+    use unicode_normalization::UnicodeNormalization;
+    match std::str::from_utf8(name) {
+        Ok(s) => {
+            let n: String = s.nfc().collect();
+            if n.as_bytes() == name {
+                Cow::Borrowed(name)
+            } else {
+                Cow::Owned(n.into_bytes())
+            }
+        }
+        Err(_) => Cow::Borrowed(name),
+    }
+}
+
+/// NFC-normalize a query string. Identity off macOS (see [`normalize_name`]).
+#[cfg(target_os = "macos")]
+pub fn normalize_text(s: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    use unicode_normalization::UnicodeNormalization;
+    let n: String = s.nfc().collect();
+    if n == s {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(n)
+    }
+}
+
+/// Identity on platforms whose filenames are already precomposed (Linux,
+/// Windows); the call sites stay platform-free.
+#[cfg(not(target_os = "macos"))]
+pub fn normalize_name(name: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    std::borrow::Cow::Borrowed(name)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn normalize_text(s: &str) -> std::borrow::Cow<'_, str> {
+    std::borrow::Cow::Borrowed(s)
+}
+
 /// Escape a byte path for JSON output. Returns a `String`; invalid UTF-8 is
 /// handled by serde_json's lossy conversion at the call site. Here we only
 /// need equality/print behaviour for CLI, so keep bytes intact.
@@ -72,6 +122,18 @@ mod tests {
         let whole = crc32(b"the quick brown fox");
         let part = crc32_update(crc32_update(0, b"the quick "), b"brown fox");
         assert_eq!(whole, part);
+    }
+
+    #[test]
+    fn normalization_is_identity_where_not_needed() {
+        // Linux/Windows filenames are taken as-is; macOS folds to NFC.
+        let nfd = "cafe\u{301}";
+        let got = normalize_name(nfd.as_bytes());
+        #[cfg(target_os = "macos")]
+        assert_eq!(got.as_ref(), "caf\u{e9}".as_bytes());
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(got.as_ref(), nfd.as_bytes());
+        assert_eq!(normalize_text("plain").as_ref(), "plain");
     }
 
     #[test]

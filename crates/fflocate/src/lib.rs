@@ -34,6 +34,7 @@ pub mod excludes;
 pub mod expr;
 pub mod fuzzy;
 pub mod health;
+pub mod ids;
 pub mod index;
 pub mod journal;
 pub mod modelfs;

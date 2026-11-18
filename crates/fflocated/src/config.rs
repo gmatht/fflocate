@@ -46,6 +46,8 @@ pub enum BackendChoice {
     Inotify,
     /// fanotify-FID: whole-mount watch, file-handle events (§6, v1.5).
     Fanotify,
+    /// FSEvents: the macOS whole-volume watcher (§6).
+    Fsevents,
     Fake,
     /// Pick the best available backend for this system (§4): fanotify when the
     /// kernel supports it, else inotify on Linux, else nothing (caller errors).
@@ -57,6 +59,7 @@ impl BackendChoice {
         match self {
             BackendChoice::Inotify => "inotify",
             BackendChoice::Fanotify => "fanotify",
+            BackendChoice::Fsevents => "fsevents",
             BackendChoice::Fake => "fake",
             BackendChoice::Auto => "auto",
         }
@@ -67,6 +70,7 @@ impl BackendChoice {
         Some(match s {
             "inotify" => BackendChoice::Inotify,
             "fanotify" => BackendChoice::Fanotify,
+            "fsevents" | "fsevent" => BackendChoice::Fsevents,
             "fake" => BackendChoice::Fake,
             "auto" => BackendChoice::Auto,
             _ => return None,
@@ -86,10 +90,14 @@ impl BackendChoice {
                         Some(BackendChoice::Inotify)
                     }
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(target_os = "macos")]
                 {
-                    // No kernel watcher is ported off Linux yet (FSEvents is
-                    // v1.5); `fake` is the only honest option.
+                    Some(BackendChoice::Fsevents)
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                {
+                    // No real watcher on this platform: `fake` keeps the
+                    // daemon honest but static (the store still answers).
                     Some(BackendChoice::Fake)
                 }
             }
@@ -162,17 +170,37 @@ impl Config {
     pub fn with_system(mut self, on: bool) -> Self {
         self.system = on;
         if on {
-            self.socket_path = PathBuf::from("/run/fflocated.sock");
-            self.pidfile = PathBuf::from("/run/fflocated.pid");
-            self.state_dir = PathBuf::from(format!("/var/lib/fflocate/{FORMAT_VERSION}"));
+            #[cfg(target_os = "macos")]
+            {
+                // macOS has no /run and no /var/lib: the system socket lives in
+                // /var/run (the platform's daemon runtime dir) and the store in
+                // /Library/Application Support, which root owns.
+                self.socket_path = PathBuf::from("/var/run/fflocated.sock");
+                self.pidfile = PathBuf::from("/var/run/fflocated.pid");
+                self.state_dir =
+                    PathBuf::from(format!("/Library/Application Support/fflocate/{FORMAT_VERSION}"));
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                self.socket_path = PathBuf::from("/run/fflocated.sock");
+                self.pidfile = PathBuf::from("/run/fflocated.pid");
+                self.state_dir = PathBuf::from(format!("/var/lib/fflocate/{FORMAT_VERSION}"));
+            }
         }
         self
     }
 
-    /// The `fflocate` group's gid from `/etc/group`, or `None` when it does not
-    /// exist. A system instance refuses to start without it rather than silently
-    /// widening the socket's mode.
+    /// The `fflocate` group's gid, or `None` when it does not exist. A system
+    /// instance refuses to start without it rather than silently widening the
+    /// socket's mode.
+    ///
+    /// Resolved through the platform's account database (`getgrnam`), not by
+    /// parsing `/etc/group`: macOS serves groups from OpenDirectory and often
+    /// has no `/etc/group` at all.
     pub fn fflocate_group_gid() -> Option<u32> {
+        if let Some(gid) = fflocate::ids::gid_for_name("fflocate") {
+            return Some(gid);
+        }
         let txt = std::fs::read_to_string("/etc/group").ok()?;
         for line in txt.lines() {
             let f: Vec<&str> = line.split(':').collect();
@@ -224,7 +252,7 @@ impl Config {
     /// usable (containers, exotic fstypes) the historical `$HOME` root
     /// applies. Elsewhere `$HOME` is the default, unchanged.
     pub fn default_roots() -> Vec<PathBuf> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             let mounts = fflocate::mount::read_mountinfo();
             let mut roots: Vec<PathBuf> = Vec::new();
@@ -244,7 +272,7 @@ impl Config {
             }
             roots
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             vec![home_dir()]
         }

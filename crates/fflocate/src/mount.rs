@@ -33,12 +33,26 @@ const EXCLUDED_FSTYPES: &[&str] = &[
 /// needs an explicit root — pseudo-FS never, network/fuse/removable media only
 /// when asked for — and the mount-aware crawl enforces that boundary even when
 /// such a mount sits inside an indexed tree.
+#[cfg(not(target_os = "macos"))]
 const NATIVE_FSTYPES: &[&str] = &[
     "ext2", "ext3", "ext4", "btrfs", "xfs", "f2fs", "jfs", "reiserfs", "nilfs2", "zfs", "bcachefs",
 ];
 
+/// Native macOS filesystems: APFS and HFS+ are the local disks; devfs,
+/// autofs, network and FUSE volumes need an explicit root.
+#[cfg(target_os = "macos")]
+const NATIVE_FSTYPES_MACOS: &[&str] = &["apfs", "hfs", "hfsx"];
+
 pub fn is_native_fstype(fstype: &str) -> bool {
-    NATIVE_FSTYPES.contains(&fstype.to_ascii_lowercase().as_str())
+    let f = fstype.to_ascii_lowercase();
+    #[cfg(target_os = "macos")]
+    {
+        return NATIVE_FSTYPES_MACOS.contains(&f.as_str());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        NATIVE_FSTYPES.contains(&f.as_str())
+    }
 }
 
 /// Default roots on Linux: the mount points of native filesystems (§4).
@@ -58,6 +72,12 @@ pub fn default_root_candidates(mounts: &[MountInfo]) -> Vec<String> {
         if is_excluded_fstype(&m.fstype) {
             continue; // belt and braces: exclusion beats nativity
         }
+        // macOS exposes the writable Data volume under /System/Volumes/Data
+        // as a firmlink inside /: indexing both would double every file.
+        #[cfg(target_os = "macos")]
+        if m.mount_point.starts_with("/System/Volumes/") {
+            continue;
+        }
         seen.insert(normalize_mount_point(&m.mount_point));
     }
     seen.into_iter().collect()
@@ -76,11 +96,24 @@ pub fn normalize_mount_point(p: &str) -> String {
 }
 /// Filesystems treated as case-insensitive by default (the fstype table; the
 /// optional temp-file-pair probe overrides this when the dir is writable).
-const CASE_INSENSITIVE_FSTYPES: &[&str] =
-    &["vfat", "exfat", "msdos", "ntfs", "ntfs3", "cifs", "smbfs"];
+/// `apfs`/`hfs` are *usually* case-insensitive (the macOS default) but can be
+/// formatted case-sensitive; the temp-file probe overrides this table on any
+/// writable root, and read-only roots fall back to "insensitive", which is the
+/// common case and the one where folding is the safer error to make.
+const CASE_INSENSITIVE_FSTYPES: &[&str] = &[
+    "vfat", "exfat", "msdos", "ntfs", "ntfs3", "cifs", "smbfs", "apfs", "hfs", "hfsx",
+];
+
+/// macOS pseudo-filesystems: kernel bookkeeping with no user files in them.
+#[cfg(target_os = "macos")]
+const EXCLUDED_FSTYPES_MACOS: &[&str] = &["devfs", "autofs", "fdesc", "none"];
 
 pub fn is_excluded_fstype(fstype: &str) -> bool {
     let f = fstype.to_ascii_lowercase();
+    #[cfg(target_os = "macos")]
+    if EXCLUDED_FSTYPES_MACOS.contains(&f.as_str()) {
+        return true;
+    }
     EXCLUDED_FSTYPES.iter().any(|e| f == *e)
         || f.starts_with("cgroup")
         || (f == "overlay" && !overlay_opt_in())
@@ -160,6 +193,41 @@ pub fn unescape_mountinfo_field(s: &str) -> String {
     out
 }
 
+/// The mount table, in the platform's own terms.
+///
+/// macOS has no mountinfo: `getmntinfo(3)` is the supported interface and
+/// already reports the fields we classify on (mount point, fstype, source).
+#[cfg(target_os = "macos")]
+pub fn read_mountinfo() -> Vec<MountInfo> {
+    let mut out = Vec::new();
+    let mut buf: *mut libc::statfs = std::ptr::null_mut();
+    // MNT_NOWAIT: never block on a dead network mount during discovery.
+    let n = unsafe { libc::getmntinfo(&mut buf, libc::MNT_NOWAIT) };
+    if n <= 0 || buf.is_null() {
+        return out;
+    }
+    for i in 0..n as isize {
+        let st = unsafe { &*buf.offset(i) };
+        out.push(MountInfo {
+            mount_point: c_field(&st.f_mntonname),
+            fstype: c_field(&st.f_fstypename),
+            source: c_field(&st.f_mntfromname),
+        });
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+fn c_field(bytes: &[libc::c_char]) -> String {
+    let b: Vec<u8> = bytes
+        .iter()
+        .take_while(|c| **c != 0)
+        .map(|c| *c as u8)
+        .collect();
+    String::from_utf8_lossy(&b).into_owned()
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn read_mountinfo() -> Vec<MountInfo> {
     // Lossy: a non-UTF-8 mount point must not make the whole table unreadable
     // (it degrades to a replacement character and may miss its boundary, but
@@ -248,7 +316,9 @@ pub fn probe_root(path: &Path) -> MountCaps {
         dtype_unreliable,
         file_handles,
         case_probe,
-        watch_time_ignore: true, // inotify backend is per-dir watch
+        // inotify can decline a subtree at watch time; FSEvents watches whole
+        // mounts and leaves filtering to the applier (§6).
+        watch_time_ignore: cfg!(target_os = "linux"),
     })
 }
 
@@ -477,11 +547,21 @@ pub fn has_file_handle(path: &Path) -> bool {
 /// after `std::fs` has already resolved the type, so this is a conservative
 /// heuristic: report unreliable on filesystems known to sometimes omit d_type.
 fn dtype_probe(path: &Path) -> bool {
-    let mounts = read_mountinfo();
-    matches!(
-        mount_for(&mounts, path).map(|m| m.fstype.as_str()),
-        Some("xfs") | Some("9p") | Some("fuse") | Some("fuseblk")
-    )
+    // APFS and HFS+ always report a usable d_type; only Linux filesystems
+    // (xfs, 9p, fuse) are known to return DT_UNKNOWN.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = path;
+        return false;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mounts = read_mountinfo();
+        matches!(
+            mount_for(&mounts, path).map(|m| m.fstype.as_str()),
+            Some("xfs") | Some("9p") | Some("fuse") | Some("fuseblk")
+        )
+    }
 }
 
 /// Write a temp file and check whether a variant spelling resolves to it. Only

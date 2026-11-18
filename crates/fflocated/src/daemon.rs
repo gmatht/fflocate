@@ -43,6 +43,8 @@ use fflocate::server::{Control, ControlSender, ServerCtx};
 use fflocate::sync::SyncRegistry;
 #[cfg(target_os = "linux")]
 use fflocate::watch::InotifyBackend;
+#[cfg(target_os = "macos")]
+use fflocate::watch::FseventsBackend;
 use fflocate::watch::{FakeBackend, WatchBackend};
 
 use crate::config::{BackendChoice, Config};
@@ -152,11 +154,20 @@ pub fn make_backend(choice: BackendChoice) -> anyhow::Result<(SharedBackend, Bac
             Ok(b) => Box::new(b),
             Err(e) => anyhow::bail!("inotify unavailable: {e}"),
         },
-        // No kernel watcher yet on this platform (FSEvents is v1.5, §17);
-        // fail loudly rather than silently running unwatched.
+        // `inotify` is a Linux API; fail loudly rather than silently running
+        // unwatched.
         #[cfg(not(target_os = "linux"))]
         BackendChoice::Inotify => {
-            anyhow::bail!("backend `inotify` is Linux-only; use `fake` on this platform")
+            anyhow::bail!("backend `inotify` is Linux-only; use `fsevents` on macOS")
+        }
+        #[cfg(target_os = "macos")]
+        BackendChoice::Fsevents => match FseventsBackend::new() {
+            Ok(b) => Box::new(b),
+            Err(e) => anyhow::bail!("fsevents unavailable: {e}"),
+        },
+        #[cfg(not(target_os = "macos"))]
+        BackendChoice::Fsevents => {
+            anyhow::bail!("backend `fsevents` is macOS-only")
         }
         #[cfg(target_os = "linux")]
         BackendChoice::Fanotify => match fflocate::watch::FanotifyBackend::new() {
