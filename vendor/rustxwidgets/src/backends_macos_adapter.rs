@@ -2524,14 +2524,20 @@ mod macos_adapter {
     /// what lets the same call sites work with or without a host — before this
     /// a standalone app built every widget against no root at all and exited.
     unsafe fn own_window() -> *mut c_void {
+        // Breadcrumbs: each risky AppKit call logs before it runs. An exception
+        // from one of them unwinds through Rust and aborts the process, so the
+        // last line printed is the call that threw.
+        let step = |n: &str| crate::backends::macos::log_macos(&format!("macos: window step {n}"));
         let existing = OWN_WINDOW.load(Ordering::Relaxed);
         if existing != 0 {
             return existing as *mut c_void;
         }
+        step("1 sharedApplication");
         if unsafe { shared_app() }.is_null() {
             crate::backends::macos::log_macos("macos: no NSApplication (headless session?)");
             return std::ptr::null_mut();
         }
+        step("2 alloc window");
         let window_cls = cls("NSWindow");
         if window_cls.is_null() {
             crate::backends::macos::log_macos("macos: NSWindow class not found");
@@ -2550,6 +2556,7 @@ mod macos_adapter {
         if window.is_null() {
             return std::ptr::null_mut();
         }
+        step("3 initWithContentRect");
         let window = unsafe {
             raw_send!(
                 window,
@@ -2583,12 +2590,21 @@ mod macos_adapter {
             return std::ptr::null_mut();
         }
         let window = own(window);
+        step("4 contentView");
         let view = unsafe { msg0(window, "contentView") };
         if view.is_null() {
             crate::backends::macos::log_macos("macos: window has no contentView");
             return std::ptr::null_mut();
         }
         // SAFETY: every object below is the live window/app made above.
+        step("5 finishLaunching");
+        unsafe {
+            let app = shared_app();
+            if !app.is_null() {
+                msg0v(app, "finishLaunching");
+            }
+        }
+        step("6 title + init_with_root");
         unsafe {
             // A closed window must not free itself: this handle is the
             // process's window for its whole life.
@@ -2602,6 +2618,9 @@ mod macos_adapter {
             if let Err(e) = core_apple::init_with_root_impl(view, std::ptr::null_mut(), "macos") {
                 crate::backends::macos::log_macos(&format!("macos: window init failed: {e}"));
             }
+        }
+        step("7 order front");
+        unsafe {
             msg1v(window, "makeKeyAndOrderFront:", std::ptr::null_mut());
             let app = shared_app();
             if !app.is_null() {
