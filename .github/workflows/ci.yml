@@ -23,8 +23,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # ff-gui is excluded: it does not build in either tree (widget-API drift).
+      # Failures are re-emitted as an annotation so they can be read without
+      # downloading logs (job logs require a token; annotations do not).
       - name: Unit and integration tests
-        run: cargo test -p fflocate -p fflocated -p ff
+        shell: bash
+        run: |
+          set -o pipefail
+          if cargo test -p fflocate -p fflocated -p ff 2>&1 | tee test.log; then
+            exit 0
+          fi
+          msg=$(grep -E '^(error|failures:)|panicked at|^ *---- ' test.log | head -20 | tr '\n' '|' | cut -c1-3500)
+          echo "::error title=test failure (${RUNNER_OS})::${msg}"
+          exit 1
 
       # The FSEvents backend is cfg(target_os = "macos"), so its unit tests only
       # run here; this also proves a live stream follows create/rename/delete.
