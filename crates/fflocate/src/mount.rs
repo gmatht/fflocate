@@ -695,19 +695,37 @@ mod tests {
 
     #[test]
     fn native_fstype_table() {
-        for fs in [
-            "ext4", "ext3", "ext2", "btrfs", "xfs", "f2fs", "zfs", "bcachefs", "EXT4",
-        ] {
-            assert!(is_native_fstype(fs), "{fs} must count as native");
+        // Per-platform tables: the native set is what a *discovered* root may
+        // come from, so each platform asserts only its own entries.
+        #[cfg(not(target_os = "macos"))]
+        {
+            for fs in [
+                "ext4", "ext3", "ext2", "btrfs", "xfs", "f2fs", "zfs", "bcachefs", "EXT4",
+            ] {
+                assert!(is_native_fstype(fs), "{fs} must count as native");
+            }
+            for fs in [
+                "vfat", "ntfs", "ntfs3", "nfs", "cifs", "tmpfs", "squashfs", "overlay",
+                "proc", "fuseblk",
+            ] {
+                assert!(!is_native_fstype(fs), "{fs} must not count as native");
+            }
         }
-        for fs in [
-            "vfat", "ntfs", "ntfs3", "nfs", "cifs", "tmpfs", "squashfs", "overlay", "proc",
-            "fuseblk",
-        ] {
-            assert!(!is_native_fstype(fs), "{fs} must not count as native");
+        #[cfg(target_os = "macos")]
+        {
+            for fs in ["apfs", "hfs", "hfsx", "APFS"] {
+                assert!(is_native_fstype(fs), "{fs} must count as native on macOS");
+            }
+            for fs in [
+                "exfat", "vfat", "msdos", "ntfs", "smbfs", "nfs", "devfs", "autofs", "none",
+                "tmpfs",
+            ] {
+                assert!(!is_native_fstype(fs), "{fs} must not count as native");
+            }
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn default_roots_are_native_mounts_only() {
         let mounts = parse_mountinfo(NATIVE_SAMPLE);
@@ -722,15 +740,34 @@ mod tests {
         );
     }
 
+    /// The macOS equivalent: APFS everywhere, with the Data volume's firmlink
+    /// and the VM volume under `/System/Volumes` skipped (indexing both `/`
+    /// and the Data volume would double every file), and an external APFS
+    /// volume kept as its own root.
+    #[cfg(target_os = "macos")]
     #[test]
-    fn duplicate_mount_points_collapse() {
-        // The same mount listed twice (bind) yields one root.
+    fn default_roots_are_native_mounts_only() {
         let mounts = parse_mountinfo(
             "\
-23 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw
-28 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw
+23 1 8:1 / / rw - apfs /dev/disk3s1s1 rw
+24 1 8:2 / /System/Volumes/Data rw - apfs /dev/disk3s5 rw
+25 1 8:3 / /Volumes/Backup rw - apfs /dev/disk4s1 rw
+26 1 8:4 / /Volumes/USB rw - exfat /dev/disk5s1 rw
+27 1 0:5 / /dev rw - devfs devfs rw
 ",
         );
+        assert_eq!(default_root_candidates(&mounts), vec!["/", "/Volumes/Backup"]);
+    }
+
+    #[test]
+    fn duplicate_mount_points_collapse() {
+        // The same mount listed twice (bind) yields one root. The fstype has to
+        // be native *for the platform under test* for the mount to be a
+        // candidate at all.
+        let fs = if cfg!(target_os = "macos") { "apfs" } else { "ext4" };
+        let mounts = parse_mountinfo(&format!(
+            "23 1 8:1 / / rw,relatime - {fs} /dev/sda1 rw\n28 1 8:1 / / rw,relatime - {fs} /dev/sda1 rw\n"
+        ));
         assert_eq!(default_root_candidates(&mounts), vec!["/"]);
     }
 
