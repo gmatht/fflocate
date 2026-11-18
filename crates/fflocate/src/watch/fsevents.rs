@@ -77,6 +77,18 @@ const LOSSY: u32 = ev::MUST_SCAN_SUBDIRS | ev::USER_DROPPED | ev::KERNEL_DROPPED
 /// Mount/source changes: the root (or a volume below it) changed identity.
 const STRUCTURAL: u32 = ev::ROOT_CHANGED | ev::MOUNT | ev::UNMOUNT;
 
+/// `$FFLOCATE_FSEVENTS_TRACE` echoes every raw event and how it translated.
+/// Off by default; the macOS smoke test turns it on so a failing run reports
+/// what the kernel actually delivered instead of a count that never moved.
+fn tracing() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var_os("FFLOCATE_FSEVENTS_TRACE") {
+        Some(v) => !v.is_empty() && v != "0",
+        None => false,
+    })
+}
+
 /// Metadata changes that can alter the executable bit, without touching the
 /// namespace. `ItemInodeMetaMod` is chmod/chown; content writes never reach
 /// this backend's index (§1).
@@ -348,12 +360,17 @@ impl FseventsBackend {
     }
 
     fn translate(&self, raw: Vec<RawEvent>) -> Vec<FsEvent> {
+        let trace = tracing();
+        let raw_len = raw.len();
         let mut out = Vec::new();
         // Coalescing: one poll batch often repeats the same path (create +
         // modify + attrib). Keep the last kind emitted per path.
         let mut seen: HashSet<(PathBuf, u8)> = HashSet::new();
         for r in raw {
             let flags = r.flags;
+            if trace {
+                eprintln!("fsevents: raw {} flags={flags:#x}", r.path.display());
+            }
             if flags & LOSSY != 0 || flags & STRUCTURAL != 0 {
                 // We were told we missed events: rescan the owning root, or
                 // the deepest directory we do know about.
@@ -392,10 +409,16 @@ impl FseventsBackend {
             } else {
                 // Content writes, finder-info and xattr changes: no index
                 // work (§1).
+                if trace {
+                    eprintln!("fsevents: ignored {} flags={flags:#x}", r.path.display());
+                }
                 continue;
             }
 
             let Some((parent, name)) = self.resolve(&r.path) else {
+                if trace {
+                    eprintln!("fsevents: unresolved {} (no watched parent)", r.path.display());
+                }
                 // A parent we have never indexed (a directory created and
                 // written to before the crawl reached it). Rescan the nearest
                 // known ancestor instead of dropping the event.
@@ -419,6 +442,9 @@ impl FseventsBackend {
                 2 => out.push(FsEvent::remove(parent, name)),
                 _ => out.push(FsEvent::refresh_exec(parent, name)),
             }
+        }
+        if trace {
+            eprintln!("fsevents: {raw_len} raw -> {} events", out.len());
         }
         out
     }

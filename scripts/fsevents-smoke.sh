@@ -17,7 +17,10 @@ printf 'seed\n' > "$root/seed.txt"
 
 cargo build --release -p fflocated -p ff
 
-./target/release/fflocated \
+# The daemon's event trace goes to the log, which is printed when this script
+# gives up: a failing run then shows what the kernel delivered, not just a
+# count that never moved.
+FFLOCATE_FSEVENTS_TRACE=1 ./target/release/fflocated \
     --socket "$state/s.sock" \
     --state-dir "$state/store" \
     --root "$root" \
