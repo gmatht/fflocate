@@ -2469,6 +2469,29 @@ mod macos_adapter {
     /// `NSWindowStyleMaskTitled | Closable | Miniaturizable | Resizable`.
     const WINDOW_STYLE: usize = 1 | 2 | 4 | 8;
 
+    /// Whether `obj` answers `selname`.
+    ///
+    /// A message send to a selector that does not exist raises an Objective-C
+    /// exception, and that unwinds into the Rust frame that sent it and aborts
+    /// the process (`fatal runtime error: Rust cannot catch foreign
+    /// exceptions`) — which is how a misspelled selector once took the whole
+    /// GUI down. Raw sends outside the hot path are checked first.
+    fn responds(obj: *mut c_void, selname: &str) -> bool {
+        if obj.is_null() {
+            return false;
+        }
+        // SAFETY: `-respondsToSelector:` is an NSObject method on any object we
+        // hold, and the BOOL return is a C `bool`.
+        unsafe {
+            raw_send!(
+                obj,
+                "respondsToSelector:",
+                unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool,
+                (core_apple::selector(selname),)
+            )
+        }
+    }
+
     /// Make AppKit's classes exist in this process.
     ///
     /// `objc_getClass("NSWindow")` only finds a class that some loaded image
@@ -2582,10 +2605,16 @@ mod macos_adapter {
             return std::ptr::null_mut();
         }
         step("3 initWithContentRect");
+        if !responds(window, "initWithContentRect:styleMask:backing:defer:") {
+            crate::backends::macos::log_macos(
+                "macos: NSWindow has no initWithContentRect:styleMask:backing:defer:",
+            );
+            return std::ptr::null_mut();
+        }
         let window = unsafe {
             raw_send!(
                 window,
-                "initWithContentRect:styleMask:backingMask:defer:",
+                "initWithContentRect:styleMask:backing:defer:",
                 unsafe extern "C" fn(
                     *mut c_void,
                     *mut c_void,
