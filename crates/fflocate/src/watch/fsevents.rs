@@ -390,19 +390,25 @@ impl FseventsBackend {
 
             // Created / renamed: the file may or may not exist now. A rename
             // reports both names but cannot pair them, so existence decides.
-            let created = flags & ev::ITEM_CREATED != 0;
             let renamed = flags & ev::ITEM_RENAMED != 0;
-            let removed = flags & ev::ITEM_REMOVED != 0;
             let kind: u8;
             let is_dir = flags & ev::ITEM_IS_DIR != 0;
+            // A rename reports both names and cannot pair them, so the
+            // filesystem decides which side an event is. `ItemCreated` must not
+            // override that decision: macOS marks the *vanished* side
+            // `Created|Renamed` (0x11900; the surviving side carries `Renamed`
+            // alone, 0x10800), so trusting the bit inserted an entry for a name
+            // that no longer existed and never removed the old one.
             let exists = if renamed {
                 std::fs::symlink_metadata(&r.path).is_ok()
             } else {
                 true
             };
-            if created || (renamed && exists) {
+            if renamed {
+                kind = if exists { 1 } else { 2 };
+            } else if flags & ev::ITEM_CREATED != 0 {
                 kind = 1; // upsert
-            } else if removed || renamed {
+            } else if flags & ev::ITEM_REMOVED != 0 {
                 kind = 2; // remove
             } else if flags & METADATA != 0 {
                 kind = 3; // refresh exec
@@ -733,6 +739,45 @@ mod tests {
             b.resolve(&real.join("a.txt")),
             Some((9, b"a.txt".to_vec())),
             "an event on the real path must resolve through a symlinked watch"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_vanished_rename_side_is_removed_even_when_marked_created() {
+        // macOS reports the old path of a rename as Created|Renamed|ItemModified
+        // (0x11900). It no longer exists, so it is a removal; treating Created
+        // as proof of existence inserted a phantom entry for the dead name.
+        let b = backend_with_dirs();
+        let out = b.translate(vec![raw(
+            "/Users/me/Documents/gone.txt",
+            ev::ITEM_CREATED | ev::ITEM_RENAMED | 0x0000_1000,
+        )]);
+        assert_eq!(
+            out,
+            vec![FsEvent::remove(DirKey::new(8), b"gone.txt".to_vec())],
+            "the old name of a rename must disappear from the index"
+        );
+    }
+
+    #[test]
+    fn a_surviving_rename_side_is_an_upsert() {
+        // The new path arrives as Renamed alone (0x10800) and does exist.
+        let tmp = std::env::temp_dir().join(format!("fx-rename-{}", std::process::id()));
+        let file = tmp.join("new.txt");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+
+        let mut b = FseventsBackend::new().unwrap();
+        b.dirs.insert(tmp.clone(), 11);
+        let out = b.translate(vec![RawEvent {
+            path: file,
+            flags: ev::ITEM_RENAMED | 0x0001_0000, // | ItemIsFile
+        }]);
+
+        assert_eq!(
+            out,
+            vec![FsEvent::upsert(DirKey::new(11), b"new.txt".to_vec(), false)]
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
