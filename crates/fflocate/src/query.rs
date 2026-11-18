@@ -1198,6 +1198,19 @@ pub fn execute_scan_emit(
             }
         }
     }
+    // A scan can finish between two chunk reports. Without this the client
+    // only ever saw the `(0, total)` announcement and the percentage sat at
+    // 0% (the rate gate suppresses everything slower than 100 ms). `scanned`
+    // only reaches `pass_total` when the whole pass ran, so a truncated or
+    // aborted scan never claims completion it did not reach.
+    if progress && pass_total > 0 && scanned == pass_total {
+        if !emit(ScanEvent::Progress {
+            scanned: pass_total,
+            total: pass_total,
+        }) {
+            return None;
+        }
+    }
     Some(total)
 }
 
@@ -1293,6 +1306,16 @@ pub fn execute_with_trigram_emit(
                     return None;
                 }
             }
+        }
+    }
+    // Same closing report as the plain streaming scan: a pass that finished
+    // inside one rate-gate window still tells the client where it ended.
+    if progress && pass_total > 0 && scanned == pass_total {
+        if !emit(ScanEvent::Progress {
+            scanned: pass_total,
+            total: pass_total,
+        }) {
+            return None;
         }
     }
     Some(total)
