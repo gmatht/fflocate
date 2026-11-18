@@ -2469,12 +2469,40 @@ mod macos_adapter {
     /// `NSWindowStyleMaskTitled | Closable | Miniaturizable | Resizable`.
     const WINDOW_STYLE: usize = 1 | 2 | 4 | 8;
 
+    /// Make AppKit's classes exist in this process.
+    ///
+    /// `objc_getClass("NSWindow")` only finds a class that some loaded image
+    /// registered. A Rust binary links libobjc but not the frameworks, so
+    /// before this runs every lookup here returns null and every widget
+    /// factory silently degrades to an inert handle — which is exactly how a
+    /// standalone app ends up building no UI at all. `dlopen` lives in
+    /// libSystem, which is always linked; loading AppKit there also brings in
+    /// Foundation, so no `#[link]` attribute (and no linker flag) is needed.
+    fn load_appkit() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            const RTLD_LAZY: i32 = 1;
+            extern "C" {
+                fn dlopen(path: *const std::os::raw::c_char, mode: i32) -> *mut c_void;
+            }
+            // NUL-terminated: a `&[u8]` literal keeps this free of allocation
+            // and of the `CString` unwrap.
+            let path = b"/System/Library/Frameworks/AppKit.framework/AppKit\0";
+            let handle = unsafe { dlopen(path.as_ptr() as *const std::os::raw::c_char, RTLD_LAZY) };
+            if handle.is_null() {
+                crate::backends::macos::log_macos("macos: could not load AppKit");
+            }
+        });
+    }
+
     /// The process's shared `NSApplication`, created on first use.
     ///
     /// AppKit expects `NSApplicationMain` — the app bundle's C entry point — to
     /// create this. A plain Rust binary has no bundle and no delegate, so the
     /// backend does it here, before any window exists.
     unsafe fn shared_app() -> *mut c_void {
+        load_appkit();
         let app_cls = cls("NSApplication");
         if app_cls.is_null() {
             return std::ptr::null_mut();
@@ -2501,10 +2529,12 @@ mod macos_adapter {
             return existing as *mut c_void;
         }
         if unsafe { shared_app() }.is_null() {
+            crate::backends::macos::log_macos("macos: no NSApplication (headless session?)");
             return std::ptr::null_mut();
         }
         let window_cls = cls("NSWindow");
         if window_cls.is_null() {
+            crate::backends::macos::log_macos("macos: NSWindow class not found");
             return std::ptr::null_mut();
         }
         // SAFETY: `alloc` then the designated initialiser, each with its exact
@@ -2547,11 +2577,15 @@ mod macos_adapter {
             )
         };
         if window.is_null() {
+            crate::backends::macos::log_macos(
+                "macos: initWithContentRect: failed (no window server?)",
+            );
             return std::ptr::null_mut();
         }
         let window = own(window);
         let view = unsafe { msg0(window, "contentView") };
         if view.is_null() {
+            crate::backends::macos::log_macos("macos: window has no contentView");
             return std::ptr::null_mut();
         }
         // SAFETY: every object below is the live window/app made above.
@@ -2574,6 +2608,9 @@ mod macos_adapter {
                 msg1bv(app, "activateIgnoringOtherApps:", true);
             }
         }
+        crate::backends::macos::log_macos(&format!(
+            "macos: self-driven window {window:p} with content view {view:p} ready"
+        ));
         OWN_WINDOW.store(window as usize, Ordering::Relaxed);
         view
     }
@@ -2607,6 +2644,7 @@ mod macos_adapter {
     /// The window handle is the content view: a host hands us its own, and a
     /// standalone process gets the one [`own_window`] just made.
     pub fn create_window() -> Result<Window, Error> {
+        load_appkit();
         match root() {
             Some(view) => Ok(Window(view)),
             None => Ok(Window(unsafe { own_window() })),
