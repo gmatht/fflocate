@@ -1559,13 +1559,21 @@ where
             _ => path.to_string(),
         };
         return match copy(&text) {
-            Ok(()) => format!("copied {}", text),
+            Ok(()) => format!("copied {}", short_path(&text)),
             Err(e) => format!("copy failed: {e}"),
         };
     }
     match std::process::Command::new(program).args(&args).spawn() {
-        Ok(_) => format!("{} → {}", action.label(), path),
+        Ok(_) => format!("{} → {}", action.label(), short_path(path)),
         Err(e) => format!("{} failed: {e}", action.label()),
+    }
+}
+
+/// The last component of `path`, for a status line.
+pub fn short_path(path: &str) -> String {
+    match path.rfind('/') {
+        Some(i) => path[i + 1..].to_string(),
+        None => path.to_string(),
     }
 }
 
@@ -2170,9 +2178,20 @@ mod tests {
             let (prog, args) = RowAction::OpenWith.command("/a/b.rs");
             assert_eq!(prog, "mimeopen");
             assert_eq!(args, vec!["-a".to_string(), "/a/b.rs".to_string()]);
-            // A terminal is launched in the file's directory, with a shell.
+            // A terminal is launched in the file's directory, with a shell
+            // (on macOS: Terminal.app, given the directory as its argument).
             let (prog, args) = RowAction::OpenInTerminal.command("/a/b.rs");
+            #[cfg(target_os = "macos")]
+            assert_eq!(prog, "open");
+            #[cfg(not(target_os = "macos"))]
             assert_eq!(prog, "x-terminal-emulator");
+            if cfg!(target_os = "macos") {
+                assert_eq!(
+                    args,
+                    vec!["-a".to_string(), "Terminal".to_string(), "/a".to_string()]
+                );
+                return;
+            }
             assert_eq!(args.first().map(String::as_str), Some("-e"));
             assert_eq!(
                 args.last().map(String::as_str),
@@ -2201,7 +2220,15 @@ mod tests {
     #[test]
     fn open_in_terminal_lands_in_the_containing_dir() {
         // "Open in terminal" promises the *directory containing* the file.
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        {
+            let (_, args) = RowAction::OpenInTerminal.command("/home/me/src/main.rs");
+            assert_eq!(args.last().map(String::as_str), Some("/home/me/src"));
+            // A bare name has no usable parent; the name itself is the answer.
+            let (_, args) = RowAction::OpenInTerminal.command("b.rs");
+            assert_eq!(args.last().map(String::as_str), Some("b.rs"));
+        }
+        #[cfg(all(not(windows), not(target_os = "macos")))]
         {
             // the `cd` target is the parent, not the file itself.
             let (_, args) = RowAction::OpenInTerminal.command("/home/me/src/main.rs");
@@ -2301,9 +2328,19 @@ mod tests {
 
     #[test]
     fn open_in_terminal_command_matches_the_live_launch() {
+        // macOS has no alternatives link to splice: `open -a Terminal <dir>`.
+        #[cfg(target_os = "macos")]
+        {
+            let (prog, args) = open_in_terminal_command("/a/b.rs");
+            assert_eq!(prog, "open");
+            assert_eq!(
+                args,
+                vec!["-a".to_string(), "Terminal".to_string(), "/a".to_string()]
+            );
+        }
         // Unix: the one entry point is base `cd` body plus the optional font
         // prefix in front of `-e`.
-        #[cfg(not(windows))]
+        #[cfg(all(not(windows), not(target_os = "macos")))]
         {
             // On this machine the alternative is zutty with
             // DejaVuSansMono installed, so the prefix is present — and the test
@@ -2352,7 +2389,12 @@ mod tests {
     #[test]
     fn open_containing_folder_of_a_bare_name_is_the_name() {
         // A path with no parent directory falls back to the path itself.
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
+        {
+            let (_, args) = RowAction::OpenContainingFolder.command("b.rs");
+            assert_eq!(args, vec!["-R".to_string(), "b.rs".to_string()]);
+        }
+        #[cfg(all(not(windows), not(target_os = "macos")))]
         {
             let (_, args) = RowAction::OpenContainingFolder.command("b.rs");
             assert_eq!(args, vec!["b.rs".to_string()]);

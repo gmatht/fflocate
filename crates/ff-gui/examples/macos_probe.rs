@@ -1231,7 +1231,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if *action == ff_gui::RowAction::CopyPath {
                 assert_eq!(
                     line,
-                    format!("copied {row_path}"),
+                    format!("copied {name}"),
                     "Copy path reported {line:?}"
                 );
                 let read_back = rswidgets::compat::clipboard_get_text()
