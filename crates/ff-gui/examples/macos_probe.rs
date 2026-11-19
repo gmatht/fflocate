@@ -349,9 +349,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         win.set_child(&outer);
 
         let view = win.raw_handle();
-        rswidgets::backends_macos_adapter::use_legacy_scrollers(view);
         let shot = rswidgets::backends_macos_adapter::capture(view, Some((1350.0, 858.0)))
             .ok_or("the window produced no capture")?;
+        let scroller_view = send0(sv, "verticalScroller");
+        let scroller_frame = if scroller_view.is_null() {
+            Rect::default()
+        } else {
+            send_rect(scroller_view, "frame")
+        };
+        println!(
+            "probe: scroller style {} (0 overlay, 1 legacy), vertical scroller {} at x={} w={}",
+            send0i(sv, "scrollerStyle"),
+            !scroller_view.is_null(),
+            scroller_frame.x,
+            scroller_frame.w
+        );
         println!(
             "probe: capture {}x{} (linux 1350x858), title bar {}, scroller ink {} px on {}% of the gutter",
             shot.width, shot.height, shot.title_bar, shot.scroller_ink, shot.scroller_coverage

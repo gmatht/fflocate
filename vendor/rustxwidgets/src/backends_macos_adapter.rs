@@ -3846,6 +3846,11 @@ mod macos_adapter {
                     set_frame(view, 0.0, 0.0, want_w, want_h);
                 }
             }
+            // After the resize, not before: a scroll view re-tiles when its
+            // frame changes, and a legacy scroller rebuilt earlier would be
+            // replaced by an overlay one here.
+            step("2b scrollers");
+            use_legacy_scrollers(view);
             step("3 layout");
             msg0v(view, "layoutSubtreeIfNeeded");
             step("4 bounds");
