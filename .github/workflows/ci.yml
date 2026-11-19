@@ -131,25 +131,30 @@ jobs:
         run: |
           ulimit -c 0 || true
           cargo build -p ff-gui 2>&1 | tail -1
-          FF_GUI_TRACE=1 ./target/debug/ff-gui >shot-run.log 2>&1 &
+          rm -f /tmp/app.png
+          # `screencapture` photographs the desktop, not this process's own
+          # view, and a runner's desktop is not where the window we care about
+          # lives. The binary renders itself instead.
+          FF_GUI_SCREENSHOT=/tmp/app.png ./target/debug/ff-gui >shot-run.log 2>&1 &
           pid=$!
-          sleep 6
-          /usr/sbin/screencapture -x -t png /tmp/screen.png || true
+          for _ in $(seq 1 30); do
+            [ -s /tmp/app.png ] && break
+            sleep 1
+          done
           kill "$pid" 2>/dev/null || true
           wait "$pid" 2>/dev/null || true
-          if [ ! -s /tmp/screen.png ]; then
-            echo "::error title=GUI screenshot (macOS)::screencapture wrote no file; $(head -c 400 shot-run.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+          if [ ! -s /tmp/app.png ]; then
+            echo "::error title=GUI screenshot (macOS)::no png written; $(head -c 400 shot-run.log | tr -cd '[:print:]\n' | tr '\n' '|')"
             exit 1
           fi
-          sips -Z 900 /tmp/screen.png --out /tmp/shot.png >/dev/null 2>&1 || cp /tmp/screen.png /tmp/shot.png
-          bytes=$(stat -f%z /tmp/shot.png)
-          size=$(sips -g pixelWidth -g pixelHeight /tmp/shot.png | grep -E 'pixel' | tr -d ' \n')
-          b64=$(base64 -i /tmp/shot.png | tr -d '\n')
-          echo "::notice title=GUI screenshot (macOS)::${bytes} bytes png ${size}, ${#b64} base64 chars"
+          bytes=$(stat -f%z /tmp/app.png)
+          b64=$(base64 -i /tmp/app.png | tr -d '\n')
+          echo "::notice title=GUI screenshot (macOS)::${bytes} bytes png, ${#b64} base64 chars: $(grep -o 'ff-gui: screenshot.*' shot-run.log | head -1)"
+          # 4000-char chunks: GitHub truncates longer annotation messages.
           i=0
           while [ -n "$b64" ]; do
-            echo "::notice title=shot-part-${i}::$(printf '%s' "$b64" | cut -c1-6000)"
-            b64=${b64:6000}
+            echo "::notice title=shot-part-${i}::$(printf '%s' "$b64" | cut -c1-4000)"
+            b64=${b64:4000}
             i=$((i+1))
           done
           echo "::notice title=shot-parts::${i} chunks"

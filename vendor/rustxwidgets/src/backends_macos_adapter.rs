@@ -3414,6 +3414,129 @@ mod macos_adapter {
         }
     }
 
+    /// Write a PNG of `view`, as AppKit draws it, to `path`.
+    ///
+    /// This exists because a CI runner has no screen to photograph: the macOS
+    /// job can start the GUI but cannot see it, and `screencapture` takes the
+    /// desktop rather than this process's own view. The picture is taken here
+    /// instead, through the same display path the window uses, and PNG-encoded
+    /// by AppKit — so what lands in the file is what `drawRect:` painted, at
+    /// the size the view was laid out at.
+    ///
+    /// Returns `(width, height, bytes written)`.
+    pub fn write_view_png(view: *mut c_void, path: &str) -> Option<(u32, u32, usize)> {
+        if view.is_null() {
+            return None;
+        }
+        // SAFETY: a live NSView; both selectors are AppKit's own, and `bounds`
+        // returns a `CGRect` (four `CGFloat`s) by value.
+        let (w, h) = unsafe {
+            msg0v(view, "layoutSubtreeIfNeeded");
+            let b: CGRect = raw_send!(
+                view,
+                "bounds",
+                unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
+                ()
+            );
+            (
+                b.width.round().max(1.0) as u32,
+                b.height.round().max(1.0) as u32,
+            )
+        };
+        // Draw it once through the normal path, then hand those pixels to a
+        // bitmap rep purely to get AppKit's PNG encoder.
+        let (px_w, px_h, px) = render_view_rgba(view, w, h)?;
+        let rep_cls = cls("NSBitmapImageRep");
+        if rep_cls.is_null() {
+            return None;
+        }
+        // SAFETY: the rep owns its buffer; every pointer is null-checked before
+        // it is dereferenced, and the copy stays inside `bytesPerRow`.
+        unsafe {
+            let rep = raw_send!(
+                raw_send!(
+                    rep_cls,
+                    "alloc",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void,
+                    ()
+                ),
+                "initWithBitmapDataPlanes:pixelsWide:pixelsHigh:bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow:bitsPerPixel:",
+                unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *const *mut c_void,
+                    isize,
+                    isize,
+                    isize,
+                    isize,
+                    bool,
+                    bool,
+                    *mut c_void,
+                    isize,
+                    isize,
+                ) -> *mut c_void,
+                (
+                    std::ptr::null::<*mut c_void>(),
+                    px_w as isize,
+                    px_h as isize,
+                    8isize,
+                    4isize,
+                    true,
+                    false,
+                    nsstring("NSDeviceRGBColorSpace"),
+                    0isize,
+                    0isize,
+                )
+            );
+            if rep.is_null() {
+                return None;
+            }
+            let data = msg0(rep, "bitmapData") as *mut u8;
+            let row = msg0i(rep, "bytesPerRow") as usize;
+            let width_bytes = px_w as usize * 4;
+            if data.is_null() || row < width_bytes {
+                return None;
+            }
+            for y in 0..px_h as usize {
+                std::ptr::copy_nonoverlapping(
+                    px.as_ptr().add(y * width_bytes),
+                    data.add(y * row),
+                    width_bytes,
+                );
+            }
+            // `NSBitmapImageFileTypePNG` is 4.
+            const PNG: usize = 4;
+            let dict = msg0(cls("NSDictionary"), "dictionary");
+            let nsdata = raw_send!(
+                rep,
+                "representationUsingType:properties:",
+                unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut c_void) -> *mut c_void,
+                (PNG, dict)
+            );
+            if nsdata.is_null() {
+                return None;
+            }
+            let len: usize = raw_send!(
+                nsdata,
+                "length",
+                unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize,
+                ()
+            );
+            let bytes: *const u8 = raw_send!(
+                nsdata,
+                "bytes",
+                unsafe extern "C" fn(*mut c_void, *mut c_void) -> *const u8,
+                ()
+            );
+            if bytes.is_null() || len == 0 {
+                return None;
+            }
+            let slice = std::slice::from_raw_parts(bytes, len);
+            std::fs::write(path, slice).ok()?;
+            Some((px_w, px_h, len))
+        }
+    }
+
     // ------------------------------------------------------------------
     // Factories
     // ------------------------------------------------------------------

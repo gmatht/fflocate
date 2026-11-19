@@ -1165,6 +1165,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // on an unmapped widget is a silent no-op in GTK, so this must come after.
     query.grab_focus();
 
+    // A picture of the AppKit window, for CI: a macOS runner can start this
+    // process but cannot see it, and `screencapture` photographs the desktop
+    // rather than this view. Env-gated like `FF_GUI_TRACE`, so it costs a
+    // normal run nothing, and asked for only after `present()` — the tree has
+    // been laid out by then, which is what makes the image match the window.
+    #[cfg(all(target_os = "macos", feature = "macos", not(feature = "zork")))]
+    if let Ok(path) = std::env::var("FF_GUI_SCREENSHOT") {
+        match rswidgets::backends_macos_adapter::write_view_png(win.raw_handle(), &path) {
+            Some((w, h, bytes)) => {
+                eprintln!("ff-gui: screenshot {path} ({w}x{h}, {bytes} bytes)");
+            }
+            None => eprintln!("ff-gui: screenshot {path} failed"),
+        }
+    }
+
     trace_step!("run loop");
     println!("ff-gui — fflocate search browser (backend: {BACKEND})");
     println!("Enter a query in the entry, then invoke Search.");
