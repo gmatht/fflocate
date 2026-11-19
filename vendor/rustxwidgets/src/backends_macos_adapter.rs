@@ -3623,11 +3623,18 @@ mod macos_adapter {
                         0,
                     );
                     if !c.is_null() {
+                        // The encoding must describe the real ABI — an
+                        // `NSRect` returned, an `NSRect` and an `NSScreen*`
+                        // taken. Registered as `@@:@@` (object in, object out),
+                        // AppKit's own frame arithmetic read garbage: the
+                        // window kept 645 of the 858 points asked for, and
+                        // `contentRectForFrameRect:` reported an 858-tall frame
+                        // as having 34 points of content.
                         add_method(
                             c,
                             "constrainFrameRect:toScreen:",
                             constrain_frame_imp as *const (),
-                            "@@:@@",
+                            "{CGRect={CGPoint=dd}{CGSize=dd}}@:{CGRect={CGPoint=dd}{CGSize=dd}}@",
                         );
                         objc_registerClassPair(c);
                     }
