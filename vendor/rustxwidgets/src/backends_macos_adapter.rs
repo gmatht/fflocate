@@ -208,6 +208,66 @@ mod macos_adapter {
         }
     }
 
+    /// Size `child` to `content`'s bounds, inset by [`WINDOW_MARGIN`].
+    ///
+    /// AppKit does not lay a plain subview out by itself: a view added to the
+    /// content view keeps its zeroed `NSRect`, so the root box stayed 0x0 and
+    /// the window rendered blank. GTK's `set_child` sizes the child to the
+    /// window for free, so this is the macOS equivalent, shared by `set_child`
+    /// and by the capture path (which resizes the window and must re-fit the
+    /// child, because a box re-fits itself to its contents on the next layout
+    /// pass and leaves the list below it without any height).
+    unsafe fn fit_content_child(content: *mut c_void, child: *mut c_void) {
+        if content.is_null() || child.is_null() {
+            return;
+        }
+        // SAFETY: both handles are live AppKit views; `bounds` returns a
+        // `CGRect` by value and `NSViewWidthSizable|NSViewHeightSizable` are the
+        // documented autoresizing constants.
+        unsafe {
+            const NSVIEW_WIDTH_SIZABLE: isize = 2;
+            const NSVIEW_HEIGHT_SIZABLE: isize = 16;
+            let bounds: CGRect = raw_send!(
+                content,
+                "bounds",
+                unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
+                ()
+            );
+            msg4cv(
+                child,
+                "setFrame:",
+                WINDOW_MARGIN,
+                WINDOW_MARGIN,
+                (bounds.width - 2.0 * WINDOW_MARGIN).max(1.0),
+                (bounds.height - 2.0 * WINDOW_MARGIN).max(1.0),
+            );
+            msg1i(
+                child,
+                "setAutoresizingMask:",
+                NSVIEW_WIDTH_SIZABLE | NSVIEW_HEIGHT_SIZABLE,
+            );
+        }
+    }
+
+    /// Re-fit every direct child of `content` (the window's root views).
+    unsafe fn refit_content_children(content: *mut c_void) {
+        if content.is_null() {
+            return;
+        }
+        // SAFETY: a live view; `subviews` is an `NSArray` of live views.
+        unsafe {
+            let subviews = msg0(content, "subviews");
+            if subviews.is_null() {
+                return;
+            }
+            let count = msg0i(subviews, "count").max(0);
+            for i in 0..count {
+                let child = msg1i(subviews, "objectAtIndex:", i);
+                fit_content_child(content, child);
+            }
+        }
+    }
+
     /// Put `child` inside `parent` (`addSubview:`), keeping the child's own
     /// frame. Null-safe: a null parent (backend not initialised) means the
     /// child is simply never attached, which is what makes host runs work.
@@ -384,105 +444,8 @@ mod macos_adapter {
             if self.0.is_null() || child_ptr.is_null() {
                 return;
             }
-            // AppKit does not lay a plain subview out by itself: a view added to
-            // the content view keeps its zeroed `NSRect`, so the root box stayed
-            // 0x0 and the window rendered blank — an empty white window with one
-            // stray glyph, which is exactly what the first CI screenshot showed.
-            // Size it to the content view and let it track resizes, which is what
-            // GTK's `set_child` does for free.
-            //
-            // SAFETY: both handles are live AppKit views; `bounds` returns a
-            // `CGRect` by value and `NSViewWidthSizable|NSViewHeightSizable` are
-            // the documented autoresizing constants.
-            unsafe {
-                const NSVIEW_WIDTH_SIZABLE: isize = 2;
-                const NSVIEW_HEIGHT_SIZABLE: isize = 16;
-                let bounds: CGRect = raw_send!(
-                    self.0,
-                    "bounds",
-                    unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
-                    ()
-                );
-                // GTK's window leaves a few points around its content, and
-                // without them the labels sat flush against the edge. The
-                // child is inset here rather than pinned: its autoresizing mask
-                // keeps both margins fixed when the window grows, and every
-                // other widget is laid out inside it, so the margin is not
-                // compounded per level.
-                msg4cv(
-                    child_ptr,
-                    "setFrame:",
-                    WINDOW_MARGIN,
-                    WINDOW_MARGIN,
-                    (bounds.width - 2.0 * WINDOW_MARGIN).max(1.0),
-                    (bounds.height - 2.0 * WINDOW_MARGIN).max(1.0),
-                );
-                msg1i(
-                    child_ptr,
-                    "setAutoresizingMask:",
-                    NSVIEW_WIDTH_SIZABLE | NSVIEW_HEIGHT_SIZABLE,
-                );
-            }
-            // The mask alone is not enough for a box: an `NSStackView` re-fits
-            // itself to its contents the moment it is laid out, so a resized
-            // window shrank the root box back to one row tall (1340x22 for a
-            // 1350x858 window) and the list inside it got no height at all --
-            // an empty window below the query row. Pinning each edge keeps the
-            // child the size of the window, which is what GTK's `set_child`
-            // gives for free; the inset becomes the constraints' constants.
-            let constraint_cls = cls("NSLayoutConstraint");
-            if !constraint_cls.is_null() {
-                unsafe {
-                    msg1bv(child_ptr, "setTranslatesAutoresizingMaskIntoConstraints:", false);
-                    // `NSLayoutAttribute` top 3, bottom 4, leading 5, trailing 6.
-                    for (attr, constant) in [
-                        (3isize, WINDOW_MARGIN),
-                        (4isize, -WINDOW_MARGIN),
-                        (5isize, WINDOW_MARGIN),
-                        (6isize, -WINDOW_MARGIN),
-                    ] {
-                        let constraint: *mut c_void = raw_send!(
-                            constraint_cls,
-                            "constraintWithItem:attribute:relatedBy:toItem:attribute:multiplier:constant:",
-                            unsafe extern "C" fn(
-                                *mut c_void,
-                                *mut c_void,
-                                *mut c_void,
-                                isize,
-                                isize,
-                                *mut c_void,
-                                isize,
-                                f64,
-                                f64,
-                            ) -> *mut c_void,
-                            (
-                                child_ptr,
-                                attr,
-                                0isize,
-                                self.0,
-                                attr,
-                                1.0,
-                                constant,
-                            )
-                        );
-                        if !constraint.is_null() {
-                            msg1v(self.0, "addConstraint:", constraint);
-                        }
-                    }
-                    // Constraints take effect on the next layout pass, and a
-                    // caller that reads the frame right after `set_child` (as
-                    // the probe does) would otherwise see the stack's fitting
-                    // height. Lay out now: the same pass AppKit is about to do.
-                    if responds(self.0, "layoutSubtreeIfNeeded") {
-                        raw_send!(
-                            self.0,
-                            "layoutSubtreeIfNeeded",
-                            unsafe extern "C" fn(*mut c_void, *mut c_void),
-                            ()
-                        );
-                    }
-                }
-            }
+            // SAFETY: both handles are live AppKit views (see the helper).
+            unsafe { fit_content_child(self.0, child_ptr) }
         }
 
         pub fn set_child_box(&self, bx: &BoxWidget) {
@@ -3912,6 +3875,9 @@ mod macos_adapter {
                         ),
                         (origin.x, origin.y, want_w, want_h, false)
                     );
+                    msg0v(theme, "layoutSubtreeIfNeeded");
+                    step("2c refit");
+                    refit_content_children(view);
                     msg0v(theme, "layoutSubtreeIfNeeded");
                 } else {
                     set_frame(view, 0.0, 0.0, want_w, want_h);
