@@ -1429,6 +1429,18 @@ mod macos_adapter {
         }
 
         pub fn queue_redraw(&self) {
+            // A list whose canvas is wider than its viewport lays its columns
+            // out for the wider box, which puts the path column past the right
+            // edge; fitting it on every repaint keeps it inside the window.
+            unsafe {
+                let clip = msg0(self.0, "superview");
+                if !clip.is_null() {
+                    let scroll = msg0(clip, "superview");
+                    if !scroll.is_null() && responds(scroll, "documentView") {
+                        fit_document_view(scroll);
+                    }
+                }
+            }
             // Schedule a real draw through the host view (which replays the
             // closure with a CG-backed context at the live size), and run it
             // immediately against the estimating context so headless/test
@@ -4270,6 +4282,44 @@ mod macos_adapter {
         }
     }
 
+    /// Make a scroll view's document view no wider than the viewport.
+    ///
+    /// `Canvas::set_size_request` clamps when it is called, but a canvas that
+    /// asked for its width *before* the scroll view had a size stays that wide
+    /// for good: the list's columns were laid out for a ~2060pt canvas in a
+    /// 1350pt window and the path column ran off the right edge, with a
+    /// horizontal scroller under every screenful. GTK's treeview fits its
+    /// viewport, so the document view is fitted here — whenever the list
+    /// repaints, and whenever a capture re-tiles the scroll views.
+    unsafe fn fit_document_view(scroll_view: *mut c_void) {
+        if scroll_view.is_null() {
+            return;
+        }
+        // SAFETY: a live `NSScrollView`; both sends are AppKit's own.
+        unsafe {
+            let doc = msg0(scroll_view, "documentView");
+            let clip = msg0(scroll_view, "contentView");
+            if doc.is_null() || clip.is_null() {
+                return;
+            }
+            let doc_rect: CGRect = raw_send!(
+                doc,
+                "frame",
+                unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
+                ()
+            );
+            let clip_rect: CGRect = raw_send!(
+                clip,
+                "bounds",
+                unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
+                ()
+            );
+            if clip_rect.width > 1.0 && doc_rect.width > clip_rect.width + 0.5 {
+                msg2cv(doc, "setFrameSize:", clip_rect.width, doc_rect.height);
+            }
+        }
+    }
+
     /// Draw every scroller over the image `target` was just rendered into.
     ///
     /// Current AppKit leaves the scroll view's scroller out of a render pass
@@ -4405,6 +4455,7 @@ mod macos_adapter {
                     (scroll_cls)
                 );
             if is_scroll_view {
+                fit_document_view(view);
                 if responds(view, "tile") {
                     msg0v(view, "tile");
                 }
