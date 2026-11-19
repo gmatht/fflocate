@@ -62,25 +62,10 @@ jobs:
           echo "::error title=GUI build/test failure (${RUNNER_OS})::${msg}"
           exit 1
 
-      # When the build fails, the log tail goes to the job summary as well as
-      # to annotations: a step that dies without emitting a workflow command
-      # (a killed process, say) leaves nothing else readable without a token.
-      - name: GUI build diagnostics (macOS)
-        if: failure()
-        shell: bash
-        run: |
-          {
-            echo '### gui build diagnostics'
-            echo '```'
-            tail -c 3000 gui-test.log 2>/dev/null || echo 'no gui-test.log'
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # Readable evidence of what the GUI build step did, whatever it did:
-      # annotations from a step that produced no output of its own never
-      # appeared, so a second step reports the log file directly.
+      # The build step's own annotations can be dropped when it fails, so a
+      # failed build is also reported from its log file by this step.
       - name: GUI build log (macOS)
-        if: always()
+        if: failure()
         shell: bash
         run: |
           echo "::notice title=build-log-info::$(ls -l gui-test.log 2>&1 | head -1) | $(cargo --version 2>&1) | $(df -h . 2>&1 | tail -1)"

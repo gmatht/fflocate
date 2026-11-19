@@ -368,15 +368,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             shot.scroller_coverage
         );
 
-        // Columns: the list paints for its own viewport, so the path column
-        // lands on the same fraction of it as on Linux (0.536 of the list).
+        // Columns: the list must be exactly as wide as its viewport (a canvas
+        // wider than the window laid its columns out for the wider one, which
+        // put the path column at 80% and clipped it), and the path cells must
+        // land where Linux puts them. Measured from the pixels the list drew,
+        // the same way the Linux number was measured.
         let clip_w = send_rect(clip, "bounds").w;
         let doc_w = send_rect(doc, "frame").w;
-        let starts = rswidgets::compat::column_starts(clip_w);
-        let path_share = starts[2] / clip_w;
+        let (pw, ph) = (doc_w.max(1.0) as u32, send_rect(doc, "frame").h.max(1.0) as u32);
+        let (_, _, list_px) =
+            rswidgets::backends_macos_adapter::render_view_rgba(doc, pw, ph)
+                .ok_or("the list produced no bitmap")?;
+        // The first data row sits under the 22px header; its third run of dark
+        // pixels is the path cell.
+        let mut path_start = 0.0f64;
+        for y in 24..36usize.min(ph as usize) {
+            let mut run: Option<usize> = None;
+            for x in 0..pw as usize {
+                let i = (y * pw as usize + x) * 4;
+                let dark = list_px[i] < 140 && list_px[i + 1] < 140 && list_px[i + 2] < 140;
+                if dark && run.is_none() {
+                    run = Some(x);
+                } else if !dark {
+                    if let Some(start) = run {
+                        if start as f64 > pw as f64 * 0.3 {
+                            path_start = start as f64;
+                            break;
+                        }
+                        run = None;
+                    }
+                }
+            }
+            if path_start > 0.0 {
+                break;
+            }
+        }
+        let path_share = path_start / pw as f64;
         println!(
-            "probe: list viewport {clip_w}pt, canvas {doc_w}pt, name column {:.1}%, path column {:.1}% (linux 53.6%)",
-            starts[1] / clip_w * 100.0,
+            "probe: list viewport {clip_w}pt, canvas {doc_w}pt, path column at {:.1}% (linux 53.6%)",
             path_share * 100.0
         );
         assert!(
