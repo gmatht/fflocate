@@ -287,8 +287,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "the box itself has no width: {}pt",
             box_bounds.w
         );
+        // `>=`, not `==`: a label's frame carries its own bezel/inset, so it can
+        // come out a few points wider than the box it is pinned to. What matters
+        // is that it spans the width instead of sitting at its intrinsic size.
         assert!(
-            (child_frame.w - box_bounds.w).abs() < 1.0,
+            child_frame.w >= box_bounds.w - 1.0 && child_frame.w <= box_bounds.w + 8.0,
             "the box's child is {}pt wide in a {}pt box: it is not filling the width",
             child_frame.w,
             box_bounds.w
