@@ -159,8 +159,12 @@ jobs:
           # look identical for UI, so that is the transport. If it still does
           # not fit, downscale rather than drop the shot.
           cp /tmp/app.png /tmp/shot.png
-          python3 -m pip install --quiet --disable-pip-version-check pillow >/dev/null 2>&1 || true
-          python3 -c "from PIL import Image; im = Image.open('/tmp/app.png').convert('RGB'); im.quantize(colors=256).save('/tmp/shot.png', optimize=True)" >/dev/null 2>&1 || true
+          # Homebrew's python3 refuses a plain `pip install` (PEP 668), so the
+          # quantiser gets a throwaway venv of its own.
+          python3 -m venv /tmp/shotenv >/dev/null 2>&1 || true
+          /tmp/shotenv/bin/pip install --quiet --disable-pip-version-check pillow >/dev/null 2>&1 || true
+          /tmp/shotenv/bin/python -c "from PIL import Image; im = Image.open('/tmp/app.png').convert('RGB'); im.quantize(colors=256).save('/tmp/shot.png', optimize=True)" >/dev/null 2>&1 || true
+          quant=$(stat -f%z /tmp/shot.png)
           bytes=$(stat -f%z /tmp/shot.png)
           for w in 1350 1100 900 760 620 500; do
             [ "$bytes" -le 51000 ] && break
@@ -176,7 +180,7 @@ jobs:
             b64=${b64:3800}
             i=$((i+1))
           done
-          echo "::notice title=GUI screenshot (macOS)::window ${full_dims}, sent ${size}, ${bytes} bytes, ${i} chunks: $(grep -o 'ff-gui: screenshot.*' shot-run.log | head -1)"
+          echo "::notice title=GUI screenshot (macOS)::window ${full_dims}, 256-colour ${quant} bytes, sent ${size}, ${bytes} bytes, ${i} chunks: $(grep -o 'ff-gui: screenshot.*' shot-run.log | head -1)"
           last=8
           [ "$i" -lt 9 ] && last=$((i-1))
           for p in $(seq 0 "$last"); do
