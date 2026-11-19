@@ -3530,6 +3530,17 @@ mod macos_adapter {
             if rep.is_null() {
                 return None;
             }
+            // A view paints its subviews but not the window behind them, so an
+            // unpainted area would come out transparent — black once the alpha
+            // is flattened. The live window is white there, and the capture is
+            // meant to look like the window.
+            let data = msg0(rep, "bitmapData") as *mut u8;
+            let row = msg0i(rep, "bytesPerRow") as usize;
+            if !data.is_null() && row >= w as usize * 4 {
+                for y in 0..h as usize {
+                    std::ptr::write_bytes(data.add(y * row), 0xFF, w as usize * 4);
+                }
+            }
             let rect = CGRect {
                 x: 0.0,
                 y: 0.0,
@@ -3997,14 +4008,6 @@ mod macos_adapter {
             // is the behaviour GTK's box has, and it is what lets a child with
             // `corroSetFlex:` take the spare space.
             unsafe { msg1iv(bx, "setDistribution:", 1) };
-            // Cross-axis alignment, as in GTK: a vertical box stretches its
-            // children to its full width, a horizontal box to its full height
-            // (`NSLayoutAttributeWidth` = 7, `...Height` = 8).
-            let fill_across = match orientation {
-                Orientation::Vertical => 7,
-                Orientation::Horizontal => 8,
-            };
-            unsafe { msg1iv(bx, "setAlignment:", fill_across as isize) };
         } else {
             shim_i(bx, "corroSetSpacing:", spacing as isize);
         }
