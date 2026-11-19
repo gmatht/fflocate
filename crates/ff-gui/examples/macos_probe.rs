@@ -891,6 +891,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     rswidgets::backends_macos_adapter::dispatch_canvas_click_button(
         canvas_id, 60.0, row_click_y, 1, 0,
     );
+    // Delivered at all? The list's own handler runs on every click, so an
+    // empty log here means the id AppKit passes and the id the list registered
+    // under are not the same one -- a click that goes nowhere.
+    let delivered = presses.borrow().clone();
+    println!(
+        "probe: list canvas id {canvas_id}, click delivered as {delivered:?}"
+    );
+    assert!(
+        !delivered.is_empty(),
+        "the canvas click never reached the list (canvas id {canvas_id})"
+    );
     let selected = list
         .selected_path(2)
         .expect("a primary click selected no row");
