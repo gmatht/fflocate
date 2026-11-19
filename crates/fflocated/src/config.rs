@@ -153,7 +153,13 @@ impl Config {
             // plus explicit rescans — rather than refusing to start.
             #[cfg(windows)]
             backend: BackendChoice::Fake,
-            #[cfg(not(windows))]
+            // inotify is a Linux API, and `new_backend` refuses it rather than
+            // running unwatched; a daemon started by hand on macOS must
+            // therefore default to the platform's own watcher, the same one
+            // `ff` asks for when it auto-spawns (fflocate::spawn).
+            #[cfg(target_os = "macos")]
+            backend: BackendChoice::Fsevents,
+            #[cfg(not(any(windows, target_os = "macos")))]
             backend: BackendChoice::Inotify,
             compaction_threshold: 100_000,
             sync_timeout_ms: 2_000,

@@ -3,8 +3,13 @@
 #
 # The unit tests in fsevents.rs are macOS-gated, so a Linux `cargo test` never
 # executes them. This script proves the parts that only a real Mac can: that the
-# daemon starts with the FSEvents backend, indexes a fresh root, and then
+# daemon starts on its *default* backend (no `--backend` flag, as a user starts
+# it), that the default resolves to FSEvents, indexes a fresh root, and then
 # follows create / rename / delete without falling back to a full rescan.
+#
+# The default matters: it used to be inotify everywhere but Windows, and
+# `new_backend` refuses inotify off Linux, so a hand-started daemon on macOS
+# exited at once. Asking for `fsevents` explicitly here would hide that.
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -23,8 +28,7 @@ cargo build --release -p fflocated -p ff
 FFLOCATE_FSEVENTS_TRACE=1 ./target/release/fflocated \
     --socket "$state/s.sock" \
     --state-dir "$state/store" \
-    --root "$root" \
-    --backend fsevents >"$state/log" 2>&1 &
+    --root "$root" >"$state/log" 2>&1 &
 daemon=$!
 trap 'kill "$daemon" 2>/dev/null || true' EXIT
 
