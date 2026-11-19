@@ -630,10 +630,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             x += send_rect(v, "frame").x;
             v = send0(v, "superview");
         }
-        println!("probe: left label margin {x}pt (linux 5)");
+        // The frame says where the label's box is; the pixels say where its
+        // glyphs are, which is what "the label sits N points from the edge"
+        // means to a reader comparing this with the Linux capture.
+        let f = send_rect(margin_label.raw_handle(), "frame");
+        let mut y = f.y;
+        let mut v = send0(margin_label.raw_handle(), "superview");
+        while !v.is_null() && v != view {
+            y += send_rect(v, "frame").y;
+            v = send0(v, "superview");
+        }
+        let row0 = ((band + content_h - (y + f.h)).max(0.0) as usize).min(shot.height as usize);
+        let row1 = (row0 + f.h.max(0.0) as usize).min(shot.height as usize);
+        let mut ink_x: Option<usize> = None;
+        for row in row0..row1 {
+            for col in 0..shot.width as usize {
+                let i = (row * shot.width as usize + col) * 4;
+                if shot.rgba[i] < 200 || shot.rgba[i + 1] < 200 || shot.rgba[i + 2] < 200 {
+                    ink_x = Some(col);
+                    break;
+                }
+            }
+            if ink_x.is_some() {
+                break;
+            }
+        }
+        let margin = ink_x.unwrap_or(0) as f64;
+        println!("probe: left label margin {margin}pt of ink (frame {x}pt, linux 5)");
         assert!(
-            (x - 5.0).abs() <= 1.0,
-            "the label sits {x}pt from the window edge, Linux puts it at 5pt"
+            (margin - 5.0).abs() <= 1.0,
+            "the label's text starts {margin}pt from the window edge, Linux puts it at 5pt"
         );
     }
 

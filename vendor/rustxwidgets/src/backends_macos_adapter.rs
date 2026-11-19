@@ -5205,11 +5205,12 @@ mod macos_adapter {
             // is the behaviour GTK's box has, and it is what lets a child with
             // `corroSetFlex:` take the spare space.
             unsafe { msg1iv(bx, "setDistribution:", 1) }
-            // Cross-axis alignment: leading for a vertical box, top for a
-            // horizontal one. The stack's default centre alignment put each
-            // child where the constraints below could not, which left a label
-            // 4pt wider than its box and hanging 2pt over the window's margin.
-            let align = if orientation.as_int() == 1 { 5 } else { 3 };
+            // Cross-axis fill, the way GTK's box stretches its children: a
+            // vertical stack aligned at `NSLayoutAttributeWidth` (7) makes every
+            // arranged view as wide as the stack, a horizontal one at `Height`
+            // (8) as tall. The default centre alignment let a label sit 4pt
+            // wider than its box and hang 2pt over the window's margin.
+            let align = if orientation.as_int() == 1 { 7 } else { 8 };
             unsafe { msg1iv(bx, "setAlignment:", align) }
         } else {
             shim_i(bx, "corroSetSpacing:", spacing as isize);
