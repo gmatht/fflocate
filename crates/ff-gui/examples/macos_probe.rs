@@ -405,9 +405,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let b = send_rect(outer.raw_handle(), "frame");
             let l = send_rect(margin_label.raw_handle(), "frame");
+            let c = send_rect(sv, "superview");
             println!(
-                "probe: after capture box {}x{} at ({}, {}), label {}x{}",
-                b.w, b.h, b.x, b.y, l.w, l.h
+                "probe: after capture box {}x{} at ({}, {}), label {}x{}, its superview {}x{}",
+                b.w, b.h, b.x, b.y, l.w, l.h, c.w, c.h
             );
         }
         println!(

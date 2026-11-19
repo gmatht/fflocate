@@ -3875,10 +3875,13 @@ mod macos_adapter {
                         ),
                         (origin.x, origin.y, want_w, want_h, false)
                     );
-                    msg0v(theme, "layoutSubtreeIfNeeded");
+                    // The content view, not the window's frame view: a layout
+                    // pass from the frame view runs the window's own autolayout,
+                    // which resized a stack view back to its fitting height and
+                    // left the list with none.
                     step("2c refit");
                     refit_content_children(view);
-                    msg0v(theme, "layoutSubtreeIfNeeded");
+                    msg0v(view, "layoutSubtreeIfNeeded");
                 } else {
                     set_frame(view, 0.0, 0.0, want_w, want_h);
                 }
@@ -3897,6 +3900,9 @@ mod macos_adapter {
             step("3b retile");
             retile_scrollers(view);
             msg0v(view, "layoutSubtreeIfNeeded");
+            // Last word on the frames: whatever the layout passes decided, the
+            // window's root views are the size of the window, as GTK's are.
+            refit_content_children(view);
             step("4 bounds");
             let bounds: CGRect = raw_send!(
                 target,
