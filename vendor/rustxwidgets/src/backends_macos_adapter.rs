@@ -1237,6 +1237,13 @@ mod macos_adapter {
 
         pub fn set_size_request(&self, w: i32, h: i32) {
             core_apple::with_meta_mut(self.0, |m| m.size_request = (w.max(1), h.max(1)));
+            // The frame is what an enclosing `NSScrollView` measures. Recording
+            // the request alone left the canvas at 0x0 inside the clip view, so
+            // there was nothing to scroll and no scroller to show, however many
+            // rows the draw closure painted.
+            if !self.0.is_null() {
+                unsafe { msg2cv(self.0, "setFrameSize:", w as f64, h as f64) };
+            }
         }
 
         /// Size to replay the draw closure at: the real laid-out size once
@@ -2433,11 +2440,16 @@ mod macos_adapter {
     // ScrolledWindow + Overlay
     // ------------------------------------------------------------------
     //
-    // AppKit scroll views exist (NSScrollView), but corro drives its own
-    // viewport (the draw closure paints the visible window and the scrollbar
-    // chrome itself), so these are inert containers — exactly the iOS and
-    // Android decision. Keeping them inert means one viewport model across
-    // every backend.
+    // This is a real `NSScrollView`, not the inert container it used to be.
+    // `compat::TreeView` draws the results list on a canvas sized to the whole
+    // content, exactly as it does for GTK, and expects the container to clip
+    // it, show a scroller and scroll it — that is what `GtkScrolledWindow`
+    // gives the Linux build. An `NSView` gave none of the three: the list drew
+    // past the bottom of the window with no scroller and no wheel.
+    //
+    // The canvas is the document view. Two details make that work: its width
+    // follows the clip view (autoresizing), while its height stays the content
+    // height it asked for — the scroller measures that height.
 
     #[repr(transparent)]
     #[derive(Clone, Copy)]
@@ -2450,10 +2462,78 @@ mod macos_adapter {
     }
 
     impl ScrolledWindow {
-        /// Attach the sheet canvas to this container (the one real
-        /// parent-child edge macOS needs: scrolled window -> canvas).
+        /// Put the sheet canvas in the scroll view as its document view.
+        ///
+        /// `setDocumentView:` is what puts it inside the clip view (so it is
+        /// clipped rather than overflowing), and the width autoresizing mask
+        /// keeps it as wide as the window while leaving its height at the
+        /// content height the canvas set — which is what the scroller
+        /// measures and what the wheel scrolls.
         pub fn attach_canvas(&self, canvas: &Canvas) {
-            attach(self.0, canvas.0);
+            if self.0.is_null() || canvas.0.is_null() {
+                return;
+            }
+            // SAFETY: both handles are live AppKit views from this adapter,
+            // and `NSViewWidthSizable` is the documented autoresizing constant.
+            unsafe {
+                const NSVIEW_WIDTH_SIZABLE: isize = 2;
+                msg1i(canvas.0, "setAutoresizingMask:", NSVIEW_WIDTH_SIZABLE);
+                msg1v(self.0, "setDocumentView:", canvas.0);
+            }
+        }
+
+        /// GTK's `GtkPolicyType`, mapped onto the two AppKit scrollers.
+        ///
+        /// The integers are the portable layer's (`0` ALWAYS, `1` AUTOMATIC,
+        /// `2` NEVER, `3` EXTERNAL). AppKit has one autohide flag for both
+        /// scrollers, so a policy asking for an always-visible bar on either
+        /// axis wins; `EXTERNAL` has no AppKit equivalent and behaves as
+        /// `AUTOMATIC`.
+        pub fn set_policy(&self, hscroll: u32, vscroll: u32) {
+            if self.0.is_null() {
+                return;
+            }
+            const POLICY_ALWAYS: u32 = 0;
+            const POLICY_NEVER: u32 = 2;
+            let always = hscroll == POLICY_ALWAYS || vscroll == POLICY_ALWAYS;
+            // SAFETY: live NSScrollView; both selectors are AppKit's own.
+            unsafe {
+                msg1bv(self.0, "setHasHorizontalScroller:", hscroll != POLICY_NEVER);
+                msg1bv(self.0, "setHasVerticalScroller:", vscroll != POLICY_NEVER);
+                msg1bv(self.0, "setAutohidesScrollers:", !always);
+            }
+        }
+
+        /// Scroll to a position given in GTK adjustment terms.
+        ///
+        /// `vval` is the adjustment's value (the top of the visible area),
+        /// `vupper` its upper bound and `vpage` the page size. The clip view
+        /// scrolls to the same place GTK would.
+        pub fn scroll_to(
+            &self,
+            _hval: f64,
+            _hupper: f64,
+            _hpage: f64,
+            vval: f64,
+            vupper: f64,
+            vpage: f64,
+        ) {
+            if self.0.is_null() {
+                return;
+            }
+            // SAFETY: live NSScrollView and its clip view; `scrollToPoint:`
+            // takes an `NSPoint` (two `CGFloat`s) and `reflectScrolledClipView:`
+            // redraws the scroller for the new position.
+            unsafe {
+                let clip = msg0(self.0, "contentView");
+                if clip.is_null() {
+                    return;
+                }
+                let max = (vupper - vpage).max(0.0);
+                let y = vval.clamp(0.0, max);
+                msg2cv(clip, "scrollToPoint:", 0.0, y);
+                msg1v(self.0, "reflectScrolledClipView:", clip);
+            }
         }
     }
 
@@ -3959,7 +4039,23 @@ mod macos_adapter {
     }
 
     pub fn create_scrolled_window() -> Result<ScrolledWindow, Error> {
-        Ok(ScrolledWindow(new_widget("NSView", Kind::Container)))
+        // A real `NSScrollView`: clipping, a scroller and wheel scrolling are
+        // what GTK's scrolled window gives the Linux build, and what the
+        // results list needs — the canvas is taller than the window.
+        ensure_runtime_classes();
+        let view = new_widget("NSScrollView", Kind::Container);
+        if !view.is_null() {
+            // SAFETY: live NSScrollView; these are AppKit's own setters.
+            unsafe {
+                msg1bv(view, "setHasVerticalScroller:", true);
+                // Overlay scrollers that fade out are the modern default; asking
+                // for them explicitly keeps the list flush with the window edge
+                // instead of reserving a permanent gutter.
+                msg1bv(view, "setAutohidesScrollers:", true);
+                msg1bv(view, "setDrawsBackground:", false);
+            }
+        }
+        Ok(ScrolledWindow(view))
     }
 
     pub fn create_dropdown(items: &[&str]) -> Result<DropDown, Error> {

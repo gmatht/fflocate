@@ -120,6 +120,40 @@ jobs:
           echo "::error title=GUI is not interactive (${RUNNER_OS})::exit ${status}: ${msg}"
           exit 1
 
+      # A picture of the AppKit window, so parity with the GTK build can be
+      # checked by looking at it rather than only by reading assertions. The PNG
+      # is downscaled and re-emitted as base64 notices: job logs need a token,
+      # annotations do not. A missing capture fails the step — a screenshot that
+      # silently produced nothing would be worse than no screenshot.
+      - name: GUI screenshot (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          ulimit -c 0 || true
+          cargo build -p ff-gui 2>&1 | tail -1
+          FF_GUI_TRACE=1 ./target/debug/ff-gui >shot-run.log 2>&1 &
+          pid=$!
+          sleep 6
+          /usr/sbin/screencapture -x -t png /tmp/screen.png || true
+          kill "$pid" 2>/dev/null || true
+          wait "$pid" 2>/dev/null || true
+          if [ ! -s /tmp/screen.png ]; then
+            echo "::error title=GUI screenshot (macOS)::screencapture wrote no file; $(head -c 400 shot-run.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            exit 1
+          fi
+          sips -Z 900 /tmp/screen.png --out /tmp/shot.png >/dev/null 2>&1 || cp /tmp/screen.png /tmp/shot.png
+          bytes=$(stat -f%z /tmp/shot.png)
+          size=$(sips -g pixelWidth -g pixelHeight /tmp/shot.png | grep -E 'pixel' | tr -d ' \n')
+          b64=$(base64 -i /tmp/shot.png | tr -d '\n')
+          echo "::notice title=GUI screenshot (macOS)::${bytes} bytes png ${size}, ${#b64} base64 chars"
+          i=0
+          while [ -n "$b64" ]; do
+            echo "::notice title=shot-part-${i}::$(printf '%s' "$b64" | cut -c1-6000)"
+            b64=${b64:6000}
+            i=$((i+1))
+          done
+          echo "::notice title=shot-parts::${i} chunks"
+
       # The FSEvents backend is cfg(target_os = "macos"), so its unit tests only
       # run here; this also proves a live stream follows create/rename/delete.
       # The script prints the daemon log and stats when it gives up, so the

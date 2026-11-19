@@ -593,9 +593,15 @@ mod common_types {
     }
     impl ScrolledWindow {
         pub fn set_child(&self, child: &crate::common::Canvas) { self.inner.attach_canvas(&child.inner); }
-        pub fn set_policy(&self, _hscroll: u32, _vscroll: u32) {}
+        // Forwarded: the adapter's scrolled window is a real `NSScrollView`, so
+        // a policy request and a scroll position both have somewhere to go.
+        // `on_scroll` stays a no-op: the wheel is AppKit's own `scrollWheel:`
+        // on the scroll view, which no caller needs to intercept here.
+        pub fn set_policy(&self, hscroll: u32, vscroll: u32) { self.inner.set_policy(hscroll, vscroll); }
         pub fn set_vexpand(&self, _expand: bool) {}
-        pub fn scroll_to(&self, _hval: f64, _hupper: f64, _hpage: f64, _vval: f64, _vupper: f64, _vpage: f64) {}
+        pub fn scroll_to(&self, hval: f64, hupper: f64, hpage: f64, vval: f64, vupper: f64, vpage: f64) {
+            self.inner.scroll_to(hval, hupper, hpage, vval, vupper, vpage);
+        }
         pub fn on_scroll(&self, _cb: Box<dyn FnMut(bool, f64)>) {}
     }
 }
