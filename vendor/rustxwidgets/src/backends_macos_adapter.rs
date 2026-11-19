@@ -4382,6 +4382,23 @@ mod macos_adapter {
         }
     }
 
+    /// `[NSAffineTransform transform]`, or `None` when AppKit is unavailable.
+    unsafe fn affine_transform() -> Option<*mut c_void> {
+        // SAFETY: AppKit class lookup, no arguments.
+        unsafe {
+            let cls_ = cls("NSAffineTransform");
+            if cls_.is_null() {
+                return None;
+            }
+            let transform = msg0(cls_, "transform");
+            if transform.is_null() {
+                None
+            } else {
+                Some(transform)
+            }
+        }
+    }
+
     /// Draw the window's chrome into the capture.
     ///
     /// `NSThemeFrame` paints its title bar through private layers, which an
@@ -4579,6 +4596,19 @@ mod macos_adapter {
                     );
                     msg0v(cls("NSGraphicsContext"), "saveGraphicsState");
                     concat_translate(view, target);
+                    // The control is a flipped view, and its cell compensates
+                    // for that by flipping the context itself. Our context is
+                    // not flipped, so the compensation inverted the title:
+                    // "Search" and every checkbox label came out upside down.
+                    // Give the cell the context it expects.
+                    if msg0i(view, "isFlipped") != 0 {
+                        let b = bounds;
+                        if let Some(transform) = affine_transform() {
+                            msg2cv(transform, "translateXBy:yBy:", 0.0, b.height);
+                            msg2cv(transform, "scaleXBy:yBy:", 1.0, -1.0);
+                            msg0v(transform, "concat");
+                        }
+                    }
                     raw_send!(
                         cell,
                         "drawWithFrame:inView:",
@@ -5204,7 +5234,10 @@ mod macos_adapter {
             // centred entry and button above a mostly empty window. `Fill` (1)
             // is the behaviour GTK's box has, and it is what lets a child with
             // `corroSetFlex:` take the spare space.
-            unsafe { msg1iv(bx, "setDistribution:", 1) }
+            // `NSStackViewDistributionFill` (0). FillEqually (1) gave every
+            // child an equal share, so the query entry and the Search button
+            // took half the row each where GTK gives the entry all of it.
+            unsafe { msg1iv(bx, "setDistribution:", 0) }
             // Cross-axis fill, the way GTK's box stretches its children: a
             // vertical stack aligned at `NSLayoutAttributeWidth` (7) makes every
             // arranged view as wide as the stack, a horizontal one at `Height`

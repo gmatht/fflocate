@@ -373,6 +373,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         outer.append(&case_cb);
         outer.append(&fuzzy_cb);
         outer.append(&count_cb);
+        // GTK gives an expanding entry the query row's leftover width and leaves
+        // the control beside it at its natural size — in linux-gui-rows.png a
+        // 1150pt entry beside a 74pt Search button. The same shape, in a row the
+        // window's width.
+        let flex_row = app.create_box(Orientation::Horizontal, 2)?;
+        let flex_label = app.create_label("go:")?;
+        let flex_entry = app.create_entry()?;
+        rswidgets::backends::apple::set_view_expanding(flex_entry.raw_handle(), true);
+        flex_row.append(&flex_label);
+        flex_row.append(&flex_entry);
+        outer.append(&flex_row);
         outer.append(&scrolled);
         win.set_child(&outer);
         // The list takes the spare height, as it does in the app (where
@@ -571,6 +582,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "the \"{label}\" checkbox did not render into the capture ({ink} px of ink)"
             );
         }
+
+        // An expanding child takes the row's leftover width, as GTK's box does.
+        let flex_entry_w = send_rect(flex_entry.raw_handle(), "frame").w;
+        let flex_label_w = send_rect(flex_label.raw_handle(), "frame").w;
+        println!(
+            "probe: expanding entry {flex_entry_w}pt, label beside it {flex_label_w}pt of a 1340pt row"
+        );
+        assert!(
+            flex_entry_w > 900.0,
+            "the expanding entry got {flex_entry_w}pt of a 1340pt row, not the leftover width"
+        );
+        assert!(
+            flex_label_w < 120.0,
+            "the label beside it stretched to {flex_label_w}pt instead of keeping its size"
+        );
 
         // Columns: the list must be exactly as wide as its viewport (a canvas
         // wider than the window laid its columns out for the wider one, which
