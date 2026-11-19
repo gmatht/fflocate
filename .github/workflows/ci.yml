@@ -123,6 +123,9 @@ jobs:
           # captured explicitly so a build failure, a panic and a clean run are
           # all reported, instead of a pipeline status that can hide one.
           status=0
+          # The probe starts a real daemon for one query and stops it again, so
+          # that binary has to exist next to the example's own.
+          cargo build -p fflocated 2>&1 | tail -1
           cargo run -p ff-gui --example macos_probe >probe.log 2>&1 || status=$?
           if [ "$status" -eq 0 ]; then
             echo "::notice title=GUI interactivity (macOS)::$(grep '^probe:' probe.log | tr '\n' '|')"

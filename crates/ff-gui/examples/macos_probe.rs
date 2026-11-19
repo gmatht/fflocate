@@ -689,6 +689,85 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // --- A real daemon: started, questioned, stopped ---
+    //
+    // The daemon is an ordinary child process, not a service: this starts one
+    // on a throwaway root and socket, asks it the question a user's first
+    // search would ask, and kills it before the assertions. Nothing has to be
+    // running beforehand, and nothing is left behind, so the check needs no
+    // supervision and no privileges on the runner. The binary is the one this
+    // build just produced (`cargo build -p fflocated`), not one from $PATH.
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path().join("root");
+    std::fs::create_dir_all(root.join("sub"))?;
+    for name in ["alpha-probe.txt", "beta-probe.md", "sub/gamma-probe.rs"] {
+        std::fs::write(root.join(name), "probe fixture\n")?;
+    }
+    // A file the query must not match: three hits, not four.
+    std::fs::write(root.join("unrelated.rs"), "no match here\n")?;
+    let socket = fixture.path().join("ff.sock");
+    let exe = std::env::current_exe()?;
+    let daemon_bin = exe
+        .parent()
+        .and_then(|examples| examples.parent())
+        .map(|debug| debug.join("fflocated"))
+        .filter(|p| p.exists())
+        .ok_or_else(|| {
+            format!(
+                "no fflocated next to {}: build it first (cargo build -p fflocated)",
+                exe.display()
+            )
+        })?;
+    let mut daemon = std::process::Command::new(&daemon_bin)
+        .arg("--foreground")
+        .arg("--backend")
+        .arg("fake")
+        .arg("--root")
+        .arg(&root)
+        .arg("--state-dir")
+        .arg(fixture.path().join("state"))
+        .arg("--socket")
+        .arg(&socket)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    // The GUI's own client, so this exercises the request it really sends
+    // (protocol version stamped, advanced options applied) rather than a
+    // hand-written JSON line that could drift from it.
+    let client = ff_gui::DaemonClient::with_socket(socket.clone());
+    let attempt = std::time::Instant::now();
+    let mut hits = 0usize;
+    let mut last_error = String::new();
+    // The socket binds before the first crawl finishes, so ask again until the
+    // fixture files are indexed; a wedged daemon fails on the deadline instead
+    // of hanging the probe.
+    while attempt.elapsed() < std::time::Duration::from_secs(30) {
+        match client.search("probe", 10) {
+            Ok(outcome) => {
+                hits = outcome.paths.len();
+                if hits >= 3 {
+                    break;
+                }
+            }
+            Err(e) => last_error = e.to_string(),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let elapsed = attempt.elapsed().as_millis();
+    // Stopped and reaped first: a failing assertion must not leave a daemon
+    // holding the socket for the rest of the job.
+    let killed = daemon.kill().is_ok();
+    let reaped = daemon.wait().is_ok();
+    println!(
+        "probe: daemon {} spawned on a temp root, answered {hits} hits for \"probe\" \
+         in {elapsed}ms (last error {last_error:?}), killed {killed} and reaped {reaped}",
+        daemon_bin.display()
+    );
+    assert_eq!(
+        hits, 3,
+        "the daemon answered {hits} of the 3 fixture files (last error {last_error:?})"
+    );
+
     println!("probe: ok");
     Ok(())
 }
