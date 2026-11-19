@@ -151,6 +151,51 @@ mod macos_adapter {
         unsafe { msg4cv(view, "setFrame:", x, y, w, h) };
     }
 
+    /// The margin GTK's window leaves around its content, in points.
+    const WINDOW_MARGIN: f64 = 5.0;
+
+    /// Pin `child` to all four edges of `parent`, `inset` points in.
+    ///
+    /// `NSLayoutAttribute` top 3, bottom 4, leading 5, trailing 6; the constant
+    /// carries the sign, so the trailing/bottom pins move inward.
+    unsafe fn pin_inside(parent: *mut c_void, child: *mut c_void, inset: f64) {
+        let constraint_cls = cls("NSLayoutConstraint");
+        if constraint_cls.is_null() || parent.is_null() || child.is_null() {
+            return;
+        }
+        // SAFETY: both views are live and owned by this adapter's tree; the
+        // constraints are installed on their common ancestor.
+        unsafe {
+            msg1bv(child, "setTranslatesAutoresizingMaskIntoConstraints:", false);
+            for (attr, constant) in [
+                (3isize, inset),
+                (4isize, -inset),
+                (5isize, inset),
+                (6isize, -inset),
+            ] {
+                let constraint: *mut c_void = raw_send!(
+                    constraint_cls,
+                    "constraintWithItem:attribute:relatedBy:toItem:attribute:multiplier:constant:",
+                    unsafe extern "C" fn(
+                        *mut c_void,
+                        *mut c_void,
+                        *mut c_void,
+                        isize,
+                        isize,
+                        *mut c_void,
+                        isize,
+                        f64,
+                        f64,
+                    ) -> *mut c_void,
+                    (child, attr, 0isize, parent, attr, 1.0f64, constant)
+                );
+                if !constraint.is_null() {
+                    msg1v(parent, "addConstraint:", constraint);
+                }
+            }
+        }
+    }
+
     /// Pin `child` to both of `stack`'s cross-axis edges.
     ///
     /// GTK's box stretches a child across the axis it does not lay out along;
@@ -159,11 +204,7 @@ mod macos_adapter {
     /// reproduce the fill — leading/trailing in a vertical stack, top/bottom in
     /// a horizontal one (`NSLayoutAttribute` top 3, bottom 4, leading 5,
     /// trailing 6) — and stay consistent with the stack view's centre alignment.
-    ///
-    /// `inset` is the margin the child keeps from those edges. The top-level box
-    /// passes the few points GTK's window leaves around its content; every
-    /// nested box passes zero, so the margin is not compounded per level.
-    unsafe fn pin_across(stack: *mut c_void, child: *mut c_void, inset: f64) {
+    unsafe fn pin_across(stack: *mut c_void, child: *mut c_void) {
         let constraint_cls = cls("NSLayoutConstraint");
         if constraint_cls.is_null() || stack.is_null() || child.is_null() {
             return;
@@ -185,7 +226,7 @@ mod macos_adapter {
             // autoresizing mask must not translate the frame into constraints
             // as well.
             msg1bv(child, "setTranslatesAutoresizingMaskIntoConstraints:", false);
-            for (attr, constant) in [(first, inset), (second, -inset)] {
+            for attr in [first, second] {
                 let constraint: *mut c_void = raw_send!(
                     constraint_cls,
                     "constraintWithItem:attribute:relatedBy:toItem:attribute:multiplier:constant:",
@@ -200,7 +241,7 @@ mod macos_adapter {
                         f64,
                         f64,
                     ) -> *mut c_void,
-                    (child, attr, 0isize, stack, attr, 1.0f64, constant)
+                    (child, attr, 0isize, stack, attr, 1.0f64, 0.0f64)
                 );
                 if !constraint.is_null() {
                     msg1v(stack, "addConstraint:", constraint);
@@ -417,6 +458,11 @@ mod macos_adapter {
                     "setAutoresizingMask:",
                     NSVIEW_WIDTH_SIZABLE | NSVIEW_HEIGHT_SIZABLE,
                 );
+                // GTK's window leaves a few points around its content, and the
+                // labels sat flush against the edge without it. Pinning the one
+                // child of the window is enough: everything else is laid out
+                // inside it, so the margin is not compounded per level.
+                pin_inside(self.0, child_ptr, WINDOW_MARGIN);
             }
         }
 
@@ -821,13 +867,7 @@ mod macos_adapter {
                 // shim the same selector is implemented by the host view.
                 msg1v(self.0, "addArrangedSubview:", child_ptr);
                 if stack_appkit {
-                    // GTK's window leaves a small margin around its content;
-                    // the box directly under the window reproduces it (see
-                    // [`pin_across`]). Nested boxes pass zero.
-                    let is_top_level =
-                        root().map(|r| msg0(self.0, "superview") == r) == Some(true);
-                    let inset = if is_top_level { 5.0 } else { 0.0 };
-                    pin_across(self.0, child_ptr, inset);
+                    pin_across(self.0, child_ptr);
                 }
                 if expands || is_canvas {
                     // Weight 1 equivalent: let this child take the leftover

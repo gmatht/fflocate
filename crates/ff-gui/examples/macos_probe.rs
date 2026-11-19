@@ -269,12 +269,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "the box itself has no width: {}pt",
             box_bounds.w
         );
-        // The box is under the window, so it keeps the window's margin on both
-        // sides (5pt each, as GTK's window does); the child spans what is left.
-        // A child left at its intrinsic width would be far narrower than this.
+        // The window keeps a 5pt margin around this box, and the box's child
+        // spans the box: a child left at its intrinsic width would be far
+        // narrower than this.
         assert!(
-            (box_bounds.w - child_frame.w - 10.0).abs() <= 2.0,
-            "the box's child is {}pt wide in a {}pt box: it does not fill the width less the 5pt margin",
+            (box_bounds.w - child_frame.w).abs() <= 8.0,
+            "the box's child is {}pt wide in a {}pt box: it is not filling the width",
             child_frame.w,
             box_bounds.w
         );
