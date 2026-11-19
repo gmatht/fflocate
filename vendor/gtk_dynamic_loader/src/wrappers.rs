@@ -2617,6 +2617,168 @@ pub unsafe fn gdk_event_get_state(loader: &Arc<Loader>, event: *mut c_void) -> O
     None
 }
 
+// ---- Context menus (GTK3) ----
+
+/// A built GtkMenu plus the handler for the item the user picks.
+struct ContextMenuState {
+    menu: *mut c_void,
+    items: Vec<*mut c_void>,
+    labels: Vec<String>,
+    on_choose: Box<dyn FnMut(usize)>,
+}
+
+// SAFETY: every field is only touched on the thread that built the menu (GTK
+// requires that anyway); the mutex serialises access from that thread alone.
+unsafe impl Send for ContextMenuState {}
+
+fn context_menus() -> &'static std::sync::Mutex<HashMap<u64, ContextMenuState>> {
+    static MENUS: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, ContextMenuState>>> =
+        std::sync::OnceLock::new();
+    MENUS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+static NEXT_CONTEXT_MENU: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// `GtkMenuItem::activate`: run the handler for the item that fired it.
+extern "C" fn context_item_activated(item: *mut c_void, data: *mut c_void) {
+    let id = data as usize as u64;
+    let mut menus = match context_menus().lock() {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    if let Some(state) = menus.get_mut(&id) {
+        if let Some(index) = state.items.iter().position(|p| *p == item) {
+            (state.on_choose)(index);
+        }
+    }
+}
+
+/// Build a `GtkMenu` with one sensitive item per label.
+///
+/// The returned id identifies the menu for [`popup_context_menu`], for
+/// [`fire_context_menu`] and for [`context_menu_labels`]. GTK3 menus are
+/// widgets, not models, so building and showing are separate steps: a caller
+/// can inspect what would be shown before showing it.
+pub fn build_context_menu(
+    loader: &Arc<Loader>,
+    labels: &[&str],
+    on_choose: Box<dyn FnMut(usize)>,
+) -> Result<u64, Error> {
+    let syms = &loader.symbols;
+    let (Some(new_menu), Some(new_item), Some(append), Some(show_all), Some(connect)) = (
+        syms.gtk_menu_new,
+        syms.gtk_menu_item_new_with_label,
+        syms.gtk_menu_shell_append,
+        syms.gtk_widget_show_all,
+        syms.g_signal_connect_data,
+    ) else {
+        return Err(Error::MissingSymbol("gtk context menu".into()));
+    };
+    // SAFETY: every call below is GTK3's own constructor for a menu and its
+    // items; the label is a NUL-terminated C string that GTK copies.
+    let menu = unsafe { new_menu() };
+    if menu.is_null() {
+        return Err(Error::Other("gtk_menu_new returned null".into()));
+    }
+    let mut items = Vec::new();
+    for label in labels {
+        let c = CString::new(*label).map_err(|_| Error::Other("label holds a NUL".into()))?;
+        let item = unsafe { new_item(c.as_ptr() as *const u8) };
+        if item.is_null() {
+            continue;
+        }
+        unsafe { append(menu, item) };
+        items.push(item);
+    }
+    let id = NEXT_CONTEXT_MENU.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Ok(mut menus) = context_menus().lock() {
+        menus.insert(
+            id,
+            ContextMenuState {
+                menu,
+                items: items.clone(),
+                labels: labels.iter().map(|l| l.to_string()).collect(),
+                on_choose,
+            },
+        );
+    }
+    for item in &items {
+        // SAFETY: the handler's signature is GtkMenuItem's "activate" ABI, and
+        // the id is passed as plain data (no ownership transfer).
+        unsafe {
+            connect(
+                *item,
+                b"activate\0".as_ptr(),
+                context_item_activated as *mut c_void,
+                id as usize as *mut c_void,
+                None,
+                0,
+            );
+        }
+    }
+    // SAFETY: the menu is ours and not yet shown.
+    unsafe { show_all(menu) };
+    Ok(id)
+}
+
+/// The labels of a built menu, in order.
+pub fn context_menu_labels(id: u64) -> Vec<String> {
+    context_menus()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&id).map(|s| s.labels.clone()))
+        .unwrap_or_default()
+}
+
+/// Fire item `index` exactly as a click does: GTK emits "activate" on it.
+///
+/// This is the headless half of a menu choice — the same signal the popup
+/// delivers — so a test can observe the handler without a window manager.
+pub fn fire_context_menu(loader: &Arc<Loader>, id: u64, index: usize) -> bool {
+    let item = context_menus()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&id).and_then(|s| s.items.get(index).copied()));
+    let Some(item) = item else {
+        return false;
+    };
+    let Some(activate) = loader.symbols.gtk_menu_item_activate else {
+        return false;
+    };
+    // SAFETY: the item belongs to a menu we built and is still alive.
+    unsafe { activate(item) };
+    true
+}
+
+/// Show a built menu at the pointer. `button` is the mouse button that opened
+/// it (GTK positions an unanchored menu at that button's last press).
+pub fn popup_context_menu(loader: &Arc<Loader>, id: u64, button: u32, time: u32) -> bool {
+    let menu = context_menus()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&id).map(|s| s.menu));
+    let Some(menu) = menu else {
+        return false;
+    };
+    let Some(popup) = loader.symbols.gtk_menu_popup else {
+        return false;
+    };
+    // SAFETY: unanchored popup (`parent_menu_shell`/`item`/position/null data
+    // are all null, which is GTK's documented "position at the pointer").
+    unsafe {
+        popup(
+            menu,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            button,
+            time,
+        );
+    }
+    true
+}
+
 /// Screen-space origin of `widget`'s top-left corner, as `(x, y)`.
 ///
 /// Needed to turn a widget-relative click position (what GTK hands an event

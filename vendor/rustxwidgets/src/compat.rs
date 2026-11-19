@@ -587,14 +587,10 @@ pub fn clipboard_set_text(text: &str) -> Result<(), Error> {
 }
 
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
-pub fn clipboard_set_text(_text: &str) -> Result<(), Error> {
-    // The loader has no `gtk_clipboard_*` binding yet; wiring one means adding
-    // the symbol and its wrapper to `gtk_dynamic_loader`. Until then say so
-    // rather than claim the copy happened.
-    Err(Error::Backend(
-        "clipboard is not wired up in the GTK build".to_string(),
-    ))
+pub fn clipboard_set_text(text: &str) -> Result<(), Error> {
+    crate::backends_gtk_adapter::clipboard_set_text(text)
 }
+
 
 #[cfg(not(any(
     all(feature = "macos", target_os = "macos", not(feature = "zork")),
@@ -605,6 +601,31 @@ pub fn clipboard_set_text(_text: &str) -> Result<(), Error> {
         "clipboard is not wired up on this backend".to_string(),
     ))
 }
+
+/// Read the text currently on the system clipboard.
+///
+/// The checkable half of a copy: a caller (and the probe) can ask what the
+/// clipboard holds instead of trusting that the write returned `Ok`.
+#[cfg(all(feature = "macos", target_os = "macos", not(feature = "zork")))]
+pub fn clipboard_get_text() -> Result<String, Error> {
+    crate::backends_macos_adapter::clipboard_get_text()
+}
+
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+pub fn clipboard_get_text() -> Result<String, Error> {
+    crate::backends_gtk_adapter::clipboard_get_text()
+}
+
+#[cfg(not(any(
+    all(feature = "macos", target_os = "macos", not(feature = "zork")),
+    all(feature = "gtk", target_os = "linux", not(feature = "zork"))
+)))]
+pub fn clipboard_get_text() -> Result<String, Error> {
+    Err(Error::Backend(
+        "clipboard is not wired up on this backend".to_string(),
+    ))
+}
+
 
 /// A disclosure: a toggle button with a child box under it.
 #[derive(Clone)]
@@ -658,53 +679,201 @@ impl AsRef<*mut c_void> for Expander {
     }
 }
 
-/// A menu built from labelled closures.
+/// A menu of labelled actions for a right-click.
 ///
-/// Collecting items works everywhere; showing one requires a native popup
-/// (`gtk_menu_popup_at_pointer` / `NSMenu popUpMenu:atLocation:inView:`), which
-/// this build does not provide.
+/// The actions live behind a shared cell because a shown menu runs them later:
+/// GTK delivers the choice through a signal on the main loop, so the popup
+/// returns before the action runs.
 pub struct ContextMenu {
-    items: Vec<(String, Box<dyn FnMut()>)>,
+    labels: Vec<String>,
+    actions: Rc<RefCell<Vec<Box<dyn FnMut()>>>>,
 }
 
 impl ContextMenu {
     pub fn new() -> ContextMenu {
-        ContextMenu { items: Vec::new() }
+        ContextMenu {
+            labels: Vec::new(),
+            actions: Rc::new(RefCell::new(Vec::new())),
+        }
     }
 
     pub fn append_item(&mut self, label: &str, action: Box<dyn FnMut()>) {
-        self.items.push((label.to_string(), action));
+        self.labels.push(label.to_string());
+        self.actions.borrow_mut().push(action);
     }
 
     pub fn len(&self) -> usize {
-        self.items.len()
+        self.labels.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+        self.labels.is_empty()
+    }
+
+    /// The labels this menu offers, in the order they were appended.
+    pub fn labels(&self) -> Vec<String> {
+        self.labels.clone()
+    }
+
+    fn dispatcher(&self) -> Box<dyn FnMut(usize)> {
+        let actions = self.actions.clone();
+        Box::new(move |index: usize| {
+            if let Some(action) = actions.borrow_mut().get_mut(index) {
+                action();
+            }
+        })
+    }
+
+    /// Build the native menu without showing it.
+    ///
+    /// This is the popup's first step, exposed so a test can inspect exactly
+    /// the menu the popup would put on screen and fire its items through the
+    /// same plumbing a click uses. A handle of `0` means the backend cannot
+    /// build one.
+    pub fn build(&mut self) -> Result<usize, Error> {
+        context_menu_build(&self.labels, self.dispatcher())
+    }
+
+    /// The items of a built menu and whether each is enabled.
+    pub fn items_of(handle: usize) -> Vec<(String, bool)> {
+        if handle == 0 {
+            return Vec::new();
+        }
+        context_menu_items(handle)
+    }
+
+    /// Fire item `index` of a built menu, the way choosing it does.
+    pub fn fire(handle: usize, index: usize) -> bool {
+        if handle == 0 {
+            return false;
+        }
+        context_menu_fire(handle, index)
     }
 
     pub fn popup_at_pointer(
         &mut self,
-        _widget: *mut c_void,
-        _event: *mut c_void,
+        widget: *mut c_void,
+        event: *mut c_void,
     ) -> Result<(), Error> {
-        Err(Error::Backend(
-            "context menus are not available in this build".to_string(),
-        ))
+        if self.labels.is_empty() {
+            return Ok(());
+        }
+        let handle = self.build()?;
+        context_menu_show(handle, widget, event)
     }
 
-    /// Run an item's action by label (used by tests and by a future popup).
+    /// Run an item's action by label (used by tests and by the popup).
     pub fn activate(&mut self, label: &str) -> bool {
-        match self.items.iter_mut().find(|(l, _)| l == label) {
-            Some((_, action)) => {
-                action();
+        match self.labels.iter().position(|l| l == label) {
+            Some(index) => {
+                if let Some(action) = self.actions.borrow_mut().get_mut(index) {
+                    action();
+                }
                 true
             }
             None => false,
         }
     }
 }
+
+/// Build the native menu for `labels`, routing a choice to `on_choose`.
+#[cfg(all(feature = "macos", target_os = "macos", not(feature = "zork")))]
+fn context_menu_build(
+    labels: &[String],
+    on_choose: Box<dyn FnMut(usize)>,
+) -> Result<usize, Error> {
+    crate::backends_macos_adapter::context_menu_build(labels, on_choose)
+}
+
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+fn context_menu_build(
+    labels: &[String],
+    on_choose: Box<dyn FnMut(usize)>,
+) -> Result<usize, Error> {
+    crate::backends_gtk_adapter::context_menu_build(labels, on_choose)
+}
+
+#[cfg(not(any(
+    all(feature = "macos", target_os = "macos", not(feature = "zork")),
+    all(feature = "gtk", target_os = "linux", not(feature = "zork"))
+)))]
+fn context_menu_build(
+    _labels: &[String],
+    _on_choose: Box<dyn FnMut(usize)>,
+) -> Result<usize, Error> {
+    Err(Error::Backend(
+        "this backend has no menu implementation".to_string(),
+    ))
+}
+
+#[cfg(all(feature = "macos", target_os = "macos", not(feature = "zork")))]
+fn context_menu_items(handle: usize) -> Vec<(String, bool)> {
+    crate::backends_macos_adapter::context_menu_items(handle)
+}
+
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+fn context_menu_items(handle: usize) -> Vec<(String, bool)> {
+    crate::backends_gtk_adapter::context_menu_items(handle)
+}
+
+#[cfg(not(any(
+    all(feature = "macos", target_os = "macos", not(feature = "zork")),
+    all(feature = "gtk", target_os = "linux", not(feature = "zork"))
+)))]
+fn context_menu_items(_handle: usize) -> Vec<(String, bool)> {
+    Vec::new()
+}
+
+#[cfg(all(feature = "macos", target_os = "macos", not(feature = "zork")))]
+fn context_menu_fire(handle: usize, index: usize) -> bool {
+    crate::backends_macos_adapter::context_menu_fire(handle, index)
+}
+
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+fn context_menu_fire(handle: usize, index: usize) -> bool {
+    crate::backends_gtk_adapter::context_menu_fire(handle, index)
+}
+
+#[cfg(not(any(
+    all(feature = "macos", target_os = "macos", not(feature = "zork")),
+    all(feature = "gtk", target_os = "linux", not(feature = "zork"))
+)))]
+fn context_menu_fire(_handle: usize, _index: usize) -> bool {
+    false
+}
+
+#[cfg(all(feature = "macos", target_os = "macos", not(feature = "zork")))]
+fn context_menu_show(
+    handle: usize,
+    widget: *mut c_void,
+    event: *mut c_void,
+) -> Result<(), Error> {
+    crate::backends_macos_adapter::context_menu_show(handle, widget, event)
+}
+
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+fn context_menu_show(
+    handle: usize,
+    widget: *mut c_void,
+    event: *mut c_void,
+) -> Result<(), Error> {
+    crate::backends_gtk_adapter::context_menu_show(handle, widget, event)
+}
+
+#[cfg(not(any(
+    all(feature = "macos", target_os = "macos", not(feature = "zork")),
+    all(feature = "gtk", target_os = "linux", not(feature = "zork"))
+)))]
+fn context_menu_show(
+    _handle: usize,
+    _widget: *mut c_void,
+    _event: *mut c_void,
+) -> Result<(), Error> {
+    Err(Error::Backend(
+        "this backend has no menu implementation".to_string(),
+    ))
+}
+
 
 impl Default for ContextMenu {
     fn default() -> Self {

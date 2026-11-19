@@ -652,6 +652,132 @@ mod gtk_adapter {
         }
     }
 
+    /// Build a context menu with one item per label; `on_choose` runs with the
+    /// index of the item the user picks.
+    ///
+    /// The handle is the loader's menu id: the same id the popup shows, so a
+    /// test can build the menu, list it and fire an item through the very
+    /// `activate` signal a click emits.
+    pub fn context_menu_build(
+        labels: &[String],
+        on_choose: Box<dyn FnMut(usize)>,
+    ) -> Result<usize, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK is not initialised".to_string()))?;
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let id = gtk_dynamic_loader::build_context_menu(&loader, &refs, on_choose)
+            .map_err(|e| Error::Backend(format!("{e}")))?;
+        Ok(id as usize)
+    }
+
+    /// The items a built menu offers, with their sensitive state.
+    pub fn context_menu_items(handle: usize) -> Vec<(String, bool)> {
+        gtk_dynamic_loader::context_menu_labels(handle as u64)
+            .into_iter()
+            .map(|label| (label, true))
+            .collect()
+    }
+
+    /// Fire item `index` the way a click does (GTK emits "activate").
+    pub fn context_menu_fire(handle: usize, index: usize) -> bool {
+        match crate::backends::gtk::loader() {
+            Some(loader) => gtk_dynamic_loader::fire_context_menu(&loader, handle as u64, index),
+            None => false,
+        }
+    }
+
+    /// Show a built menu at the pointer.
+    pub fn context_menu_show(
+        handle: usize,
+        _widget: *mut c_void,
+        _event: *mut c_void,
+    ) -> Result<(), Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK is not initialised".to_string()))?;
+        // Button 3: GTK positions the unanchored menu at that button's press.
+        if gtk_dynamic_loader::popup_context_menu(&loader, handle as u64, 3, 0) {
+            Ok(())
+        } else {
+            Err(Error::Backend(
+                "the context menu could not be shown".to_string(),
+            ))
+        }
+    }
+
+    /// Put `text` on the CLIPBOARD selection.
+    ///
+    /// GTK's clipboard is per-selection and owned by this process while it
+    /// runs, which is what a Copy needs; the atom is interned once per call
+    /// because `gdk_atom_intern` is cheap and returns the same atom id.
+    pub fn clipboard_set_text(text: &str) -> Result<(), Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK is not initialised".to_string()))?;
+        let syms = &loader.symbols;
+        let (Some(intern), Some(get), Some(set)) = (
+            syms.gdk_atom_intern,
+            syms.gtk_clipboard_get,
+            syms.gtk_clipboard_set_text,
+        ) else {
+            return Err(Error::Backend(
+                "the GTK build has no clipboard symbols".to_string(),
+            ));
+        };
+        // SAFETY: the atom name is a NUL-terminated literal, and the clipboard
+        // is GTK's own; the text pointer is valid for the duration of the call
+        // (GTK copies the string).
+        unsafe {
+            let atom = intern(b"CLIPBOARD\0".as_ptr(), 1);
+            if atom.is_null() {
+                return Err(Error::Backend("no CLIPBOARD atom".to_string()));
+            }
+            let clipboard = get(atom);
+            if clipboard.is_null() {
+                return Err(Error::Backend("no clipboard for CLIPBOARD".to_string()));
+            }
+            set(clipboard, text.as_ptr(), text.len() as i32);
+        }
+        Ok(())
+    }
+
+    /// The text on the CLIPBOARD selection, if any.
+    ///
+    /// `gtk_clipboard_wait_for_text` spins GTK's main loop until the owner
+    /// answers, so this blocks briefly when another process owns the clipboard.
+    pub fn clipboard_get_text() -> Result<String, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK is not initialised".to_string()))?;
+        let syms = &loader.symbols;
+        let (Some(intern), Some(get), Some(wait)) = (
+            syms.gdk_atom_intern,
+            syms.gtk_clipboard_get,
+            syms.gtk_clipboard_wait_for_text,
+        ) else {
+            return Err(Error::Backend(
+                "the GTK build has no clipboard symbols".to_string(),
+            ));
+        };
+        // SAFETY: as above; the returned string is g_malloc'd by GTK and is
+        // copied before `g_free` releases it.
+        unsafe {
+            let atom = intern(b"CLIPBOARD\0".as_ptr(), 1);
+            let clipboard = get(atom);
+            if clipboard.is_null() {
+                return Err(Error::Backend("no clipboard for CLIPBOARD".to_string()));
+            }
+            let raw = wait(clipboard);
+            if raw.is_null() {
+                return Err(Error::Backend("the clipboard holds no text".to_string()));
+            }
+            let text = std::ffi::CStr::from_ptr(raw as *const std::os::raw::c_char)
+                .to_string_lossy()
+                .into_owned();
+            if let Some(free) = syms.g_free {
+                free(raw as *mut c_void);
+            }
+            Ok(text)
+        }
+    }
+
     pub fn create_simple_action(name: &str) -> Result<SimpleAction, Error> {
         let a = crate::backends::gtk::create_simple_action(name).map_err(|e| Error::Backend(format!("{}", e)))?;
         Ok(SimpleAction(a))

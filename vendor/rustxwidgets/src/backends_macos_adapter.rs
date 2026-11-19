@@ -1715,6 +1715,18 @@ mod macos_adapter {
         }
     }
 
+    /// Dispatch a press carrying AppKit's `clickCount`.
+    ///
+    /// This is the responder's decision without an `NSEvent`: the single click
+    /// always lands, and a count of two (or more) also activates. The probe
+    /// drives it to check that one press selects without opening.
+    pub fn dispatch_canvas_press(canvas_id: u64, x: f64, y: f64, click_count: isize) {
+        dispatch_canvas_click_button(canvas_id, x, y, 1, 0);
+        if activates_on_click_count(click_count) {
+            dispatch_canvas_double_click(canvas_id, x, y);
+        }
+    }
+
     /// Dispatch the second press of a double click at `(x, y)`.
     ///
     /// A caller driving this by hand has to dispatch the single click first, as
@@ -3532,7 +3544,7 @@ mod macos_adapter {
                 // SAFETY: as above.
                 unsafe { (*ptr)(local.x, local.y) };
             }
-            if clicks >= 2 {
+            if activates_on_click_count(clicks) {
                 if let Some(ptr) = double {
                     // SAFETY: as above.
                     unsafe { (*ptr)(local.x, local.y) }
@@ -3558,6 +3570,17 @@ mod macos_adapter {
     extern "C" fn mouse_up_imp(obj: *mut c_void, _cmd: *mut c_void, event: *mut c_void) {
         // SAFETY: as above.
         unsafe { sheet_fire_click(obj, event, false) }
+    }
+
+    /// Whether a press carrying this AppKit `clickCount` activates what is
+    /// under it.
+    ///
+    /// A single click only selects. AppKit reports 1 on the first press and 2
+    /// on the second press of a double click, which is the press that opens.
+    /// Factored out of the responder so the decision can be tested without an
+    /// `NSEvent`.
+    pub fn activates_on_click_count(count: isize) -> bool {
+        count >= 2
     }
 
     /// `-[NSView setContentHuggingPriority:forOrientation:]` for both axes.
@@ -5506,6 +5529,181 @@ mod macos_adapter {
                     "the pasteboard did not store the text".to_string(),
                 ))
             }
+        }
+    }
+
+    /// Build a context menu with one enabled item per label.
+    ///
+    /// The handle is the `NSMenu` pointer. Each item's action is named
+    /// `corro.ctx.<index>` and registered here, so choosing one lands in
+    /// `corroFired:` -> `invoke_action`, the same path a menu-bar item uses.
+    pub fn context_menu_build(
+        labels: &[String],
+        on_choose: Box<dyn FnMut(usize)>,
+    ) -> Result<usize, Error> {
+        let menu_cls = cls("NSMenu");
+        let item_cls = cls("NSMenuItem");
+        let target_cls = cls("CorroMacMenuTarget");
+        if menu_cls.is_null() || item_cls.is_null() || target_cls.is_null() {
+            return Err(Error::Backend("AppKit has no menu classes".to_string()));
+        }
+        // SAFETY: AppKit's own menu classes; every pointer is null-checked and
+        // the menu is leaked into the handle on purpose (the popup and the
+        // tests use it after this call returns).
+        unsafe {
+            let menu = msg0(msg0(menu_cls, "alloc"), "init");
+            if menu.is_null() {
+                return Err(Error::Backend("NSMenu could not be created".to_string()));
+            }
+            // Our targets fire the action but implement no validator, so with
+            // auto-enabling on AppKit would grey every item out.
+            msg1bv(menu, "setAutoenablesItems:", false);
+            let chosen: std::rc::Rc<std::cell::RefCell<Box<dyn FnMut(usize)>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(on_choose));
+            for (index, label) in labels.iter().enumerate() {
+                let name = format!("corro.ctx.{index}");
+                let chosen = chosen.clone();
+                register_action(
+                    &name,
+                    Box::new(move |_sender| {
+                        if let Ok(mut f) = chosen.try_borrow_mut() {
+                            f(index);
+                        }
+                    }),
+                );
+                append_menu_item(menu, item_cls, target_cls, label, &name);
+            }
+            Ok(menu as usize)
+        }
+    }
+
+    /// The items of a built menu, with their enabled state.
+    pub fn context_menu_items(handle: usize) -> Vec<(String, bool)> {
+        let menu = handle as *mut c_void;
+        if menu.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: the handle is an NSMenu this module built.
+        unsafe {
+            let array = msg0(menu, "itemArray");
+            if array.is_null() {
+                return Vec::new();
+            }
+            let count: usize = raw_send!(
+                array,
+                "count",
+                unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize,
+                ()
+            );
+            (0..count)
+                .map(|i| {
+                    let item = raw_send!(
+                        array,
+                        "objectAtIndex:",
+                        unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void,
+                        (i)
+                    );
+                    let title = nsstring_to_rust(msg0(item, "title")).unwrap_or_default();
+                    // BOOL is a signed char, not Rust's one-byte bool.
+                    let enabled: i8 = raw_send!(
+                        item,
+                        "isEnabled",
+                        unsafe extern "C" fn(*mut c_void, *mut c_void) -> i8,
+                        ()
+                    );
+                    (title, enabled != 0)
+                })
+                .collect()
+        }
+    }
+
+    /// Fire item `index` the way a click does.
+    ///
+    /// `performActionForItemAtIndex:` runs the item's target/action, i.e. the
+    /// same `corroFired:` -> `invoke_action` dispatch the popup uses; only the
+    /// modal tracking loop is skipped.
+    pub fn context_menu_fire(handle: usize, index: usize) -> bool {
+        let menu = handle as *mut c_void;
+        if menu.is_null() {
+            return false;
+        }
+        // SAFETY: NSMenu's own dispatch for a selection.
+        unsafe {
+            raw_send!(
+                menu,
+                "performActionForItemAtIndex:",
+                unsafe extern "C" fn(*mut c_void, *mut c_void, isize),
+                (index as isize)
+            );
+        }
+        true
+    }
+
+    /// Show a built menu at the click that opened it.
+    ///
+    /// `+[NSMenu popUpContextMenu:withEvent:forView:]` positions the menu at
+    /// the event and tracks it; the chosen item's action fires before it
+    /// returns, so the caller's handler has already run when this is done.
+    pub fn context_menu_show(
+        handle: usize,
+        view: *mut c_void,
+        event: *mut c_void,
+    ) -> Result<(), Error> {
+        let menu = handle as *mut c_void;
+        if menu.is_null() || view.is_null() || event.is_null() {
+            return Err(Error::Backend(
+                "no menu, view or event to show the menu from".to_string(),
+            ));
+        }
+        // SAFETY: AppKit's own context-menu entry point.
+        unsafe {
+            let menu_cls = cls("NSMenu");
+            raw_send!(
+                menu_cls,
+                "popUpContextMenu:withEvent:forView:",
+                unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *mut c_void,
+                    *mut c_void,
+                    *mut c_void,
+                ),
+                (menu, event, view)
+            );
+        }
+        Ok(())
+    }
+
+    /// The text on the general pasteboard, if it holds any.
+    ///
+    /// The readable half of [`clipboard_set_text`], so a caller can verify
+    /// what a Copy actually put there.
+    pub fn clipboard_get_text() -> Result<String, Error> {
+        // SAFETY: AppKit's own pasteboard class and a documented selector; the
+        // null checks cover a session without a pasteboard.
+        unsafe {
+            let pasteboard_cls = cls("NSPasteboard");
+            if pasteboard_cls.is_null() {
+                return Err(Error::Backend(
+                    "no NSPasteboard on this system".to_string(),
+                ));
+            }
+            let pasteboard = msg0(pasteboard_cls, "generalPasteboard");
+            let type_obj = core_apple::nsstring("public.utf8-plain-text");
+            if pasteboard.is_null() || type_obj.is_null() {
+                return Err(Error::Backend(
+                    "the pasteboard refused the type".to_string(),
+                ));
+            }
+            let text = raw_send!(
+                pasteboard,
+                "stringForType:",
+                unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void,
+                (type_obj)
+            );
+            core_apple::nsstring_to_rust(text).ok_or_else(|| {
+                Error::Backend("the pasteboard holds no text".to_string())
+            })
         }
     }
 

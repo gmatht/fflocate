@@ -140,6 +140,12 @@ pub type GtkFileChooserSetCurrentName = unsafe extern "C" fn(chooser: *mut c_voi
 pub type GtkWidgetDestroy = unsafe extern "C" fn(widget: *mut c_void);
 pub type GtkWindowClose = unsafe extern "C" fn(window: *mut c_void);
 pub type GFree = unsafe extern "C" fn(ptr: *mut c_void);
+// Clipboard: GTK's clipboard is per-selection, advertised through a GdkAtom.
+pub type GtkClipboardGet = unsafe extern "C" fn(atom: *mut c_void) -> *mut c_void;
+pub type GtkClipboardSetText =
+    unsafe extern "C" fn(clipboard: *mut c_void, text: *const u8, len: i32);
+pub type GtkClipboardWaitForText = unsafe extern "C" fn(clipboard: *mut c_void) -> *mut u8;
+pub type GdkAtomIntern = unsafe extern "C" fn(name: *const u8, only_if_exists: i32) -> *mut c_void;
 // gdk event helpers
 pub type GdkEventGetKeyval = unsafe extern "C" fn(event: *mut c_void, keyval: *mut u32) -> i32;
 pub type GdkEventGetState = unsafe extern "C" fn(event: *mut c_void, state: *mut u32);
@@ -693,6 +699,10 @@ pub struct Symbols {
     /// that submenu `visible=0 mapped=0` - nothing appears on screen and no
     /// error is raised. `gtk_menu_popup` on the same menu gives `1/1`.
     pub gtk_menu_popup: Option<GtkMenuPopup>,
+    pub gtk_clipboard_get: Option<GtkClipboardGet>,
+    pub gtk_clipboard_set_text: Option<GtkClipboardSetText>,
+    pub gtk_clipboard_wait_for_text: Option<GtkClipboardWaitForText>,
+    pub gdk_atom_intern: Option<GdkAtomIntern>,
     /// Coordinates of a widget's top-left in screen space. Used to place a
     /// context menu (a right-click on a sheet tab) at the pointer.
     pub gtk_widget_translate_coordinates: Option<GtkWidgetTranslateCoordinates>,
@@ -1060,6 +1070,13 @@ impl Symbols {
         let gtk_container_foreach = unsafe { sym::<GtkContainerForeach>(gtk, "gtk_container_foreach") };
         let gtk_menu_item_activate = unsafe { sym::<GtkMenuItemActivate>(gtk, "gtk_menu_item_activate") };
         let gtk_menu_popup = unsafe { sym::<GtkMenuPopup>(gtk, "gtk_menu_popup") };
+        let gtk_clipboard_get = unsafe { sym::<GtkClipboardGet>(gtk, "gtk_clipboard_get") };
+        let gtk_clipboard_set_text =
+            unsafe { sym::<GtkClipboardSetText>(gtk, "gtk_clipboard_set_text") };
+        let gtk_clipboard_wait_for_text =
+            unsafe { sym::<GtkClipboardWaitForText>(gtk, "gtk_clipboard_wait_for_text") };
+        let gdk_atom_intern = open_sym_try!(libs, "libgdk", GdkAtomIntern, "gdk_atom_intern")
+            .or_else(|| unsafe { sym::<GdkAtomIntern>(gtk, "gdk_atom_intern") });
         let gtk_widget_get_next_sibling = unsafe { sym::<GtkWidgetGetNextSibling>(gtk, "gtk_widget_get_next_sibling") };
         // Screen-space placement of a context menu. `gtk_widget_get_window`
         // and `gdk_window_get_origin` live in different libraries, like the
@@ -1170,7 +1187,7 @@ impl Symbols {
             gtk_editable_get_position,
             gtk_widget_unparent, gtk_widget_get_parent,
             gtk_widget_get_first_child, gtk_widget_get_next_sibling,
-            gtk_container_get_children, gtk_container_foreach, gtk_menu_item_activate, g_list_free, gtk_menu_item_get_submenu, gtk_widget_is_visible, gtk_menu_popup,
+            gtk_container_get_children, gtk_container_foreach, gtk_menu_item_activate, g_list_free, gtk_menu_item_get_submenu, gtk_widget_is_visible, gtk_menu_popup, gtk_clipboard_get, gtk_clipboard_set_text, gtk_clipboard_wait_for_text, gdk_atom_intern,
             gtk_widget_translate_coordinates, gtk_widget_get_window, gdk_window_get_origin,
             gtk_popover_menu_bar_item_get_popover, gtk_popover_get_child, gtk_popover_new, gtk_popover_set_child,
             gtk_menu_button_get_label, gtk_menu_button_set_active,

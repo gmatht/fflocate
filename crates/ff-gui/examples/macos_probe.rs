@@ -1154,6 +1154,122 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // --- A single press selects; only a double press activates ---
+    // The responder reads AppKit's `clickCount`; this drives the same dispatch
+    // with counts 1 and 2, so the decision is tested, not just compiled.
+    {
+        let canvas = app.create_canvas()?;
+        let presses = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let activations = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let p = presses.clone();
+        canvas.on_click_button(Box::new(move |_, _, _, _| p.set(p.get() + 1)));
+        let act = activations.clone();
+        canvas.on_double_click(Box::new(move |_, _| act.set(act.get() + 1)));
+        let id = rswidgets::backends_macos_adapter::Canvas(canvas.raw_handle()).canvas_id();
+        rswidgets::backends_macos_adapter::dispatch_canvas_press(id, 10.0, 10.0, 1);
+        let after_one = (presses.get(), activations.get());
+        rswidgets::backends_macos_adapter::dispatch_canvas_press(id, 10.0, 10.0, 2);
+        let after_two = (presses.get(), activations.get());
+        println!(
+            "probe: clickCount 1 -> presses {:?}, clickCount 2 -> presses {:?} (presses, activations)",
+            after_one, after_two
+        );
+        assert_eq!(after_one, (1, 0), "one press must select without activating");
+        assert_eq!(after_two, (2, 1), "the second press must activate");
+    }
+
+    // --- The row menu: four actions, each runs, Copy reaches the clipboard ---
+    // Built and fired through the same menu the popup shows: `build` is the
+    // popup's first step, and `fire` is AppKit's `performActionForItemAtIndex:`,
+    // i.e. the target/action dispatch a click inside the menu runs.
+    {
+        list.select_row(1);
+        let row_path = list.selected_path(2).expect("the list has no second row");
+        let status = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let mut menu = rswidgets::compat::ContextMenu::new();
+        let actions = [
+            ff_gui::RowAction::Open,
+            ff_gui::RowAction::OpenContainingFolder,
+            ff_gui::RowAction::CopyPath,
+            ff_gui::RowAction::OpenInTerminal,
+        ];
+        for action in actions {
+            let status = status.clone();
+            let path = row_path.clone();
+            menu.append_item(
+                action.label(),
+                Box::new(move || {
+                    let line = ff_gui::run_row_action(action, &path, |text| {
+                        rswidgets::compat::clipboard_set_text(text).map_err(|e| e.to_string())
+                    });
+                    *status.borrow_mut() = line;
+                }),
+            );
+        }
+        let handle = menu.build().expect("the row menu could not be built");
+        let items = rswidgets::compat::ContextMenu::items_of(handle);
+        let labels: Vec<String> = items.iter().map(|(l, _)| l.clone()).collect();
+        println!("probe: row menu items {items:?}");
+        assert_eq!(items.len(), 4, "the row menu does not offer four actions");
+        assert_eq!(
+            labels,
+            actions.iter().map(|a| a.label().to_string()).collect::<Vec<_>>(),
+            "the row menu labels are not the four row actions"
+        );
+        for (label, enabled) in &items {
+            assert!(*enabled, "the row menu item {label:?} is disabled");
+        }
+        let name = row_path.rsplit('/').next().unwrap_or(&row_path);
+        for (index, action) in actions.iter().enumerate() {
+            assert!(
+                rswidgets::compat::ContextMenu::fire(handle, index),
+                "{} could not be fired",
+                action.label()
+            );
+            let line = status.borrow().clone();
+            println!("probe: choosing {:?} ran {line:?}", action.label());
+            if *action == ff_gui::RowAction::CopyPath {
+                assert_eq!(
+                    line,
+                    format!("copied {row_path}"),
+                    "Copy path reported {line:?}"
+                );
+                let read_back = rswidgets::compat::clipboard_get_text()
+                    .expect("the clipboard holds no text after Copy path");
+                println!("probe: clipboard now holds {read_back:?}");
+                assert_eq!(
+                    read_back, row_path,
+                    "Copy path did not leave the row's path on the clipboard"
+                );
+            } else {
+                assert!(
+                    line.starts_with(action.label()),
+                    "choosing {:?} ran {line:?}",
+                    action.label()
+                );
+                assert!(
+                    line.contains(name),
+                    "choosing {:?} did not name the row: {line:?}",
+                    action.label()
+                );
+            }
+        }
+        // The popup is modal, so headless CI cannot track it; what can be shown
+        // is that the path no longer reports the feature missing — without an
+        // event it fails on the event.
+        let err = menu
+            .popup_at_pointer(list.raw_handle(), std::ptr::null_mut())
+            .err()
+            .map(|e| format!("{e}"));
+        println!("probe: popup with no event -> {err:?}");
+        if let Some(e) = &err {
+            assert!(
+                !e.contains("not available") && !e.contains("not wired up"),
+                "the popup still reports the feature missing: {e}"
+            );
+        }
+    }
+
     // --- The scrollbar: knob geometry, and the scroll a drag drives ---
     //
     // Dragging the knob is AppKit's own tracking loop on a real NSScroller, so

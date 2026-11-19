@@ -1214,6 +1214,10 @@ impl RowAction {
             // xdg-open dispatches on a file or a directory identically.
             #[cfg(not(target_os = "macos"))]
             RowAction::Open => ("xdg-open", vec![path.to_string()]),
+            // `open -R` reveals the file in Finder.
+            #[cfg(target_os = "macos")]
+            RowAction::OpenContainingFolder => ("open", vec!["-R".into(), path.to_string()]),
+            #[cfg(not(target_os = "macos"))]
             RowAction::OpenContainingFolder => ("xdg-open", vec![containing_dir(path)]),
             // `mimeopen -a` lists the applications that handle the file and asks
             // which to use, without changing the default handler -- i.e. an "open
@@ -1231,6 +1235,13 @@ impl RowAction {
             // (zutty needs it when its `9x18` default is not installed). Kept
             // separate so `command` stays pure and unit-testable without
             // touching the filesystem.
+            // Terminal.app opens in the directory it is given.
+            #[cfg(target_os = "macos")]
+            RowAction::OpenInTerminal => (
+                "open",
+                vec!["-a".into(), "Terminal".into(), containing_dir(path)],
+            ),
+            #[cfg(not(target_os = "macos"))]
             RowAction::OpenInTerminal => (
                 "x-terminal-emulator",
                 vec![
@@ -1528,6 +1539,36 @@ pub fn extension_sort_key(name: &str) -> String {
 }
 
 /// Build one row from a path.
+/// Run a row action for `path` and return the status line the app shows.
+///
+/// `copy` is how the caller puts text on the clipboard (the app passes the
+/// list's own clipboard, the probe passes the compat one), so the same runner
+/// serves both and the probe exercises the handler the app really uses.
+pub fn run_row_action<F>(action: RowAction, path: &str, copy: F) -> String
+where
+    F: Fn(&str) -> Result<(), String>,
+{
+    let (program, args) = if action == RowAction::OpenInTerminal {
+        open_in_terminal_command(path)
+    } else {
+        action.command(path)
+    };
+    if program.is_empty() {
+        let text = match action {
+            RowAction::CopyFolderPath => containing_dir(path),
+            _ => path.to_string(),
+        };
+        return match copy(&text) {
+            Ok(()) => format!("copied {}", text),
+            Err(e) => format!("copy failed: {e}"),
+        };
+    }
+    match std::process::Command::new(program).args(&args).spawn() {
+        Ok(_) => format!("{} → {}", action.label(), path),
+        Err(e) => format!("{} failed: {e}", action.label()),
+    }
+}
+
 /// Wire `list` so double-clicking a row opens that row's path.
 ///
 /// The app installs this on its results list, and the macOS probe installs the
@@ -1543,15 +1584,11 @@ where
             report(format!("Open failed: row {row} has no path"));
             return;
         };
-        let (program, args) = RowAction::Open.command(&path);
-        let line = if program.is_empty() {
-            format!("Open has no command for {path}")
-        } else {
-            match std::process::Command::new(program).args(&args).spawn() {
-                Ok(_) => format!("{} → {}", RowAction::Open.label(), path),
-                Err(e) => format!("{} failed: {e}", RowAction::Open.label()),
-            }
-        };
+        // The same runner the context menu uses, so a double click and the
+        // menu's Open cannot drift apart.
+        let line = run_row_action(RowAction::Open, &path, |text| {
+            rswidgets::compat::clipboard_set_text(text).map_err(|e| e.to_string())
+        });
         report(line);
     }));
 }
@@ -2120,8 +2157,15 @@ mod tests {
             assert_eq!(args, vec!["/a/b.rs".to_string()]);
             // ...while "containing folder" launches the parent directory.
             let (prog, args) = RowAction::OpenContainingFolder.command("/a/b.rs");
+            #[cfg(target_os = "macos")]
+            assert_eq!(prog, "open");
+            #[cfg(not(target_os = "macos"))]
             assert_eq!(prog, "xdg-open");
-            assert_eq!(args, vec!["/a".to_string()]);
+            if cfg!(target_os = "macos") {
+                assert_eq!(args, vec!["-R".to_string(), "/a/b.rs".to_string()]);
+            } else {
+                assert_eq!(args, vec!["/a".to_string()]);
+            }
             // "Open with" asks mimeopen to list handlers for this very file.
             let (prog, args) = RowAction::OpenWith.command("/a/b.rs");
             assert_eq!(prog, "mimeopen");

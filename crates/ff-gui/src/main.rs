@@ -1297,34 +1297,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// when the alternative target is zutty; see
 /// [`ff_gui::open_in_terminal_command`]).
 fn run_row_action(action: RowAction, path: &str, results: &impl TextViewLike) -> String {
-    // "Open in terminal" carries host-specific prefix flags: when the
-    // alternatives link resolves to zutty — whose `9x18` default aborts when
-    // `xfonts-base` is not installed — splice `-font <installed monospace>`
-    // in front of `-e` so the emulator starts at all. Every other action
-    // launches exactly what `RowAction::command` says.
-    let (program, args) = if action == RowAction::OpenInTerminal {
-        ff_gui::open_in_terminal_command(path)
-    } else {
-        action.command(path)
-    };
-    if program.is_empty() {
-        // Clipboard actions need no external command; they differ only in what
-        // they copy.
-        let text = match action {
-            RowAction::CopyFolderPath => containing_dir(path),
-            _ => path.to_string(),
-        };
-        return match results.clipboard_set_text(&text) {
-            Ok(()) => format!("copied {}", short_path(&text)),
-            Err(e) => format!("copy failed: {e}"),
-        };
-    }
-    match std::process::Command::new(program).args(&args).spawn() {
-        Ok(_) => format!("{} → {}", action.label(), short_path(path)),
-        Err(e) => format!("{} failed: {e}", action.label()),
-    }
+    // The runner lives in the library so the macOS probe drives exactly the
+    // handler the app installs; only the clipboard comes from this caller's
+    // widget (the GTK list and the compat tree view each own one).
+    ff_gui::run_row_action(action, path, |text| {
+        results.clipboard_set_text(text).map_err(|e| e.to_string())
+    })
 }
-
 /// Show a one-label dialog with a Close button. Failures go through `report`
 /// (usually the status line), like every other UI error here. `report` keeps
 /// this helper free of widget types, which differ per backend.
