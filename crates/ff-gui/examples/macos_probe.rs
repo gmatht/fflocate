@@ -405,10 +405,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let b = send_rect(outer.raw_handle(), "frame");
             let l = send_rect(margin_label.raw_handle(), "frame");
-            let c = send_rect(sv, "superview");
+            let box_ptr = outer.raw_handle();
+            let content = send0(box_ptr, "superview");
+            let content_frame = if content.is_null() {
+                Rect::default()
+            } else {
+                send_rect(content, "frame")
+            };
+            let box_constraints = send0(box_ptr, "constraints");
+            let content_constraints = if content.is_null() {
+                std::ptr::null_mut()
+            } else {
+                send0(content, "constraints")
+            };
             println!(
-                "probe: after capture box {}x{} at ({}, {}), label {}x{}, its superview {}x{}",
-                b.w, b.h, b.x, b.y, l.w, l.h, c.w, c.h
+                "probe: after capture box {}x{} at ({}, {}), label {}x{}, content {}x{}, box constraints {}, content constraints {}, box mask {}, translates {}",
+                b.w,
+                b.h,
+                b.x,
+                b.y,
+                l.w,
+                l.h,
+                content_frame.w,
+                content_frame.h,
+                send0i(box_constraints, "count"),
+                send0i(content_constraints, "count"),
+                send0i(box_ptr, "autoresizingMask"),
+                send0i(box_ptr, "translatesAutoresizingMaskIntoConstraints") != 0
             );
         }
         println!(
