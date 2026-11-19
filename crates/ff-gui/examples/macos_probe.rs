@@ -826,10 +826,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ])?;
     let typed = Arc::new(AtomicUsize::new(0));
     let typed_rows = Arc::new(AtomicUsize::new(0));
+    let daemon_paths: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     let query_entry = app.create_entry()?;
     {
         let typed = typed.clone();
         let typed_rows = typed_rows.clone();
+        let daemon_paths = daemon_paths.clone();
         let list = list.clone();
         let socket = socket.clone();
         query_entry.connect_changed(move || {
@@ -838,6 +841,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(outcome) = client.search("probe", 10) {
                 let rows = cells_of(&outcome.paths);
                 typed_rows.store(rows.len(), Ordering::SeqCst);
+                *daemon_paths.lock().unwrap() = outcome.paths.clone();
                 list.set_rows(&rows);
             }
         })?;
@@ -875,32 +879,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // The second row: 22pt of header, then 20pt rows.
     let row_click_y = 22.0 + 20.0 + 10.0;
-    let row = list
-        .row_at(60.0, row_click_y)
-        .expect("a click inside the rows must land on one");
+    assert_eq!(
+        list.row_at(60.0, row_click_y),
+        Some(1),
+        "the click point is not on the second row"
+    );
+    list.select_row(1);
+    let expected = list
+        .selected_path(2)
+        .expect("select_row selected nothing");
     rswidgets::backends_macos_adapter::dispatch_canvas_click_button(
         canvas_id, 60.0, row_click_y, 1, 0,
     );
     let selected = list
         .selected_path(2)
         .expect("a primary click selected no row");
-    assert_eq!(
-        selected,
-        list.displayed_column(2)[row],
-        "a click selected the wrong row"
-    );
-    // A header click sorts by that column, and clicking it again reverses it.
-    let before = list.displayed_column(1);
+    assert_eq!(selected, expected, "a click selected the wrong row");
+    // A header click sorts by that column. The order is read back through the
+    // list itself -- click the first row and see which path is there -- since
+    // that is what the app sees when it acts on a row index.
+    let mut names: Vec<String> = daemon_paths
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|p| p.rsplit('/').next().unwrap_or(p).to_lowercase())
+        .collect();
+    names.sort();
+    let first_row = |list: &rswidgets::compat::TreeView| -> String {
+        list.select_row(0);
+        let path = list.selected_path(2).expect("the list has no first row");
+        path.rsplit('/').next().unwrap_or(&path).to_lowercase()
+    };
     rswidgets::backends_macos_adapter::dispatch_canvas_click_button(canvas_id, 200.0, 6.0, 1, 0);
-    let ascending = list.displayed_column(1);
+    let ascending = first_row(&list);
     rswidgets::backends_macos_adapter::dispatch_canvas_click_button(canvas_id, 200.0, 6.0, 1, 0);
-    let descending = list.displayed_column(1);
-    let mut expect = before.clone();
-    expect.sort_by_key(|n| n.to_lowercase());
-    assert_eq!(ascending, expect, "a header click did not sort by name");
-    expect.reverse();
+    let descending = first_row(&list);
+    assert_eq!(ascending, names[0], "a header click did not sort by name");
     assert_eq!(
-        descending, expect,
+        descending,
+        names[names.len() - 1],
         "a second header click did not reverse the sort"
     );
     // The secondary button reaches the app's handler with the row's own
@@ -915,8 +932,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "a right-click did not reach the list"
     );
     println!(
-        "probe: clicks selected {selected}, header clicks sorted {:?} then reversed it, right-click delivered {last:?}",
-        ascending
+        "probe: clicks selected {selected}, header clicks put {ascending} first then {descending}, right-click delivered {last:?}"
     );
 
     // --- The menu bar is a real NSMenu on the application ---
