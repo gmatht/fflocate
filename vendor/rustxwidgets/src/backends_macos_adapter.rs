@@ -159,7 +159,11 @@ mod macos_adapter {
     /// reproduce the fill — leading/trailing in a vertical stack, top/bottom in
     /// a horizontal one (`NSLayoutAttribute` top 3, bottom 4, leading 5,
     /// trailing 6) — and stay consistent with the stack view's centre alignment.
-    unsafe fn pin_across(stack: *mut c_void, child: *mut c_void) {
+    ///
+    /// `inset` is the margin the child keeps from those edges. The top-level box
+    /// passes the few points GTK's window leaves around its content; every
+    /// nested box passes zero, so the margin is not compounded per level.
+    unsafe fn pin_across(stack: *mut c_void, child: *mut c_void, inset: f64) {
         let constraint_cls = cls("NSLayoutConstraint");
         if constraint_cls.is_null() || stack.is_null() || child.is_null() {
             return;
@@ -181,7 +185,7 @@ mod macos_adapter {
             // autoresizing mask must not translate the frame into constraints
             // as well.
             msg1bv(child, "setTranslatesAutoresizingMaskIntoConstraints:", false);
-            for attr in [first, second] {
+            for (attr, constant) in [(first, inset), (second, -inset)] {
                 let constraint: *mut c_void = raw_send!(
                     constraint_cls,
                     "constraintWithItem:attribute:relatedBy:toItem:attribute:multiplier:constant:",
@@ -196,7 +200,7 @@ mod macos_adapter {
                         f64,
                         f64,
                     ) -> *mut c_void,
-                    (child, attr, 0isize, stack, attr, 1.0f64, 0.0f64)
+                    (child, attr, 0isize, stack, attr, 1.0f64, constant)
                 );
                 if !constraint.is_null() {
                     msg1v(stack, "addConstraint:", constraint);
@@ -817,7 +821,13 @@ mod macos_adapter {
                 // shim the same selector is implemented by the host view.
                 msg1v(self.0, "addArrangedSubview:", child_ptr);
                 if stack_appkit {
-                    pin_across(self.0, child_ptr);
+                    // GTK's window leaves a small margin around its content;
+                    // the box directly under the window reproduces it (see
+                    // [`pin_across`]). Nested boxes pass zero.
+                    let is_top_level =
+                        root().map(|r| msg0(self.0, "superview") == r) == Some(true);
+                    let inset = if is_top_level { 5.0 } else { 0.0 };
+                    pin_across(self.0, child_ptr, inset);
                 }
                 if expands || is_canvas {
                     // Weight 1 equivalent: let this child take the leftover
@@ -1345,7 +1355,27 @@ mod macos_adapter {
             // there was nothing to scroll and no scroller to show, however many
             // rows the draw closure painted.
             if !self.0.is_null() {
-                unsafe { msg2cv(self.0, "setFrameSize:", w as f64, h as f64) };
+                // A canvas inside a scroll view is at most as wide as the
+                // viewport. The list asks for the width it last painted at, so
+                // one wide frame would keep it that wide for good: the columns
+                // were laid out for a ~2050pt canvas in a 1350pt window, which
+                // put the path column at 80% instead of 53% and clipped it.
+                let mut width = w as f64;
+                unsafe {
+                    let clip = msg0(self.0, "superview");
+                    if !clip.is_null() {
+                        let b: CGRect = raw_send!(
+                            clip,
+                            "bounds",
+                            unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
+                            ()
+                        );
+                        if b.width > 1.0 && width > b.width {
+                            width = b.width;
+                        }
+                    }
+                    msg2cv(self.0, "setFrameSize:", width, h as f64)
+                }
             }
         }
 
@@ -3685,59 +3715,95 @@ mod macos_adapter {
     /// same window size as the Linux one instead of whatever the default was.
     ///
     /// Returns `(width, height, bytes written)`.
-    pub fn write_view_png(
-        view: *mut c_void,
-        path: &str,
-        size: Option<(f64, f64)>,
-    ) -> Option<(u32, u32, usize)> {
+    /// What a capture proves about itself, besides its pixels.
+    pub struct Shot {
+        pub width: u32,
+        pub height: u32,
+        /// The PNG, ready to write.
+        pub png: Vec<u8>,
+        /// Whether the top band of the image is the window's title-bar chrome
+        /// rather than the content view's own white.
+        pub title_bar: bool,
+        /// Pixels drawn in the right-hand gutter, where a scroller sits: zero
+        /// when the scroll view drew none.
+        pub scroller_ink: usize,
+        /// How much of that gutter has ink, in percent of its height. A drawn
+        /// scroller runs almost the whole way down; text that merely reaches
+        /// the right edge shows up on a few rows only.
+        pub scroller_coverage: u32,
+    }
+
+    /// Render a view into a PNG, and report what it contains.
+    ///
+    /// When `view` is a window's content view the window's *frame* view is
+    /// captured instead, so the title bar is part of the picture: a capture of
+    /// the content alone cannot be compared with a Linux capture of a whole
+    /// window. The frame view is also the only view that may be given the
+    /// requested size — a window cannot grow past the screen, but the view
+    /// holding its chrome has no such limit.
+    pub fn capture(view: *mut c_void, size: Option<(f64, f64)>) -> Option<Shot> {
         if view.is_null() {
             return None;
         }
-        if let Some((win_w, win_h)) = size {
-            // A window cannot grow past the screen's visible frame, and the
-            // macOS runner's screen is shorter than this shot: `setContentSize:`
-            // alone produced a 1350x645 window, i.e. a different picture from
-            // the 1350x858 Linux capture. The view has no such limit, so it is
-            // sized directly and rendered at that size — the window is asked
-            // for the same size first for the on-screen case.
-            // SAFETY: a live content view; `window`, `setContentSize:` and
-            // `setFrameSize:` are AppKit's own, and a view without a window is
-            // skipped.
-            unsafe {
-                let window = msg0(view, "window");
-                if !window.is_null() {
-                    msg2cv(window, "setContentSize:", win_w, win_h);
-                }
-                msg2cv(view, "setFrameSize:", win_w, win_h);
+        // SAFETY: a live view from this adapter; every selector below is
+        // AppKit's own and every pointer is null-checked before use.
+        unsafe {
+            let window = msg0(view, "window");
+            let theme = if window.is_null() {
+                std::ptr::null_mut()
+            } else {
+                msg0(view, "superview")
+            };
+            let target = if theme.is_null() { view } else { theme };
+            // The chrome is exactly what `frameRectForContentRect:` adds to an
+            // empty content rect: the title bar plus the window border.
+            let mut chrome = 0.0f64;
+            if !window.is_null() {
+                let empty = CGRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                };
+                let frame_rect: CGRect = raw_send!(
+                    window,
+                    "frameRectForContentRect:",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect) -> CGRect,
+                    (empty)
+                );
+                chrome = frame_rect.height.max(0.0);
             }
-        }
-        // SAFETY: a live NSView; both selectors are AppKit's own, and `bounds`
-        // returns a `CGRect` (four `CGFloat`s) by value.
-        let (w, h) = unsafe {
+            if let Some((want_w, want_h)) = size {
+                if theme.is_null() {
+                    set_frame(view, 0.0, 0.0, want_w, want_h);
+                } else {
+                    // Size the frame view, let AppKit place the content inside
+                    // it, then pin the content below the title bar so the
+                    // capture shows both rather than overlapping them.
+                    set_frame(theme, 0.0, 0.0, want_w, want_h);
+                    msg0v(theme, "layoutSubtreeIfNeeded");
+                    let content_h = (want_h - chrome).max(1.0);
+                    set_frame(view, 0.0, 0.0, want_w, content_h);
+                }
+            }
+            // Only the content view is laid out again here: laying the frame
+            // view out once more would let its own constraints put the content
+            // back over the title bar that this capture exists to show.
             msg0v(view, "layoutSubtreeIfNeeded");
-            let b: CGRect = raw_send!(
-                view,
+            let bounds: CGRect = raw_send!(
+                target,
                 "bounds",
                 unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
                 ()
             );
-            (
-                b.width.round().max(1.0) as u32,
-                b.height.round().max(1.0) as u32,
-            )
-        };
-        // `cacheDisplayInRect:toBitmapImageRep:` is the AppKit call that renders
-        // a view *and its subviews*, layer-backed or not. The plain
-        // `displayRectIgnoringOpacity:inContext:` path leaves a layer-backed
-        // tree empty — the first attempt at this produced a blank window with
-        // one glyph in the corner.
-        let rep_cls = cls("NSBitmapImageRep");
-        if rep_cls.is_null() {
-            return None;
-        }
-        // SAFETY: the rep owns its buffer; every pointer is null-checked before
-        // it is dereferenced, and the copy stays inside `bytesPerRow`.
-        unsafe {
+            let (w, h) = (
+                bounds.width.round().max(1.0) as u32,
+                bounds.height.round().max(1.0) as u32,
+            );
+            let rep_cls = cls("NSBitmapImageRep");
+            if rep_cls.is_null() {
+                return None;
+            }
             let rep = raw_send!(
                 raw_send!(
                     rep_cls,
@@ -3776,16 +3842,15 @@ mod macos_adapter {
             if rep.is_null() {
                 return None;
             }
-            // A view paints its subviews but not the window behind them, so an
-            // unpainted area would come out transparent — black once the alpha
-            // is flattened. The live window is white there, and the capture is
-            // meant to look like the window.
             let data = msg0(rep, "bitmapData") as *mut u8;
             let row = msg0i(rep, "bytesPerRow") as usize;
-            if !data.is_null() && row >= w as usize * 4 {
-                for y in 0..h as usize {
-                    std::ptr::write_bytes(data.add(y * row), 0xFF, w as usize * 4);
-                }
+            if data.is_null() || row < w as usize * 4 {
+                return None;
+            }
+            // The view paints itself but not what is behind it, so an unpainted
+            // area would be transparent — black once the alpha is flattened.
+            for y in 0..h as usize {
+                std::ptr::write_bytes(data.add(y * row), 0xFF, w as usize * 4);
             }
             let rect = CGRect {
                 x: 0.0,
@@ -3794,11 +3859,62 @@ mod macos_adapter {
                 height: h as f64,
             };
             raw_send!(
-                view,
+                target,
                 "cacheDisplayInRect:toBitmapImageRep:",
                 unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect, *mut c_void),
                 (rect, rep)
             );
+            // Copy the pixels out first: they are what the measurements read,
+            // and the rep's buffer goes away with the object.
+            let mut rgba = vec![0u8; w as usize * h as usize * 4];
+            for y in 0..h as usize {
+                std::ptr::copy_nonoverlapping(
+                    data.add(y * row),
+                    rgba.as_mut_ptr().add(y * w as usize * 4),
+                    w as usize * 4,
+                );
+            }
+            let ink_at = |rgba: &[u8], x: usize, y: usize| -> bool {
+                let i = (y * w as usize + x) * 4;
+                rgba[i] < 245 || rgba[i + 1] < 245 || rgba[i + 2] < 245
+            };
+            // Title bar: the chrome band must not be the content view's white.
+            let band = (chrome.round() as u32).min(h);
+            let mut band_ink = 0usize;
+            for y in (band as usize / 2)..(band as usize) {
+                for x in 0..w as usize {
+                    if ink_at(&rgba, x, y) {
+                        band_ink += 1;
+                    }
+                }
+            }
+            let title_bar = band_ink > (band as usize / 2) * (w as usize / 20);
+            // Scroller: the right-hand gutter of the scroll view, below the
+            // chrome and above the last few rows.
+            let mut scroller_ink = 0usize;
+            let mut inked_rows = 0usize;
+            let mut rows = 0usize;
+            let x0 = w.saturating_sub(14) as usize;
+            let y_start = (band as usize + 2).min(h as usize);
+            let y_end = (h as usize).saturating_sub(4);
+            for y in y_start..y_end {
+                let mut row_ink = 0usize;
+                for x in x0..w as usize {
+                    if ink_at(&rgba, x, y) {
+                        row_ink += 1;
+                    }
+                }
+                scroller_ink += row_ink;
+                rows += 1;
+                if row_ink >= 3 {
+                    inked_rows += 1;
+                }
+            }
+            let scroller_coverage = if rows == 0 {
+                0
+            } else {
+                (inked_rows * 100 / rows) as u32
+            };
             // `NSBitmapImageFileTypePNG` is 4.
             const PNG: usize = 4;
             let dict = msg0(cls("NSDictionary"), "dictionary");
@@ -3826,9 +3942,85 @@ mod macos_adapter {
             if bytes.is_null() || len == 0 {
                 return None;
             }
-            let slice = std::slice::from_raw_parts(bytes, len);
-            std::fs::write(path, slice).ok()?;
-            Some((w, h, len))
+            let png = std::slice::from_raw_parts(bytes, len).to_vec();
+            Some(Shot {
+                width: w,
+                height: h,
+                png,
+                title_bar,
+                scroller_ink,
+                scroller_coverage,
+            })
+        }
+    }
+
+    pub fn write_view_png(
+        view: *mut c_void,
+        path: &str,
+        size: Option<(f64, f64)>,
+    ) -> Option<(u32, u32, usize)> {
+        let shot = capture(view, size)?;
+        std::fs::write(path, &shot.png).ok()?;
+        Some((shot.width, shot.height, shot.png.len()))
+    }
+
+    /// Ask AppKit for the persistent (`NSScrollerStyleLegacy`) scroller style.
+    ///
+    /// The modern overlay scroller fades out and is not drawn at all until the
+    /// list is scrolled, so a screenshot of a fresh window shows no scroller —
+    /// and "the scrollbar works" cannot be seen in the pixels. Legacy scrollers
+    /// are drawn permanently, which is what GTK's capture shows too. Only the
+    /// screenshot path calls this: a normal run keeps the platform style.
+    pub fn use_legacy_scrollers(view: *mut c_void) {
+        if view.is_null() {
+            return;
+        }
+        // SAFETY: AppKit's own class method and views from this adapter.
+        unsafe {
+            let scroller_cls = cls("NSScroller");
+            if !scroller_cls.is_null() {
+                // `NSScrollerStyleLegacy` is 1.
+                msg1iv(scroller_cls, "setPreferredScrollerStyle:", 1);
+            }
+            force_legacy_scrollers(view);
+        }
+    }
+
+    /// Walk the view tree and switch every scroll view to legacy scrollers.
+    ///
+    /// The preferred style is a default for *new* scrollers, so the ones the
+    /// results list already made have to be told individually.
+    unsafe fn force_legacy_scrollers(view: *mut c_void) {
+        if view.is_null() {
+            return;
+        }
+        // SAFETY: `subviews`/`isKindOfClass:` are NSView/NSObject methods on
+        // objects from this adapter's own tree.
+        unsafe {
+            let scroll_cls = cls("NSScrollView");
+            let is_scroll_view = !scroll_cls.is_null()
+                && raw_send!(
+                    view,
+                    "isKindOfClass:",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool,
+                    (scroll_cls)
+                );
+            if is_scroll_view {
+                msg1iv(view, "setScrollerStyle:", 1);
+                msg1bv(view, "setAutohidesScrollers:", false);
+                msg1bv(view, "setHasVerticalScroller:", true);
+                let clip = msg0(view, "contentView");
+                if !clip.is_null() {
+                    msg1v(view, "reflectScrolledClipView:", clip);
+                }
+            }
+            let subviews = msg0(view, "subviews");
+            if !subviews.is_null() {
+                let count = msg0i(subviews, "count");
+                for i in 0..count {
+                    force_legacy_scrollers(msg1i(subviews, "objectAtIndex:", i));
+                }
+            }
         }
     }
 

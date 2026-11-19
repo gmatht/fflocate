@@ -1215,6 +1215,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let (w, h) = spec.split_once('x')?;
                 Some((w.trim().parse::<f64>().ok()?, h.trim().parse::<f64>().ok()?))
             });
+        // Overlay scrollers fade out, so a fresh window would show no scroller
+        // at all and "the scrollbar works" could not be seen in the pixels. Only
+        // this path asks for the persistent style; a normal run keeps AppKit's.
+        rswidgets::backends_macos_adapter::use_legacy_scrollers(win.raw_handle());
         match rswidgets::backends_macos_adapter::write_view_png(win.raw_handle(), &path, size) {
             Some((w, h, bytes)) => {
                 eprintln!("ff-gui: screenshot {path} ({w}x{h}, {bytes} bytes)");

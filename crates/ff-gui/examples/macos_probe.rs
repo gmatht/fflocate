@@ -269,12 +269,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "the box itself has no width: {}pt",
             box_bounds.w
         );
-        // `>=`, not `==`: a label's frame carries its own bezel/inset, so it can
-        // come out a few points wider than the box it is pinned to. What matters
-        // is that it spans the width instead of sitting at its intrinsic size.
+        // The box is under the window, so it keeps the window's margin on both
+        // sides (5pt each, as GTK's window does); the child spans what is left.
+        // A child left at its intrinsic width would be far narrower than this.
         assert!(
-            child_frame.w >= box_bounds.w - 1.0 && child_frame.w <= box_bounds.w + 8.0,
-            "the box's child is {}pt wide in a {}pt box: it is not filling the width",
+            (box_bounds.w - child_frame.w - 10.0).abs() <= 2.0,
+            "the box's child is {}pt wide in a {}pt box: it does not fill the width less the 5pt margin",
             child_frame.w,
             box_bounds.w
         );
@@ -333,6 +333,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(
             response, 0,
             "the alert's clicked button did not reach the Rust response handler"
+        );
+    }
+
+    // --- The capture is the whole window: title bar, scroller, GTK's columns ---
+    //
+    // A screenshot of the content view alone cannot be compared with a Linux
+    // capture of a whole window, and one taken with the platform's overlay
+    // scrollers shows no scroller at all, because they fade out.
+    {
+        let outer = app.create_box(Orientation::Vertical, 6)?;
+        let margin_label = app.create_label("max distance:")?;
+        outer.append(&margin_label);
+        outer.append(&scrolled);
+        win.set_child(&outer);
+
+        let view = win.raw_handle();
+        rswidgets::backends_macos_adapter::use_legacy_scrollers(view);
+        let shot = rswidgets::backends_macos_adapter::capture(view, Some((1350.0, 858.0)))
+            .ok_or("the window produced no capture")?;
+        println!(
+            "probe: capture {}x{} (linux 1350x858), title bar {}, scroller ink {} px on {}% of the gutter",
+            shot.width, shot.height, shot.title_bar, shot.scroller_ink, shot.scroller_coverage
+        );
+        assert_eq!(
+            (shot.width, shot.height),
+            (1350, 858),
+            "the capture is not the size of the Linux one"
+        );
+        assert!(shot.title_bar, "the capture has no window title bar");
+        assert!(
+            shot.scroller_coverage >= 60,
+            "no visible vertical scrollbar: ink on {}% of the gutter",
+            shot.scroller_coverage
+        );
+
+        // Columns: the list paints for its own viewport, so the path column
+        // lands on the same fraction of it as on Linux (0.536 of the list).
+        let clip_w = send_rect(clip, "bounds").w;
+        let doc_w = send_rect(doc, "frame").w;
+        let starts = rswidgets::compat::column_starts(clip_w);
+        let path_share = starts[2] / clip_w;
+        println!(
+            "probe: list viewport {clip_w}pt, canvas {doc_w}pt, name column {:.1}%, path column {:.1}% (linux 53.6%)",
+            starts[1] / clip_w * 100.0,
+            path_share * 100.0
+        );
+        assert!(
+            (doc_w - clip_w).abs() <= 1.0,
+            "the list canvas is {doc_w}pt wide in a {clip_w}pt viewport"
+        );
+        assert!(
+            (path_share - 0.536).abs() < 0.02,
+            "the path column starts at {:.1}% of the list, Linux puts it at 53.6%",
+            path_share * 100.0
+        );
+
+        // Left margin: the top-level box keeps the few points GTK's window
+        // leaves around its content, so a label does not touch the edge.
+        let mut x = send_rect(margin_label.raw_handle(), "frame").x;
+        let mut v = send0(margin_label.raw_handle(), "superview");
+        while !v.is_null() && v != view {
+            x += send_rect(v, "frame").x;
+            v = send0(v, "superview");
+        }
+        println!("probe: left label margin {x}pt (linux 5)");
+        assert!(
+            (x - 5.0).abs() <= 2.5,
+            "the label sits {x}pt from the window edge, Linux puts it at 5pt"
         );
     }
 
