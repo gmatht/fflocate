@@ -3956,22 +3956,28 @@ mod macos_adapter {
             let title_bar = band_ink > (band as usize / 2) * (w as usize / 20);
             // Scroller: the right-hand gutter of the scroll view, below the
             // chrome and above the last few rows.
+            // The gutter is wide enough for a legacy scroller (17pt) plus its
+            // border: a narrower strip sampled past the bar and reported an
+            // empty gutter with the scroller plainly drawn beside it.
             let mut scroller_ink = 0usize;
             let mut inked_rows = 0usize;
             let mut rows = 0usize;
-            let x0 = w.saturating_sub(14) as usize;
+            let x0 = w.saturating_sub(22) as usize;
             let y_start = (band as usize + 2).min(h as usize);
             let y_end = (h as usize).saturating_sub(4);
             for y in y_start..y_end {
                 let mut row_ink = 0usize;
                 for x in x0..w as usize {
-                    if ink_at(&rgba, x, y) {
+                    // A scroller's track is a very light grey, lighter than the
+                    // 245 used elsewhere: 250 still separates it from white.
+                    let i = (y * w as usize + x) * 4;
+                    if rgba[i] < 250 || rgba[i + 1] < 250 || rgba[i + 2] < 250 {
                         row_ink += 1;
                     }
                 }
                 scroller_ink += row_ink;
                 rows += 1;
-                if row_ink >= 3 {
+                if row_ink >= 2 {
                     inked_rows += 1;
                 }
             }
