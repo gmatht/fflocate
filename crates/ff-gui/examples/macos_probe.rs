@@ -737,11 +737,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = ff_gui::DaemonClient::with_socket(socket.clone());
     let attempt = std::time::Instant::now();
     let mut hits = 0usize;
+    let mut attempts = 0usize;
     let mut last_error = String::new();
     // The socket binds before the first crawl finishes, so ask again until the
     // fixture files are indexed; a wedged daemon fails on the deadline instead
     // of hanging the probe.
     while attempt.elapsed() < std::time::Duration::from_secs(30) {
+        attempts += 1;
         match client.search("probe", 10) {
             Ok(outcome) => {
                 hits = outcome.paths.len();
@@ -760,7 +762,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reaped = daemon.wait().is_ok();
     println!(
         "probe: daemon {} spawned on a temp root, answered {hits} hits for \"probe\" \
-         in {elapsed}ms (last error {last_error:?}), killed {killed} and reaped {reaped}",
+         in {elapsed}ms on attempt {attempts}, killed {killed} and reaped {reaped}",
         daemon_bin.display()
     );
     assert_eq!(
