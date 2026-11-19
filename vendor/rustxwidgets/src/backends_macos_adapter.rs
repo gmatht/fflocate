@@ -423,6 +423,54 @@ mod macos_adapter {
                     NSVIEW_WIDTH_SIZABLE | NSVIEW_HEIGHT_SIZABLE,
                 );
             }
+            // The mask alone is not enough for a box: an `NSStackView` re-fits
+            // itself to its contents the moment it is laid out, so a resized
+            // window shrank the root box back to one row tall (1340x22 for a
+            // 1350x858 window) and the list inside it got no height at all --
+            // an empty window below the query row. Pinning each edge keeps the
+            // child the size of the window, which is what GTK's `set_child`
+            // gives for free; the inset becomes the constraints' constants.
+            let constraint_cls = cls("NSLayoutConstraint");
+            if !constraint_cls.is_null() {
+                unsafe {
+                    msg1bv(child_ptr, "setTranslatesAutoresizingMaskIntoConstraints:", false);
+                    // `NSLayoutAttribute` top 3, bottom 4, leading 5, trailing 6.
+                    for (attr, constant) in [
+                        (3isize, WINDOW_MARGIN),
+                        (4isize, -WINDOW_MARGIN),
+                        (5isize, WINDOW_MARGIN),
+                        (6isize, -WINDOW_MARGIN),
+                    ] {
+                        let constraint: *mut c_void = raw_send!(
+                            constraint_cls,
+                            "constraintWithItem:attribute:relatedBy:toItem:attribute:multiplier:constant:",
+                            unsafe extern "C" fn(
+                                *mut c_void,
+                                *mut c_void,
+                                *mut c_void,
+                                isize,
+                                isize,
+                                *mut c_void,
+                                isize,
+                                f64,
+                                f64,
+                            ) -> *mut c_void,
+                            (
+                                child_ptr,
+                                attr,
+                                0isize,
+                                self.0,
+                                attr,
+                                1.0,
+                                constant,
+                            )
+                        );
+                        if !constraint.is_null() {
+                            msg1v(self.0, "addConstraint:", constraint);
+                        }
+                    }
+                }
+            }
         }
 
         pub fn set_child_box(&self, bx: &BoxWidget) {
@@ -867,6 +915,17 @@ mod macos_adapter {
         /// expansion is the axis' business (`set_child_vexpand` handles a
         /// child); recorded as a no-op, as on `Entry`.
         pub fn set_vexpand(&self, _expand: bool) {}
+
+        /// Show or hide the box (and everything in it).
+        ///
+        /// `setHidden:` on the stack view's own view: NSStackView skips a
+        /// hidden arranged subview, so the box collapses instead of leaving a
+        /// gap. This is what lets a disclosure hide its body.
+        pub fn set_visible(&self, visible: bool) {
+            if !self.0.is_null() {
+                unsafe { msg1bv(self.0, "setHidden:", !visible) };
+            }
+        }
 
         /// Size the stack view.
         ///
