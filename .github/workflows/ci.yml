@@ -95,24 +95,33 @@ jobs:
       # The row menu and the clipboard are GTK3 features that need a display:
       # Xvfb gives the Linux runner one, so this runs for real instead of
       # returning early like the display-gated tests above.
-      - name: Row menu and clipboard (Linux, Xvfb)
+      - name: Interaction, row menu and menubar (Linux, Xvfb)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           # xvfb-run is part of the ubuntu runner image; the action that wraps a
           # script for us put the script outside this checkout, so its log never
           # reached the next step.
-          command -v xvfb-run || { echo "::error title=row menu (Linux)::xvfb-run is not installed"; exit 1; }
+          command -v xvfb-run || { echo "::error title=interaction (Linux)::xvfb-run is not installed"; exit 1; }
           status=0
-          xvfb-run -a -s "-screen 0 1280x1024x24" \
-            cargo test -p ff-gui --test row_menu_gtk -- --nocapture > row-menu.log 2>&1 || status=$?
-          echo "row menu: exit ${status}; $(head -c 400 row-menu.log | tr -cd '[:print:]\n' | tr '\n' '|')"
-          lines=$(grep -E 'row menu:|clipboard holds|test result' row-menu.log | tr '\n' '|' | cut -c1-3500)
-          if [ "$status" -eq 0 ] && grep -q 'test result: ok' row-menu.log; then
-            echo "::notice title=row menu (Linux)::${lines}"
+          : > interaction.log
+          # One xvfb-run (and one process) per test binary: the menu tests spin a
+          # GTK main loop, and two of them in one session have been seen to wait
+          # on each other. Each is bounded so a hang fails the job instead of
+          # stalling it.
+          for t in row_menu_gtk interaction_gtk menubar_gtk; do
+            printf '=== %s ===\n' "$t" >> interaction.log
+            xvfb-run -a -s "-screen 0 1280x1024x24" \
+              timeout 180 cargo test -p ff-gui --test "$t" -- --nocapture >> interaction.log 2>&1 \
+              || status=1
+          done
+          echo "interaction tests: exit ${status}; $(grep -E 'test result' interaction.log | tr '\n' '|')"
+          lines=$(grep -E 'row menu:|clipboard holds|interaction:|menu bar:|test result' interaction.log | tr '\n' '|' | cut -c1-3500)
+          if [ "$status" -eq 0 ]; then
+            echo "::notice title=interaction (Linux)::${lines}"
             exit 0
           fi
-          echo "::error title=row menu test (Linux)::$(grep -E 'panicked|assertion|^error|error\[|not found|No such' row-menu.log | head -12 | tr '\n' '|' | cut -c1-3000)"
+          echo "::error title=interaction test (Linux)::$(grep -E 'panicked|assertion|^error|error\[|not found|No such|timed out' interaction.log | head -12 | tr '\n' '|' | cut -c1-3000)"
           exit 1
 
       - name: GUI launches (macOS)

@@ -235,4 +235,10 @@ fn menubar_items_are_enabled_and_fire() {
         fired.load(Ordering::SeqCst),
         "activating the Quit item must fire its registered action"
     );
+    println!(
+        "menu bar: {} submenu(s), {} item(s), all {} enabled, activating Quit fired its action",
+        menus.len(),
+        leaves.len(),
+        leaves.len()
+    );
 }

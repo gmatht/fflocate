@@ -860,35 +860,84 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let typed_rows = Arc::new(AtomicUsize::new(0));
     let daemon_paths: Arc<std::sync::Mutex<Vec<String>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
+    // What the pump sent, so the request itself is asserted rather than assumed.
+    let requests: Arc<std::sync::Mutex<Vec<String>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    // The GUI's own debounce type, shortened so the probe does not wait 150 ms.
+    let debounce = std::rc::Rc::new(ff_gui::Debounce::new(std::time::Duration::from_millis(120)));
     let query_entry = app.create_entry()?;
     {
         let typed = typed.clone();
-        let typed_rows = typed_rows.clone();
-        let daemon_paths = daemon_paths.clone();
-        let list = list.clone();
-        let socket = socket.clone();
+        let debounce = debounce.clone();
         query_entry.connect_changed(move || {
             typed.fetch_add(1, Ordering::SeqCst);
-            let client = ff_gui::DaemonClient::with_socket(socket.clone());
-            if let Ok(outcome) = client.search("probe", 10) {
-                let rows = cells_of(&outcome.paths);
-                typed_rows.store(rows.len(), Ordering::SeqCst);
-                *daemon_paths.lock().unwrap() = outcome.paths.clone();
-                list.set_rows(&rows);
-            }
+            // A keystroke only arms the deadline; it must never send a request.
+            debounce.arm();
         })?;
     }
     query_entry.set_text("probe");
     rswidgets::backends_macos_adapter::dispatch_text_changed(query_entry.raw_handle());
     let changes = typed.load(Ordering::SeqCst);
+    assert_eq!(changes, 1, "a text change did not reach connect_changed");
+    assert!(
+        debounce.pending(),
+        "the text change did not arm the debounce: the window would never elapse"
+    );
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "a request went out while the user was still typing: {:?}",
+        requests.lock().unwrap()
+    );
+
+    // The pump: issue once the window has elapsed, then paint the answer. The
+    // GUI runs this on a 30 ms timer; stepping it here is the same decision.
+    let mut issued = false;
+    for _ in 0..200 {
+        if debounce.due() {
+            let query = query_entry.get_text().unwrap_or_default();
+            requests.lock().unwrap().push(query.clone());
+            let client = ff_gui::DaemonClient::with_socket(socket.clone());
+            if let Ok(outcome) = client.search(&query, 10) {
+                let rows = cells_of(&outcome.paths);
+                typed_rows.store(rows.len(), Ordering::SeqCst);
+                *daemon_paths.lock().unwrap() = outcome.paths.clone();
+                list.set_rows(&rows);
+            }
+            debounce.clear();
+            issued = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(issued, "the debounce never elapsed, so no request was issued");
+    assert!(!debounce.pending(), "the debounce stayed armed after issuing");
+    let sent = requests.lock().unwrap().clone();
     let rows_after_typing = typed_rows.load(Ordering::SeqCst);
     println!(
-        "probe: typing produced {changes} change(s) and {rows_after_typing} row(s) through the client"
+        "probe: typing {changes} change(s) -> debounce -> request {sent:?} -> {rows_after_typing} row(s) repainted"
     );
-    assert_eq!(changes, 1, "a text change did not reach connect_changed");
+    assert_eq!(
+        sent,
+        vec!["probe".to_string()],
+        "the request did not carry the typed text exactly once"
+    );
     assert_eq!(
         rows_after_typing, 3,
         "the typing path drew {rows_after_typing} rows, not the daemon's 3"
+    );
+    // Read the answer back out of the list's own model, not the closure.
+    let expected_names: Vec<String> = daemon_paths
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
+        .collect();
+    let painted_names: Vec<String> = (0..expected_names.len())
+        .filter_map(|row| list.cell_text(row, 1))
+        .collect();
+    assert_eq!(
+        painted_names, expected_names,
+        "the list does not hold the rows the daemon returned"
     );
 
     // --- Pixels from the daemon's answer ---

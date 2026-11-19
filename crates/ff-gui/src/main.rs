@@ -439,7 +439,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // back. Everything between is now pure I/O and could run anywhere.
     // ---------------------------------------------------------------------
     {
-        let due_at: Rc<RefCell<Option<std::time::Instant>>> = Rc::new(RefCell::new(None));
+        // The keystroke window lives in `ff_gui::Debounce`, the same type the
+        // macOS probe and the Linux interaction test drive.
+        let debounce = Rc::new(ff_gui::Debounce::new(std::time::Duration::from_millis(
+            DEBOUNCE_MS,
+        )));
         // The gate is what stops a slow query from being overwritten by a newer one
         // and keeps a burst of keystrokes from queuing a query each. It is plain
         // logic, tested in `ff_gui::asyou_type_tests`.
@@ -449,11 +453,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         const PUMP_MS: u32 = 30;
 
         let arm = {
-            let due_at = due_at.clone();
-            move || {
-                *due_at.borrow_mut() =
-                    Some(std::time::Instant::now() + std::time::Duration::from_millis(DEBOUNCE_MS));
-            }
+            let debounce = debounce.clone();
+            move || debounce.arm()
         };
 
         // Set by the Search button / Return: "start the next request without waiting
@@ -465,7 +466,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let pump = {
-            let due_at = due_at.clone();
+            let debounce = debounce.clone();
             let gate = gate.clone();
             let render = render.clone();
             let build_request = build_request.clone();
@@ -728,17 +729,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     //    4 s scan completes.
                     let immediate = start_now.swap(false, Ordering::SeqCst);
                     if !immediate {
-                        let Some(t) = *due_at.borrow() else {
-                            // No keystroke pending. But the user may have hit
-                            // Search while a scan is in flight — `immediate`
-                            // covers that above, so nothing to do here.
-                            if pending.borrow().is_some() {
-                                return true;
-                            }
+                        // No keystroke pending, or still typing: either way
+                        // there is nothing to issue on this tick. (A Search
+                        // press while a scan is in flight is `immediate`,
+                        // handled above.)
+                        if !debounce.due() {
                             return true;
-                        };
-                        if std::time::Instant::now() < t {
-                            return true; // still typing
                         }
                     }
                     if pending.borrow().is_some() {
@@ -760,7 +756,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &quick_box.get_text().unwrap_or_default(),
                         &adv_box.get_text().unwrap_or_default(),
                     ) {
-                        *due_at.borrow_mut() = None;
+                        debounce.clear();
                         // An emptied box shows no results, but the daemon may
                         // still be behind — say so rather than rendering a
                         // clean-looking "0 matches" from a stale view.
@@ -775,7 +771,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let Some(ticket) = gate.borrow_mut().begin() else {
                         return true;
                     };
-                    *due_at.borrow_mut() = None;
+                    debounce.clear();
 
                     // The display label is read now (main thread owns the boxes):
                     // by the time the reply lands the user may have typed on.

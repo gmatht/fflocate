@@ -330,6 +330,62 @@ impl Clone for TreeView {
     }
 }
 
+/// One press at `(x, y)`, exactly as the backend's button signal handles it: a
+/// press in the header band sorts by that column, a left press selects the row
+/// under the pointer, and every registered press handler runs.
+///
+/// The canvas closure and [`TreeView::click_at`] both call this, so a test that
+/// drives a click is driving the list, not a copy of its click logic.
+fn handle_press(
+    rows: &Rc<RefCell<Vec<Vec<CellValue>>>>,
+    sort: &Rc<Cell<Option<(usize, bool)>>>,
+    sortable: &[bool],
+    width: f64,
+    selected: &Rc<Cell<Option<usize>>>,
+    press: &Rc<RefCell<Vec<PressHandler>>>,
+    x: f64,
+    y: f64,
+    button: u32,
+) -> Option<usize> {
+    let row = row_index_at(y, rows.borrow().len());
+    if button == 1 {
+        if y < HEADER_HEIGHT {
+            // A header click sorts by that column (the old `GtkTreeView` did;
+            // the canvas list does it itself). It is not a row selection, so
+            // the selection goes.
+            if apply_header_click(rows, sort, sortable, width, x) {
+                selected.set(None);
+            }
+        } else {
+            selected.set(row);
+        }
+    }
+    for handler in press.borrow_mut().iter_mut() {
+        handler(button, x, y, std::ptr::null_mut());
+    }
+    row
+}
+
+/// The second press of a double click at `y`: select the row under the pointer
+/// and run every activation handler. Returns the row, or `None` over the header
+/// or blank space.
+///
+/// A double click is a second press on the same row, so its first press already
+/// selected it; the selection is set again so a handler reading it sees this row.
+fn handle_double_click(
+    rows: &Rc<RefCell<Vec<Vec<CellValue>>>>,
+    selected: &Rc<Cell<Option<usize>>>,
+    activate: &Rc<RefCell<Vec<ActivateHandler>>>,
+    y: f64,
+) -> Option<usize> {
+    let row = row_index_at(y, rows.borrow().len())?;
+    selected.set(Some(row));
+    for handler in activate.borrow_mut().iter_mut() {
+        handler(row);
+    }
+    Some(row)
+}
+
 impl TreeView {
     pub fn new(columns: &[(&str, bool, bool)]) -> Result<TreeView, Error> {
         let canvas = new_canvas()?;
@@ -429,23 +485,10 @@ impl TreeView {
             let sortable: Vec<bool> = columns.iter().map(|(_, _, s)| *s).collect();
             let canvas_for_redraw = canvas.clone();
             canvas.on_click_button(Box::new(move |x, y, button, _state| {
-                let row = row_index_at(y, rows.borrow().len());
-                if button == 1 {
-                    if y < HEADER_HEIGHT {
-                        // A header click sorts by that column (the old
-                        // `GtkTreeView` did; the canvas list does it itself).
-                        // It is not a row selection, so the selection goes.
-                        if apply_header_click(&rows, &sort, &sortable, width.get(), x) {
-                            selected.set(None);
-                        }
-                    } else {
-                        selected.set(row);
-                    }
-                    canvas_for_redraw.queue_redraw();
-                }
-                for handler in press.borrow_mut().iter_mut() {
-                    handler(button, x, y, std::ptr::null_mut());
-                }
+                handle_press(
+                    &rows, &sort, &sortable, width.get(), &selected, &press, x, y, button,
+                );
+                canvas_for_redraw.queue_redraw();
             }));
         }
 
@@ -457,17 +500,8 @@ impl TreeView {
             register_double_click(
                 &canvas,
                 Box::new(move |_x, y| {
-                    let Some(row) = row_index_at(y, rows.borrow().len()) else {
-                        return;
-                    };
-                    // A double click is a second press on the same row, so its
-                    // first press already selected it; set it again so a handler
-                    // that reads the selection sees this row.
-                    selected.set(Some(row));
+                    handle_double_click(&rows, &selected, &activate, y);
                     canvas_for_redraw.queue_redraw();
-                    for handler in activate.borrow_mut().iter_mut() {
-                        handler(row);
-                    }
                 }),
             );
         }
@@ -485,6 +519,36 @@ impl TreeView {
             sort,
             activate,
         })
+    }
+
+    /// Feed a press through the list the way the backend's button signal does.
+    ///
+    /// The canvas closure calls the same code; this is how a test can exercise
+    /// a click where the toolkit has no way to synthesise a native event (the
+    /// GTK interaction test), without re-implementing the hit-test.
+    pub fn click_at(&self, x: f64, y: f64, button: u32) -> Option<usize> {
+        let sortable: Vec<bool> = self.columns.iter().map(|(_, _, s)| *s).collect();
+        let row = handle_press(
+            &self.rows,
+            &self.sort,
+            &sortable,
+            self.width.get(),
+            &self.selected,
+            &self.press,
+            x,
+            y,
+            button,
+        );
+        self.canvas.queue_redraw();
+        row
+    }
+
+    /// Feed the second press of a double click at `y`, running the activation
+    /// handlers exactly as the canvas' double-click registration does.
+    pub fn double_click_at(&self, y: f64) -> Option<usize> {
+        let row = handle_double_click(&self.rows, &self.selected, &self.activate, y);
+        self.canvas.queue_redraw();
+        row
     }
 
     /// Replace every row, then repaint.

@@ -2836,6 +2836,35 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn the_debounce_waits_for_its_window_and_rearms_on_a_new_keystroke() {
+        let d = ff_gui_debounce_for_test();
+        // Nothing typed yet: nothing pending, nothing due.
+        assert!(!d.pending());
+        assert!(!d.due());
+        d.arm();
+        assert!(d.pending());
+        // Immediately after a keystroke the window has not elapsed, so a pump
+        // that ticks straight away must not issue a request.
+        assert!(!d.due(), "a request was due the instant a key was pressed");
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(!d.due(), "80ms of a 120ms window was treated as elapsed");
+        // Another keystroke pushes the deadline out again.
+        d.arm();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(!d.due(), "the second keystroke did not re-arm the window");
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        assert!(d.due(), "the window elapsed but no request was due");
+        // Issuing the request clears it: a quiet pump must not re-issue.
+        d.clear();
+        assert!(!d.pending());
+        assert!(!d.due());
+    }
+
+    fn ff_gui_debounce_for_test() -> Debounce {
+        Debounce::new(std::time::Duration::from_millis(120))
+    }
+
     fn query_request_opts_into_scan_progress() {
         // The GUI asks for Progress; `ff` never does (its output must stay
         // byte-identical, and old daemons ignore the unknown field anyway).
@@ -2932,6 +2961,59 @@ mod tests {
 pub struct SearchTicket {
     /// Monotonic id, so a slow answer cannot overwrite a newer one.
     pub seq: u64,
+}
+
+/// The keystroke debounce: every edit pushes the deadline out, and the pump
+/// asks once per tick whether it has elapsed.
+///
+/// Both the GUI's own pump and the interaction tests (the macOS probe and
+/// `tests/interaction_gtk.rs`) drive this type, so "typing waits for the
+/// window before a request goes out" is asserted on the code the app runs
+/// rather than on a copy of it.
+#[derive(Debug)]
+pub struct Debounce {
+    window: std::time::Duration,
+    /// When the pending edit may be turned into a request; `None` when no
+    /// keystroke is waiting.
+    due_at: std::cell::RefCell<Option<std::time::Instant>>,
+}
+
+impl Debounce {
+    pub fn new(window: std::time::Duration) -> Debounce {
+        Debounce {
+            window,
+            due_at: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// A keystroke: (re)arm the deadline to `window` from now.
+    pub fn arm(&self) {
+        *self.due_at.borrow_mut() = Some(std::time::Instant::now() + self.window);
+    }
+
+    /// Drop the deadline because its request has been issued.
+    pub fn clear(&self) {
+        *self.due_at.borrow_mut() = None;
+    }
+
+    /// Whether an edit is waiting for its window to elapse.
+    pub fn pending(&self) -> bool {
+        self.due_at.borrow().is_some()
+    }
+
+    /// The deadline itself, for a pump that wants to skip waking up early.
+    pub fn deadline(&self) -> Option<std::time::Instant> {
+        *self.due_at.borrow()
+    }
+
+    /// Whether the window has elapsed. A pump that keeps ticking asks this;
+    /// nothing is cleared, so the caller decides when the request is issued.
+    pub fn due(&self) -> bool {
+        match *self.due_at.borrow() {
+            Some(t) => std::time::Instant::now() >= t,
+            None => false,
+        }
+    }
 }
 
 /// Decide whether a request may be *issued*: only if no newer one has been issued
