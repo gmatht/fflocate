@@ -192,6 +192,103 @@ fn new_scrolled() -> Result<ScrolledWindow, Error> {
 const ROW_HEIGHT: f64 = 20.0;
 /// Header height in logical pixels.
 const HEADER_HEIGHT: f64 = 22.0;
+/// The kinds of pictogram the icon column draws.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IconKind {
+    Folder,
+    Code,
+    Image,
+    Archive,
+    Document,
+    Pdf,
+}
+
+/// Which pictogram a themed icon name stands for.
+///
+/// The names are the freedesktop ones the search result carries; anything
+/// unrecognised is a plain document rather than nothing at all.
+fn icon_kind(name: &str) -> IconKind {
+    match name {
+        "folder" => IconKind::Folder,
+        "image-x-generic" => IconKind::Image,
+        "package-x-generic" => IconKind::Archive,
+        "application-pdf" => IconKind::Pdf,
+        "text-x-rust"
+        | "text-x-python"
+        | "text-x-javascript"
+        | "text-x-typescript"
+        | "application-json"
+        | "text-x-csrc"
+        | "text-x-c++src"
+        | "text-x-go"
+        | "text-x-java"
+        | "text-x-ruby"
+        | "text-x-script"
+        | "text-html"
+        | "text-css" => IconKind::Code,
+        _ => IconKind::Document,
+    }
+}
+
+/// Paint one icon cell as a pictogram in a `size`-wide box whose top left is
+/// `(x, y)`. Returns `false` for a cell that is not an icon, so the caller can
+/// draw whatever text it holds.
+///
+/// Only `fill_rect` and `stroke_rect` are used: the canvas has no paths, and
+/// both desktops implement these two, so GTK and AppKit paint the same
+/// picture. A font glyph is deliberately not used — a symbol the font lacks
+/// comes out as a blank box, and one letter per file kind is not an icon.
+fn paint_icon(
+    ctx: &mut dyn crate::core::DrawContext,
+    x: f64,
+    y: f64,
+    size: f64,
+    cell: &CellValue,
+) -> bool {
+    let CellValue::Icon { name, .. } = cell else {
+        return false;
+    };
+    let s = size.max(6.0);
+    match icon_kind(name) {
+        // A folder: a tab behind a wider body, the way a file manager draws it.
+        IconKind::Folder => {
+            let (r, g, b) = (0.86, 0.62, 0.16);
+            ctx.fill_rect(x, y + s * 0.16, s * 0.44, s * 0.18, r, g, b, 1.0);
+            ctx.fill_rect(x, y + s * 0.28, s, s * 0.56, r, g, b, 1.0);
+        }
+        // A page with two ruled lines; code files get the blue tint.
+        IconKind::Code | IconKind::Document => {
+            let (r, g, b) = match icon_kind(name) {
+                IconKind::Code => (0.22, 0.44, 0.78),
+                _ => (0.45, 0.47, 0.52),
+            };
+            ctx.fill_rect(x + s * 0.06, y + s * 0.08, s * 0.88, s * 0.84, r, g, b, 1.0);
+            ctx.fill_rect(x + s * 0.22, y + s * 0.30, s * 0.56, s * 0.10, 1.0, 1.0, 1.0, 1.0);
+            ctx.fill_rect(x + s * 0.22, y + s * 0.52, s * 0.40, s * 0.10, 1.0, 1.0, 1.0, 1.0);
+        }
+        // A framed picture: a sun over a horizon bar.
+        IconKind::Image => {
+            let (r, g, b) = (0.20, 0.58, 0.36);
+            ctx.stroke_rect(x, y + s * 0.12, s, s * 0.72, r, g, b, 1.0, 1.0);
+            ctx.fill_rect(x + s * 0.14, y + s * 0.56, s * 0.70, s * 0.16, r, g, b, 1.0);
+            ctx.fill_rect(x + s * 0.62, y + s * 0.24, s * 0.20, s * 0.20, r, g, b, 1.0);
+        }
+        // A box with a band across it: an archive.
+        IconKind::Archive => {
+            let (r, g, b) = (0.52, 0.36, 0.70);
+            ctx.fill_rect(x + s * 0.04, y + s * 0.16, s * 0.92, s * 0.68, r, g, b, 1.0);
+            ctx.fill_rect(x + s * 0.04, y + s * 0.40, s * 0.92, s * 0.12, 1.0, 1.0, 1.0, 1.0);
+        }
+        // A red page, so a PDF is told apart from a text file at this size.
+        IconKind::Pdf => {
+            ctx.fill_rect(x + s * 0.06, y + s * 0.08, s * 0.88, s * 0.84, 0.72, 0.18, 0.18, 1.0);
+            ctx.fill_rect(x + s * 0.22, y + s * 0.30, s * 0.56, s * 0.10, 1.0, 1.0, 1.0, 1.0);
+            ctx.fill_rect(x + s * 0.22, y + s * 0.52, s * 0.40, s * 0.10, 1.0, 1.0, 1.0, 1.0);
+        }
+    }
+    true
+}
+
 /// Column widths as fractions of the canvas width: the icon column is narrow,
 /// name and path share the rest.
 const ICON_COLUMN_SHARE: f64 = 0.06;
@@ -285,17 +382,25 @@ impl TreeView {
                     let mut x = 4.0;
                     let icon_w = w * ICON_COLUMN_SHARE;
                     let text_w = (w - icon_w) / 2.0;
-                    ctx.draw_text(
-                        x,
-                        y + 14.0,
-                        &row.first().map(CellValue::render).unwrap_or_default(),
-                        "sans",
-                        11.0,
-                        0.2,
-                        0.2,
-                        0.2,
-                        1.0,
-                    );
+                    // A pictogram when the cell is an icon, its text otherwise:
+                    // one letter per file kind read as "the icons are gone".
+                    let drew_icon = row
+                        .first()
+                        .map(|cell| paint_icon(ctx, x, y + 4.5, 11.0, cell))
+                        .unwrap_or(false);
+                    if !drew_icon {
+                        ctx.draw_text(
+                            x,
+                            y + 14.0,
+                            &row.first().map(CellValue::render).unwrap_or_default(),
+                            "sans",
+                            11.0,
+                            0.2,
+                            0.2,
+                            0.2,
+                            1.0,
+                        );
+                    }
                     x += icon_w;
                     for cell in row.iter().skip(1).take(2) {
                         ctx.draw_text(
@@ -934,6 +1039,88 @@ mod tests {
     }
 
     #[test]
+    /// The reported regression: the icon column drew one letter per file kind,
+    /// so the icons were gone. It must paint a pictogram instead.
+    #[test]
+    fn icons_paint_pictures_not_their_letters() {
+        use crate::backends::headless::{DrawOp, RecordingDrawContext};
+
+        let cell = CellValue::Icon {
+            name: "folder".into(),
+            fallback: "d".into(),
+        };
+        let mut dc = RecordingDrawContext::new();
+        assert!(paint_icon(&mut dc, 4.0, 24.0, 11.0, &cell));
+        // A picture: more than one filled rectangle...
+        let fills = dc
+            .ops
+            .iter()
+            .filter(|op| matches!(op, DrawOp::FillRect { .. }))
+            .count();
+        assert!(fills >= 2, "the folder drew {fills} rectangle(s): {:?}", dc.ops);
+        // ...and no text at all, so the fallback letter is not what is shown.
+        assert!(
+            !dc
+                .ops
+                .iter()
+                .any(|op| matches!(op, DrawOp::Text { .. })),
+            "the icon still draws text: {:?}",
+            dc.ops
+        );
+        // Everything stays inside the 11pt box it was given.
+        for op in &dc.ops {
+            let (x, y, w, h) = match *op {
+                DrawOp::FillRect { x, y, w, h, .. }
+                | DrawOp::StrokeRect { x, y, w, h, .. } => (x, y, w, h),
+                _ => continue,
+            };
+            assert!(x >= 4.0 && y >= 24.0, "{op:?} starts outside the box");
+            assert!(x + w <= 4.0 + 11.0 + 1e-9, "{op:?} runs past the box");
+            assert!(y + h <= 24.0 + 11.0 + 1e-9, "{op:?} runs past the box");
+        }
+    }
+
+    #[test]
+    fn different_kinds_draw_different_pictures() {
+        use crate::backends::headless::{DrawOp, RecordingDrawContext};
+
+        let first_colour = |name: &str| {
+            let cell = CellValue::Icon {
+                name: name.into(),
+                fallback: "?".into(),
+            };
+            let mut dc = RecordingDrawContext::new();
+            assert!(paint_icon(&mut dc, 0.0, 0.0, 11.0, &cell));
+            dc.ops
+                .iter()
+                .find_map(|op| match op {
+                    DrawOp::FillRect { rgba, .. } => Some(*rgba),
+                    DrawOp::StrokeRect { rgba, .. } => Some(*rgba),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name} drew nothing"))
+        };
+
+        let names = [
+            "folder",
+            "text-x-rust",
+            "image-x-generic",
+            "package-x-generic",
+            "text-x-generic",
+            "application-pdf",
+        ];
+        let colours: Vec<_> = names.iter().map(|n| first_colour(n)).collect();
+        for (i, a) in colours.iter().enumerate() {
+            for (j, b) in colours.iter().enumerate().skip(i + 1) {
+                assert_ne!(a, b, "{} and {} look the same", names[i], names[j]);
+            }
+        }
+        // A cell that is not an icon is not painted as one.
+        let mut dc = RecordingDrawContext::new();
+        assert!(!paint_icon(&mut dc, 0.0, 0.0, 11.0, &CellValue::Text("x".into())));
+        assert!(dc.ops.is_empty());
+    }
+
     fn cell_value_renders_its_fallback_for_icons() {
         let icon = CellValue::Icon {
             name: "folder".into(),

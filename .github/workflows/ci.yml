@@ -37,6 +37,23 @@ jobs:
           echo "::error title=test failure (${RUNNER_OS})::${msg}"
           exit 1
 
+      # The canvas list lives in the vendored widget crate, whose unit tests
+      # `cargo test -p ff-gui` does not run (a dependency's tests are not
+      # built). The icon-column tests are the ones that matter here.
+      - name: Widget tests (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          status=0
+          cargo test --manifest-path vendor/rustxwidgets/Cargo.toml --lib compat:: > widget-test.log 2>&1 || status=$?
+          echo "widget tests: exit ${status}; $(grep -E 'test result' widget-test.log | tr '\n' '|')"
+          if [ "$status" -eq 0 ]; then
+            echo "::notice title=widget tests (Linux)::$(grep -E 'icons_paint_pictures|different_kinds_draw_different_pictures|the_icon_column' widget-test.log | tr '\n' '|')"
+            exit 0
+          fi
+          echo "::error title=widget test failure (Linux)::$(grep -E 'panicked|assertion|^error' widget-test.log | head -10 | tr '\n' '|' | cut -c1-2500)"
+          exit 1
+
       # The GUI binary compiles on both platforms (its widgets come from
       # rswidgets::compat), so the whole crate is built and tested here — lib,
       # binary and integration tests — plus the documented `zork` fallback
