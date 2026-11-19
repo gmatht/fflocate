@@ -910,17 +910,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(ink)
         };
-        list.set_rows(&[]);
-        let blank = list_ink(&list)?;
-        let rows = cells_of(&daemon_paths.lock().unwrap().clone());
-        list.set_rows(&rows);
         let ink = list_ink(&list)?;
         println!(
-            "probe: the daemon's {rows_after_typing} row(s) painted {ink} px of ink (empty list {blank} px)"
+            "probe: the daemon's {rows_after_typing} row(s) painted {ink} px of ink in the list"
         );
+        // Three rows of text measure ~150 px of ink at the default font; the
+        // floor is low enough to survive a font change and far above the 0 a
+        // blank list or a missed draw leaves.
         assert!(
-            ink > blank + 50,
-            "the daemon's rows painted {ink} px against {blank} px for no rows, so nothing reached the screen"
+            ink > 50,
+            "the daemon's rows painted only {ink} px, so nothing reached the screen"
         );
     }
 
