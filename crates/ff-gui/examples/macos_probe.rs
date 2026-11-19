@@ -140,33 +140,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
         unsafe { f(obj, rswidgets::backends::apple::selector(selname)) }
     }
+    fn send1v(obj: *mut std::ffi::c_void, selname: &str, arg: *mut std::ffi::c_void) {
+        let f: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) =
+            unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+        unsafe { f(obj, rswidgets::backends::apple::selector(selname), arg) }
+    }
     fn send1i(obj: *mut std::ffi::c_void, selname: &str, arg: isize) -> *mut std::ffi::c_void {
         let f: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, isize) -> *mut std::ffi::c_void =
             unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
         unsafe { f(obj, rswidgets::backends::apple::selector(selname), arg) }
-    }
-    fn send_after(
-        obj: *mut std::ffi::c_void,
-        selname: &str,
-        arg: *mut std::ffi::c_void,
-        delay: f64,
-    ) {
-        let f: unsafe extern "C" fn(
-            *mut std::ffi::c_void,
-            *mut std::ffi::c_void,
-            *mut std::ffi::c_void,
-            *mut std::ffi::c_void,
-            f64,
-        ) = unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
-        unsafe {
-            f(
-                obj,
-                rswidgets::backends::apple::selector("performSelector:withObject:afterDelay:"),
-                rswidgets::backends::apple::selector(selname),
-                arg,
-                delay,
-            )
-        }
     }
 
     use rswidgets::compat::{CellValue, TreeView};
@@ -308,10 +290,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "scrolling to the end left the clip view at {end}pt instead of {last}pt"
     );
 
-    // --- A dialog presents its buttons and the click comes back to Rust ---
+    // --- A dialog presents its buttons, and a click reaches Rust ---
     {
         let dlg = app.new_dialog()?;
-        dlg.set_title("ff-gui probe");
+        dlg.set_title("ff-gui probe: daemon status");
         dlg.add_button("Close", 0);
         dlg.add_button("Open", 1);
         let fired: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(usize::MAX));
@@ -322,31 +304,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
         }
         let alert = dlg.inner.raw_handle();
+        // An alert lays its buttons out on request; before that they exist but
+        // have no frames, which is what "presented with no buttons" looked like.
+        send0v(alert, "layout");
         let buttons = send0(alert, "buttons");
         let count = send0i(buttons, "count") as usize;
         let first = send1i(buttons, "objectAtIndex:", 0);
-        println!("probe: alert has {count} button(s)");
+        let first_frame = if first.is_null() {
+            Rect::default()
+        } else {
+            send_rect(first, "frame")
+        };
+        println!(
+            "probe: alert has {count} buttons, first is {}x{} at ({}, {})",
+            first_frame.w, first_frame.h, first_frame.x, first_frame.y
+        );
         assert_eq!(count, 2, "the alert presents {count} buttons, expected 2");
-        assert!(!first.is_null(), "the alert's first button is missing");
-        // Click the first button once the modal loop is running, and make sure
-        // a stuck alert cannot hang the job: `abortModal` ends it after 5 s.
-        send_after(first, "performClick:", std::ptr::null_mut(), 0.2);
-        // SAFETY: NSApp exists (App::init ran) and `abortModal` takes no object.
-        unsafe {
-            let app_cls = rswidgets::backends::apple::msg_shim();
-            let shared: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void =
-                std::mem::transmute(app_cls);
-            let app_obj = shared(
-                rswidgets::backends::apple::selector("NSApplication"),
-                rswidgets::backends::apple::selector("sharedApplication"),
-            );
-            if !app_obj.is_null() {
-                send_after(app_obj, "abortModal", std::ptr::null_mut(), 5.0);
-            }
-        }
-        dlg.present();
+        assert!(
+            first_frame.w > 0.0 && first_frame.h > 0.0,
+            "the alert's first button has no frame, so nothing would be clickable"
+        );
+        // Show the alert, then press its first button: `-performClick:` sends
+        // the action the adapter installed, exactly as a user's click does.
+        dlg.set_visible(true);
+        send1v(first, "performClick:", std::ptr::null_mut());
         let response = fired.load(Ordering::SeqCst);
-        println!("probe: alert closed with response {response} (0 = first button)");
+        println!("probe: alert response {response} (0 = first button)");
         assert_eq!(
             response, 0,
             "the alert's clicked button did not reach the Rust response handler"

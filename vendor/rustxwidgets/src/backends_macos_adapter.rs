@@ -2417,19 +2417,40 @@ mod macos_adapter {
             if s.is_null() {
                 return;
             }
-            // NSAlert's own button, so `runModal` dismisses on click and reports
-            // which one: `corroAddAction:` had no implementation, which is why
-            // the alert presented with no buttons at all.
-            // Returns the new `NSButton`; the alert owns it, so it is dropped
-            // here and the button list comes back through `-buttons`.
-            raw_send!(
+            // NSAlert's own button, so the alert draws a real, clickable one:
+            // `corroAddAction:` had no implementation at all, which is why the
+            // alert presented with no buttons. The alert owns the `NSButton`.
+            let button = raw_send!(
                 self.0,
                 "addButtonWithTitle:",
                 unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void,
                 (s)
             );
-            if let Ok(mut buttons) = DIALOG_BUTTONS.lock() {
-                buttons.entry(self.0 as usize).or_default().push(response_id);
+            let index = match DIALOG_BUTTONS.lock() {
+                Ok(mut buttons) => {
+                    let entry = buttons.entry(self.0 as usize).or_default();
+                    entry.push(response_id);
+                    entry.len() - 1
+                }
+                Err(_) => 0,
+            };
+            // Take over the button's action so the click reaches Rust: the same
+            // target/action pair any AppKit control uses.
+            ensure_runtime_classes();
+            let target_cls = cls("CorroMacAlertTarget");
+            if !button.is_null() && !target_cls.is_null() {
+                let target: *mut c_void = raw_send!(
+                    target_cls,
+                    "alertTargetWithDialog:index:",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void, isize, isize) -> *mut c_void,
+                    (self.0 as isize, index as isize)
+                );
+                if !target.is_null() {
+                    unsafe {
+                        msg1v(button, "setTarget:", target);
+                        msg1v(button, "setAction:", core_apple::selector("corroFired:"));
+                    }
+                }
             }
         }
 
@@ -2508,21 +2529,16 @@ mod macos_adapter {
                 return -1;
             }
             // `runModal` returns `NSAlertFirstButtonReturn` (1000) plus the
-            // button's index, so the clicked button maps back to the response id
-            // the caller registered with `add_button`.
+            // button's index. The response callback already ran — the button's
+            // action fires it — so this only reports which button ended the
+            // session; firing here too would report every click twice.
             let raw = unsafe { msg0i(self.0, "runModal") };
             let index = if raw >= 1000 { (raw - 1000) as usize } else { 0 };
-            let id = DIALOG_BUTTONS
+            DIALOG_BUTTONS
                 .lock()
                 .ok()
                 .and_then(|buttons| buttons.get(&(self.0 as usize)).and_then(|v| v.get(index).copied()))
-                .unwrap_or(index as i32);
-            if let Ok(mut responses) = DIALOG_RESPONSES.lock() {
-                if let Some(SendResponse(f)) = responses.get_mut(&(self.0 as usize)) {
-                    f(id);
-                }
-            }
-            id
+                .unwrap_or(index as i32)
         }
     }
 
@@ -3038,6 +3054,77 @@ mod macos_adapter {
         }
     }
 
+    /// `NSAlert`'s button target: carries the alert and the button's index.
+    static ALERT_KEY: u8 = 0;
+    static ALERT_INDEX_KEY: u8 = 0;
+
+    /// `-corroFired:` for an alert button.
+    ///
+    /// This *is* the button's action, so it runs on the same path a user's click
+    /// takes: it reports the response id the caller registered, ends the modal
+    /// session `runModal` is running, and takes the alert down. Without it the
+    /// alert's buttons were AppKit's own, whose action NSAlert installs, and
+    /// nothing reached Rust.
+    extern "C" fn alert_fired_imp(obj: *mut c_void, _cmd: *mut c_void, _sender: *mut c_void) {
+        // SAFETY: associated-object lookups on a target we handed AppKit.
+        let (dialog, index) = unsafe {
+            (
+                objc_getAssociatedObject(obj, key_addr(&ALERT_KEY)) as usize,
+                objc_getAssociatedObject(obj, key_addr(&ALERT_INDEX_KEY)) as usize,
+            )
+        };
+        if dialog == 0 {
+            return;
+        }
+        let id = DIALOG_BUTTONS
+            .lock()
+            .ok()
+            .and_then(|buttons| buttons.get(&dialog).and_then(|v| v.get(index).copied()))
+            .unwrap_or(index as i32);
+        if let Ok(mut responses) = DIALOG_RESPONSES.lock() {
+            if let Some(SendResponse(f)) = responses.get_mut(&dialog) {
+                f(id);
+            }
+        }
+        // SAFETY: NSApp is a plain Objective-C object; `stopModalWithCode:` is
+        // a no-op when no modal session is running, and `orderOut:` takes the
+        // alert's window down either way.
+        unsafe {
+            let app = msg0(cls("NSApplication"), "sharedApplication");
+            if !app.is_null() {
+                msg1iv(app, "stopModalWithCode:", 1000 + index as isize);
+            }
+            let window = msg0(dialog as *mut c_void, "window");
+            if !window.is_null() {
+                msg1v(window, "orderOut:", std::ptr::null_mut());
+            }
+        }
+    }
+
+    /// `+[CorroMacAlertTarget alertTargetWithDialog:index:]`.
+    extern "C" fn alert_target_imp(
+        cls_ptr: *mut c_void,
+        _cmd: *mut c_void,
+        dialog: isize,
+        index: isize,
+    ) -> *mut c_void {
+        // SAFETY: `alloc`/`init` on our own NSObject subclass.
+        unsafe {
+            let obj = msg0(msg0(cls_ptr, "alloc"), "init");
+            if obj.is_null() {
+                return obj;
+            }
+            objc_setAssociatedObject(obj, key_addr(&ALERT_KEY), dialog as *mut c_void, OBJC_ASSIGN);
+            objc_setAssociatedObject(
+                obj,
+                key_addr(&ALERT_INDEX_KEY),
+                index as *mut c_void,
+                OBJC_ASSIGN,
+            );
+            own(obj)
+        }
+    }
+
     /// `+[CorroMacTarget targetWithCallbackId:]`: the target a control keeps as
     /// its `target`, carrying the id `register_callback` handed out.
     extern "C" fn target_with_id_imp(
@@ -3442,6 +3529,26 @@ mod macos_adapter {
                         add_method(c, "corroSetCanvasId:", set_canvas_id_imp as *const (), "v@:q");
                         add_method(c, "mouseDown:", mouse_down_imp as *const (), "v@:@");
                         add_method(c, "mouseUp:", mouse_up_imp as *const (), "v@:@");
+                        objc_registerClassPair(c);
+                    }
+                }
+                // A dialog button's target: carries the alert and its button
+                // index, so a click reports the response id the caller used.
+                if cls("CorroMacAlertTarget").is_null() {
+                    let name = b"CorroMacAlertTarget\0";
+                    let c = objc_allocateClassPair(
+                        nsobject,
+                        name.as_ptr() as *const std::os::raw::c_char,
+                        0,
+                    );
+                    if !c.is_null() {
+                        add_method(c, "corroFired:", alert_fired_imp as *const (), "v@:@");
+                        add_class_method(
+                            c,
+                            "alertTargetWithDialog:index:",
+                            alert_target_imp as *const (),
+                            "@@:qq",
+                        );
                         objc_registerClassPair(c);
                     }
                 }
