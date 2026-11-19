@@ -4119,6 +4119,7 @@ mod macos_adapter {
                     unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect, *mut c_void),
                     (rect, context)
                 );
+                paint_scrollers(target, target, context);
                 msg0v(context_cls, "restoreGraphicsState");
             }
             // Copy the pixels out first: they are what the measurements read,
@@ -4266,6 +4267,77 @@ mod macos_adapter {
                 }
             }
             force_legacy_scrollers(view);
+        }
+    }
+
+    /// Draw every scroller over the image `target` was just rendered into.
+    ///
+    /// Current AppKit leaves the scroll view's scroller out of a render pass
+    /// (`cacheDisplayInRect:` and `displayRectIgnoringOpacity:` alike): the
+    /// list drew 28k pixels and the scroller's 17x627 gutter held none. Drawing
+    /// each scroller itself, at its own place in the target's coordinates, is
+    /// still a real `NSScroller`'s own drawing — the pixels a user sees on
+    /// screen, not a bar painted by hand.
+    unsafe fn paint_scrollers(view: *mut c_void, target: *mut c_void, context: *mut c_void) {
+        if view.is_null() || context.is_null() {
+            return;
+        }
+        // SAFETY: views from this adapter's own tree, and a live context.
+        unsafe {
+            let scroll_cls = cls("NSScrollView");
+            let is_scroll_view = !scroll_cls.is_null()
+                && raw_send!(
+                    view,
+                    "isKindOfClass:",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool,
+                    (scroll_cls)
+                );
+            if is_scroll_view && responds(view, "verticalScroller") {
+                let scroller = msg0(view, "verticalScroller");
+                if !scroller.is_null() && !msg0(scroller, "superview").is_null() {
+                    let bounds: CGRect = raw_send!(
+                        scroller,
+                        "bounds",
+                        unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
+                        ()
+                    );
+                    // Where the scroller sits in the view being drawn.
+                    let placed: CGRect = raw_send!(
+                        scroller,
+                        "convertRect:toView:",
+                        unsafe extern "C" fn(
+                            *mut c_void,
+                            *mut c_void,
+                            CGRect,
+                            *mut c_void,
+                        ) -> CGRect,
+                        (bounds, target)
+                    );
+                    let transform_cls = cls("NSAffineTransform");
+                    let transform = if transform_cls.is_null() {
+                        std::ptr::null_mut()
+                    } else {
+                        msg0(transform_cls, "transform")
+                    };
+                    if !transform.is_null() {
+                        msg2cv(transform, "translateXBy:yBy:", placed.x, placed.y);
+                        msg0v(transform, "concat");
+                    }
+                    raw_send!(
+                        scroller,
+                        "displayRectIgnoringOpacity:inContext:",
+                        unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect, *mut c_void),
+                        (bounds, context)
+                    );
+                }
+            }
+            let subviews = msg0(view, "subviews");
+            if !subviews.is_null() {
+                let count = msg0i(subviews, "count").max(0);
+                for i in 0..count {
+                    paint_scrollers(msg1i(subviews, "objectAtIndex:", i), target, context);
+                }
+            }
         }
     }
 
