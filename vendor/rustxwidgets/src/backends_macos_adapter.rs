@@ -3479,8 +3479,8 @@ mod macos_adapter {
                 ) -> *mut c_void,
                 (
                     std::ptr::null::<*mut c_void>(),
-                    px_w as isize,
-                    px_h as isize,
+                    w as isize,
+                    h as isize,
                     8isize,
                     4isize,
                     true,
@@ -3534,7 +3534,7 @@ mod macos_adapter {
             }
             let slice = std::slice::from_raw_parts(bytes, len);
             std::fs::write(path, slice).ok()?;
-            Some((px_w, px_h, len))
+            Some((w, h, len))
         }
     }
 
