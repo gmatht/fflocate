@@ -62,6 +62,20 @@ jobs:
           echo "::error title=GUI build/test failure (${RUNNER_OS})::${msg}"
           exit 1
 
+      # When the build fails, the log tail goes to the job summary as well as
+      # to annotations: a step that dies without emitting a workflow command
+      # (a killed process, say) leaves nothing else readable without a token.
+      - name: GUI build diagnostics (macOS)
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo '### gui build diagnostics'
+            echo '```'
+            tail -c 3000 gui-test.log 2>/dev/null || echo 'no gui-test.log'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # The GUI's macOS arm is AppKit, and only this runner can start it: the
       # steps above build it, this one opens a window and checks the process is
       # still alive seconds later, i.e. AppKit initialised without aborting.
