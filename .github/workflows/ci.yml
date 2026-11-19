@@ -56,6 +56,9 @@ jobs:
             exit 0
           fi
           msg=$(grep -E '^(error|failures:)|panicked at|^ *---- ' gui-test.log | head -20 | tr '\n' '|' | cut -c1-3000)
+          # The tail as well as the grepped lines: a linker error or a `cargo`
+          # failure with no `error:` line would otherwise be reported blank.
+          echo "::notice title=gui-test tail (${RUNNER_OS})::$(tail -c 1500 gui-test.log | tr -cd '[:print:]\n' | tr '\n' '|')"
           echo "::error title=GUI build/test failure (${RUNNER_OS})::${msg}"
           exit 1
 
