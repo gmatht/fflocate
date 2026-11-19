@@ -76,6 +76,16 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Readable evidence of what the GUI build step did, whatever it did:
+      # annotations from a step that produced no output of its own never
+      # appeared, so a second step reports the log file directly.
+      - name: GUI build log (macOS)
+        if: always()
+        shell: bash
+        run: |
+          echo "::notice title=build-log-info::$(ls -l gui-test.log 2>&1 | head -1) | $(cargo --version 2>&1) | $(df -h . 2>&1 | tail -1)"
+          echo "::notice title=build-log-tail::$(tail -c 2000 gui-test.log 2>/dev/null | tr -cd '[:print:]\n' | tr '\n' '|')"
+
       # The GUI's macOS arm is AppKit, and only this runner can start it: the
       # steps above build it, this one opens a window and checks the process is
       # still alive seconds later, i.e. AppKit initialised without aborting.
