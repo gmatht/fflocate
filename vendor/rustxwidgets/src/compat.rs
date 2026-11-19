@@ -420,12 +420,30 @@ fn row_index_at(y: f64, row_count: usize) -> Option<usize> {
 
 /// Put `text` on the system clipboard.
 ///
-/// Neither merged backend keeps a clipboard helper: GTK's loader has no
-/// `gtk_clipboard_*` binding and AppKit needs an `NSPasteboard` shim. Say so
-/// instead of pretending the copy happened.
+/// Each desktop backend answers with its own pasteboard; a platform with
+/// neither says so instead of pretending the copy happened.
+#[cfg(all(feature = "macos", target_os = "macos", not(feature = "zork")))]
+pub fn clipboard_set_text(text: &str) -> Result<(), Error> {
+    crate::backends_macos_adapter::clipboard_set_text(text)
+}
+
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+pub fn clipboard_set_text(_text: &str) -> Result<(), Error> {
+    // The loader has no `gtk_clipboard_*` binding yet; wiring one means adding
+    // the symbol and its wrapper to `gtk_dynamic_loader`. Until then say so
+    // rather than claim the copy happened.
+    Err(Error::Backend(
+        "clipboard is not wired up in the GTK build".to_string(),
+    ))
+}
+
+#[cfg(not(any(
+    all(feature = "macos", target_os = "macos", not(feature = "zork")),
+    all(feature = "gtk", target_os = "linux", not(feature = "zork"))
+)))]
 pub fn clipboard_set_text(_text: &str) -> Result<(), Error> {
     Err(Error::Backend(
-        "clipboard is not wired up in this build".to_string(),
+        "clipboard is not wired up on this backend".to_string(),
     ))
 }
 

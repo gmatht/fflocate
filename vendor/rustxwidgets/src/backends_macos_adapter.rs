@@ -5409,6 +5409,53 @@ mod macos_adapter {
         }
     }
 
+    /// Put `text` on the general pasteboard.
+    ///
+    /// This is what the app's Copy action needs; GTK's equivalent is
+    /// `gtk_clipboard_set_text`. Returns an error rather than a silent success
+    /// when the pasteboard refuses, so the caller can say why nothing copied.
+    pub fn clipboard_set_text(text: &str) -> Result<(), Error> {
+        // SAFETY: `NSPasteboard` is AppKit's own class, every send below is a
+        // documented selector, and the null checks cover a system without it.
+        unsafe {
+            let pasteboard_cls = cls("NSPasteboard");
+            if pasteboard_cls.is_null() {
+                return Err(Error::Backend(
+                    "no NSPasteboard on this system".to_string(),
+                ));
+            }
+            let pasteboard = msg0(pasteboard_cls, "generalPasteboard");
+            let text_obj = core_apple::nsstring(text);
+            let type_obj = core_apple::nsstring("public.utf8-plain-text");
+            if pasteboard.is_null() || text_obj.is_null() || type_obj.is_null() {
+                return Err(Error::Backend(
+                    "the pasteboard refused the text".to_string(),
+                ));
+            }
+            // Without `clearContents` a second Copy appends to the previous
+            // one instead of replacing it.
+            let _ = msg0(pasteboard, "clearContents");
+            let stored = raw_send!(
+                pasteboard,
+                "setString:forType:",
+                unsafe extern "C" fn(
+                    *mut c_void,
+                    *mut c_void,
+                    *mut c_void,
+                    *mut c_void,
+                ) -> bool,
+                (text_obj, type_obj)
+            );
+            if stored {
+                Ok(())
+            } else {
+                Err(Error::Backend(
+                    "the pasteboard did not store the text".to_string(),
+                ))
+            }
+        }
+    }
+
     pub fn create_simple_action(name: &str) -> Result<SimpleAction, Error> {
         Ok(SimpleAction {
             name: name.to_owned(),

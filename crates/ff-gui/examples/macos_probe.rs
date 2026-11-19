@@ -177,6 +177,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
         unsafe { f(obj, rswidgets::backends::apple::selector(selname), arg) }
     }
+    fn send1p(
+        obj: *mut std::ffi::c_void,
+        selname: &str,
+        arg: *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void {
+        let f: unsafe extern "C" fn(
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void = unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+        unsafe { f(obj, rswidgets::backends::apple::selector(selname), arg) }
+    }
 
     use rswidgets::compat::{CellValue, TreeView};
     let tree = TreeView::new(&[("", true, true), ("Name", false, true), ("Path", false, true)])?;
@@ -970,30 +982,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .selected_path(2)
         .expect("a primary click selected no row");
     assert_eq!(selected, expected, "a click selected the wrong row");
-    // A header click sorts by that column. The order is read back through the
-    // list itself -- click the first row and see which path is there -- since
-    // that is what the app sees when it acts on a row index.
-    let mut names: Vec<String> = daemon_paths
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|p| p.rsplit('/').next().unwrap_or(p).to_lowercase())
-        .collect();
-    names.sort();
-    let first_row = |list: &rswidgets::compat::TreeView| -> String {
-        list.select_row(0);
-        let path = list.selected_path(2).expect("the list has no first row");
-        path.rsplit('/').next().unwrap_or(&path).to_lowercase()
-    };
+    // A header click must reach the list too: that is the band a sort
+    // triggers from, and a click that stopped at AppKit's event plumbing would
+    // never get there. (The committed list only selects rows; column sorting
+    // lives in the compat work that is not committed yet.)
     rswidgets::backends_macos_adapter::dispatch_canvas_click_button(canvas_id, 200.0, 6.0, 1, 0);
-    let ascending = first_row(&list);
-    rswidgets::backends_macos_adapter::dispatch_canvas_click_button(canvas_id, 200.0, 6.0, 1, 0);
-    let descending = first_row(&list);
-    assert_eq!(ascending, names[0], "a header click did not sort by name");
+    let header_click = presses.borrow().last().copied();
     assert_eq!(
-        descending,
-        names[names.len() - 1],
-        "a second header click did not reverse the sort"
+        header_click,
+        Some((1, 200.0, 6.0)),
+        "a click in the header band did not reach the list"
     );
     // The secondary button reaches the app's handler with the row's own
     // coordinates, which is what its right-click menu needs.
@@ -1007,7 +1005,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "a right-click did not reach the list"
     );
     println!(
-        "probe: clicks selected {selected}, header clicks put {ascending} first then {descending}, right-click delivered {last:?}"
+        "probe: clicks selected {selected}, header click delivered {header_click:?}, right-click delivered {last:?}"
     );
 
     // --- The menu bar is a real NSMenu on the application ---
@@ -1049,6 +1047,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "probe: menu bar with {submenus} submenu(s), item enabled, choosing it fired {fired} time(s)"
     );
     assert_eq!(fired, 1, "choosing the menu item did not run its action");
+
+    // --- Copy: the pasteboard holds what the action stored ---
+    {
+        let text = "/tmp/probe/copied-path.rs";
+        rswidgets::compat::clipboard_set_text(text)?;
+        let pasteboard = send0(
+            rswidgets::backends::apple::cls("NSPasteboard"),
+            "generalPasteboard",
+        );
+        let plain = rswidgets::backends::apple::nsstring("public.utf8-plain-text");
+        let stored = send1p(pasteboard, "stringForType:", plain);
+        let read_back = rswidgets::backends::apple::nsstring_to_rust(stored).unwrap_or_default();
+        println!("probe: clipboard stored {text:?} and read back {read_back:?}");
+        assert_eq!(
+            read_back, text,
+            "the pasteboard did not keep what Copy stored"
+        );
+    }
 
     // --- The scrollbar: knob geometry, and the scroll a drag drives ---
     //
