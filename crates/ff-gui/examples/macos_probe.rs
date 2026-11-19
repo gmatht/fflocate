@@ -279,6 +279,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "no dark text or icon pixels in the populated list render"
     );
 
+    // The left column draws a picture now, not one letter per file kind: the
+    // fixture's icons are all plain documents, painted as a grey page
+    // (0.45, 0.47, 0.52). Letters would leave only dark ink there.
+    let mut icon_px = 0usize;
+    for (i, p) in scrolled_px.chunks_exact(4).enumerate() {
+        let x = (i as u32 % sw_px_w) as f64;
+        if x > 40.0 {
+            continue; // somewhere right of the icon column
+        }
+        let near = |v: u8, want: f64| (f64::from(v) - want * 255.0).abs() < 30.0;
+        if near(p[0], 0.45) && near(p[1], 0.47) && near(p[2], 0.52) {
+            icon_px += 1;
+        }
+    }
+    println!("probe: {icon_px} px of icon colour in the left column");
+    assert!(
+        icon_px >= 40,
+        "the icon column drew no pictogram ({icon_px} px of icon colour)"
+    );
+
     // --- A box's children span its width, the way GTK's box stretches them ---
     //
     // `NSStackView` only aligns arranged subviews, so they kept their intrinsic
