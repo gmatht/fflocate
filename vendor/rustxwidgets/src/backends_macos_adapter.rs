@@ -3867,41 +3867,50 @@ mod macos_adapter {
                         unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
                         ()
                     );
-                    // `setContentSize:` instead of a raw frame: the window then
-                    // keeps its title bar and, crucially, resizes the content
-                    // view with it. A `setFrame:display:` here grew the window's
-                    // frame view while the content view stayed 32pt tall, so the
-                    // capture showed a title bar over an empty window.
-                    let wanted = CGRect {
-                        x: 0.0,
-                        y: 0.0,
-                        width: want_w,
-                        height: want_h,
-                    };
-                    let content: CGRect = raw_send!(
-                        window,
-                        "contentRectForFrameRect:",
-                        unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect) -> CGRect,
-                        (wanted)
-                    );
-                    raw_send!(
-                        window,
-                        "setContentSize:",
-                        unsafe extern "C" fn(*mut c_void, *mut c_void, f64, f64),
-                        (content.width, content.height)
-                    );
-                    raw_send!(
-                        window,
-                        "setFrameOrigin:",
-                        unsafe extern "C" fn(*mut c_void, *mut c_void, f64, f64),
-                        (origin.x, origin.y)
-                    );
-                    raw_send!(
-                        window,
-                        "display",
-                        unsafe extern "C" fn(*mut c_void, *mut c_void),
+                    // The chrome (title bar plus border) is the difference
+                    // between the window's own view and its content view. Both
+                    // are `bounds` returns, with no struct passed in: AppKit's
+                    // `contentRectForFrameRect:` has been unreliable on the
+                    // window subclass, reporting an 858-tall frame as 34 points
+                    // of content, so the capture does the arithmetic itself.
+                    let frame_bounds: CGRect = raw_send!(
+                        theme,
+                        "bounds",
+                        unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
                         ()
                     );
+                    let content_bounds: CGRect = raw_send!(
+                        view,
+                        "bounds",
+                        unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
+                        ()
+                    );
+                    let chrome_h = (frame_bounds.height - content_bounds.height).max(0.0);
+                    raw_send!(
+                        window,
+                        "setFrame:display:",
+                        unsafe extern "C" fn(
+                            *mut c_void,
+                            *mut c_void,
+                            f64,
+                            f64,
+                            f64,
+                            f64,
+                            bool,
+                        ),
+                        (origin.x, origin.y, want_w, want_h, false)
+                    );
+                    // Explicit, because AppKit left the content view at its old
+                    // height when the frame grew.
+                    msg4cv(
+                        view,
+                        "setFrame:",
+                        0.0,
+                        0.0,
+                        want_w,
+                        (want_h - chrome_h).max(1.0),
+                    );
+                    msg0v(view, "layoutSubtreeIfNeeded");
                     step("2c refit");
                     refit_content_children(view);
                     msg0v(view, "layoutSubtreeIfNeeded");
