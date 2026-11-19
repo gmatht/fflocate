@@ -459,8 +459,7 @@ These are deliberate and small; each is noted so the design stays honest.
    `ff-gui` builds for Linux (GTK) and macOS (AppKit) from one source. The cost
    is fidelity, recorded in `crates/ff-gui/README.md`: the results list draws a
    glyph per file kind instead of a themed icon and its headers do not sort,
-   the row context menu cannot be popped up (the status line says so) and
-   drag-and-drop is unavailable. The daemon and CLI are unaffected.
+   and drag-and-drop is unavailable. The daemon and CLI are unaffected.
 
    On macOS the window is real, and so is what those shim classes provide.
    `ff-gui` creates its own `NSApplication` and `NSWindow`, builds the whole
@@ -496,8 +495,10 @@ These are deliberate and small; each is noted so the design stays honest.
    runtime implementation, so `add_button` is a logged skip and a dialog would
    open with no buttons; `corroPresentDialog:` is a skip too, so `present` only
    falls back to `runModal` when no view controller is registered), the canvas'
-   **keyboard** events (`keyDown:` is not wired), **drag-and-drop** and the row
-   **context menu**. A selector with no implementation is still checked with
+   **keyboard** events (`keyDown:` is not wired) and **drag-and-drop**. The row
+   context menu is *not* in this list: it is a real `NSMenu` now, with the four
+   row actions dispatching into the same registry the menu bar uses. A selector
+   with no implementation is still checked with
    `-respondsToSelector:` and reported once, because an unchecked AppKit send
    raises an Objective-C exception that unwinds into Rust and aborts with no
    backtrace — which is why `$FF_GUI_TRACE=1` names every construction step on

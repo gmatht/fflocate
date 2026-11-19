@@ -279,14 +279,15 @@ depend on a checkout outside this repository.
   and *Count only* (`count`) which returns just the total — shown as
   `N matches (count only)` rather than an empty list that would read as "no
   matches". Ticking them changes what is searched; they are not decoration.
-* **Right-clicking a result reports that the popup menu is unavailable** in
-  this build (see *One widget set for both platforms* above): the row under the
-  cursor is found by the canvas hit-test and selected, then the status line
-  carries the reason. The same row actions (*Copy full path*, *Copy folder
-  path*, *Open*, *Open with…*, *Open containing folder*, *Open in terminal*)
-  are reachable from the **Search** menu and act on the selected row. Copy
-  reports the toolkit's clipboard answer — the merged toolkit carries no
-  clipboard helper, so it says so instead of pretending the copy happened.
+* **Right-clicking a result opens its row menu.** The row under the cursor is
+  selected by the canvas hit-test, then a real menu (`GtkMenu` on GTK, `NSMenu`
+  on AppKit) offers *Open*, *Open containing folder*, *Copy full path* and
+  *Open in terminal*. Each entry dispatches the same handler the **Search**
+  menu uses, for the selected row, and *Copy full path* puts the row's absolute
+  path on the system clipboard (`gtk_clipboard_set_text` / `NSPasteboard`),
+  from where it can be read back. Both paths are asserted rather than assumed:
+  `tests/row_menu_gtk.rs` builds and fires the menu offscreen and under Xvfb,
+  and the macOS probe drives the AppKit menu and the pasteboard.
 * **Drag-and-drop is unavailable** in this build, and the status line says so
   instead of starting a drag that carries nothing.
 * Results come from the daemon's `query` op; the consistency metadata
