@@ -154,69 +154,14 @@ mod macos_adapter {
     /// The margin GTK's window leaves around its content, in points.
     const WINDOW_MARGIN: f64 = 5.0;
 
-    /// Pin `child` to both of `stack`'s cross-axis edges.
-    ///
-    /// GTK's box stretches a child across the axis it does not lay out along;
-    /// `NSStackView` only *aligns* it, so children kept their intrinsic widths
-    /// and the UI sat in a narrow central column. Two equality constraints
-    /// reproduce the fill — leading/trailing in a vertical stack, top/bottom in
-    /// a horizontal one (`NSLayoutAttribute` top 3, bottom 4, leading 5,
-    /// trailing 6) — and stay consistent with the stack view's centre alignment.
-    unsafe fn pin_across(stack: *mut c_void, child: *mut c_void) {
-        let constraint_cls = cls("NSLayoutConstraint");
-        if constraint_cls.is_null() || stack.is_null() || child.is_null() {
-            return;
-        }
-        // SAFETY: a live NSStackView; `orientation` returns an NSInteger.
-        unsafe {
-            let vertical = raw_send!(
-                stack,
-                "orientation",
-                unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize,
-                ()
-            ) == 1;
-            let (first, second) = if vertical {
-                (5isize, 6isize)
-            } else {
-                (3isize, 4isize)
-            };
-            // Auto Layout owns this child's frame from here on, so its
-            // autoresizing mask must not translate the frame into constraints
-            // as well.
-            msg1bv(child, "setTranslatesAutoresizingMaskIntoConstraints:", false);
-            for attr in [first, second] {
-                let constraint: *mut c_void = raw_send!(
-                    constraint_cls,
-                    "constraintWithItem:attribute:relatedBy:toItem:attribute:multiplier:constant:",
-                    unsafe extern "C" fn(
-                        *mut c_void,
-                        *mut c_void,
-                        *mut c_void,
-                        isize,
-                        isize,
-                        *mut c_void,
-                        isize,
-                        f64,
-                        f64,
-                    ) -> *mut c_void,
-                    (child, attr, 0isize, stack, attr, 1.0f64, 0.0f64)
-                );
-                if !constraint.is_null() {
-                    msg1v(stack, "addConstraint:", constraint);
-                }
-            }
-        }
-    }
-
     /// Size `child` to `content`'s bounds, inset by [`WINDOW_MARGIN`].
     ///
     /// AppKit does not lay a plain subview out by itself: a view added to the
     /// content view keeps its zeroed `NSRect`, so the root box stayed 0x0 and
     /// the window rendered blank. GTK's `set_child` sizes the child to the
     /// window for free, so this is the macOS equivalent, shared by `set_child`
-    /// and by the capture path (which resizes the window and must re-fit the
-    /// child, because a box re-fits itself to its contents on the next layout
-    /// pass and leaves the list below it without any height).
+    /// and by the capture path, which resizes the window and re-fits what it
+    /// already holds.
     unsafe fn fit_content_child(content: *mut c_void, child: *mut c_void) {
         if content.is_null() || child.is_null() {
             return;
@@ -843,14 +788,10 @@ mod macos_adapter {
             // cross-axis edges is the "fill" the alignment attribute cannot
             // express, and it stays consistent with the stack view's own centre
             // alignment (centre + both edges is not over-constrained).
-            let stack_appkit = responds(self.0, "setDistribution:");
             unsafe {
                 // `addArrangedSubview:` exists on NSStackView; on the manual
                 // shim the same selector is implemented by the host view.
                 msg1v(self.0, "addArrangedSubview:", child_ptr);
-                if stack_appkit {
-                    pin_across(self.0, child_ptr);
-                }
                 if expands || is_canvas {
                     // Weight 1 equivalent: let this child take the leftover
                     // space. On a stack view that is a low content-hugging
@@ -4632,7 +4573,20 @@ mod macos_adapter {
             // centred entry and button above a mostly empty window. `Fill` (1)
             // is the behaviour GTK's box has, and it is what lets a child with
             // `corroSetFlex:` take the spare space.
-            unsafe { msg1iv(bx, "setDistribution:", 1) };
+            unsafe { msg1iv(bx, "setDistribution:", 1) }
+            // Cross-axis fill, the way GTK's box stretches its children: a
+            // vertical stack at `NSLayoutAttributeWidth` (7) makes every
+            // arranged view as wide as the stack, a horizontal one at
+            // `NSLayoutAttributeHeight` (8) as tall.
+            //
+            // This used to be two edge constraints per child. Installing
+            // constraints anywhere under the content view brings the window's
+            // subtree under Auto Layout, and the content view then sized itself
+            // to fit its subviews: a 1350x858 window kept a 1350x32 content
+            // view, so every row below the first was squeezed out of the
+            // window. Alignment keeps the layout frame-based, as GTK's is.
+            let fill = if orientation.as_int() == 1 { 7 } else { 8 };
+            unsafe { msg1iv(bx, "setAlignment:", fill) };
         } else {
             shim_i(bx, "corroSetSpacing:", spacing as isize);
         }
