@@ -4087,12 +4087,40 @@ mod macos_adapter {
                 height: h as f64,
             };
             step("5 display");
-            raw_send!(
-                target,
-                "cacheDisplayInRect:toBitmapImageRep:",
-                unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect, *mut c_void),
-                (rect, rep)
-            );
+            // Drawing through a graphics context, not `cacheDisplayInRect:`:
+            // the latter left the scroll view's legacy scroller out of the image
+            // entirely (a 17x627 frame, not one pixel), because a view that
+            // draws through a layer is not part of that path.
+            let context_cls = cls("NSGraphicsContext");
+            let mut context = std::ptr::null_mut();
+            if !context_cls.is_null() && responds(context_cls, "graphicsContextWithBitmapImageRep:") {
+                context = raw_send!(
+                    context_cls,
+                    "graphicsContextWithBitmapImageRep:",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void,
+                    (rep)
+                );
+            }
+            if context.is_null() || !responds(target, "displayRectIgnoringOpacity:inContext:") {
+                raw_send!(
+                    target,
+                    "cacheDisplayInRect:toBitmapImageRep:",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect, *mut c_void),
+                    (rect, rep)
+                );
+            } else {
+                msg0v(context_cls, "saveGraphicsState");
+                if responds(context_cls, "setCurrentContext:") {
+                    msg1v(context_cls, "setCurrentContext:", context);
+                }
+                raw_send!(
+                    target,
+                    "displayRectIgnoringOpacity:inContext:",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect, *mut c_void),
+                    (rect, context)
+                );
+                msg0v(context_cls, "restoreGraphicsState");
+            }
             // Copy the pixels out first: they are what the measurements read,
             // and the rep's buffer goes away with the object.
             let mut rgba = vec![0u8; w as usize * h as usize * 4];
