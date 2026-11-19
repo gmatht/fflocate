@@ -172,6 +172,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
         unsafe { f(obj, rswidgets::backends::apple::selector(selname), arg) }
     }
+    fn send1iv(obj: *mut std::ffi::c_void, selname: &str, arg: isize) {
+        let f: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, isize) =
+            unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+        unsafe { f(obj, rswidgets::backends::apple::selector(selname), arg) }
+    }
 
     use rswidgets::compat::{CellValue, TreeView};
     let tree = TreeView::new(&[("", true, true), ("Name", false, true), ("Path", false, true)])?;
@@ -718,19 +723,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 exe.display()
             )
         })?;
-    let mut daemon = std::process::Command::new(&daemon_bin)
-        .arg("--foreground")
-        .arg("--backend")
-        .arg("fake")
-        .arg("--root")
-        .arg(&root)
-        .arg("--state-dir")
-        .arg(fixture.path().join("state"))
-        .arg("--socket")
-        .arg(&socket)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
+    // The daemon is killed when this guard drops, so a failed assertion below
+    // cannot leave one running (and holding the socket) for the rest of the
+    // job. `stop` is what the probe calls when everything passed.
+    struct DaemonGuard(Option<std::process::Child>);
+    impl DaemonGuard {
+        fn stop(&mut self) -> (bool, bool) {
+            match self.0.take() {
+                None => (false, false),
+                Some(mut child) => {
+                    let killed = child.kill().is_ok();
+                    let reaped = child.wait().is_ok();
+                    (killed, reaped)
+                }
+            }
+        }
+    }
+    impl Drop for DaemonGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let mut daemon = DaemonGuard(Some(
+        std::process::Command::new(&daemon_bin)
+            .arg("--foreground")
+            .arg("--backend")
+            .arg("fake")
+            .arg("--root")
+            .arg(&root)
+            .arg("--state-dir")
+            .arg(fixture.path().join("state"))
+            .arg("--socket")
+            .arg(&socket)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?,
+    ));
     // The GUI's own client, so this exercises the request it really sends
     // (protocol version stamped, advanced options applied) rather than a
     // hand-written JSON line that could drift from it.
@@ -756,19 +788,275 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     let elapsed = attempt.elapsed().as_millis();
-    // Stopped and reaped first: a failing assertion must not leave a daemon
-    // holding the socket for the rest of the job.
-    let killed = daemon.kill().is_ok();
-    let reaped = daemon.wait().is_ok();
     println!(
-        "probe: daemon {} spawned on a temp root, answered {hits} hits for \"probe\" \
-         in {elapsed}ms on attempt {attempts}, killed {killed} and reaped {reaped}",
+        "probe: daemon {} spawned on a temp root, answered {hits} hits for \"probe\" in {elapsed}ms on attempt {attempts}",
         daemon_bin.display()
     );
     assert_eq!(
         hits, 3,
         "the daemon answered {hits} of the 3 fixture files (last error {last_error:?})"
     );
+
+    // --- Typing: change -> request -> rows ---
+    //
+    // `controlTextDidChange:` reaches `dispatch_text_changed`, which is exactly
+    // what a keystroke produces (`setText:` deliberately suppresses the
+    // signal, so it is raised here on purpose). The callback is the app's own
+    // step: ask the daemon and put the answer into the list.
+    let cells_of = |paths: &[String]| -> Vec<Vec<rswidgets::compat::CellValue>> {
+        paths
+            .iter()
+            .map(|p| {
+                let name = p.rsplit('/').next().unwrap_or(p).to_string();
+                vec![
+                    rswidgets::compat::CellValue::Icon {
+                        name: "text-x-generic".to_string(),
+                        fallback: "R".to_string(),
+                    },
+                    rswidgets::compat::CellValue::Text(name),
+                    rswidgets::compat::CellValue::Text(p.clone()),
+                ]
+            })
+            .collect()
+    };
+    let list = app.create_treeview(&[
+        ("", true, false),
+        ("Name", false, true),
+        ("Path", false, true),
+    ])?;
+    let typed = Arc::new(AtomicUsize::new(0));
+    let typed_rows = Arc::new(AtomicUsize::new(0));
+    let query_entry = app.create_entry()?;
+    {
+        let typed = typed.clone();
+        let typed_rows = typed_rows.clone();
+        let list = list.clone();
+        let socket = socket.clone();
+        query_entry.connect_changed(move || {
+            typed.fetch_add(1, Ordering::SeqCst);
+            let client = ff_gui::DaemonClient::with_socket(socket.clone());
+            if let Ok(outcome) = client.search("probe", 10) {
+                let rows = cells_of(&outcome.paths);
+                typed_rows.store(rows.len(), Ordering::SeqCst);
+                list.set_rows(&rows);
+            }
+        })?;
+    }
+    query_entry.set_text("probe");
+    rswidgets::backends_macos_adapter::dispatch_text_changed(query_entry.raw_handle());
+    let changes = typed.load(Ordering::SeqCst);
+    let rows_after_typing = typed_rows.load(Ordering::SeqCst);
+    println!(
+        "probe: typing produced {changes} change(s) and {rows_after_typing} row(s) through the client"
+    );
+    assert_eq!(changes, 1, "a text change did not reach connect_changed");
+    assert_eq!(
+        rows_after_typing, 3,
+        "the typing path drew {rows_after_typing} rows, not the daemon's 3"
+    );
+
+    // --- The list's own click handling ---
+    //
+    // compat hit-tests the canvas itself, but only if AppKit's mouse plumbing
+    // reaches it: the id below is the one the sheet view sends with every
+    // click, so a mismatched id here is a click that goes nowhere.
+    let canvas_id = rswidgets::backends_macos_adapter::Canvas(list.raw_handle()).canvas_id();
+    assert_ne!(
+        canvas_id, 0,
+        "the list's canvas has no id, so no click can reach it"
+    );
+    let presses: std::rc::Rc<std::cell::RefCell<Vec<(u32, f64, f64)>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    {
+        let presses = presses.clone();
+        list.connect_button_press_event(move |button, x, y, _event| {
+            presses.borrow_mut().push((button, x, y));
+        })?;
+    }
+    // The second row: 22pt of header, then 20pt rows.
+    let row_click_y = 22.0 + 20.0 + 10.0;
+    let row = list
+        .row_at(60.0, row_click_y)
+        .expect("a click inside the rows must land on one");
+    rswidgets::backends_macos_adapter::dispatch_canvas_click_button(
+        canvas_id, 60.0, row_click_y, 1, 0,
+    );
+    let selected = list
+        .selected_path(2)
+        .expect("a primary click selected no row");
+    assert_eq!(
+        selected,
+        list.displayed_column(2)[row],
+        "a click selected the wrong row"
+    );
+    // A header click sorts by that column, and clicking it again reverses it.
+    let before = list.displayed_column(1);
+    rswidgets::backends_macos_adapter::dispatch_canvas_click_button(canvas_id, 200.0, 6.0, 1, 0);
+    let ascending = list.displayed_column(1);
+    rswidgets::backends_macos_adapter::dispatch_canvas_click_button(canvas_id, 200.0, 6.0, 1, 0);
+    let descending = list.displayed_column(1);
+    let mut expect = before.clone();
+    expect.sort_by_key(|n| n.to_lowercase());
+    assert_eq!(ascending, expect, "a header click did not sort by name");
+    expect.reverse();
+    assert_eq!(
+        descending, expect,
+        "a second header click did not reverse the sort"
+    );
+    // The secondary button reaches the app's handler with the row's own
+    // coordinates, which is what its right-click menu needs.
+    rswidgets::backends_macos_adapter::dispatch_canvas_click_button(
+        canvas_id, 60.0, row_click_y, 3, 0,
+    );
+    let last = presses.borrow().last().copied();
+    assert_eq!(
+        last,
+        Some((3, 60.0, row_click_y)),
+        "a right-click did not reach the list"
+    );
+    println!(
+        "probe: clicks selected {selected}, header clicks sorted {:?} then reversed it, right-click delivered {last:?}",
+        ascending
+    );
+
+    // --- The menu bar is a real NSMenu on the application ---
+    let menu_fired = Arc::new(AtomicUsize::new(0));
+    let mut model = app.new_menu()?;
+    let mut menu = app.new_menu()?;
+    let action = app.new_simple_action("probe_menu_item")?;
+    {
+        let menu_fired = menu_fired.clone();
+        action.connect_activate(move |_| {
+            menu_fired.fetch_add(1, Ordering::SeqCst);
+        })?;
+    }
+    menu.append("Probe Item", "app.probe_menu_item");
+    model.append_submenu("Probe", &menu);
+    let _bar = app.new_menubar(&model, std::ptr::null_mut())?;
+    let nsapp = send0(
+        rswidgets::backends::apple::cls("NSApplication"),
+        "sharedApplication",
+    );
+    let main_menu = send0(nsapp, "mainMenu");
+    assert!(
+        !main_menu.is_null(),
+        "the menu bar was not installed as the application's main menu"
+    );
+    let submenus = send0i(main_menu, "numberOfItems");
+    assert!(submenus >= 1, "the main menu has no submenus");
+    let holder = send1i(main_menu, "itemAtIndex:", 0);
+    let installed = send0(holder, "submenu");
+    assert!(!installed.is_null(), "the first submenu is empty");
+    let items = send0i(installed, "numberOfItems");
+    assert_eq!(items, 1, "the submenu holds {items} items, not 1");
+    let item = send1i(installed, "itemAtIndex:", 0);
+    assert!(send_bool(item, "isEnabled"), "the menu item is disabled");
+    // The same path AppKit takes when the user picks the item.
+    send1iv(installed, "performActionForItemAtIndex:", 0);
+    let fired = menu_fired.load(Ordering::SeqCst);
+    println!(
+        "probe: menu bar with {submenus} submenu(s), item enabled, choosing it fired {fired} time(s)"
+    );
+    assert_eq!(fired, 1, "choosing the menu item did not run its action");
+
+    // --- Pixels from the daemon's answer ---
+    //
+    // Rows the daemon actually returned, painted by the real list and read back
+    // out of the capture: the search path, end to end, in pixels.
+    let holder_box = app.create_box(Orientation::Vertical, 2)?;
+    {
+        let painted = list.clone().into_scrolled()?;
+        holder_box.append(&painted);
+        win.set_child(&holder_box);
+        let window_view = win.raw_handle();
+        send0v(window_view, "layoutSubtreeIfNeeded");
+        let shot_rows = rswidgets::backends_macos_adapter::capture(window_view, Some((1350.0, 858.0)))
+            .ok_or("the window produced no capture after the rows were set")?;
+        let f = send_rect(list.raw_handle(), "frame");
+        let mut x = f.x;
+        let mut y = f.y;
+        let mut v = send0(list.raw_handle(), "superview");
+        while !v.is_null() && v != window_view {
+            let parent = send_rect(v, "frame");
+            x += parent.x;
+            y += parent.y;
+            v = send0(v, "superview");
+        }
+        let content_h2 = send_rect(window_view, "bounds").h;
+        let band2 = shot_rows.height as f64 - content_h2;
+        let x0 = x.max(0.0) as usize;
+        let x1 = ((x + f.w).max(0.0) as usize).min(shot_rows.width as usize);
+        let y0 = ((band2 + content_h2 - (y + f.h)).max(0.0) as usize).min(shot_rows.height as usize);
+        let y1 = (y0 + f.h.max(0.0) as usize).min(shot_rows.height as usize);
+        let mut ink = 0usize;
+        for row in y0..y1 {
+            for col in x0..x1 {
+                let i = (row * shot_rows.width as usize + col) * 4;
+                if shot_rows.rgba[i] < 200 || shot_rows.rgba[i + 1] < 200 || shot_rows.rgba[i + 2] < 200 {
+                    ink += 1;
+                }
+            }
+        }
+        println!(
+            "probe: the daemon's {rows_after_typing} row(s) painted {ink} px of ink in the list"
+        );
+        assert!(
+            ink > 500,
+            "the daemon's rows painted only {ink} px, so nothing reached the screen"
+        );
+    }
+
+    // --- The scrollbar: knob geometry, and the scroll a drag drives ---
+    //
+    // Dragging the knob is AppKit's own tracking loop on a real NSScroller, so
+    // what is checked here is that the scroller is live (target/action wired to
+    // the scroll view) and that the scroll it drives moves the clip view and
+    // the knob together.
+    {
+        let scroller = send0(sv, "verticalScroller");
+        assert!(!scroller.is_null(), "the scroll view has no vertical scroller");
+        let target = send0(scroller, "target");
+        let action_sel = send0(scroller, "action");
+        assert!(
+            !target.is_null() && !action_sel.is_null(),
+            "the scroller has no target/action, so a drag could not scroll anything"
+        );
+        let knob_before = send0d(scroller, "doubleValue");
+        rswidgets::backends_macos_adapter::ScrolledWindow(sv).scroll_to(
+            0.0, 0.0, 0.0, 300.0, 826.0, 630.0,
+        );
+        let scrolled_to = send_rect(send0(sv, "contentView"), "bounds").y;
+        let knob_after = send0d(scroller, "doubleValue");
+        println!(
+            "probe: scroller wired to its scroll view, scroll moved the clip to {scrolled_to}pt (knob {knob_before:.3} -> {knob_after:.3})"
+        );
+        assert!(
+            (scrolled_to - 300.0).abs() < 2.0,
+            "the clip view moved to {scrolled_to}pt, not 300"
+        );
+        assert!(
+            knob_after > knob_before,
+            "the knob did not follow: {knob_before:.3} -> {knob_after:.3}"
+        );
+    }
+
+    // --- Resizing reflows the content ---
+    {
+        let window_view = win.raw_handle();
+        let before_w = send_rect(holder_box.raw_handle(), "frame").w;
+        win.resize(1200, 700);
+        send0v(window_view, "layoutSubtreeIfNeeded");
+        let after_w = send_rect(holder_box.raw_handle(), "frame").w;
+        println!("probe: 1200x700 resize took the content box from {before_w}pt to {after_w}pt");
+        assert!(
+            after_w < before_w - 50.0,
+            "resizing did not reflow the content box ({before_w}pt -> {after_w}pt)"
+        );
+    }
+
+    let (killed, reaped) = daemon.stop();
+    println!("probe: daemon stopped, killed {killed} and reaped {reaped}");
+    assert!(killed && reaped, "the daemon did not stop cleanly");
 
     println!("probe: ok");
     Ok(())
