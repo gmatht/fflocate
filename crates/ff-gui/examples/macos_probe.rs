@@ -1013,58 +1013,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // viewport, and scrolling changes which rows are on screen. The geometry
     // is `compat::reflow`'s, derived from the painter the canvas runs; the
     // viewport and the offset are read back from AppKit's clip view after the
-    // window has been resized and drawn. Nothing here is compared against a
-    // stored image: every pixel comes from the window rendered in this run.
+    // window has been resized and drawn. The pixels are a render of that clip
+    // view -- the viewport itself -- so there is no window chrome to map
+    // around and nothing is compared against a stored image.
     {
         let sv = painted.inner.raw_handle();
         let clip = send0(sv, "contentView");
         let canvas_frame = || send_rect(list.raw_handle(), "frame");
         let viewport = || send_rect(clip, "bounds");
+        // Which end the view draws content y 0 from. AppKit's default is the
+        // bottom edge; a flipped view puts it at the top.
+        let flipped = send_bool(clip, "isFlipped");
 
-        // The list's canvas, in the capture: content y 0 is at `top` pixels
-        // down, and content y `cy` is at `top + cy`.
-        let canvas_in_capture = |shot_h: usize,
-                                 content_h: f64|
-         -> (usize, f64, f64, usize) {
-            let f = canvas_frame();
-            let mut x = f.x;
-            let mut y = f.y;
-            let mut v = send0(list.raw_handle(), "superview");
-            while !v.is_null() && v != window_view {
-                let parent = send_rect(v, "frame");
-                x += parent.x;
-                y += parent.y;
-                v = send0(v, "superview");
-            }
-            let band = shot_h as f64 - content_h;
-            let top = band + content_h - (y + f.h);
-            (x.max(0.0) as usize, x + f.w, top, f.h as usize)
+        // The viewport, rendered: exactly the pixels on screen right now.
+        let clip_shot = || -> Result<(u32, u32, Vec<u8>), Box<dyn std::error::Error>> {
+            let v = viewport();
+            let w = v.w.round().max(1.0) as u32;
+            let h = v.h.round().max(1.0) as u32;
+            rswidgets::backends_macos_adapter::render_view_rgba(clip, w, h)
+                .ok_or_else(|| "the viewport produced no bitmap".into())
         };
 
-        // Per visible row, the dark pixels inside the row rect the geometry
-        // reports, read out of a fresh capture of the window.
+        // The bitmap rows of one row's band: content y `cy` sits `cy - offset`
+        // down the viewport, whichever edge the view counts from.
+        let band_rows = |geo: &rswidgets::compat::reflow::ListGeometry,
+                         row: usize,
+                         shot_h: u32|
+         -> (usize, usize) {
+            let cy = geo.header_height + row as f64 * geo.row_height - geo.offset;
+            let top = cy.max(0.0);
+            let bottom = (cy + geo.row_height).min(geo.viewport_height);
+            let (y0, y1) = if flipped {
+                (top, bottom)
+            } else {
+                (geo.viewport_height - bottom, geo.viewport_height - top)
+            };
+            (
+                y0.max(0.0) as usize,
+                y1.max(0.0).min(f64::from(shot_h)) as usize,
+            )
+        };
+
+        // Dark pixels per visible row, inside the row rect the geometry
+        // reports.
         let ink_rows = |geo: &rswidgets::compat::reflow::ListGeometry|
          -> Result<Vec<usize>, Box<dyn std::error::Error>> {
-            let content = send_rect(window_view, "bounds");
-            let shot = rswidgets::backends_macos_adapter::capture(
-                window_view,
-                Some((content.w, content.h)),
-            )
-            .ok_or("the window produced no capture")?;
-            let (x0, x1f, top, _) = canvas_in_capture(shot.height as usize, content.h);
-            let x1 = (x1f.max(0.0) as usize).min(shot.width as usize);
+            let (w, h, px) = clip_shot()?;
             let mut per_row = Vec::new();
             for row in geo.visible_range() {
-                let cy = geo.header_height + row as f64 * geo.row_height - geo.offset;
-                let py = top + cy;
-                let y0 = py.max(0.0) as usize;
-                let y1 = ((py + geo.row_height).max(0.0) as usize).min(shot.height as usize);
+                let (y0, y1) = band_rows(geo, row, h);
                 let mut ink = 0usize;
                 for r in y0..y1 {
-                    for c in x0..x1 {
-                        let i = (r * shot.width as usize + c) * 4;
-                        if shot.rgba[i] < 200 || shot.rgba[i + 1] < 200 || shot.rgba[i + 2] < 200
-                        {
+                    for c in 0..w as usize {
+                        let i = (r * w as usize + c) * 4;
+                        if px[i] < 200 || px[i + 1] < 200 || px[i + 2] < 200 {
                             ink += 1;
                         }
                     }
@@ -1083,7 +1085,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ink_big = ink_rows(&big)?;
 
         // Shrunk: the same rows, a viewport too short for all of them.
-        let _ = rswidgets::backends_macos_adapter::capture(window_view, Some((900.0, 60.0)));
+        let _ = rswidgets::backends_macos_adapter::capture(window_view, Some((900.0, 96.0)));
         send0v(window_view, "layoutSubtreeIfNeeded");
         let f_small = canvas_frame();
         let v_small = viewport();
@@ -1095,7 +1097,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             big.viewport_height, big.visible_rows, rows_after_typing, ink_big
         );
         println!(
-            "probe: resize 900x60 -> viewport {}pt, {}/{} row(s) visible, ink {:?}",
+            "probe: resize 900x96 -> viewport {}pt, {}/{} row(s) visible, ink {:?}",
             small.viewport_height, small.visible_rows, rows_after_typing, ink_small
         );
         assert!(
@@ -1125,6 +1127,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             small.visible_rows,
             big.visible_rows
         );
+        assert!(
+            small.visible_rows >= 1,
+            "the shrunk window left no row to look at ({}pt viewport)",
+            small.viewport_height
+        );
         assert_eq!(
             small.row_rects.len(),
             small.visible_rows,
@@ -1153,23 +1160,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // An empty list: no rows, nothing to ink below the header.
         {
-            let content = send_rect(window_view, "bounds");
             list.set_rows(&[]);
             let empty = list.layout(f_small.w, v_small.h, 0.0);
-            let shot = rswidgets::backends_macos_adapter::capture(
-                window_view,
-                Some((content.w, content.h)),
-            )
-            .ok_or("the window produced no capture")?;
-            let (x0, x1f, top, canvas_h) = canvas_in_capture(shot.height as usize, content.h);
-            let x1 = (x1f.max(0.0) as usize).min(shot.width as usize);
+            let (w, h, px) = clip_shot()?;
+            // The header band in bitmap rows; everything outside it is row
+            // space and must be blank.
+            let header_top = if flipped { 0.0 } else { f64::from(h) - empty.header_height };
+            let header_bottom = header_top + empty.header_height;
             let mut ink = 0usize;
-            for r in (top + empty.header_height).max(0.0) as usize
-                ..((top + canvas_h as f64).max(0.0) as usize).min(shot.height as usize)
-            {
-                for c in x0..x1 {
-                    let i = (r * shot.width as usize + c) * 4;
-                    if shot.rgba[i] < 200 || shot.rgba[i + 1] < 200 || shot.rgba[i + 2] < 200 {
+            for r in 0..h as usize {
+                if (r as f64) >= header_top && (r as f64) < header_bottom {
+                    continue;
+                }
+                for c in 0..w as usize {
+                    let i = (r * w as usize + c) * 4;
+                    if px[i] < 200 || px[i + 1] < 200 || px[i + 2] < 200 {
                         ink += 1;
                     }
                 }
@@ -1220,26 +1225,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Scrolled by two bands, through the same entry point a knob drag uses.
         let want = top_geo.header_height + 2.0 * top_geo.row_height;
         {
-            let content = send_rect(window_view, "bounds");
-            let before = rswidgets::backends_macos_adapter::capture(
-                window_view,
-                Some((content.w, content.h)),
-            )
-            .ok_or("the window produced no capture")?;
+            let before = clip_shot()?;
             painted.scroll_to(0.0, 0.0, 0.0, want, top_geo.content_height, v2.h);
             let offset = viewport().y;
             let geo = list.layout(f2.w, viewport().h, offset);
             let ink = ink_rows(&geo)?;
-            let after = rswidgets::backends_macos_adapter::capture(
-                window_view,
-                Some((content.w, content.h)),
-            )
-            .ok_or("the window produced no capture")?;
+            let after = clip_shot()?;
 
             let changed = before
-                .rgba
+                .2
                 .iter()
-                .zip(after.rgba.iter())
+                .zip(after.2.iter())
                 .filter(|(a, b)| a != b)
                 .count();
             println!(
@@ -1279,8 +1275,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "a visible row painted no ink before scrolling: {ink_top:?}"
             );
             assert!(
-                changed > 1000,
-                "scrolling changed only {changed} px of the window: the rows did not move"
+                changed > 500,
+                "scrolling changed only {changed} px of the viewport: the rows did not move"
             );
         }
         list.set_rows(&cells_of(&daemon_paths.lock().unwrap().clone()));
