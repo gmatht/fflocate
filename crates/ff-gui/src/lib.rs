@@ -2110,8 +2110,12 @@ mod tests {
         assert!(!RowAction::Open.is_clipboard());
         #[cfg(not(windows))]
         {
-            // Open launches the file itself...
+            // Open launches the file itself: `open` on macOS, xdg-open on the
+            // freedesktop platforms.
             let (prog, args) = RowAction::Open.command("/a/b.rs");
+            #[cfg(target_os = "macos")]
+            assert_eq!(prog, "open");
+            #[cfg(not(target_os = "macos"))]
             assert_eq!(prog, "xdg-open");
             assert_eq!(args, vec!["/a/b.rs".to_string()]);
             // ...while "containing folder" launches the parent directory.
