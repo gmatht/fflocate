@@ -154,48 +154,6 @@ mod macos_adapter {
     /// The margin GTK's window leaves around its content, in points.
     const WINDOW_MARGIN: f64 = 5.0;
 
-    /// Pin `child` to all four edges of `parent`, `inset` points in.
-    ///
-    /// `NSLayoutAttribute` top 3, bottom 4, leading 5, trailing 6; the constant
-    /// carries the sign, so the trailing/bottom pins move inward.
-    unsafe fn pin_inside(parent: *mut c_void, child: *mut c_void, inset: f64) {
-        let constraint_cls = cls("NSLayoutConstraint");
-        if constraint_cls.is_null() || parent.is_null() || child.is_null() {
-            return;
-        }
-        // SAFETY: both views are live and owned by this adapter's tree; the
-        // constraints are installed on their common ancestor.
-        unsafe {
-            msg1bv(child, "setTranslatesAutoresizingMaskIntoConstraints:", false);
-            for (attr, constant) in [
-                (3isize, inset),
-                (4isize, -inset),
-                (5isize, inset),
-                (6isize, -inset),
-            ] {
-                let constraint: *mut c_void = raw_send!(
-                    constraint_cls,
-                    "constraintWithItem:attribute:relatedBy:toItem:attribute:multiplier:constant:",
-                    unsafe extern "C" fn(
-                        *mut c_void,
-                        *mut c_void,
-                        *mut c_void,
-                        isize,
-                        isize,
-                        *mut c_void,
-                        isize,
-                        f64,
-                        f64,
-                    ) -> *mut c_void,
-                    (child, attr, 0isize, parent, attr, 1.0f64, constant)
-                );
-                if !constraint.is_null() {
-                    msg1v(parent, "addConstraint:", constraint);
-                }
-            }
-        }
-    }
-
     /// Pin `child` to both of `stack`'s cross-axis edges.
     ///
     /// GTK's box stretches a child across the axis it does not lay out along;
@@ -445,24 +403,25 @@ mod macos_adapter {
                     unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
                     ()
                 );
+                // GTK's window leaves a few points around its content, and
+                // without them the labels sat flush against the edge. The
+                // child is inset here rather than pinned: its autoresizing mask
+                // keeps both margins fixed when the window grows, and every
+                // other widget is laid out inside it, so the margin is not
+                // compounded per level.
                 msg4cv(
                     child_ptr,
                     "setFrame:",
-                    0.0,
-                    0.0,
-                    bounds.width,
-                    bounds.height,
+                    WINDOW_MARGIN,
+                    WINDOW_MARGIN,
+                    (bounds.width - 2.0 * WINDOW_MARGIN).max(1.0),
+                    (bounds.height - 2.0 * WINDOW_MARGIN).max(1.0),
                 );
                 msg1i(
                     child_ptr,
                     "setAutoresizingMask:",
                     NSVIEW_WIDTH_SIZABLE | NSVIEW_HEIGHT_SIZABLE,
                 );
-                // GTK's window leaves a few points around its content, and the
-                // labels sat flush against the edge without it. Pinning the one
-                // child of the window is enough: everything else is laid out
-                // inside it, so the margin is not compounded per level.
-                pin_inside(self.0, child_ptr, WINDOW_MARGIN);
             }
         }
 
