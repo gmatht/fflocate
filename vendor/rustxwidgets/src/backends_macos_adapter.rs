@@ -3232,6 +3232,24 @@ mod macos_adapter {
         true
     }
 
+    /// `-[CorroMacWindow constrainFrameRect:toScreen:]`: return the rect
+    /// unchanged.
+    ///
+    /// AppKit shrinks a window to the screen's visible frame, which on a CI
+    /// runner is shorter than the Linux capture the screenshot is compared
+    /// with — asking for 1350x858 gave a 1350x645 window. This is the
+    /// documented hook for "this window may be bigger than the screen", so a
+    /// capture can be the size of the GTK one while still being a real window
+    /// with a real title bar.
+    extern "C" fn constrain_frame_imp(
+        _obj: *mut c_void,
+        _cmd: *mut c_void,
+        rect: CGRect,
+        _screen: *mut c_void,
+    ) -> CGRect {
+        rect
+    }
+
     /// `-[CorroSheetView acceptsFirstResponder]`: the canvas takes focus, so
     /// key events reach the results list once it is clicked.
     extern "C" fn accepts_first_responder_imp(_obj: *mut c_void, _cmd: *mut c_void) -> bool {
@@ -3561,6 +3579,26 @@ mod macos_adapter {
                         objc_registerClassPair(c);
                     }
                 }
+                // A window that keeps the frame it is given, so a screenshot
+                // can be as large as the GTK capture (see
+                // `constrain_frame_imp`).
+                if cls("CorroMacWindow").is_null() {
+                    let name = b"CorroMacWindow\0";
+                    let c = objc_allocateClassPair(
+                        cls("NSWindow"),
+                        name.as_ptr() as *const std::os::raw::c_char,
+                        0,
+                    );
+                    if !c.is_null() {
+                        add_method(
+                            c,
+                            "constrainFrameRect:toScreen:",
+                            constrain_frame_imp as *const (),
+                            "@@:@@",
+                        );
+                        objc_registerClassPair(c);
+                    }
+                }
                 // A dialog button's target: carries the alert and its button
                 // index, so a click reports the response id the caller used.
                 if cls("CorroMacAlertTarget").is_null() {
@@ -3779,21 +3817,35 @@ mod macos_adapter {
             }
             step("2 size");
             if let Some((want_w, want_h)) = size {
-                if theme.is_null() {
-                    set_frame(view, 0.0, 0.0, want_w, want_h);
-                } else {
-                    // Size the frame view, let AppKit place the content inside
-                    // it, then pin the content below the title bar so the
-                    // capture shows both rather than overlapping them.
-                    set_frame(theme, 0.0, 0.0, want_w, want_h);
+                if !window.is_null() {
+                    // Let the window do the work: AppKit places the title bar
+                    // and the content itself, instead of the capture poking
+                    // both frames and hoping. `CorroMacWindow` keeps the size.
+                    let origin: CGRect = raw_send!(
+                        window,
+                        "frame",
+                        unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
+                        ()
+                    );
+                    raw_send!(
+                        window,
+                        "setFrame:display:",
+                        unsafe extern "C" fn(
+                            *mut c_void,
+                            *mut c_void,
+                            f64,
+                            f64,
+                            f64,
+                            f64,
+                            bool,
+                        ),
+                        (origin.x, origin.y, want_w, want_h, false)
+                    );
                     msg0v(theme, "layoutSubtreeIfNeeded");
-                    let content_h = (want_h - chrome).max(1.0);
-                    set_frame(view, 0.0, 0.0, want_w, content_h);
+                } else {
+                    set_frame(view, 0.0, 0.0, want_w, want_h);
                 }
             }
-            // Only the content view is laid out again here: laying the frame
-            // view out once more would let its own constraints put the content
-            // back over the title bar that this capture exists to show.
             step("3 layout");
             msg0v(view, "layoutSubtreeIfNeeded");
             step("4 bounds");
@@ -4026,6 +4078,15 @@ mod macos_adapter {
                     (scroll_cls)
                 );
             if is_scroll_view {
+                // The style is read when a scroller is made, so the scroller is
+                // rebuilt under the preferred style: toggling the flag replaces
+                // it. Without this the overlay scroller stays, and overlay
+                // scrollers live in their own layer, which a view's bitmap
+                // capture does not contain at all.
+                if responds(view, "setHasVerticalScroller:") {
+                    msg1bv(view, "setHasVerticalScroller:", false);
+                    msg1bv(view, "setHasVerticalScroller:", true);
+                }
                 if responds(view, "setAutohidesScrollers:") {
                     msg1bv(view, "setAutohidesScrollers:", false);
                 }
@@ -4238,7 +4299,14 @@ mod macos_adapter {
             return std::ptr::null_mut();
         }
         step("2 alloc window");
-        let window_cls = cls("NSWindow");
+        // The runtime classes exist before the window does: it is built from
+        // `CorroMacWindow`, whose one override keeps the frame it is given.
+        ensure_runtime_classes();
+        let window_cls = if cls("CorroMacWindow").is_null() {
+            cls("NSWindow")
+        } else {
+            cls("CorroMacWindow")
+        };
         if window_cls.is_null() {
             crate::backends::macos::log_macos("macos: NSWindow class not found");
             return std::ptr::null_mut();
