@@ -469,6 +469,18 @@ mod macos_adapter {
                             msg1v(self.0, "addConstraint:", constraint);
                         }
                     }
+                    // Constraints take effect on the next layout pass, and a
+                    // caller that reads the frame right after `set_child` (as
+                    // the probe does) would otherwise see the stack's fitting
+                    // height. Lay out now: the same pass AppKit is about to do.
+                    if responds(self.0, "layoutSubtreeIfNeeded") {
+                        raw_send!(
+                            self.0,
+                            "layoutSubtreeIfNeeded",
+                            unsafe extern "C" fn(*mut c_void, *mut c_void),
+                            ()
+                        );
+                    }
                 }
             }
         }
