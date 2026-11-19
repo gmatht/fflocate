@@ -4009,6 +4009,10 @@ mod macos_adapter {
             // Last word on the frames: whatever the layout passes decided, the
             // window's root views are the size of the window, as GTK's are.
             refit_content_children(view);
+            step("3c no layers");
+            disable_layers(target);
+            msg0v(view, "layoutSubtreeIfNeeded");
+            refit_content_children(view);
             step("4 bounds");
             let bounds: CGRect = raw_send!(
                 target,
@@ -4221,6 +4225,35 @@ mod macos_adapter {
                 }
             }
             force_legacy_scrollers(view);
+        }
+    }
+
+    /// Turn layer backing off for `view` and its subviews.
+    ///
+    /// A layer-backed view draws through its layer, which
+    /// `cacheDisplayInRect:toBitmapImageRep:` does not render: with the window's
+    /// views layer-backed the list's content appeared but its legacy scroller
+    /// contributed no pixels at all — a 17x627 scroller frame over an empty
+    /// gutter. Drawing without layers puts every subview into the bitmap.
+    unsafe fn disable_layers(view: *mut c_void) {
+        if view.is_null() {
+            return;
+        }
+        // SAFETY: views from this adapter's own tree; both sends are guarded.
+        unsafe {
+            if responds(view, "setWantsLayer:") {
+                msg1bv(view, "setWantsLayer:", false);
+            }
+            if responds(view, "setNeedsDisplay:") {
+                msg1bv(view, "setNeedsDisplay:", true);
+            }
+            let subviews = msg0(view, "subviews");
+            if !subviews.is_null() {
+                let count = msg0i(subviews, "count").max(0);
+                for i in 0..count {
+                    disable_layers(msg1i(subviews, "objectAtIndex:", i));
+                }
+            }
         }
     }
 
