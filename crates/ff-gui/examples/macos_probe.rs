@@ -368,7 +368,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `set_vexpand` asks for exactly this): a stack view gives leftover
         // space to the child that resists growing least.
         send_priority(
-            scrolled.raw_handle(),
+            scrolled.inner.raw_handle(),
             "setContentHuggingPriority:forOrientation:",
             1.0,
             1,
