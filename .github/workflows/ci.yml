@@ -229,6 +229,9 @@ jobs:
         run: |
           set -o pipefail
           if sh scripts/fsevents-smoke.sh 2>&1 | tee fsevents-smoke.log; then
+            # The script's closing line is its receipt; re-emit it as a notice
+            # so the result is readable without downloading the log.
+            echo "::notice title=FSEvents smoke (macOS)::$(tail -1 fsevents-smoke.log)"
             exit 0
           fi
           msg=$(tail -c 3500 fsevents-smoke.log | tr '\n' '|')
