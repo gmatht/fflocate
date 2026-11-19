@@ -3853,6 +3853,13 @@ mod macos_adapter {
             use_legacy_scrollers(view);
             step("3 layout");
             msg0v(view, "layoutSubtreeIfNeeded");
+            // The toggle in step 2b makes a fresh scroller; it only gets its
+            // frame when the scroll view re-tiles, which the layout pass above
+            // does. Re-tiling again here makes the bar's geometry final before
+            // the bitmap is taken.
+            step("3b retile");
+            retile_scrollers(view);
+            msg0v(view, "layoutSubtreeIfNeeded");
             step("4 bounds");
             let bounds: CGRect = raw_send!(
                 target,
@@ -4065,6 +4072,44 @@ mod macos_adapter {
                 }
             }
             force_legacy_scrollers(view);
+        }
+    }
+
+    /// Re-tile every scroll view without touching its scroller style.
+    ///
+    /// Split out because the style switch has to happen before the size is
+    /// final, while the tiling that gives the new scroller its frame happens
+    /// after the layout pass.
+    unsafe fn retile_scrollers(view: *mut c_void) {
+        if view.is_null() {
+            return;
+        }
+        // SAFETY: views from this adapter's own tree; each send is guarded.
+        unsafe {
+            let scroll_cls = cls("NSScrollView");
+            let is_scroll_view = !scroll_cls.is_null()
+                && raw_send!(
+                    view,
+                    "isKindOfClass:",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool,
+                    (scroll_cls)
+                );
+            if is_scroll_view {
+                if responds(view, "tile") {
+                    msg0v(view, "tile");
+                }
+                let clip = msg0(view, "contentView");
+                if !clip.is_null() && responds(view, "reflectScrolledClipView:") {
+                    msg1v(view, "reflectScrolledClipView:", clip);
+                }
+            }
+            let subviews = msg0(view, "subviews");
+            if !subviews.is_null() {
+                let count = msg0i(subviews, "count");
+                for i in 0..count {
+                    retile_scrollers(msg1i(subviews, "objectAtIndex:", i));
+                }
+            }
         }
     }
 

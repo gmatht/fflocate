@@ -357,12 +357,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             send_rect(scroller_view, "frame")
         };
+        let sv_frame = send_rect(sv, "frame");
         println!(
-            "probe: scroller style {} (0 overlay, 1 legacy), vertical scroller {} at x={} w={}",
+            "probe: scroller style {} (0 overlay, 1 legacy), vertical scroller {} at x={} {}x{}, scroll view {}x{}",
             send0i(sv, "scrollerStyle"),
             !scroller_view.is_null(),
             scroller_frame.x,
-            scroller_frame.w
+            scroller_frame.w,
+            scroller_frame.h,
+            sv_frame.w,
+            sv_frame.h
         );
         println!(
             "probe: capture {}x{} (linux 1350x858), title bar {}, scroller ink {} px on {}% of the gutter",
