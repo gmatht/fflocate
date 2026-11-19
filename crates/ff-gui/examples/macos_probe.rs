@@ -384,15 +384,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         flex_row.append(&flex_label);
         flex_row.append(&flex_entry);
         outer.append(&flex_row);
-        // A field that is not expanding keeps GTK's entry width instead of
-        // shrinking to its text: the app's max-distance field holds one digit.
-        let width_row = app.create_box(Orientation::Horizontal, 2)?;
-        let width_label = app.create_label("max distance:")?;
-        let width_entry = app.create_entry()?;
-        width_entry.set_text("2");
-        width_row.append(&width_label);
-        width_row.append(&width_entry);
-        outer.append(&width_row);
         outer.append(&scrolled);
         win.set_child(&outer);
         // The list takes the spare height, as it does in the app (where
@@ -591,13 +582,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "the \"{label}\" checkbox did not render into the capture ({ink} px of ink)"
             );
         }
-
-        let width_entry_w = send_rect(width_entry.raw_handle(), "frame").w;
-        println!("probe: a one-digit entry is {width_entry_w}pt wide (linux 150)");
-        assert!(
-            (120.0..=190.0).contains(&width_entry_w),
-            "a one-digit entry is {width_entry_w}pt wide, not GTK's ~150pt field"
-        );
 
         // An expanding child takes the row's leftover width, as GTK's box does.
         let flex_entry_w = send_rect(flex_entry.raw_handle(), "frame").w;

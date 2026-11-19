@@ -5269,11 +5269,6 @@ mod macos_adapter {
             // autocorrected as it is typed — so there is nothing to translate
             // and the pair is simply not sent here.
             set_frame(e, 0.0, 0.0, 0.0, MIN_CTRL_PT);
-            // GTK's entry asks for room for about twenty characters; an AppKit
-            // text field's intrinsic width is just its text, so a field holding
-            // "2" collapsed to 13pt and the row's controls shifted with every
-            // keystroke. Linux draws that field 150pt wide.
-            core_apple::set_view_min_chars(e, 20);
         }
         Ok(Entry(e))
     }
