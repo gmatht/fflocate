@@ -1206,7 +1206,13 @@ impl RowAction {
         match self {
             // Handled in-process.
             RowAction::CopyPath | RowAction::CopyFolderPath => ("", Vec::new()),
+            // `open` is macOS's dispatcher; xdg-open is the freedesktop one.
+            // Without this branch the app spawns `xdg-open` on macOS and every
+            // Open (context menu, double click) fails with ENOENT.
+            #[cfg(target_os = "macos")]
+            RowAction::Open => ("open", vec![path.to_string()]),
             // xdg-open dispatches on a file or a directory identically.
+            #[cfg(not(target_os = "macos"))]
             RowAction::Open => ("xdg-open", vec![path.to_string()]),
             RowAction::OpenContainingFolder => ("xdg-open", vec![containing_dir(path)]),
             // `mimeopen -a` lists the applications that handle the file and asks
@@ -1522,6 +1528,34 @@ pub fn extension_sort_key(name: &str) -> String {
 }
 
 /// Build one row from a path.
+/// Wire `list` so double-clicking a row opens that row's path.
+///
+/// The app installs this on its results list, and the macOS probe installs the
+/// same function, so the probe drives the handler the app really uses instead
+/// of a stand-in. `report` receives the status line the app would show.
+pub fn connect_open_on_double_click<F>(list: &rswidgets::compat::TreeView, path_column: usize, mut report: F)
+where
+    F: FnMut(String) + 'static,
+{
+    let rows = list.clone();
+    list.connect_row_activated(Box::new(move |row| {
+        let Some(path) = rows.cell_text(row, path_column) else {
+            report(format!("Open failed: row {row} has no path"));
+            return;
+        };
+        let (program, args) = RowAction::Open.command(&path);
+        let line = if program.is_empty() {
+            format!("Open has no command for {path}")
+        } else {
+            match std::process::Command::new(program).args(&args).spawn() {
+                Ok(_) => format!("{} → {}", RowAction::Open.label(), path),
+                Err(e) => format!("{} failed: {e}", RowAction::Open.label()),
+            }
+        };
+        report(line);
+    }));
+}
+
 pub fn row_from_path(path: &str) -> Row {
     let (dir, name) = match path.rfind('/') {
         Some(i) => (&path[..i], &path[i + 1..]),

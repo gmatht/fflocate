@@ -1008,6 +1008,94 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "probe: clicks selected {selected}, header click delivered {header_click:?}, right-click delivered {last:?}"
     );
 
+    // --- A header click re-sorts the rows ---
+    //
+    // The header band is the top 22 points and the titles are drawn in 32%
+    // steps of the canvas width, so x=600 lands on the Name column at the
+    // drawn width. What matters is the row order, so the first row is read
+    // before and after rather than trusting the sort flag alone.
+    let first_row = |list: &rswidgets::compat::TreeView| -> String {
+        list.select_row(0);
+        list.selected_path(2).unwrap_or_default()
+    };
+    let before_sort = first_row(&list);
+    rswidgets::backends_macos_adapter::dispatch_canvas_click_button(canvas_id, 600.0, 6.0, 1, 0);
+    let ascending_state = list.sort_state();
+    let ascending_first = first_row(&list);
+    rswidgets::backends_macos_adapter::dispatch_canvas_click_button(canvas_id, 600.0, 6.0, 1, 0);
+    let descending_state = list.sort_state();
+    let descending_first = first_row(&list);
+    println!(
+        "probe: header click sorted by {ascending_state:?} then {descending_state:?}; first row {before_sort} -> {ascending_first} -> {descending_first}"
+    );
+    assert_eq!(
+        ascending_state,
+        Some((1, true)),
+        "the first header click did not sort ascending by Name"
+    );
+    assert_eq!(
+        descending_state,
+        Some((1, false)),
+        "the second header click did not reverse the sort"
+    );
+    assert!(
+        ascending_first.ends_with("alpha-probe.txt"),
+        "sorting by Name ascending put {ascending_first} first"
+    );
+    assert!(
+        descending_first.ends_with("gamma-probe.rs"),
+        "sorting by Name descending put {descending_first} first"
+    );
+    assert_ne!(
+        ascending_first, descending_first,
+        "the header click changed the flag but not the row order"
+    );
+
+    // --- A double click opens the row through the real handler ---
+    //
+    // The handler installed here is `ff_gui::connect_open_on_double_click`, the
+    // same function the app installs, so this exercises the app's Open action
+    // (command, spawn, status line) rather than a stand-in. The rows are in
+    // descending order from the check above, so row 1 is beta-probe.md.
+    {
+        let opened: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = opened.clone();
+        ff_gui::connect_open_on_double_click(&list, 2, move |line| {
+            seen.borrow_mut().push(line);
+        });
+        // A real double click is a press, then a second press with a count of
+        // two; the adapter forwards the count, and the probe dispatches the
+        // two the way AppKit would.
+        rswidgets::backends_macos_adapter::dispatch_canvas_click_button(canvas_id, 60.0, 52.0, 1, 0);
+        let selected_by_click = list.selected_path(2).unwrap_or_default();
+        rswidgets::backends_macos_adapter::dispatch_canvas_double_click(canvas_id, 60.0, 52.0);
+        let lines = opened.borrow().clone();
+        println!(
+            "probe: click selected {selected_by_click}, double click activated {lines:?}"
+        );
+        assert!(
+            selected_by_click.ends_with("beta-probe.md"),
+            "a click on row 1 selected {selected_by_click}"
+        );
+        assert_eq!(
+            lines.len(),
+            1,
+            "the double click activated {} handlers: {lines:?}",
+            lines.len()
+        );
+        assert!(
+            lines[0].contains("beta-probe.md"),
+            "the open handler ran for {:?}, not the double-clicked row",
+            lines[0]
+        );
+        assert!(
+            lines[0].starts_with("Open"),
+            "the row action that ran was {:?}",
+            lines[0]
+        );
+    }
+
     // --- The menu bar is a real NSMenu on the application ---
     let menu_fired = Arc::new(AtomicUsize::new(0));
     let mut model = app.new_menu()?;

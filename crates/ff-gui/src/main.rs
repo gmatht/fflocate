@@ -943,6 +943,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         status.set_text(&format!("drag and drop unavailable: {e}"));
     }
 
+    // Double-clicking a row opens it. `ff_gui::connect_open_on_double_click` is
+    // the function the macOS probe installs too, so the probe exercises this
+    // handler rather than a stand-in; the status line reports what it did.
+    {
+        let status = status.clone();
+        ff_gui::connect_open_on_double_click(&results, PATH_COLUMN, move |line| {
+            status.set_text(&line);
+        });
+    }
+
     // Menubar (File/Search/View/Help). Every item reuses a handler something
     // else already owns — the search trigger, the checkbox/expander widgets,
     // the row actions, the daemon client — so the bar cannot drift from the

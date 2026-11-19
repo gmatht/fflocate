@@ -273,6 +273,11 @@ macro_rules! common_types_mod {
             /// canvas, so a caller can use the richer API without knowing
             /// whether it holds a plain canvas or this wrapper.
             pub fn on_click_button(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) { self.inner.on_click_button(cb); }
+            /// The second press of a double click, for the backend that reports
+            /// a click count. The other backends have no such signal in the
+            /// portable layer, so the method does not exist there.
+            #[cfg(all(feature = "macos", target_os = "macos", not(feature = "zork")))]
+            pub fn on_double_click(&self, cb: Box<dyn FnMut(f64, f64)>) { self.inner.on_double_click(cb); }
             /// This canvas's top-left in screen coordinates, or `None` when
             /// unknown. Used to place the sheet-tab context menu at the
             /// pointer; see `MenuBar::popup_submenu_by_mnemonic_at`.

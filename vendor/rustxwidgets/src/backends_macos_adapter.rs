@@ -1573,6 +1573,17 @@ mod macos_adapter {
             map.insert(self.canvas_id(), SendMotionCallback(Box::into_raw(cb)));
         }
 
+        /// A second press of a double click, at the view's own coordinates.
+        ///
+        /// AppKit reports the count on the event (`clickCount`), so the
+        /// responder forwards a press with a count of two here and a single
+        /// press to [`Canvas::on_click_button`]. The ordinary click also fires
+        /// first, which is what a list wants: the row is selected, then opened.
+        pub fn on_double_click(&self, cb: Box<dyn FnMut(f64, f64)>) {
+            let mut map = DOUBLE_CLICK_CALLBACKS.lock().unwrap();
+            map.insert(self.canvas_id(), SendDoubleClickCallback(Box::into_raw(cb)));
+        }
+
         /// This canvas's top-left in screen coordinates, or `None` when the
         /// backend cannot report one.
         ///
@@ -1655,6 +1666,11 @@ mod macos_adapter {
         Lazy::new(|| Mutex::new(HashMap::new()));
     static RELEASE_CALLBACKS: Lazy<Mutex<HashMap<u64, SendClickButtonCallback>>> =
         Lazy::new(|| Mutex::new(HashMap::new()));
+    struct SendDoubleClickCallback(*mut dyn FnMut(f64, f64));
+    // SAFETY: guarded by the registry mutex; same pattern as SendClickCallback.
+    unsafe impl Send for SendDoubleClickCallback {}
+    static DOUBLE_CLICK_CALLBACKS: Lazy<Mutex<HashMap<u64, SendDoubleClickCallback>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
 
     struct SendDrawCallback(*mut dyn FnMut(&mut dyn DrawContext, i32, i32));
     // SAFETY: guarded by the registry mutex; same pattern as the iOS and
@@ -1696,6 +1712,24 @@ mod macos_adapter {
         if let Some(raw) = raw {
             // SAFETY: registry-owned closure, single-threaded dispatch.
             unsafe { (*raw)(x, y, button, mods) };
+        }
+    }
+
+    /// Dispatch the second press of a double click at `(x, y)`.
+    ///
+    /// A caller driving this by hand has to dispatch the single click first, as
+    /// AppKit does; the probe does exactly that.
+    pub fn dispatch_canvas_double_click(canvas_id: u64, x: f64, y: f64) {
+        let raw = {
+            let mut map = DOUBLE_CLICK_CALLBACKS.lock().unwrap();
+            match map.get_mut(&canvas_id) {
+                Some(SendDoubleClickCallback(p)) => Some(*p),
+                None => None,
+            }
+        };
+        if let Some(raw) = raw {
+            // SAFETY: registry-owned closure, single-threaded dispatch.
+            unsafe { (*raw)(x, y) }
         }
     }
 
@@ -3476,6 +3510,19 @@ mod macos_adapter {
             let mut map = RELEASE_CALLBACKS.lock().unwrap();
             map.get_mut(&canvas_id).map(|SendClickButtonCallback(p)| *p)
         };
+        // A double click is a second press carrying a count of two; the plain
+        // press below still runs, so a row is selected before it opens.
+        let clicks: isize = raw_send!(
+            event,
+            "clickCount",
+            unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize,
+            ()
+        );
+        let double = {
+            let mut map = DOUBLE_CLICK_CALLBACKS.lock().unwrap();
+            map.get_mut(&canvas_id)
+                .map(|SendDoubleClickCallback(p)| *p)
+        };
         if press {
             if let Some(ptr) = rich {
                 // SAFETY: registry-owned closure, dispatched on the main thread.
@@ -3484,6 +3531,12 @@ mod macos_adapter {
             if let Some(ptr) = plain {
                 // SAFETY: as above.
                 unsafe { (*ptr)(local.x, local.y) };
+            }
+            if clicks >= 2 {
+                if let Some(ptr) = double {
+                    // SAFETY: as above.
+                    unsafe { (*ptr)(local.x, local.y) }
+                }
             }
         } else if let Some(ptr) = release {
             // SAFETY: as above.

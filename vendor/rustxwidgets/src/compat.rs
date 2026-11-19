@@ -198,6 +198,12 @@ const ICON_COLUMN_SHARE: f64 = 0.06;
 
 type PressHandler = Box<dyn FnMut(u32, f64, f64, *mut c_void)>;
 
+/// Called with the row index when a row is double-clicked.
+type ActivateHandler = Box<dyn FnMut(usize)>;
+
+/// Header titles are drawn in steps of this share of the canvas width.
+const HEADER_COLUMN_SHARE: f64 = 0.32;
+
 /// A three-column results list, drawn on a canvas and hit-tested by hand.
 pub struct TreeView {
     canvas: Canvas,
@@ -206,6 +212,10 @@ pub struct TreeView {
     selected: Rc<Cell<Option<usize>>>,
     press: Rc<RefCell<Vec<PressHandler>>>,
     width: Rc<Cell<f64>>,
+    /// The active sort: `(column, ascending)`. `None` keeps the caller's order.
+    sort: Rc<Cell<Option<(usize, bool)>>>,
+    /// Row-activation handlers, fed by the backend's double click.
+    activate: Rc<RefCell<Vec<ActivateHandler>>>,
 }
 
 impl Clone for TreeView {
@@ -217,6 +227,8 @@ impl Clone for TreeView {
             selected: self.selected.clone(),
             press: self.press.clone(),
             width: self.width.clone(),
+            sort: self.sort.clone(),
+            activate: self.activate.clone(),
         }
     }
 }
@@ -228,6 +240,8 @@ impl TreeView {
         let selected: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
         let press: Rc<RefCell<Vec<PressHandler>>> = Rc::new(RefCell::new(Vec::new()));
         let width: Rc<Cell<f64>> = Rc::new(Cell::new(640.0));
+        let sort: Rc<Cell<Option<(usize, bool)>>> = Rc::new(Cell::new(None));
+        let activate: Rc<RefCell<Vec<ActivateHandler>>> = Rc::new(RefCell::new(Vec::new()));
         canvas.set_content_size(720, 320);
 
         {
@@ -305,17 +319,52 @@ impl TreeView {
             let press = press.clone();
             let selected = selected.clone();
             let rows = rows.clone();
+            let sort = sort.clone();
+            let width = width.clone();
+            let sortable: Vec<bool> = columns.iter().map(|(_, _, s)| *s).collect();
             let canvas_for_redraw = canvas.clone();
             canvas.on_click_button(Box::new(move |x, y, button, _state| {
                 let row = row_index_at(y, rows.borrow().len());
                 if button == 1 {
-                    selected.set(row);
+                    if y < HEADER_HEIGHT {
+                        // A header click sorts by that column (the old
+                        // `GtkTreeView` did; the canvas list does it itself).
+                        // It is not a row selection, so the selection goes.
+                        if apply_header_click(&rows, &sort, &sortable, width.get(), x) {
+                            selected.set(None);
+                        }
+                    } else {
+                        selected.set(row);
+                    }
                     canvas_for_redraw.queue_redraw();
                 }
                 for handler in press.borrow_mut().iter_mut() {
                     handler(button, x, y, std::ptr::null_mut());
                 }
             }));
+        }
+
+        {
+            let activate = activate.clone();
+            let selected = selected.clone();
+            let rows = rows.clone();
+            let canvas_for_redraw = canvas.clone();
+            register_double_click(
+                &canvas,
+                Box::new(move |_x, y| {
+                    let Some(row) = row_index_at(y, rows.borrow().len()) else {
+                        return;
+                    };
+                    // A double click is a second press on the same row, so its
+                    // first press already selected it; set it again so a handler
+                    // that reads the selection sees this row.
+                    selected.set(Some(row));
+                    canvas_for_redraw.queue_redraw();
+                    for handler in activate.borrow_mut().iter_mut() {
+                        handler(row);
+                    }
+                }),
+            );
         }
 
         Ok(TreeView {
@@ -328,15 +377,22 @@ impl TreeView {
             selected,
             press,
             width,
+            sort,
+            activate,
         })
     }
 
     /// Replace every row, then repaint.
     pub fn set_rows(&self, rows: &[Vec<CellValue>]) {
-        *self.rows.borrow_mut() = rows.to_vec();
+        let mut rows = rows.to_vec();
+        // Rows arrive in the daemon's order; a table the user sorted by Name
+        // stays sorted while more hits stream in.
+        sort_rows(&mut rows, self.sort.get());
+        let count = rows.len();
+        *self.rows.borrow_mut() = rows;
         self.canvas.set_content_size(
             self.width.get().max(320.0) as i32,
-            (HEADER_HEIGHT + rows.len() as f64 * ROW_HEIGHT) as i32 + 4,
+            (HEADER_HEIGHT + count as f64 * ROW_HEIGHT) as i32 + 4,
         );
         self.canvas.queue_redraw();
     }
@@ -359,6 +415,25 @@ impl TreeView {
         let row = self.selected.get()?;
         let rows = self.rows.borrow();
         rows.get(row)?.get(column).map(CellValue::render)
+    }
+
+    /// The sort a header click chose, or `None` while the caller's order holds.
+    pub fn sort_state(&self) -> Option<(usize, bool)> {
+        self.sort.get()
+    }
+
+    /// The text in `column` of `row`, in the order currently shown.
+    pub fn cell_text(&self, row: usize, column: usize) -> Option<String> {
+        self.rows
+            .borrow()
+            .get(row)?
+            .get(column)
+            .map(CellValue::render)
+    }
+
+    /// Call `f` with the row index when a row is double-clicked.
+    pub fn connect_row_activated(&self, f: Box<dyn FnMut(usize)>) {
+        self.activate.borrow_mut().push(f);
     }
 
     pub fn connect_button_press_event<F>(&self, mut f: F) -> Result<(), Error>
@@ -404,6 +479,90 @@ impl TreeView {
         let p: &*mut c_void = self.canvas.as_ref();
         *p
     }
+}
+
+/// Register the double-click handler on the backend that reports a click count.
+///
+/// The portable canvas has no click-count signal for the other backends, so
+/// there the handler stays out of play rather than being invented.
+fn register_double_click(canvas: &Canvas, cb: Box<dyn FnMut(f64, f64)>) {
+    #[cfg(all(feature = "macos", target_os = "macos", not(feature = "zork")))]
+    {
+        canvas.on_double_click(cb);
+    }
+    #[cfg(not(all(feature = "macos", target_os = "macos", not(feature = "zork"))))]
+    {
+        let _ = (canvas, cb);
+    }
+}
+
+/// Which header column a click at `x` lands on, using the same 32% steps the
+/// titles are drawn with.
+fn header_column_at(w: f64, x: f64, columns: usize) -> Option<usize> {
+    let step = w * HEADER_COLUMN_SHARE;
+    if step <= 0.0 || x < 0.0 {
+        return None;
+    }
+    let column = ((x - 4.0).max(0.0) / step) as usize;
+    if column < columns {
+        Some(column)
+    } else {
+        None
+    }
+}
+
+/// Handle a click at `x` in the header band: sort by the column under it, or
+/// reverse the order if it is already sorted that way. Returns `true` when the
+/// sort changed.
+fn apply_header_click(
+    rows: &RefCell<Vec<Vec<CellValue>>>,
+    sort: &Cell<Option<(usize, bool)>>,
+    sortable: &[bool],
+    w: f64,
+    x: f64,
+) -> bool {
+    let Some(column) = header_column_at(w, x, sortable.len()) else {
+        return false;
+    };
+    if !sortable.get(column).copied().unwrap_or(false) {
+        return false;
+    }
+    // Same column again reverses; any other column starts ascending.
+    let next = match sort.get() {
+        Some((current, true)) if current == column => (column, false),
+        _ => (column, true),
+    };
+    sort.set(Some(next));
+    sort_rows(&mut rows.borrow_mut(), Some(next));
+    true
+}
+
+/// Sort `rows` by the rendered text of `column`, ignoring case.
+///
+/// Stable, so rows that compare equal keep the order the daemon sent them in.
+fn sort_rows(rows: &mut Vec<Vec<CellValue>>, sort: Option<(usize, bool)>) {
+    let Some((column, ascending)) = sort else {
+        return;
+    };
+    let mut keyed: Vec<(String, Vec<CellValue>)> = std::mem::take(rows)
+        .into_iter()
+        .map(|row| {
+            let key = row
+                .get(column)
+                .map(CellValue::render)
+                .unwrap_or_default()
+                .to_lowercase();
+            (key, row)
+        })
+        .collect();
+    keyed.sort_by(|a, b| {
+        if ascending {
+            a.0.cmp(&b.0)
+        } else {
+            b.0.cmp(&a.0)
+        }
+    });
+    *rows = keyed.into_iter().map(|(_, row)| row).collect();
 }
 
 fn row_index_at(y: f64, row_count: usize) -> Option<usize> {
