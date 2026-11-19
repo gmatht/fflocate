@@ -3694,13 +3694,21 @@ mod macos_adapter {
             return None;
         }
         if let Some((win_w, win_h)) = size {
-            // SAFETY: a live content view; its `window` and `setContentSize:`
-            // are AppKit's own, and a view without a window is skipped.
+            // A window cannot grow past the screen's visible frame, and the
+            // macOS runner's screen is shorter than this shot: `setContentSize:`
+            // alone produced a 1350x645 window, i.e. a different picture from
+            // the 1350x858 Linux capture. The view has no such limit, so it is
+            // sized directly and rendered at that size — the window is asked
+            // for the same size first for the on-screen case.
+            // SAFETY: a live content view; `window`, `setContentSize:` and
+            // `setFrameSize:` are AppKit's own, and a view without a window is
+            // skipped.
             unsafe {
                 let window = msg0(view, "window");
                 if !window.is_null() {
                     msg2cv(window, "setContentSize:", win_w, win_h);
                 }
+                msg2cv(view, "setFrameSize:", win_w, win_h);
             }
         }
         // SAFETY: a live NSView; both selectors are AppKit's own, and `bounds`

@@ -153,11 +153,19 @@ jobs:
             exit 1
           fi
           full_dims=$(sips -g pixelWidth -g pixelHeight /tmp/app.png | grep pixel | tr -d ' \n')
-          # 18 chunks of 3800 base64 chars cap at about 51 KB of png.
+          # 18 chunks of 3800 base64 chars (two steps of 9 notices) cap at about
+          # 51 KB of png. A true-colour PNG of a whole window is bigger than
+          # that; the same pixels in 256 colours are a third of the size and
+          # look identical for UI, so that is the transport. If it still does
+          # not fit, downscale rather than drop the shot.
+          cp /tmp/app.png /tmp/shot.png
+          python3 -m pip install --quiet --disable-pip-version-check pillow >/dev/null 2>&1 || true
+          python3 -c "from PIL import Image; im = Image.open('/tmp/app.png').convert('RGB'); im.quantize(colors=256).save('/tmp/shot.png', optimize=True)" >/dev/null 2>&1 || true
+          bytes=$(stat -f%z /tmp/shot.png)
           for w in 1350 1100 900 760 620 500; do
+            [ "$bytes" -le 51000 ] && break
             sips -Z "$w" /tmp/app.png --out /tmp/shot.png >/dev/null 2>&1 || cp /tmp/app.png /tmp/shot.png
             bytes=$(stat -f%z /tmp/shot.png)
-            [ "$bytes" -le 51000 ] && break
           done
           size=$(sips -g pixelWidth -g pixelHeight /tmp/shot.png | grep pixel | tr -d ' \n')
           rm -rf /tmp/shots && mkdir -p /tmp/shots
