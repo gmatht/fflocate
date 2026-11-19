@@ -135,6 +135,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
         unsafe { f(obj, rswidgets::backends::apple::selector(selname)) }
     }
+    fn send0d(obj: *mut std::ffi::c_void, selname: &str) -> f64 {
+        let f: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> f64 =
+            unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+        unsafe { f(obj, rswidgets::backends::apple::selector(selname)) }
+    }
     fn send0v(obj: *mut std::ffi::c_void, selname: &str) {
         let f: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) =
             unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
@@ -445,8 +450,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sv_frame.h
         );
         println!(
-            "probe: capture {}x{} (linux 1350x858), title bar {}, scroller ink {} px on {}% of the gutter",
-            shot.width, shot.height, shot.title_bar, shot.scroller_ink, shot.scroller_coverage
+            "probe: capture {}x{} (linux 1350x858), title bar {}, scroller ink {} px on {}% of the gutter, content ink {} px",
+            shot.width,
+            shot.height,
+            shot.title_bar,
+            shot.scroller_ink,
+            shot.scroller_coverage,
+            shot.content_ink
+        );
+        println!(
+            "probe: scroller hidden {}, alpha {}, knob {}, doc {}x{}",
+            send0i(scroller_view, "isHidden") != 0,
+            if scroller_view.is_null() {
+                0.0
+            } else {
+                send0d(scroller_view, "alphaValue")
+            },
+            if scroller_view.is_null() {
+                0.0
+            } else {
+                send0d(scroller_view, "knobProportion")
+            },
+            send_rect(doc, "frame").w,
+            send_rect(doc, "frame").h
         );
         assert_eq!(
             (shot.width, shot.height),

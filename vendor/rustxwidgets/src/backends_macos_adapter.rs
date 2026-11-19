@@ -3877,6 +3877,10 @@ mod macos_adapter {
         /// scroller runs almost the whole way down; text that merely reaches
         /// the right edge shows up on a few rows only.
         pub scroller_coverage: u32,
+        /// Pixels drawn anywhere else in the content area: a window whose list
+        /// did not render at all has none, which tells an empty list apart from
+        /// an undrawn scroller.
+        pub content_ink: usize,
     }
 
     /// Render a view into a PNG, and report what it contains.
@@ -4141,6 +4145,14 @@ mod macos_adapter {
                     inked_rows += 1;
                 }
             }
+            let mut content_ink = 0usize;
+            for y in band as usize..h as usize {
+                for x in 0..x0 {
+                    if ink_at(&rgba, x, y) {
+                        content_ink += 1;
+                    }
+                }
+            }
             let scroller_coverage = if rows == 0 {
                 0
             } else {
@@ -4181,6 +4193,7 @@ mod macos_adapter {
                 png,
                 title_bar,
                 scroller_ink,
+                content_ink,
                 scroller_coverage,
             })
         }
