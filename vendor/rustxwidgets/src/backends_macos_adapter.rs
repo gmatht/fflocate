@@ -3980,32 +3980,42 @@ mod macos_adapter {
     /// and "the scrollbar works" cannot be seen in the pixels. Legacy scrollers
     /// are drawn permanently, which is what GTK's capture shows too. Only the
     /// screenshot path calls this: a normal run keeps the platform style.
+    ///
+    /// The style itself is global (`+[NSScroller setPreferredScrollerStyle:]`);
+    /// a scroll view has no setter of its own — `scrollerStyle` is read-only —
+    /// and asking it for one raised an unrecognised selector, which aborted the
+    /// process. Scroll views pick the new preferred style up, so re-tiling and
+    /// flashing each of them is all that is left to do.
     pub fn use_legacy_scrollers(view: *mut c_void) {
         if view.is_null() {
             return;
         }
-        // SAFETY: AppKit's own class method and views from this adapter.
+        // SAFETY: AppKit's own class method and views from this adapter. Every
+        // send is guarded by `responds`, because an unrecognised one raises an
+        // exception that unwinds into Rust and aborts the process.
         unsafe {
-            crate::backends::macos::log_macos("macos: capture legacy scrollers");
             let scroller_cls = cls("NSScroller");
             if !scroller_cls.is_null() {
                 // `NSScrollerStyleLegacy` is 1.
-                msg1iv(scroller_cls, "setPreferredScrollerStyle:", 1);
+                if responds(scroller_cls, "setPreferredScrollerStyle:") {
+                    msg1iv(scroller_cls, "setPreferredScrollerStyle:", 1);
+                }
             }
             force_legacy_scrollers(view);
         }
     }
 
-    /// Walk the view tree and switch every scroll view to legacy scrollers.
+    /// Re-tile every scroll view so its scroller is drawn now, not on hover.
     ///
-    /// The preferred style is a default for *new* scrollers, so the ones the
-    /// results list already made have to be told individually.
+    /// The preferred style is a default for *new* scrollers; an existing scroll
+    /// view picks it up when it re-tiles, and `flashScrollers` draws the bar
+    /// immediately so the capture contains it.
     unsafe fn force_legacy_scrollers(view: *mut c_void) {
         if view.is_null() {
             return;
         }
         // SAFETY: `subviews`/`isKindOfClass:` are NSView/NSObject methods on
-        // objects from this adapter's own tree.
+        // objects from this adapter's own tree, and each mutation is guarded.
         unsafe {
             let scroll_cls = cls("NSScrollView");
             let is_scroll_view = !scroll_cls.is_null()
@@ -4016,11 +4026,17 @@ mod macos_adapter {
                     (scroll_cls)
                 );
             if is_scroll_view {
-                msg1iv(view, "setScrollerStyle:", 1);
-                msg1bv(view, "setAutohidesScrollers:", false);
-                msg1bv(view, "setHasVerticalScroller:", true);
+                if responds(view, "setAutohidesScrollers:") {
+                    msg1bv(view, "setAutohidesScrollers:", false);
+                }
+                if responds(view, "tile") {
+                    msg0v(view, "tile");
+                }
+                if responds(view, "flashScrollers") {
+                    msg0v(view, "flashScrollers");
+                }
                 let clip = msg0(view, "contentView");
-                if !clip.is_null() {
+                if !clip.is_null() && responds(view, "reflectScrolledClipView:") {
                     msg1v(view, "reflectScrolledClipView:", clip);
                 }
             }
