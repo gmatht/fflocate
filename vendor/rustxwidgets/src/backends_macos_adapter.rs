@@ -322,7 +322,44 @@ mod macos_adapter {
         }
 
         pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
-            attach(self.0, *child.as_ref());
+            let child_ptr = *child.as_ref();
+            attach(self.0, child_ptr);
+            if self.0.is_null() || child_ptr.is_null() {
+                return;
+            }
+            // AppKit does not lay a plain subview out by itself: a view added to
+            // the content view keeps its zeroed `NSRect`, so the root box stayed
+            // 0x0 and the window rendered blank — an empty white window with one
+            // stray glyph, which is exactly what the first CI screenshot showed.
+            // Size it to the content view and let it track resizes, which is what
+            // GTK's `set_child` does for free.
+            //
+            // SAFETY: both handles are live AppKit views; `bounds` returns a
+            // `CGRect` by value and `NSViewWidthSizable|NSViewHeightSizable` are
+            // the documented autoresizing constants.
+            unsafe {
+                const NSVIEW_WIDTH_SIZABLE: isize = 2;
+                const NSVIEW_HEIGHT_SIZABLE: isize = 16;
+                let bounds: CGRect = raw_send!(
+                    self.0,
+                    "bounds",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
+                    ()
+                );
+                msg4cv(
+                    child_ptr,
+                    "setFrame:",
+                    0.0,
+                    0.0,
+                    bounds.width,
+                    bounds.height,
+                );
+                msg1i(
+                    child_ptr,
+                    "setAutoresizingMask:",
+                    NSVIEW_WIDTH_SIZABLE | NSVIEW_HEIGHT_SIZABLE,
+                );
+            }
         }
 
         pub fn set_child_box(&self, bx: &BoxWidget) {

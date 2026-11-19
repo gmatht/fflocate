@@ -130,11 +130,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
         unsafe { f(obj, rswidgets::backends::apple::selector(selname)) }
     }
-    fn send4d(obj: *mut std::ffi::c_void, selname: &str, a: f64, b: f64, c: f64, d: f64) {
-        let f: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, f64, f64, f64, f64) =
-            unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
-        unsafe { f(obj, rswidgets::backends::apple::selector(selname), a, b, c, d) }
-    }
 
     use rswidgets::compat::{CellValue, TreeView};
     let tree = TreeView::new(&[("", true, true), ("Name", false, true), ("Path", false, true)])?;
@@ -155,9 +150,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     win.set_child(&scrolled);
     let sv = scrolled.inner.raw_handle();
     assert!(!sv.is_null(), "the scrolled window produced no view");
-    // A child of the content view needs a frame: AppKit does not lay it out on
-    // its own, and an `NSRect` starts zero-filled (a 640x0 window).
-    send4d(sv, "setFrame:", 0.0, 0.0, 640.0, 200.0);
+    // `set_child` has to size the root view: AppKit does not lay a plain
+    // subview out, and an `NSRect` starts zero-filled — that blank window was
+    // exactly what the first CI screenshot showed. The frame is *checked* here
+    // rather than set, so a regression fails the probe instead of quietly
+    // producing a white screenshot.
+    {
+        let frame = send_rect(sv, "frame");
+        println!("probe: root view frame {}x{}", frame.w, frame.h);
+        assert!(
+            frame.w > 100.0 && frame.h > 100.0,
+            "set_child left the root view at {}x{}: the window would render blank",
+            frame.w,
+            frame.h
+        );
+    }
 
     let doc = send0(sv, "documentView");
     let clip = send0(sv, "contentView");
