@@ -379,6 +379,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             1,
         );
 
+        // A canvas wider than its viewport pushes the path column past the
+        // right edge: size it to the window's content width, which is what the
+        // app's own layout does when the list is given the window.
+        let content_w = 1350.0 - 2.0 * 5.0;
+        rswidgets::backends_macos_adapter::Canvas(doc)
+            .set_size_request(content_w as i32, doc_h as i32);
+
         let view = win.raw_handle();
         // Who has no height? The stack, the label or the list?
         {
