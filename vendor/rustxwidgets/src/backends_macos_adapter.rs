@@ -3990,6 +3990,21 @@ mod macos_adapter {
             // the shim's integer selector here is a message AppKit does not
             // implement, so the two paths cannot share one call.
             unsafe { msg1cv(bx, "setSpacing:", spacing as f64) };
+            // The default distribution (`...GravityAreas`, 0) groups arranged
+            // subviews by gravity and centres each at its intrinsic size: the
+            // first real screenshot of the window showed exactly that — a tiny
+            // centred entry and button above a mostly empty window. `Fill` (1)
+            // is the behaviour GTK's box has, and it is what lets a child with
+            // `corroSetFlex:` take the spare space.
+            unsafe { msg1iv(bx, "setDistribution:", 1) };
+            // Cross-axis alignment, as in GTK: a vertical box stretches its
+            // children to its full width, a horizontal box to its full height
+            // (`NSLayoutAttributeWidth` = 7, `...Height` = 8).
+            let fill_across = match orientation {
+                Orientation::Vertical => 7,
+                Orientation::Horizontal => 8,
+            };
+            unsafe { msg1iv(bx, "setAlignment:", fill_across as isize) };
         } else {
             shim_i(bx, "corroSetSpacing:", spacing as isize);
         }
