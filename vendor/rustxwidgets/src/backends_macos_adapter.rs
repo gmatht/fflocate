@@ -4323,12 +4323,27 @@ mod macos_adapter {
                         msg2cv(transform, "translateXBy:yBy:", placed.x, placed.y);
                         msg0v(transform, "concat");
                     }
-                    raw_send!(
-                        scroller,
-                        "displayRectIgnoringOpacity:inContext:",
-                        unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect, *mut c_void),
-                        (bounds, context)
-                    );
+                    // `NSScroller`'s own drawing entry points: the pair a
+                    // scroller subclass calls from `drawRect:`. Its
+                    // `displayRectIgnoringOpacity:` renders nothing offscreen —
+                    // a 17x627 scroller came out as zero pixels — while these
+                    // draw into whatever context is current.
+                    if responds(scroller, "drawKnobSlotInRect:highlight:") {
+                        raw_send!(
+                            scroller,
+                            "drawKnobSlotInRect:highlight:",
+                            unsafe extern "C" fn(
+                                *mut c_void,
+                                *mut c_void,
+                                CGRect,
+                                bool,
+                            ),
+                            (bounds, false)
+                        );
+                    }
+                    if responds(scroller, "drawKnob") {
+                        msg0v(scroller, "drawKnob");
+                    }
                 }
             }
             let subviews = msg0(view, "subviews");
