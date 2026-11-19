@@ -3747,6 +3747,10 @@ mod macos_adapter {
         // SAFETY: a live view from this adapter; every selector below is
         // AppKit's own and every pointer is null-checked before use.
         unsafe {
+            // Breadcrumbs: an exception from one of these AppKit sends unwinds
+            // through Rust and aborts, so the last line is the one that threw.
+            let step = |n: &str| crate::backends::macos::log_macos(&format!("macos: capture {n}"));
+            step("0 window");
             let window = msg0(view, "window");
             let theme = if window.is_null() {
                 std::ptr::null_mut()
@@ -3758,6 +3762,7 @@ mod macos_adapter {
             // empty content rect: the title bar plus the window border.
             let mut chrome = 0.0f64;
             if !window.is_null() {
+                step("1 chrome rect");
                 let empty = CGRect {
                     x: 0.0,
                     y: 0.0,
@@ -3772,6 +3777,7 @@ mod macos_adapter {
                 );
                 chrome = frame_rect.height.max(0.0);
             }
+            step("2 size");
             if let Some((want_w, want_h)) = size {
                 if theme.is_null() {
                     set_frame(view, 0.0, 0.0, want_w, want_h);
@@ -3788,7 +3794,9 @@ mod macos_adapter {
             // Only the content view is laid out again here: laying the frame
             // view out once more would let its own constraints put the content
             // back over the title bar that this capture exists to show.
+            step("3 layout");
             msg0v(view, "layoutSubtreeIfNeeded");
+            step("4 bounds");
             let bounds: CGRect = raw_send!(
                 target,
                 "bounds",
@@ -3857,6 +3865,7 @@ mod macos_adapter {
                 width: w as f64,
                 height: h as f64,
             };
+            step("5 display");
             raw_send!(
                 target,
                 "cacheDisplayInRect:toBitmapImageRep:",
@@ -3914,6 +3923,7 @@ mod macos_adapter {
             } else {
                 (inked_rows * 100 / rows) as u32
             };
+            step("6 png");
             // `NSBitmapImageFileTypePNG` is 4.
             const PNG: usize = 4;
             let dict = msg0(cls("NSDictionary"), "dictionary");
@@ -3976,6 +3986,7 @@ mod macos_adapter {
         }
         // SAFETY: AppKit's own class method and views from this adapter.
         unsafe {
+            crate::backends::macos::log_macos("macos: capture legacy scrollers");
             let scroller_cls = cls("NSScroller");
             if !scroller_cls.is_null() {
                 // `NSScrollerStyleLegacy` is 1.
