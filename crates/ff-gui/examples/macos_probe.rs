@@ -1082,8 +1082,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "the scroller has no target/action, so a drag could not scroll anything"
         );
         let knob_before = send0d(scroller, "doubleValue");
+        // The list is already at its end from the scrolling check above, so
+        // this scrolls back up; 196 pt is the whole range (826-630).
         rswidgets::backends_macos_adapter::ScrolledWindow(sv).scroll_to(
-            0.0, 0.0, 0.0, 300.0, 826.0, 630.0,
+            0.0, 0.0, 0.0, 50.0, 826.0, 630.0,
         );
         let scrolled_to = send_rect(send0(sv, "contentView"), "bounds").y;
         let knob_after = send0d(scroller, "doubleValue");
@@ -1091,11 +1093,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "probe: scroller wired to its scroll view, scroll moved the clip to {scrolled_to}pt (knob {knob_before:.3} -> {knob_after:.3})"
         );
         assert!(
-            (scrolled_to - 300.0).abs() < 2.0,
-            "the clip view moved to {scrolled_to}pt, not 300"
+            (scrolled_to - 50.0).abs() < 2.0,
+            "the clip view moved to {scrolled_to}pt, not 50"
         );
         assert!(
-            knob_after > knob_before,
+            knob_after < knob_before,
             "the knob did not follow: {knob_before:.3} -> {knob_after:.3}"
         );
     }
