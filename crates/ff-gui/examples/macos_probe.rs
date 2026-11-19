@@ -366,7 +366,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let outer = app.create_box(Orientation::Vertical, 6)?;
         let margin_label = app.create_label("max distance:")?;
+        let case_cb = app.create_checkbutton("Case sensitive")?;
+        let fuzzy_cb = app.create_checkbutton("Fuzzy matching")?;
+        let count_cb = app.create_checkbutton("Count only (skip the list)")?;
         outer.append(&margin_label);
+        outer.append(&case_cb);
+        outer.append(&fuzzy_cb);
+        outer.append(&count_cb);
         outer.append(&scrolled);
         win.set_child(&outer);
         // The list takes the spare height, as it does in the app (where
@@ -493,6 +499,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             shot.scroller_coverage
         );
 
+        // The chrome the offscreen render leaves out, and the controls a user
+        // sees: the traffic lights in the title band, and each advanced
+        // checkbox with its label, sampled where the widget actually sits.
+        let content_h = send_rect(view, "bounds").h;
+        let band = shot.height as f64 - content_h;
+        let ink_in = |widget: *mut std::ffi::c_void| -> usize {
+            let f = send_rect(widget, "frame");
+            let mut x = f.x;
+            let mut y = f.y;
+            let mut v = send0(widget, "superview");
+            while !v.is_null() && v != view {
+                let parent = send_rect(v, "frame");
+                x += parent.x;
+                y += parent.y;
+                v = send0(v, "superview");
+            }
+            // AppKit's origin is the bottom left, the image's the top left.
+            let x0 = x.max(0.0) as usize;
+            let x1 = ((x + f.w).max(0.0) as usize).min(shot.width as usize);
+            let y0 = ((band + content_h - (y + f.h)).max(0.0) as usize).min(shot.height as usize);
+            let y1 = (y0 + f.h.max(0.0) as usize).min(shot.height as usize);
+            let mut ink = 0usize;
+            for row in y0..y1 {
+                for col in x0..x1 {
+                    let i = (row * shot.width as usize + col) * 4;
+                    if shot.rgba[i] < 200 || shot.rgba[i + 1] < 200 || shot.rgba[i + 2] < 200 {
+                        ink += 1;
+                    }
+                }
+            }
+            ink
+        };
+        let (case_ink, fuzzy_ink, count_ink) = (
+            ink_in(case_cb.raw_handle()),
+            ink_in(fuzzy_cb.raw_handle()),
+            ink_in(count_cb.raw_handle()),
+        );
+        let mut traffic_ink = 0usize;
+        for row in 0..(band as usize).min(shot.height as usize) {
+            for col in 0..80usize.min(shot.width as usize) {
+                let i = (row * shot.width as usize + col) * 4;
+                let (r, g, b) = (
+                    shot.rgba[i] as i32,
+                    shot.rgba[i + 1] as i32,
+                    shot.rgba[i + 2] as i32,
+                );
+                if r.max(g).max(b) - r.min(g).min(b) > 40 {
+                    traffic_ink += 1;
+                }
+            }
+        }
+        println!(
+            "probe: title band {band}pt, traffic lights {traffic_ink} px of colour, checkboxes ink case {case_ink}, fuzzy {fuzzy_ink}, count {count_ink}"
+        );
+        assert!(
+            band >= 20.0,
+            "the capture has no title band ({band}pt of chrome)"
+        );
+        assert!(
+            traffic_ink >= 80,
+            "the title band has no traffic-light buttons ({traffic_ink} coloured px)"
+        );
+        for (label, ink) in [
+            ("Case sensitive", case_ink),
+            ("Fuzzy matching", fuzzy_ink),
+            ("Count only (skip the list)", count_ink),
+        ] {
+            assert!(
+                ink >= 30,
+                "the \"{label}\" checkbox did not render into the capture ({ink} px of ink)"
+            );
+        }
+
         // Columns: the list must be exactly as wide as its viewport (a canvas
         // wider than the window laid its columns out for the wider one, which
         // put the path column at 80% and clipped it), and the path cells must
@@ -553,7 +632,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("probe: left label margin {x}pt (linux 5)");
         assert!(
-            (x - 5.0).abs() <= 2.5,
+            (x - 5.0).abs() <= 1.0,
             "the label sits {x}pt from the window edge, Linux puts it at 5pt"
         );
     }

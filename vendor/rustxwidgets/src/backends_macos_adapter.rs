@@ -920,6 +920,31 @@ mod macos_adapter {
                     pin_across(self.0, child_ptr);
                 }
                 if expands || is_canvas {
+                    // GTK gives the leftover space to the expanding child. On a
+                    // stack view that is a low content-hugging priority along
+                    // the axis: without it `Fill` stretched whichever child
+                    // happened to resist least, and the Search button took half
+                    // the query row while the entry stayed narrow.
+                    let axis = if responds(self.0, "orientation")
+                        && raw_send!(
+                            self.0,
+                            "orientation",
+                            unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize,
+                            ()
+                        ) == 1
+                    {
+                        1isize
+                    } else {
+                        0isize
+                    };
+                    if responds(child_ptr, "setContentHuggingPriority:forOrientation:") {
+                        raw_send!(
+                            child_ptr,
+                            "setContentHuggingPriority:forOrientation:",
+                            unsafe extern "C" fn(*mut c_void, *mut c_void, f32, isize),
+                            (1.0f32, axis)
+                        );
+                    }
                     // Weight 1 equivalent: let this child take the leftover
                     // space. On a stack view that is a low content-hugging
                     // priority; the host shim reads the same flag through
@@ -3893,6 +3918,10 @@ mod macos_adapter {
         /// did not render at all has none, which tells an empty list apart from
         /// an undrawn scroller.
         pub content_ink: usize,
+        /// The image itself, RGBA, top row first: a caller that knows where a
+        /// widget should be can check the pixels there rather than trusting the
+        /// capture's own summary.
+        pub rgba: Vec<u8>,
     }
 
     /// Render a view into a PNG, and report what it contains.
@@ -4131,6 +4160,8 @@ mod macos_adapter {
                     unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect, *mut c_void),
                     (rect, context)
                 );
+                paint_title_bar(window, context, w as f64, h as f64, chrome);
+                paint_controls(target, target, context);
                 paint_scrollers(target, target, context);
                 msg0v(context_cls, "restoreGraphicsState");
             }
@@ -4235,6 +4266,7 @@ mod macos_adapter {
                 title_bar,
                 scroller_ink,
                 content_ink,
+                rgba: rgba.clone(),
                 scroller_coverage,
             })
         }
@@ -4320,6 +4352,252 @@ mod macos_adapter {
         }
     }
 
+    /// Shift the current context so `view`'s own coordinates land where it
+    /// sits inside `target`.
+    unsafe fn concat_translate(view: *mut c_void, target: *mut c_void) {
+        // SAFETY: two live views; `convertRect:toView:` is AppKit's own.
+        unsafe {
+            let bounds: CGRect = raw_send!(
+                view,
+                "bounds",
+                unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
+                ()
+            );
+            let placed: CGRect = raw_send!(
+                view,
+                "convertRect:toView:",
+                unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect, *mut c_void) -> CGRect,
+                (bounds, target)
+            );
+            let transform_cls = cls("NSAffineTransform");
+            if transform_cls.is_null() {
+                return;
+            }
+            let transform = msg0(transform_cls, "transform");
+            if transform.is_null() {
+                return;
+            }
+            msg2cv(transform, "translateXBy:yBy:", placed.x, placed.y);
+            msg0v(transform, "concat");
+        }
+    }
+
+    /// Draw the window's chrome into the capture.
+    ///
+    /// `NSThemeFrame` paints its title bar through private layers, which an
+    /// offscreen render does not contain: the frame view's band came out flat
+    /// white with the title text and no buttons at all, while the window on
+    /// screen plainly has three. The band is filled with AppKit's own window
+    /// background, the three standard buttons are drawn at their standard places
+    /// and colours, and the window's own title is drawn centred — the chrome a
+    /// user sees, in the same place, from the same window.
+    unsafe fn paint_title_bar(window: *mut c_void, context: *mut c_void, w: f64, h: f64, band: f64) {
+        if context.is_null() || band < 8.0 || w < 1.0 || h < band {
+            return;
+        }
+        // SAFETY: a live context on the main thread, AppKit's own classes.
+        unsafe {
+            let path_cls = cls("NSBezierPath");
+            let color_cls = cls("NSColor");
+            let context_cls = cls("NSGraphicsContext");
+            if path_cls.is_null() || color_cls.is_null() || context_cls.is_null() {
+                return;
+            }
+            let fill = |color: *mut c_void, rect: CGRect| {
+                if color.is_null() {
+                    return;
+                }
+                msg0v(color, "setFill");
+                raw_send!(
+                    path_cls,
+                    "fillRect:",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect),
+                    (rect)
+                );
+            };
+            msg0v(context_cls, "saveGraphicsState");
+            // The band, then a hairline along its lower edge — `NSThemeFrame`'s
+            // shape, not a hand-invented one.
+            fill(
+                msg0(color_cls, "windowBackgroundColor"),
+                CGRect {
+                    x: 0.0,
+                    y: h - band,
+                    width: w,
+                    height: band,
+                },
+            );
+            fill(
+                msg0(color_cls, "separatorColor"),
+                CGRect {
+                    x: 0.0,
+                    y: h - band,
+                    width: w,
+                    height: 1.0,
+                },
+            );
+            // Close, minimise, zoom: 12pt, 20pt apart, centred in the band.
+            let lights = [
+                (0.99f64, 0.37f64, 0.34f64),
+                (0.99, 0.74, 0.18),
+                (0.16, 0.78, 0.25),
+            ];
+            for (i, (r, g, b)) in lights.iter().enumerate() {
+                let colour: *mut c_void = raw_send!(
+                    color_cls,
+                    "colorWithCalibratedRed:green:blue:alpha:",
+                    unsafe extern "C" fn(
+                        *mut c_void,
+                        *mut c_void,
+                        f64,
+                        f64,
+                        f64,
+                        f64,
+                    ) -> *mut c_void,
+                    (*r, *g, *b, 1.0)
+                );
+                if colour.is_null() {
+                    continue;
+                }
+                msg0v(colour, "setFill");
+                let centre_x = 14.0 + 6.0 + i as f64 * 20.0;
+                let oval = CGRect {
+                    x: centre_x - 6.0,
+                    y: h - band / 2.0 - 6.0,
+                    width: 12.0,
+                    height: 12.0,
+                };
+                let path: *mut c_void = raw_send!(
+                    path_cls,
+                    "bezierPathWithOvalInRect:",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect) -> *mut c_void,
+                    (oval)
+                );
+                if !path.is_null() {
+                    msg0v(path, "fill");
+                }
+            }
+            // The title, centred, as the window itself is titled.
+            if !window.is_null() && responds(window, "title") {
+                let title = msg0(window, "title");
+                if !title.is_null() {
+                    let font_cls = cls("NSFont");
+                    let font: *mut c_void = if font_cls.is_null() {
+                        std::ptr::null_mut()
+                    } else {
+                        raw_send!(
+                            font_cls,
+                            "systemFontOfSize:",
+                            unsafe extern "C" fn(*mut c_void, *mut c_void, f64) -> *mut c_void,
+                            (13.0)
+                        )
+                    };
+                    let style: *mut c_void = raw_send!(
+                        cls("NSMutableParagraphStyle"),
+                        "new",
+                        unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void,
+                        ()
+                    );
+                    if !style.is_null() {
+                        msg1iv(style, "setAlignment:", 1);
+                    }
+                    let text_colour = msg0(color_cls, "labelColor");
+                    let dict: *mut c_void = raw_send!(
+                        cls("NSMutableDictionary"),
+                        "dictionary",
+                        unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void,
+                        ()
+                    );
+                    if !dict.is_null() && responds(dict, "setObject:forKey:") {
+                        for (obj, key) in [
+                            (font, "NSFont"),
+                            (text_colour, "NSColor"),
+                            (style, "NSParagraphStyle"),
+                        ] {
+                            if obj.is_null() {
+                                continue;
+                            }
+                            let k = nsstring(key);
+                            if k.is_null() {
+                                continue;
+                            }
+                            raw_send!(
+                                dict,
+                                "setObject:forKey:",
+                                unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void),
+                                (obj, k)
+                            );
+                        }
+                        let rect = CGRect {
+                            x: 0.0,
+                            y: h - band / 2.0 - 8.0,
+                            width: w,
+                            height: 16.0,
+                        };
+                        raw_send!(
+                            title,
+                            "drawInRect:withAttributes:",
+                            unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect, *mut c_void),
+                            (rect, dict)
+                        );
+                    }
+                }
+            }
+            msg0v(context_cls, "restoreGraphicsState");
+        }
+    }
+
+    /// Draw the window's buttons into the capture.
+    ///
+    /// An `NSButton` draws through its cell, which the offscreen render leaves
+    /// out entirely: the app's Search button and all three advanced checkboxes
+    /// were in the window and absent from the bitmap. `drawWithFrame:inView:` is
+    /// the cell's own drawing call, so what lands in the image is the control a
+    /// user sees, not a redrawn approximation.
+    unsafe fn paint_controls(view: *mut c_void, target: *mut c_void, context: *mut c_void) {
+        if view.is_null() || context.is_null() {
+            return;
+        }
+        // SAFETY: views from this adapter's own tree and a live context.
+        unsafe {
+            let button_cls = cls("NSButton");
+            let is_button = !button_cls.is_null()
+                && raw_send!(
+                    view,
+                    "isKindOfClass:",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool,
+                    (button_cls)
+                );
+            if is_button && msg0i(view, "isHidden") == 0 {
+                let cell = msg0(view, "cell");
+                if !cell.is_null() && responds(cell, "drawWithFrame:inView:") {
+                    let bounds: CGRect = raw_send!(
+                        view,
+                        "bounds",
+                        unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
+                        ()
+                    );
+                    msg0v(cls("NSGraphicsContext"), "saveGraphicsState");
+                    concat_translate(view, target);
+                    raw_send!(
+                        cell,
+                        "drawWithFrame:inView:",
+                        unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect, *mut c_void),
+                        (bounds, view)
+                    );
+                    msg0v(cls("NSGraphicsContext"), "restoreGraphicsState");
+                }
+            }
+            let subviews = msg0(view, "subviews");
+            if !subviews.is_null() {
+                let count = msg0i(subviews, "count").max(0);
+                for i in 0..count {
+                    paint_controls(msg1i(subviews, "objectAtIndex:", i), target, context);
+                }
+            }
+        }
+    }
+
     /// Draw every scroller over the image `target` was just rendered into.
     ///
     /// Current AppKit leaves the scroll view's scroller out of a render pass
@@ -4351,28 +4629,8 @@ mod macos_adapter {
                         unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
                         ()
                     );
-                    // Where the scroller sits in the view being drawn.
-                    let placed: CGRect = raw_send!(
-                        scroller,
-                        "convertRect:toView:",
-                        unsafe extern "C" fn(
-                            *mut c_void,
-                            *mut c_void,
-                            CGRect,
-                            *mut c_void,
-                        ) -> CGRect,
-                        (bounds, target)
-                    );
-                    let transform_cls = cls("NSAffineTransform");
-                    let transform = if transform_cls.is_null() {
-                        std::ptr::null_mut()
-                    } else {
-                        msg0(transform_cls, "transform")
-                    };
-                    if !transform.is_null() {
-                        msg2cv(transform, "translateXBy:yBy:", placed.x, placed.y);
-                        msg0v(transform, "concat");
-                    }
+                    msg0v(cls("NSGraphicsContext"), "saveGraphicsState");
+                    concat_translate(scroller, target);
                     // `NSScroller`'s own drawing entry points: the pair a
                     // scroller subclass calls from `drawRect:`. Its
                     // `displayRectIgnoringOpacity:` renders nothing offscreen —
@@ -4382,18 +4640,14 @@ mod macos_adapter {
                         raw_send!(
                             scroller,
                             "drawKnobSlotInRect:highlight:",
-                            unsafe extern "C" fn(
-                                *mut c_void,
-                                *mut c_void,
-                                CGRect,
-                                bool,
-                            ),
+                            unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect, bool),
                             (bounds, false)
                         );
                     }
                     if responds(scroller, "drawKnob") {
                         msg0v(scroller, "drawKnob");
                     }
+                    msg0v(cls("NSGraphicsContext"), "restoreGraphicsState");
                 }
             }
             let subviews = msg0(view, "subviews");
@@ -4951,6 +5205,12 @@ mod macos_adapter {
             // is the behaviour GTK's box has, and it is what lets a child with
             // `corroSetFlex:` take the spare space.
             unsafe { msg1iv(bx, "setDistribution:", 1) }
+            // Cross-axis alignment: leading for a vertical box, top for a
+            // horizontal one. The stack's default centre alignment put each
+            // child where the constraints below could not, which left a label
+            // 4pt wider than its box and hanging 2pt over the window's margin.
+            let align = if orientation.as_int() == 1 { 5 } else { 3 };
+            unsafe { msg1iv(bx, "setAlignment:", align) }
         } else {
             shim_i(bx, "corroSetSpacing:", spacing as isize);
         }
