@@ -375,6 +375,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         let view = win.raw_handle();
+        // Who has no height? The stack, the label or the list?
+        {
+            let b = send_rect(outer.raw_handle(), "frame");
+            let l = send_rect(margin_label.raw_handle(), "frame");
+            let s = send_rect(scrolled.inner.raw_handle(), "frame");
+            println!(
+                "probe: before capture box {}x{} at ({}, {}), label {}x{}, list {}x{}, distribution {}",
+                b.w,
+                b.h,
+                b.x,
+                b.y,
+                l.w,
+                l.h,
+                s.w,
+                s.h,
+                send0i(outer.raw_handle(), "distribution")
+            );
+        }
         let shot = rswidgets::backends_macos_adapter::capture(view, Some((1350.0, 858.0)))
             .ok_or("the window produced no capture")?;
         let scroller_view = send0(sv, "verticalScroller");
@@ -384,6 +402,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             send_rect(scroller_view, "frame")
         };
         let sv_frame = send_rect(sv, "frame");
+        {
+            let b = send_rect(outer.raw_handle(), "frame");
+            let l = send_rect(margin_label.raw_handle(), "frame");
+            println!(
+                "probe: after capture box {}x{} at ({}, {}), label {}x{}",
+                b.w, b.h, b.x, b.y, l.w, l.h
+            );
+        }
         println!(
             "probe: scroller style {} (0 overlay, 1 legacy), vertical scroller {} at x={} {}x{}, scroll view {}x{}",
             send0i(sv, "scrollerStyle"),
