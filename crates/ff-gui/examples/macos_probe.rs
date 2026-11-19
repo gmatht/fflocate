@@ -145,6 +145,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
         unsafe { f(obj, rswidgets::backends::apple::selector(selname), arg) }
     }
+    fn send_priority(
+        obj: *mut std::ffi::c_void,
+        selname: &str,
+        priority: f32,
+        orientation: isize,
+    ) {
+        let f: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, f32, isize) =
+            unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+        unsafe {
+            f(
+                obj,
+                rswidgets::backends::apple::selector(selname),
+                priority,
+                orientation,
+            )
+        }
+    }
     fn send1i(obj: *mut std::ffi::c_void, selname: &str, arg: isize) -> *mut std::ffi::c_void {
         let f: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, isize) -> *mut std::ffi::c_void =
             unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
@@ -347,6 +364,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         outer.append(&margin_label);
         outer.append(&scrolled);
         win.set_child(&outer);
+        // The list takes the spare height, as it does in the app (where
+        // `set_vexpand` asks for exactly this): a stack view gives leftover
+        // space to the child that resists growing least.
+        send_priority(
+            scrolled.raw_handle(),
+            "setContentHuggingPriority:forOrientation:",
+            1.0,
+            1,
+        );
 
         let view = win.raw_handle();
         let shot = rswidgets::backends_macos_adapter::capture(view, Some((1350.0, 858.0)))
