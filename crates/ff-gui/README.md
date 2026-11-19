@@ -29,12 +29,30 @@ autorelease pool, builds an `NSWindow` around its content view, calls
 CI opens that window on a macOS runner and checks the process is still alive
 seconds later — the only place this path can be exercised.
 
-What the AppKit arm does **not** have yet is the generated Objective-C shim
-classes (`apple_generator` emits them; nothing compiles them), so click
-targets/actions and canvas drawing stay inert. Every shim selector is checked
-with `-respondsToSelector:` and the gap is logged once (`no host shim for
-corroSetFlex:`) rather than aborting the process, and `$FF_GUI_TRACE=1` names
-each construction step on stderr.
+The Objective-C shim classes `apple_generator` emits are never compiled here,
+so the backend builds them at runtime instead — `objc_allocateClassPair` +
+`class_addMethod`, the primitives it already used for its `NSTimer` target:
+`CorroMacTarget` (a control's target/action, dispatching into the Rust
+callback), `CorroMacMenuTarget` (menu items, in a real `NSMenu` installed with
+`setMainMenu:`) and `CorroSheetView` (the canvas: `drawRect:` paints it, text
+through `NSString` drawing attributes rather than CoreText, plus mouse clicks).
+The `corro*` selectors sent to *stock* views (`corroSetFlex:`,
+`corroSetContentHugging:`, `corroSetMinWidth:`, `corroSetPinnedWidth:`) are
+added to `NSView` the same way, so they are real behaviour rather than a skip.
+
+The `GUI interactivity (macOS)` CI step proves that rather than asserting it:
+it presses the button with `-performClick:` and requires the Rust callback to
+fire exactly once, then renders the canvas into an `NSBitmapImageRep` and
+requires a non-blank image.
+
+Still inert on AppKit: **alerts** (`corroAddAction:` has no runtime
+implementation, so `add_button` is a logged skip and a dialog would open with no
+buttons; `corroPresentDialog:` is likewise a skip, so `present` only falls back
+to `runModal` when no view controller is registered), the canvas' **keyboard**
+events (`keyDown:` is not wired), **drag-and-drop**, and the row **context
+menu**. Any selector without an implementation is still checked with
+`-respondsToSelector:` and the gap logged once rather than aborting the process,
+and `$FF_GUI_TRACE=1` names each construction step on stderr.
 
 ```sh
 cargo run -p ff-gui                       # GTK on Linux, AppKit on macOS

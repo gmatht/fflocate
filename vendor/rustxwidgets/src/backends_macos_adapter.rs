@@ -3605,6 +3605,11 @@ mod macos_adapter {
             if !title.is_null() {
                 msg1v(window, "setTitle:", title);
             }
+            // Build the shim classes before the widget tree, not lazily on the
+            // first click: `append` already sends `corroSetFlex:` to a stock
+            // `NSStackView` child, and a class registered later would make that
+            // first send a logged skip (and drop the child's flex weight).
+            ensure_runtime_classes();
             // Wire the shared Apple layer to this view. Every widget factory is
             // a no-op until a root exists, which is why the order matters here.
             if let Err(e) = core_apple::init_with_root_impl(view, std::ptr::null_mut(), "macos") {

@@ -462,20 +462,35 @@ These are deliberate and small; each is noted so the design stays honest.
    the row context menu cannot be popped up (the status line says so) and
    drag-and-drop is unavailable. The daemon and CLI are unaffected.
 
-   On macOS the window is real: `ff-gui` creates its own `NSApplication` and
-   `NSWindow`, builds the whole widget tree and enters the AppKit run loop, and
-   the `GUI launches (macOS)` CI step proves it on a runner (`session=Aqua`, the
-   process still alive after 8 s). What is *not* live there yet is what the
-   generated Objective-C shim classes would provide — button targets/actions,
-   canvas drawing and the menu bar — because `apple_generator` emits that source
-   but nothing compiles it. The adapter therefore checks each shim selector with
-   `-respondsToSelector:` and logs the gap once (`no host shim for
-   corroSetFlex:`) instead of dying: window, controls and the status line work,
-   while clicks and the canvas stay inert until those classes are built at
-   runtime. This was debugged from CI output alone, which is why
-   `$FF_GUI_TRACE=1` now names every construction step: a bad AppKit message
-   send raises an Objective-C exception that unwinds into Rust and aborts with
-   no backtrace.
+   On macOS the window is real, and so is what those shim classes provide.
+   `ff-gui` creates its own `NSApplication` and `NSWindow`, builds the whole
+   widget tree and enters the AppKit run loop, and the `GUI launches (macOS)` CI
+   step proves it on a runner (`session=Aqua`, the process still alive after 8 s).
+   The Objective-C classes `apple_generator` emits but nothing compiles are
+   built at runtime instead — `objc_allocateClassPair` + `class_addMethod`, the
+   primitives the backend already used for its `NSTimer` target. Live:
+   `CorroMacTarget` (a control's target/action reaching the Rust callback),
+   `CorroMacMenuTarget` (the menu model as a real `NSMenu` via `setMainMenu:`)
+   and `CorroSheetView` (the canvas `drawRect:`, painting through the linked
+   CoreGraphics context, its text through `NSString` drawing attributes rather
+   than CoreText, plus mouse clicks); the `corro*` selectors sent to *stock*
+   views (`corroSetFlex:`, `corroSetContentHugging:`, `corroSetMinWidth:`,
+   `corroSetPinnedWidth:`) are added to `NSView` the same way, before the tree
+   is built. `GUI interactivity (macOS)` proves it rather than asserting it: it
+   presses the button with `-performClick:` and requires the callback to fire
+   exactly once, then renders the canvas into an `NSBitmapImageRep` and requires
+   a non-blank image (320x120, 107 distinct colours on the run that landed it).
+
+   Still inert there, named as such: **alerts** (`corroAddAction:` has no
+   runtime implementation, so `add_button` is a logged skip and a dialog would
+   open with no buttons; `corroPresentDialog:` is a skip too, so `present` only
+   falls back to `runModal` when no view controller is registered), the canvas'
+   **keyboard** events (`keyDown:` is not wired), **drag-and-drop** and the row
+   **context menu**. A selector with no implementation is still checked with
+   `-respondsToSelector:` and reported once, because an unchecked AppKit send
+   raises an Objective-C exception that unwinds into Rust and aborts with no
+   backtrace — which is why `$FF_GUI_TRACE=1` names every construction step on
+   stderr.
 
 7. **The system daemon's ownership sidecar can be stale, by design.** It is
    captured at crawl time and refreshed on rescan; a `chown`/`chmod` between
