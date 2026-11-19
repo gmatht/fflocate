@@ -125,6 +125,10 @@ jobs:
       # is downscaled and re-emitted as base64 notices: job logs need a token,
       # annotations do not. A missing capture fails the step — a screenshot that
       # silently produced nothing would be worse than no screenshot.
+      # Two steps carry the PNG: annotations cap each message at 4096 chars and
+      # only ~9 notices per step survive, so one step cannot hold a 1350x858
+      # window. The capture is taken at the Linux window size and only shrunk if
+      # it cannot fit the 18 chunks the two steps provide.
       - name: GUI screenshot (macOS)
         if: runner.os == 'macOS'
         shell: bash
@@ -132,10 +136,11 @@ jobs:
           ulimit -c 0 || true
           cargo build -p ff-gui 2>&1 | tail -1
           rm -f /tmp/app.png
-          # `screencapture` photographs the desktop, not this process's own
-          # view, and a runner's desktop is not where the window we care about
-          # lives. The binary renders itself instead.
-          FF_GUI_SCREENSHOT=/tmp/app.png ./target/debug/ff-gui >shot-run.log 2>&1 &
+          # The runner has no daemon, so the window is filled from the same row
+          # builder on the screenshot path only; a normal run shows real results
+          # or an empty list.
+          FF_GUI_SCREENSHOT=/tmp/app.png FF_GUI_SCREENSHOT_SIZE=1350x858 \
+            ./target/debug/ff-gui >shot-run.log 2>&1 &
           pid=$!
           for _ in $(seq 1 30); do
             [ -s /tmp/app.png ] && break
@@ -147,22 +152,45 @@ jobs:
             echo "::error title=GUI screenshot (macOS)::no png written; $(head -c 400 shot-run.log | tr -cd '[:print:]\n' | tr '\n' '|')"
             exit 1
           fi
-          # Annotations cap each message at 4096 chars and only a handful of
-          # them reach the check, so a 960x640 PNG (44k base64 chars) lost its
-          # tail. Halving it keeps every pixel of the window in the report.
-          sips -Z 500 /tmp/app.png --out /tmp/shot.png >/dev/null 2>&1 || cp /tmp/app.png /tmp/shot.png
-          bytes=$(stat -f%z /tmp/shot.png)
+          full_dims=$(sips -g pixelWidth -g pixelHeight /tmp/app.png | grep pixel | tr -d ' \n')
+          # 18 chunks of 3800 base64 chars cap at about 51 KB of png.
+          for w in 1350 1100 900 760 620 500; do
+            sips -Z "$w" /tmp/app.png --out /tmp/shot.png >/dev/null 2>&1 || cp /tmp/app.png /tmp/shot.png
+            bytes=$(stat -f%z /tmp/shot.png)
+            [ "$bytes" -le 51000 ] && break
+          done
           size=$(sips -g pixelWidth -g pixelHeight /tmp/shot.png | grep pixel | tr -d ' \n')
+          rm -rf /tmp/shots && mkdir -p /tmp/shots
           b64=$(base64 -i /tmp/shot.png | tr -d '\n')
-          echo "::notice title=GUI screenshot (macOS)::${bytes} bytes png ${size}, ${#b64} base64 chars: $(grep -o 'ff-gui: screenshot.*' shot-run.log | head -1)"
-          # 4000-char chunks: GitHub truncates longer annotation messages.
           i=0
           while [ -n "$b64" ]; do
-            echo "::notice title=shot-part-${i}::$(printf '%s' "$b64" | cut -c1-3800)"
+            printf '%s' "${b64:0:3800}" > "/tmp/shots/part-$i"
             b64=${b64:3800}
             i=$((i+1))
           done
-          echo "::notice title=shot-parts::${i} chunks"
+          echo "::notice title=GUI screenshot (macOS)::window ${full_dims}, sent ${size}, ${bytes} bytes, ${i} chunks: $(grep -o 'ff-gui: screenshot.*' shot-run.log | head -1)"
+          last=8
+          [ "$i" -lt 9 ] && last=$((i-1))
+          for p in $(seq 0 "$last"); do
+            echo "::notice title=shot-part-${p}::$(cat "/tmp/shots/part-$p")"
+          done
+          echo "::notice title=shot-parts::${i} chunks, first 9 above"
+
+      - name: GUI screenshot part 2 (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          if [ ! -d /tmp/shots ]; then
+            echo "::notice title=shot-parts-2::no screenshot from the previous step"
+            exit 0
+          fi
+          sent=0
+          for p in $(seq 9 40); do
+            [ -f "/tmp/shots/part-$p" ] || break
+            echo "::notice title=shot-part-${p}::$(cat "/tmp/shots/part-$p")"
+            sent=$((sent+1))
+          done
+          echo "::notice title=shot-parts-2::${sent} more chunk(s)"
 
       # The FSEvents backend is cfg(target_os = "macos"), so its unit tests only
       # run here; this also proves a live stream follows create/rename/delete.

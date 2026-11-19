@@ -1172,7 +1172,50 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // been laid out by then, which is what makes the image match the window.
     #[cfg(all(target_os = "macos", feature = "macos", not(feature = "zork")))]
     if let Ok(path) = std::env::var("FF_GUI_SCREENSHOT") {
-        match rswidgets::backends_macos_adapter::write_view_png(win.raw_handle(), &path) {
+        // The runner has no daemon, so the window would otherwise show an empty
+        // list and there would be nothing to compare with the Linux capture.
+        // Only on this path: a normal run never fabricates results, and these
+        // rows go through the same builder the daemon's paths do.
+        let demo_paths: Vec<String> = [
+            "/home/me/projects/fflocate/src/main.rs",
+            "/home/me/projects/fflocate/src/index.rs",
+            "/home/me/projects/fflocate/src/watch/fsevents.rs",
+            "/home/me/projects/fflocate/crates/ff/src/main.rs",
+            "/home/me/projects/fflocate/crates/ff-cli/src/lib.rs",
+            "/home/me/projects/rustxwidgets/src/backends/apple.rs",
+            "/home/me/projects/rustxwidgets/src/backends_macos_adapter.rs",
+            "/etc/systemd/system/fflocated.service",
+            "/etc/xdg/fflocate/config.toml",
+            "/usr/share/doc/fflocate/README.md",
+            "/home/me/notes/indexing-policy.md",
+            "/home/me/notes/case-folding.txt",
+            "/home/me/.config/fflocate/fflocate.conf",
+            "/tmp/fx/dir0/file-00.rs",
+            "/tmp/fx/dir1/file-01.rs",
+            "/tmp/fx/dir2/file-02.rs",
+            "/tmp/fx/dir3/file-03.rs",
+            "/tmp/fx/dir4/run-fsevents-smoke.sh",
+            "/tmp/fx/dir5/manifest.json",
+            "/tmp/fx/dir6/logo.png",
+        ]
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+        results.set_rows(&rows_to_cells(&demo_paths));
+        status.set_text(&format!(
+            "{} of {} matches (screenshot fixture: no daemon on this runner)",
+            demo_paths.len(),
+            demo_paths.len()
+        ));
+        // Same window size as the Linux capture, when asked for, so the two
+        // PNGs can be compared directly.
+        let size = std::env::var("FF_GUI_SCREENSHOT_SIZE")
+            .ok()
+            .and_then(|spec| {
+                let (w, h) = spec.split_once('x')?;
+                Some((w.trim().parse::<f64>().ok()?, h.trim().parse::<f64>().ok()?))
+            });
+        match rswidgets::backends_macos_adapter::write_view_png(win.raw_handle(), &path, size) {
             Some((w, h, bytes)) => {
                 eprintln!("ff-gui: screenshot {path} ({w}x{h}, {bytes} bytes)");
             }

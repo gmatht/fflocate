@@ -130,6 +130,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
         unsafe { f(obj, rswidgets::backends::apple::selector(selname)) }
     }
+    fn send0i(obj: *mut std::ffi::c_void, selname: &str) -> isize {
+        let f: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> isize =
+            unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+        unsafe { f(obj, rswidgets::backends::apple::selector(selname)) }
+    }
+    fn send0v(obj: *mut std::ffi::c_void, selname: &str) {
+        let f: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) =
+            unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+        unsafe { f(obj, rswidgets::backends::apple::selector(selname)) }
+    }
+    fn send1i(obj: *mut std::ffi::c_void, selname: &str, arg: isize) -> *mut std::ffi::c_void {
+        let f: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, isize) -> *mut std::ffi::c_void =
+            unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+        unsafe { f(obj, rswidgets::backends::apple::selector(selname), arg) }
+    }
+    fn send_after(
+        obj: *mut std::ffi::c_void,
+        selname: &str,
+        arg: *mut std::ffi::c_void,
+        delay: f64,
+    ) {
+        let f: unsafe extern "C" fn(
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+            f64,
+        ) = unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+        unsafe {
+            f(
+                obj,
+                rswidgets::backends::apple::selector("performSelector:withObject:afterDelay:"),
+                rswidgets::backends::apple::selector(selname),
+                arg,
+                delay,
+            )
+        }
+    }
 
     use rswidgets::compat::{CellValue, TreeView};
     let tree = TreeView::new(&[("", true, true), ("Name", false, true), ("Path", false, true)])?;
@@ -205,11 +243,112 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "probe: scrolled render {sw_px_w}x{sw_px_h}, {} distinct colours",
         scrolled_colours.len()
     );
+    println!("probe: {} rows with icons in the list", rows.len());
     assert!(
-        scrolled_colours.len() >= 3,
-        "the scrolled results list rendered blank: {} distinct colours",
+        scrolled_colours.len() >= 20,
+        "the populated results list rendered too flat: {} distinct colours",
         scrolled_colours.len()
     );
+    // Text and icon glyphs are the only dark pixels; an empty white viewport
+    // would have none.
+    assert!(
+        scrolled_px
+            .chunks_exact(4)
+            .any(|p| p[0] < 120 && p[1] < 120 && p[2] < 120),
+        "no dark text or icon pixels in the populated list render"
+    );
+
+    // --- A box's children span its width, the way GTK's box stretches them ---
+    //
+    // `NSStackView` only aligns arranged subviews, so they kept their intrinsic
+    // widths and the window's UI sat in a narrow central column. These frames
+    // are the difference between that and a GTK-like layout.
+    {
+        let probe_box = app.create_box(Orientation::Vertical, 4)?;
+        let probe_label = app.create_label("box child")?;
+        probe_box.append(&probe_label);
+        win.set_child(&probe_box);
+        let box_ptr = probe_box.raw_handle();
+        send0v(box_ptr, "layoutSubtreeIfNeeded");
+        let box_bounds = send_rect(box_ptr, "bounds");
+        let child_frame = send_rect(probe_label.raw_handle(), "frame");
+        println!(
+            "probe: box {}pt wide, child {}pt ({}% of the box)",
+            box_bounds.w,
+            child_frame.w,
+            if box_bounds.w > 0.0 {
+                (child_frame.w * 100.0 / box_bounds.w).round() as i64
+            } else {
+                0
+            }
+        );
+        assert!(
+            box_bounds.w > 100.0,
+            "the box itself has no width: {}pt",
+            box_bounds.w
+        );
+        assert!(
+            (child_frame.w - box_bounds.w).abs() < 1.0,
+            "the box's child is {}pt wide in a {}pt box: it is not filling the width",
+            child_frame.w,
+            box_bounds.w
+        );
+    }
+
+    // --- Scrolling reaches the end of the content ---
+    scrolled.scroll_to(0.0, 0.0, 0.0, doc_h, doc_h, clip_h);
+    let end = send_rect(clip, "bounds").y;
+    let last = (doc_h - clip_h).max(0.0);
+    println!("probe: scrolled to the end at {end}pt (last {last}pt)");
+    assert!(
+        (end - last).abs() < 0.5,
+        "scrolling to the end left the clip view at {end}pt instead of {last}pt"
+    );
+
+    // --- A dialog presents its buttons and the click comes back to Rust ---
+    {
+        let dlg = app.new_dialog()?;
+        dlg.set_title("ff-gui probe");
+        dlg.add_button("Close", 0);
+        dlg.add_button("Open", 1);
+        let fired: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(usize::MAX));
+        {
+            let fired = fired.clone();
+            dlg.connect_response(move |response| {
+                fired.store(response as usize, Ordering::SeqCst);
+            })?;
+        }
+        let alert = dlg.inner.raw_handle();
+        let buttons = send0(alert, "buttons");
+        let count = send0i(buttons, "count") as usize;
+        let first = send1i(buttons, "objectAtIndex:", 0);
+        println!("probe: alert has {count} button(s)");
+        assert_eq!(count, 2, "the alert presents {count} buttons, expected 2");
+        assert!(!first.is_null(), "the alert's first button is missing");
+        // Click the first button once the modal loop is running, and make sure
+        // a stuck alert cannot hang the job: `abortModal` ends it after 5 s.
+        send_after(first, "performClick:", std::ptr::null_mut(), 0.2);
+        // SAFETY: NSApp exists (App::init ran) and `abortModal` takes no object.
+        unsafe {
+            let app_cls = rswidgets::backends::apple::msg_shim();
+            let shared: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void =
+                std::mem::transmute(app_cls);
+            let app_obj = shared(
+                rswidgets::backends::apple::selector("NSApplication"),
+                rswidgets::backends::apple::selector("sharedApplication"),
+            );
+            if !app_obj.is_null() {
+                send_after(app_obj, "abortModal", std::ptr::null_mut(), 5.0);
+            }
+        }
+        dlg.present();
+        let response = fired.load(Ordering::SeqCst);
+        println!("probe: alert closed with response {response} (0 = first button)");
+        assert_eq!(
+            response, 0,
+            "the alert's clicked button did not reach the Rust response handler"
+        );
+    }
 
     println!("probe: ok");
     Ok(())

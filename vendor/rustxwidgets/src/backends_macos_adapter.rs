@@ -151,6 +151,60 @@ mod macos_adapter {
         unsafe { msg4cv(view, "setFrame:", x, y, w, h) };
     }
 
+    /// Pin `child` to both of `stack`'s cross-axis edges.
+    ///
+    /// GTK's box stretches a child across the axis it does not lay out along;
+    /// `NSStackView` only *aligns* it, so children kept their intrinsic widths
+    /// and the UI sat in a narrow central column. Two equality constraints
+    /// reproduce the fill — leading/trailing in a vertical stack, top/bottom in
+    /// a horizontal one (`NSLayoutAttribute` top 3, bottom 4, leading 5,
+    /// trailing 6) — and stay consistent with the stack view's centre alignment.
+    unsafe fn pin_across(stack: *mut c_void, child: *mut c_void) {
+        let constraint_cls = cls("NSLayoutConstraint");
+        if constraint_cls.is_null() || stack.is_null() || child.is_null() {
+            return;
+        }
+        // SAFETY: a live NSStackView; `orientation` returns an NSInteger.
+        unsafe {
+            let vertical = raw_send!(
+                stack,
+                "orientation",
+                unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize,
+                ()
+            ) == 1;
+            let (first, second) = if vertical {
+                (5isize, 6isize)
+            } else {
+                (3isize, 4isize)
+            };
+            // Auto Layout owns this child's frame from here on, so its
+            // autoresizing mask must not translate the frame into constraints
+            // as well.
+            msg1bv(child, "setTranslatesAutoresizingMaskIntoConstraints:", false);
+            for attr in [first, second] {
+                let constraint: *mut c_void = raw_send!(
+                    constraint_cls,
+                    "constraintWithItem:attribute:relatedBy:toItem:attribute:multiplier:constant:",
+                    unsafe extern "C" fn(
+                        *mut c_void,
+                        *mut c_void,
+                        *mut c_void,
+                        isize,
+                        isize,
+                        *mut c_void,
+                        isize,
+                        f64,
+                        f64,
+                    ) -> *mut c_void,
+                    (child, attr, 0isize, stack, attr, 1.0f64, 0.0f64)
+                );
+                if !constraint.is_null() {
+                    msg1v(stack, "addConstraint:", constraint);
+                }
+            }
+        }
+    }
+
     /// Put `child` inside `parent` (`addSubview:`), keeping the child's own
     /// frame. Null-safe: a null parent (backend not initialised) means the
     /// child is simply never attached, which is what makes host runs work.
@@ -749,10 +803,22 @@ mod macos_adapter {
             }
             let is_canvas = core_apple::is_canvas_view(child_ptr);
             let expands = core_apple::is_view_expanding(child_ptr);
+            // GTK's box stretches a child across the *other* axis: a vertical
+            // box gives every child the box's width, a horizontal box its
+            // height. `NSStackView` only aligns children, so they kept their
+            // intrinsic widths and the whole UI sat in a narrow central column
+            // while the GTK window had widgets spanning it. Pinning the two
+            // cross-axis edges is the "fill" the alignment attribute cannot
+            // express, and it stays consistent with the stack view's own centre
+            // alignment (centre + both edges is not over-constrained).
+            let stack_appkit = responds(self.0, "setDistribution:");
             unsafe {
                 // `addArrangedSubview:` exists on NSStackView; on the manual
                 // shim the same selector is implemented by the host view.
                 msg1v(self.0, "addArrangedSubview:", child_ptr);
+                if stack_appkit {
+                    pin_across(self.0, child_ptr);
+                }
                 if expands || is_canvas {
                     // Weight 1 equivalent: let this child take the leftover
                     // space. On a stack view that is a low content-hugging
@@ -2283,6 +2349,18 @@ mod macos_adapter {
     // ------------------------------------------------------------------
 
     #[repr(transparent)]
+    /// One response handler per alert, keyed by the alert's address.
+    struct SendResponse(Box<dyn FnMut(i32)>);
+    // SAFETY: the boxed closure is only ever called on the thread that ran
+    // `runModal`, which is the main thread that created the alert.
+    unsafe impl Send for SendResponse {}
+
+    static DIALOG_RESPONSES: Lazy<Mutex<HashMap<usize, SendResponse>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+    /// The response id each `add_button` registered, in button order.
+    static DIALOG_BUTTONS: Lazy<Mutex<HashMap<usize, Vec<i32>>>> =
+        Lazy::new(|| Mutex::new(HashMap::new()));
+
     pub struct Dialog(pub *mut c_void);
 
     impl Widget for Dialog {
@@ -2321,9 +2399,17 @@ mod macos_adapter {
         /// `runModal`/sheet presentation is decided by the host shim.
         pub fn set_transient_for(&self, _parent: *mut c_void) {}
 
-        pub fn append_content_area(&self, _child: &impl AsRef<*mut c_void>) {}
+        pub fn append_content_area(&self, child: &impl AsRef<*mut c_void>) {
+            let c = *child.as_ref();
+            if self.0.is_null() || c.is_null() {
+                return;
+            }
+            // NSAlert's content slot is its accessory view, which is where
+            // GTK's `get_content_area` would have put the body label.
+            unsafe { msg1v(self.0, "setAccessoryView:", c) };
+        }
 
-        pub fn add_button(&self, text: &str, _response_id: i32) {
+        pub fn add_button(&self, text: &str, response_id: i32) {
             if self.0.is_null() {
                 return;
             }
@@ -2331,34 +2417,50 @@ mod macos_adapter {
             if s.is_null() {
                 return;
             }
-            // `corroAddAction:` is implemented by the host's alert shim so one
-            // Rust call covers the addButton/runModal sequence; without it the
-            // button is added but the shim decides how the alert runs.
-            shim_v(self.0, "corroAddAction:", s);
+            // NSAlert's own button, so `runModal` dismisses on click and reports
+            // which one: `corroAddAction:` had no implementation, which is why
+            // the alert presented with no buttons at all.
+            // Returns the new `NSButton`; the alert owns it, so it is dropped
+            // here and the button list comes back through `-buttons`.
+            raw_send!(
+                self.0,
+                "addButtonWithTitle:",
+                unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void,
+                (s)
+            );
+            if let Ok(mut buttons) = DIALOG_BUTTONS.lock() {
+                buttons.entry(self.0 as usize).or_default().push(response_id);
+            }
         }
 
         pub fn present(&self) {
-            if self.0.is_null() {
-                return;
-            }
-            // Host-side `corroPresentDialog:` picks `runModal` (a standalone
-            // alert) or `beginSheetModalForWindow:` (a sheet on the host
-            // window) depending on what the host has.
-            match core_apple::view_controller() {
-                Some(vc) => shim_v(vc, "corroPresentDialog:", self.0),
-                None => {
-                    // No controller: present modally on the alert itself.
-                    unsafe { msg0v(self.0, "runModal") };
-                }
-            }
+            self.run();
         }
 
-        pub fn connect_response(&self, _f: impl FnMut(i32) + 'static) -> Result<u64, Error> {
-            Ok(0) // Wired through the host shim's alert delegate.
+        pub fn connect_response(&self, f: impl FnMut(i32) + 'static) -> Result<u64, Error> {
+            if self.0.is_null() {
+                return Ok(0);
+            }
+            if let Ok(mut responses) = DIALOG_RESPONSES.lock() {
+                responses.insert(self.0 as usize, SendResponse(Box::new(f)));
+            }
+            Ok(0)
         }
 
         pub fn set_default_response(&self, _response_id: i32) {}
-        pub fn close(&self) {}
+        pub fn close(&self) {
+            if self.0.is_null() {
+                return;
+            }
+            // The modal session is over by the time `runModal` returns; hide the
+            // window anyway, because the alert outlives its loop.
+            unsafe {
+                let w = msg0(self.0, "window");
+                if !w.is_null() {
+                    msg1v(w, "orderOut:", std::ptr::null_mut());
+                }
+            }
+        }
 
         /// Measure the alert before it opens.
         ///
@@ -2375,7 +2477,19 @@ mod macos_adapter {
             if self.0.is_null() {
                 return;
             }
-            unsafe { msg0v(self.0, if visible { "orderFront:nil" } else { "orderOut:nil" }) };
+            // `orderFront:`/`orderOut:` take a sender, and the selector is
+            // `orderOut:`, not `orderOut:nil` — an alert responds to neither a
+            // two-argument nor a nil-named selector.
+            unsafe {
+                let w = msg0(self.0, "window");
+                if !w.is_null() {
+                    msg1v(
+                        w,
+                        if visible { "orderFront:" } else { "orderOut:" },
+                        std::ptr::null_mut(),
+                    );
+                }
+            }
         }
 
         /// The container a dialog's children are added to. `NSAlert` has no
@@ -2391,24 +2505,24 @@ mod macos_adapter {
         /// `beginSheetModalForWindow:` (sheet) for us.
         pub fn run(&self) -> i32 {
             if self.0.is_null() {
-                return 0;
+                return -1;
             }
-            match core_apple::view_controller() {
-                Some(vc) => {
-                    raw_send!(
-                        vc,
-                        "corroPresentDialog:",
-                        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> (),
-                        (self.0)
-                    );
-                    // The shim does not report which button was clicked, so
-                    // the caller gets the neutral 0 rather than a guess.
-                    0
-                }
-                None => {
-                    unsafe { msg0i(self.0, "runModal") as i32 }
+            // `runModal` returns `NSAlertFirstButtonReturn` (1000) plus the
+            // button's index, so the clicked button maps back to the response id
+            // the caller registered with `add_button`.
+            let raw = unsafe { msg0i(self.0, "runModal") };
+            let index = if raw >= 1000 { (raw - 1000) as usize } else { 0 };
+            let id = DIALOG_BUTTONS
+                .lock()
+                .ok()
+                .and_then(|buttons| buttons.get(&(self.0 as usize)).and_then(|v| v.get(index).copied()))
+                .unwrap_or(index as i32);
+            if let Ok(mut responses) = DIALOG_RESPONSES.lock() {
+                if let Some(SendResponse(f)) = responses.get_mut(&(self.0 as usize)) {
+                    f(id);
                 }
             }
+            id
         }
     }
 
@@ -3460,10 +3574,27 @@ mod macos_adapter {
     /// by AppKit — so what lands in the file is what `drawRect:` painted, at
     /// the size the view was laid out at.
     ///
+    /// `size` grows the view's window first, so a capture can be taken at the
+    /// same window size as the Linux one instead of whatever the default was.
+    ///
     /// Returns `(width, height, bytes written)`.
-    pub fn write_view_png(view: *mut c_void, path: &str) -> Option<(u32, u32, usize)> {
+    pub fn write_view_png(
+        view: *mut c_void,
+        path: &str,
+        size: Option<(f64, f64)>,
+    ) -> Option<(u32, u32, usize)> {
         if view.is_null() {
             return None;
+        }
+        if let Some((win_w, win_h)) = size {
+            // SAFETY: a live content view; its `window` and `setContentSize:`
+            // are AppKit's own, and a view without a window is skipped.
+            unsafe {
+                let window = msg0(view, "window");
+                if !window.is_null() {
+                    msg2cv(window, "setContentSize:", win_w, win_h);
+                }
+            }
         }
         // SAFETY: a live NSView; both selectors are AppKit's own, and `bounds`
         // returns a `CGRect` (four `CGFloat`s) by value.
@@ -3665,12 +3796,6 @@ mod macos_adapter {
         }
     }
 
-    /// [`shim_sent`] followed by the send, for one object argument.
-    fn shim_v(obj: *mut c_void, selname: &str, arg: *mut c_void) {
-        if shim_sent(obj, selname) {
-            unsafe { msg1v(obj, selname, arg) }
-        }
-    }
 
     /// [`shim_sent`] followed by the send, for one integer argument.
     fn shim_i(obj: *mut c_void, selname: &str, arg: isize) {
@@ -4302,20 +4427,25 @@ mod macos_adapter {
     }
 
     pub fn create_dialog() -> Result<Dialog, Error> {
-        // The host shim builds the NSAlert (it owns the window/sheet
-        // decision) — one Rust call, no branching here. A missing shim yields
-        // a null handle and dialogs never present, which is a degraded but
-        // working UI.
-        let shim = cls("CorroMacAlert");
-        if shim.is_null() {
-            crate::backends::macos::log_macos("macos: CorroMacAlert shim missing; dialogs inert");
+        // A real `NSAlert`: its buttons are AppKit's own and `runModal` reports
+        // which one ended the session. The generated `CorroMacAlert` shim had no
+        // runtime implementation, so `corroAddAction:` was a logged skip and the
+        // alert presented with no buttons on it.
+        let alert_cls = cls("NSAlert");
+        if alert_cls.is_null() {
+            crate::backends::macos::log_macos("macos: NSAlert unavailable; dialogs inert");
             return Ok(Dialog(std::ptr::null_mut()));
         }
-        let d = unsafe { msg0(shim, "corroNewAlert") };
-        if d.is_null() {
+        let alert = unsafe { msg0(alert_cls, "alloc") };
+        let alert = if alert.is_null() {
+            std::ptr::null_mut()
+        } else {
+            unsafe { msg0(alert, "init") }
+        };
+        if alert.is_null() {
             return Ok(Dialog(std::ptr::null_mut()));
         }
-        Ok(Dialog(own(d)))
+        Ok(Dialog(own(alert)))
     }
 
     pub fn create_textview() -> Result<TextView, Error> {
