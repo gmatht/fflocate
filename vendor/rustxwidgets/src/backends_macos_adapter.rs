@@ -3443,9 +3443,11 @@ mod macos_adapter {
                 b.height.round().max(1.0) as u32,
             )
         };
-        // Draw it once through the normal path, then hand those pixels to a
-        // bitmap rep purely to get AppKit's PNG encoder.
-        let (px_w, px_h, px) = render_view_rgba(view, w, h)?;
+        // `cacheDisplayInRect:toBitmapImageRep:` is the AppKit call that renders
+        // a view *and its subviews*, layer-backed or not. The plain
+        // `displayRectIgnoringOpacity:inContext:` path leaves a layer-backed
+        // tree empty — the first attempt at this produced a blank window with
+        // one glyph in the corner.
         let rep_cls = cls("NSBitmapImageRep");
         if rep_cls.is_null() {
             return None;
@@ -3491,19 +3493,18 @@ mod macos_adapter {
             if rep.is_null() {
                 return None;
             }
-            let data = msg0(rep, "bitmapData") as *mut u8;
-            let row = msg0i(rep, "bytesPerRow") as usize;
-            let width_bytes = px_w as usize * 4;
-            if data.is_null() || row < width_bytes {
-                return None;
-            }
-            for y in 0..px_h as usize {
-                std::ptr::copy_nonoverlapping(
-                    px.as_ptr().add(y * width_bytes),
-                    data.add(y * row),
-                    width_bytes,
-                );
-            }
+            let rect = CGRect {
+                x: 0.0,
+                y: 0.0,
+                width: w as f64,
+                height: h as f64,
+            };
+            raw_send!(
+                view,
+                "cacheDisplayInRect:toBitmapImageRep:",
+                unsafe extern "C" fn(*mut c_void, *mut c_void, CGRect, *mut c_void),
+                (rect, rep)
+            );
             // `NSBitmapImageFileTypePNG` is 4.
             const PNG: usize = 4;
             let dict = msg0(cls("NSDictionary"), "dictionary");
