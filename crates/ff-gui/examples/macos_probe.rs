@@ -1006,100 +1006,239 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // --- Resize reflow, the scroll offset and per-row ink ---
+    // --- Resize reflow, the backing store's pixels, and the knob ---
     //
-    // What a user sees while dragging the window edge and the scroller: the
-    // rows that fit follow the viewport, the knob reflects content against
-    // viewport, and scrolling changes which rows are on screen. The geometry
-    // is `compat::reflow`'s, derived from the painter the canvas runs; the
-    // viewport and the offset are read back from AppKit's clip view after the
-    // window has been resized and drawn.
-    //
-    // The pixels are renders of the two real views made in this run: the list's
-    // canvas for the per-row ink (content coordinates, so a row's band does not
-    // depend on the scroll position), and the clip view for the before/after
-    // proof that scrolling moved what is on screen.
+    // What a user sees while dragging the window edge and the scroller knob.
+    // The geometry is `compat::reflow`'s, derived from the painter the canvas
+    // runs, with the viewport and the offset read back from AppKit's clip view.
+    // The pixels are the window's own backing store, captured with
+    // `bitmapImageRepForCachingDisplayInRect:` + `cacheDisplayInRect:` on the
+    // window's content view, so the sample comes from what is on screen and
+    // not from a re-render.
     {
         let sv = painted.inner.raw_handle();
         let clip = send0(sv, "contentView");
-        let canvas_frame = || send_rect(list.raw_handle(), "frame");
+        let window = send0(window_view, "window");
+        let content_view = send0(window, "contentView");
+        let canvas = list.raw_handle();
+        let canvas_frame = || send_rect(canvas, "frame");
         let viewport = || send_rect(clip, "bounds");
 
-        // The list's own render, plus which way up it is: the header paints a
-        // grey band across the top of the content, so the half of the bitmap
-        // holding that band says where content y 0 is.
-        let canvas_shot = || -> Result<(u32, u32, Vec<u8>, bool), Box<dyn std::error::Error>> {
-            let f = canvas_frame();
-            let w = f.w.round().max(1.0) as u32;
-            let h = f.h.round().max(1.0) as u32;
-            let (w, h, px) = rswidgets::backends_macos_adapter::render_view_rgba(
-                list.raw_handle(),
+        // objc sends this section needs beyond the ones above.
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct Point {
+            x: f64,
+            y: f64,
+        }
+        fn send_rect_p(obj: *mut std::ffi::c_void, selname: &str, r: Rect) -> *mut std::ffi::c_void {
+            let f: unsafe extern "C" fn(
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                Rect,
+            ) -> *mut std::ffi::c_void = unsafe {
+                std::mem::transmute(rswidgets::backends::apple::msg_shim())
+            };
+            unsafe { f(obj, rswidgets::backends::apple::selector(selname), r) }
+        }
+        fn send_rect_rep(
+            obj: *mut std::ffi::c_void,
+            selname: &str,
+            r: Rect,
+            rep: *mut std::ffi::c_void,
+        ) {
+            let f: unsafe extern "C" fn(
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                Rect,
+                *mut std::ffi::c_void,
+            ) = unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+            unsafe { f(obj, rswidgets::backends::apple::selector(selname), r, rep) }
+        }
+        fn send_rect_to_view(
+            obj: *mut std::ffi::c_void,
+            selname: &str,
+            r: Rect,
+            view: *mut std::ffi::c_void,
+        ) -> Rect {
+            let f: unsafe extern "C" fn(
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                Rect,
+                *mut std::ffi::c_void,
+            ) -> Rect = unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+            unsafe { f(obj, rswidgets::backends::apple::selector(selname), r, view) }
+        }
+        fn send_rect_i(obj: *mut std::ffi::c_void, selname: &str, arg: isize) -> Rect {
+            let f: unsafe extern "C" fn(
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                isize,
+            ) -> Rect = unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+            unsafe { f(obj, rswidgets::backends::apple::selector(selname), arg) }
+        }
+        fn send_event_flag(
+            obj: *mut std::ffi::c_void,
+            selname: &str,
+            ev: *mut std::ffi::c_void,
+            flag: bool,
+        ) {
+            let f: unsafe extern "C" fn(
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                bool,
+            ) = unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+            unsafe { f(obj, rswidgets::backends::apple::selector(selname), ev, flag) }
+        }
+        /// `+[NSEvent mouseEventWithType:...]`: `kind` is the NSEventType
+        /// (1 down, 6 dragged, 2 up), `p` is in window coordinates.
+        fn make_event(
+            event_cls: *mut std::ffi::c_void,
+            kind: usize,
+            p: Point,
+            window_number: isize,
+        ) -> *mut std::ffi::c_void {
+            type F = unsafe extern "C" fn(
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                usize,
+                Point,
+                usize,
+                f64,
+                isize,
+                *mut std::ffi::c_void,
+                isize,
+                isize,
+                f32,
+            ) -> *mut std::ffi::c_void;
+            let f: F = unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+            unsafe {
+                f(
+                    event_cls,
+                    rswidgets::backends::apple::selector(
+                        "mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:",
+                    ),
+                    kind,
+                    p,
+                    0,
+                    0.0,
+                    window_number,
+                    std::ptr::null_mut(),
+                    0,
+                    1,
+                    1.0,
+                )
+            }
+        }
+
+        // The window's content view, as the backing store has it.
+        struct Shot {
+            w: usize,
+            h: usize,
+            row: usize,
+            px: Vec<u8>,
+            scale: f64,
+            bx: f64,
+            by: f64,
+            bmax_y: f64,
+            flipped: bool,
+        }
+        let shot_window = || -> Result<Shot, Box<dyn std::error::Error>> {
+            let b = send_rect(content_view, "bounds");
+            let rep = send_rect_p(content_view, "bitmapImageRepForCachingDisplayInRect:", b);
+            if rep.is_null() {
+                return Err("the content view produced no caching bitmap rep".into());
+            }
+            send_rect_rep(content_view, "cacheDisplayInRect:toBitmapImageRep:", b, rep);
+            let w = send0i(rep, "pixelsWide") as usize;
+            let h = send0i(rep, "pixelsHigh") as usize;
+            let row = send0i(rep, "bytesPerRow") as usize;
+            let data = send0(rep, "bitmapData") as *const u8;
+            if w == 0 || h == 0 || row < w * 4 || data.is_null() {
+                return Err("the caching rep has no usable bitmap".into());
+            }
+            let px = unsafe { std::slice::from_raw_parts(data, row * h) }.to_vec();
+            Ok(Shot {
                 w,
                 h,
+                row,
+                px,
+                scale: w as f64 / b.w.max(1.0),
+                bx: b.x,
+                by: b.y,
+                bmax_y: b.y + b.h,
+                flipped: send_bool(content_view, "isFlipped"),
+            })
+        };
+        // A rect in content-view points, in the shot's pixels.
+        let px_rect = |shot: &Shot, r: Rect| -> (usize, usize, usize, usize) {
+            let s = shot.scale;
+            let x0 = ((r.x - shot.bx) * s).round().max(0.0) as usize;
+            let x1 = ((r.x + r.w - shot.bx) * s).round().max(0.0) as usize;
+            let (t, b) = if shot.flipped {
+                ((r.y - shot.by) * s, (r.y + r.h - shot.by) * s)
+            } else {
+                (
+                    (shot.bmax_y - (r.y + r.h)) * s,
+                    (shot.bmax_y - r.y) * s,
+                )
+            };
+            (
+                x0.min(shot.w),
+                x1.min(shot.w),
+                t.round().max(0.0) as usize,
+                b.round().max(0.0) as usize,
             )
-            .ok_or("the list produced no bitmap")?;
-            let grey_row = |r: usize| -> bool {
-                let mut grey = 0usize;
-                for c in 0..w as usize {
-                    let i = (r * w as usize + c) * 4;
-                    if (i32::from(px[i]) - 237).abs() <= 4
-                        && (i32::from(px[i + 1]) - 237).abs() <= 4
-                        && (i32::from(px[i + 2]) - 242).abs() <= 6
+        };
+        let ink_in = |shot: &Shot, x0: usize, x1: usize, y0: usize, y1: usize| -> usize {
+            let mut ink = 0usize;
+            for r in y0..y1.min(shot.h) {
+                for c in x0..x1.min(shot.w) {
+                    let i = r * shot.row + c * 4;
+                    if shot.px[i + 3] > 0
+                        && (shot.px[i] < 200 || shot.px[i + 1] < 200 || shot.px[i + 2] < 200)
                     {
-                        grey += 1;
+                        ink += 1;
                     }
                 }
-                grey * 2 > w as usize
-            };
-            let half = h as usize / 2;
-            let top = (0..half).filter(|r| grey_row(*r)).count();
-            let bottom = (half..h as usize).filter(|r| grey_row(*r)).count();
-            Ok((w, h, px, top >= bottom))
+            }
+            ink
         };
-
-        // Dark, painted pixels inside each visible row's band, in content
-        // coordinates: the render is the whole canvas, so a band's place does
-        // not move when the list scrolls.
-        let ink_rows = |geo: &rswidgets::compat::reflow::ListGeometry|
+        // One row's band, converted through AppKit into content-view points so
+        // the scroll position and flip are its problem, not this probe's.
+        let row_rect = |content_y: f64, height: f64| -> Rect {
+            let r = Rect {
+                x: 0.0,
+                y: content_y,
+                w: canvas_frame().w,
+                h: height,
+            };
+            send_rect_to_view(canvas, "convertRect:toView:", r, content_view)
+        };
+        // Dark pixels in each visible row, sampled from the window's capture,
+        // and a loud failure if a band is not inside the bitmap at all.
+        let ink_rows_shot = |geo: &rswidgets::compat::reflow::ListGeometry,
+                             shot: &Shot|
          -> Result<Vec<usize>, Box<dyn std::error::Error>> {
-            let (w, h, px, top_down) = canvas_shot()?;
             let mut per_row = Vec::new();
             for row in geo.visible_range() {
                 let cy = geo.header_height + row as f64 * geo.row_height;
-                let (y0, y1) = if top_down {
-                    (cy, cy + geo.row_height)
-                } else {
-                    (
-                        geo.content_height - cy - geo.row_height,
-                        geo.content_height - cy,
+                let r = row_rect(cy, geo.row_height);
+                let (x0, x1, y0, y1) = px_rect(shot, r);
+                if x0 >= x1 || y0 >= y1 {
+                    return Err(format!(
+                        "row {row} band ({x0}..{x1}, {y0}..{y1}) falls outside the {}x{} capture",
+                        shot.w, shot.h
                     )
-                };
-                let y0 = y0.max(0.0) as usize;
-                let y1 = (y1.max(0.0) as usize).min(h as usize);
-                let mut ink = 0usize;
-                for r in y0..y1 {
-                    for c in 0..w as usize {
-                        let i = (r * w as usize + c) * 4;
-                        if px[i + 3] > 0
-                            && (px[i] < 200 || px[i + 1] < 200 || px[i + 2] < 200)
-                        {
-                            ink += 1;
-                        }
-                    }
+                    .into());
                 }
-                per_row.push(ink);
+                per_row.push(ink_in(shot, x0, x1, y0, y1));
             }
             Ok(per_row)
         };
-
-        // The viewport, rendered: what is on screen right now. Used only to
-        // show that scrolling changes those pixels.
-        let clip_shot = || -> Result<(u32, u32, Vec<u8>), Box<dyn std::error::Error>> {
-            let v = viewport();
-            let w = v.w.round().max(1.0) as u32;
-            let h = v.h.round().max(1.0) as u32;
-            rswidgets::backends_macos_adapter::render_view_rgba(clip, w, h)
-                .ok_or_else(|| "the viewport produced no bitmap".into())
+        let changed = |a: &Shot, b: &Shot| -> usize {
+            a.px.iter().zip(b.px.iter()).filter(|(x, y)| x != y).count()
         };
 
         // Grown: a window tall enough for every row the daemon returned.
@@ -1108,7 +1247,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let f_big = canvas_frame();
         let v_big = viewport();
         let big = list.layout(f_big.w, v_big.h, v_big.y);
-        let ink_big = ink_rows(&big)?;
+        let shot_big = shot_window()?;
+        let ink_big = ink_rows_shot(&big, &shot_big)?;
 
         // Shrunk: the same rows, a viewport too short for all of them.
         let _ = rswidgets::backends_macos_adapter::capture(window_view, Some((900.0, 96.0)));
@@ -1116,15 +1256,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let f_small = canvas_frame();
         let v_small = viewport();
         let small = list.layout(f_small.w, v_small.h, v_small.y);
-        let ink_small = ink_rows(&small)?;
+        let shot_small = shot_window()?;
+        let ink_small = ink_rows_shot(&small, &shot_small)?;
+        let grew_or_shrank = changed(&shot_big, &shot_small);
 
         println!(
-            "probe: resize 1200x760 -> viewport {}pt, {}/{} row(s) visible, ink {:?}",
-            big.viewport_height, big.visible_rows, rows_after_typing, ink_big
+            "probe: window capture {}x{} at {}x backing, {}pt content: grown {}pt viewport -> {}/{} row(s) visible, ink {:?}",
+            shot_big.w,
+            shot_big.h,
+            shot_big.scale,
+            send_rect(content_view, "bounds").w,
+            big.viewport_height,
+            big.visible_rows,
+            rows_after_typing,
+            ink_big
         );
         println!(
-            "probe: resize 900x96 -> viewport {}pt, {}/{} row(s) visible, ink {:?}",
+            "probe: window capture shrunk to {}pt viewport -> {}/{} row(s) visible, ink {:?}, {grew_or_shrank} px changed",
             small.viewport_height, small.visible_rows, rows_after_typing, ink_small
+        );
+        assert!(
+            shot_big.scale >= 1.0 && (shot_big.scale.fract()).abs() < 0.01,
+            "the capture's backing scale is {}: the bitmap is not a whole multiple of the content view",
+            shot_big.scale
+        );
+        println!(
+            "probe: capture scale {} ({}px for {}pt)",
+            shot_big.scale,
+            shot_big.w,
+            send_rect(content_view, "bounds").w
         );
         assert!(
             big.viewport_height > small.viewport_height,
@@ -1176,48 +1336,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (i, ink) in ink_small.iter().enumerate() {
             assert!(
                 *ink > 0,
-                "visible row {i} painted no ink at all in the smaller viewport"
+                "visible row {i} painted no ink in the window's capture at the smaller size"
             );
         }
         assert!(
             ink_big.iter().all(|ink| *ink > 0),
-            "a visible row painted no ink in the grown viewport: {ink_big:?}"
+            "a visible row painted no ink in the window's capture when grown: {ink_big:?}"
+        );
+        assert!(
+            grew_or_shrank > 1000,
+            "resizing changed only {grew_or_shrank} px of the captured window"
         );
 
-        // An empty list: no rows, nothing to ink below the header.
+        // The header's grey band in the capture fixes the band height in its
+        // own pixels, which is the cross-check for the backing scale.
+        {
+            let header = row_rect(0.0, big.header_height);
+            let (x0, x1, y0, _) = px_rect(&shot_big, header);
+            let mut grey_rows = 0usize;
+            for r in y0..shot_big.h {
+                let mut grey = 0usize;
+                for c in x0..x1 {
+                    let i = r * shot_big.row + c * 4;
+                    if (i32::from(shot_big.px[i]) - 237).abs() <= 6
+                        && (i32::from(shot_big.px[i + 1]) - 237).abs() <= 6
+                        && (i32::from(shot_big.px[i + 2]) - 242).abs() <= 8
+                    {
+                        grey += 1;
+                    }
+                }
+                if grey * 2 > (x1 - x0) {
+                    grey_rows += 1;
+                } else if grey_rows > 0 {
+                    break;
+                }
+            }
+            let want = big.header_height * shot_big.scale;
+            println!(
+                "probe: captured header band {grey_rows}px for {}pt of header ({}px expected at {}x)",
+                big.header_height, want, shot_big.scale
+            );
+            assert!(
+                (grey_rows as f64 - want).abs() <= 2.0 * shot_big.scale,
+                "the captured header band is {grey_rows}px but {}pt at {}x is {want}px",
+                big.header_height,
+                shot_big.scale
+            );
+        }
+
+        // An empty list: no rows, nothing to ink below the header, and the
+        // capture itself has to change when the rows go.
         {
             list.set_rows(&[]);
             let empty = list.layout(f_small.w, v_small.h, 0.0);
-            let (w, h, px, top_down) = canvas_shot()?;
-            let (y0, y1) = if top_down {
-                (0.0, empty.header_height)
-            } else {
-                (empty.content_height - empty.header_height, empty.content_height)
-            };
-            let y0 = y0.max(0.0) as usize;
-            let y1 = (y1.max(0.0) as usize).min(h as usize);
-            let mut ink = 0usize;
-            for r in 0..h as usize {
-                if r >= y0 && r < y1 {
-                    continue; // the header band keeps its titles
-                }
-                for c in 0..w as usize {
-                    let i = (r * w as usize + c) * 4;
-                    if px[i + 3] > 0 && (px[i] < 200 || px[i + 1] < 200 || px[i + 2] < 200) {
-                        ink += 1;
-                    }
-                }
-            }
+            let shot = shot_window()?;
+            let emptied = changed(&shot_small, &shot);
+            let header = row_rect(0.0, empty.header_height);
+            let (x0, x1, y0, y1) = px_rect(&shot, header);
+            let below = ink_in(&shot, x0, x1, y1.min(shot.h), shot.h);
+            let in_header = ink_in(&shot, x0, x1, y0, y1.min(shot.h));
             println!(
-                "probe: empty list -> {} row(s) visible, {} px of ink below the header",
-                empty.visible_rows, ink
+                "probe: empty list -> {} row(s) visible, {in_header} px of title ink in the header, {below} px below it, {emptied} px changed",
+                empty.visible_rows
             );
             assert_eq!(empty.visible_rows, 0, "an empty list has visible rows");
             assert_eq!(
                 empty.content_height, empty.header_height,
                 "an empty list is taller than its header"
             );
-            assert_eq!(ink, 0, "an empty list painted {ink} px of row ink");
+            assert!(in_header > 0, "the header lost its titles when the list emptied");
+            assert_eq!(below, 0, "an empty list painted {below} px below its header");
+            assert!(
+                emptied > 1000,
+                "emptying the list changed only {emptied} px of the captured window"
+            );
         }
 
         // A longer result set, so the knob has more content than viewport.
@@ -1236,7 +1428,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let f2 = canvas_frame();
         let v2 = viewport();
         let top_geo = list.layout(f2.w, v2.h, v2.y);
-        let ink_top = ink_rows(&top_geo)?;
+        let shot_top = shot_window()?;
+        let ink_top = ink_rows_shot(&top_geo, &shot_top)?;
         assert!(
             top_geo.content_height > top_geo.viewport_height,
             "40 rows are not taller than the viewport ({} <= {})",
@@ -1250,62 +1443,127 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             top_geo.track_height
         );
         assert_eq!(top_geo.first_row, 0, "the list does not start at its first row");
+        assert!(
+            ink_top.iter().all(|ink| *ink > 0),
+            "a visible row painted no ink before scrolling: {ink_top:?}"
+        );
 
-        // Scrolled by two bands, through the same entry point a knob drag uses.
-        let want = top_geo.header_height + 2.0 * top_geo.row_height;
+        // --- The knob, dragged with pointer events ---
+        //
+        // The scroller's thumb at the top of its track, pressed and pulled down
+        // the way a user drags it: NSEvents posted to AppKit's queue (so the
+        // scroller's tracking loop finds them) and a mouse-down delivered with
+        // `sendEvent:` to the window, which is the authoritative route.
         {
-            let before = clip_shot()?;
-            painted.scroll_to(0.0, 0.0, 0.0, want, top_geo.content_height, v2.h);
-            let offset = viewport().y;
-            let geo = list.layout(f2.w, viewport().h, offset);
-            let ink = ink_rows(&geo)?;
-            let after = clip_shot()?;
-
-            let changed = before
-                .2
-                .iter()
-                .zip(after.2.iter())
-                .filter(|(a, b)| a != b)
-                .count();
+            let scroller = send0(sv, "verticalScroller");
+            assert!(!scroller.is_null(), "the scroll view has no vertical scroller");
+            let responds_part = {
+                let f: unsafe extern "C" fn(
+                    *mut std::ffi::c_void,
+                    *mut std::ffi::c_void,
+                    *mut std::ffi::c_void,
+                ) -> bool =
+                    unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+                unsafe {
+                    f(
+                        scroller,
+                        rswidgets::backends::apple::selector("respondsToSelector:"),
+                        rswidgets::backends::apple::selector("rectForPart:"),
+                    )
+                }
+            };
+            let knob_rect = || -> Rect {
+                if responds_part {
+                    let r = send_rect_i(scroller, "rectForPart:", 2); // NSScrollerKnob
+                    send_rect_to_view(scroller, "convertRect:toView:", r, std::ptr::null_mut())
+                } else {
+                    Rect::default()
+                }
+            };
+            let before = knob_rect();
             println!(
-                "probe: scrolled to {offset}pt (asked for {want}) -> first visible row {} (was {}), thumb at {:.0}pt of {:.0}pt, ink {:?}, {changed} px changed",
+                "probe: scroller knob rect {:.0}x{:.0} at ({:.0}, {:.0}) in window coordinates (rectForPart {} )",
+                before.w, before.h, before.x, before.y, responds_part
+            );
+            assert!(
+                responds_part && before.w > 0.0 && before.h > 0.0,
+                "the scroller would not say where its knob is (rectForPart: {}, {}x{}): a pointer drag cannot be aimed",
+                responds_part,
+                before.w,
+                before.h
+            );
+
+            let event_cls = rswidgets::backends::apple::cls("NSEvent");
+            let app = send0(rswidgets::backends::apple::cls("NSApplication"), "sharedApplication");
+            let window_number = send0i(window, "windowNumber");
+            let start = viewport();
+            let centre = Point {
+                x: before.x + before.w / 2.0,
+                y: before.y + before.h / 2.0,
+            };
+            // Downwards on screen is a smaller window-coordinate y.
+            let drag = 40.0f64;
+            const DRAGGED: usize = 6;
+            const RELEASED: usize = 2;
+            const PRESSED: usize = 1;
+            // Queue the motion and the release first: the scroller tracks the
+            // mouse in its own loop, and events that are only sent later would
+            // never be seen.
+            for step in 1..=DRAGGED {
+                let p = Point {
+                    x: centre.x,
+                    y: centre.y - drag * step as f64 / DRAGGED as f64,
+                };
+                let ev = make_event(event_cls, 6, p, window_number);
+                send_event_flag(app, "postEvent:atStart:", ev, false);
+            }
+            let end = Point {
+                x: centre.x,
+                y: centre.y - drag,
+            };
+            let up = make_event(event_cls, RELEASED, end, window_number);
+            send_event_flag(app, "postEvent:atStart:", up, false);
+            let down = make_event(event_cls, PRESSED, centre, window_number);
+            send1v(window, "sendEvent:", down);
+
+            let after = viewport();
+            let geo = list.layout(f2.w, after.h, after.y);
+            let knob_after = knob_rect();
+            let shot_after = shot_window()?;
+            let scroll_changed = changed(&shot_top, &shot_after);
+            println!(
+                "probe: knob dragged {drag}pt -> clip offset {:.0}pt (was {:.0}), first visible row {} (was {}), knob moved {:.0}pt, {scroll_changed} px changed in the capture",
+                after.y,
+                start.y,
                 geo.first_row,
                 top_geo.first_row,
-                geo.thumb_top,
-                geo.track_height,
-                ink
+                before.y - knob_after.y
             );
             assert!(
-                (offset - want).abs() < 0.5,
-                "scroll_to left the clip view at {offset}pt instead of {want}pt"
+                after.y > start.y + 1.0,
+                "dragging the knob left the clip at {:.0}pt (was {:.0}): the drag did not scroll",
+                after.y,
+                start.y
             );
-            assert_eq!(
-                geo.first_row, 2,
-                "a two-band offset starts at row {}, not row 2",
+            assert!(
+                geo.first_row > top_geo.first_row,
+                "the first visible row did not move (row {} before and after the drag)",
                 geo.first_row
             );
-            assert_ne!(
-                geo.visible_range(),
-                top_geo.visible_range(),
-                "scrolling did not change which rows are visible"
+            assert!(
+                knob_after.y < before.y - 1.0,
+                "the thumb did not follow the drag: {:.0}pt then {:.0}pt",
+                before.y,
+                knob_after.y
             );
             assert!(
-                geo.thumb_top > top_geo.thumb_top,
-                "the knob did not move down with the content: {:.1} then {:.1}",
-                top_geo.thumb_top,
-                geo.thumb_top
+                scroll_changed > 1000,
+                "the drag changed only {scroll_changed} px of the captured window"
             );
+            let ink_after = ink_rows_shot(&geo, &shot_after)?;
             assert!(
-                ink.iter().all(|i| *i > 0),
-                "a visible row painted no ink after scrolling: {ink:?}"
-            );
-            assert!(
-                ink_top.iter().all(|i| *i > 0),
-                "a visible row painted no ink before scrolling: {ink_top:?}"
-            );
-            assert!(
-                changed > 500,
-                "scrolling changed only {changed} px of the viewport: the rows did not move"
+                ink_after.iter().all(|ink| *ink > 0),
+                "a visible row painted no ink after the drag: {ink_after:?}"
             );
         }
 
@@ -1314,6 +1572,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the full-size window and the daemon's own answer.
         let _ = rswidgets::backends_macos_adapter::capture(window_view, Some((1350.0, 858.0)));
         send0v(window_view, "layoutSubtreeIfNeeded");
+        painted.scroll_to(0.0, 0.0, 0.0, 0.0, top_geo.content_height, v2.h);
         list.set_rows(&cells_of(&daemon_paths.lock().unwrap().clone()));
     }
 
