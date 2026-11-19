@@ -490,8 +490,23 @@ mod macos_adapter {
             if self.0.is_null() {
                 return;
             }
-            unsafe { msg4cv(self.0, "setFrame:", 0.0, 0.0, w as f64, h as f64) };
-            // AppKit needs both: a frame change is a layout change, and the
+            // A root view that lives in a window is laid out by Auto Layout
+            // against that window, so its own frame is overwritten on the
+            // next layout pass and `setFrame:` grew nothing but a redraw.
+            // Size the window instead; only a detached view (the headless
+            // path) still needs its own frame set.
+            let window = unsafe { msg0(self.0, "window") };
+            if !window.is_null() {
+                let _ = raw_send!(
+                    window,
+                    "setContentSize:",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void, f64, f64),
+                    (w as f64, h as f64)
+                );
+            } else {
+                unsafe { msg4cv(self.0, "setFrame:", 0.0, 0.0, w as f64, h as f64) };
+            }
+            // AppKit needs both: a size change is a layout change, and the
             // canvas will keep painting the old size until something asks for
             // a redraw.
             unsafe { msg1bv(self.0, "setNeedsLayout:", true) };
