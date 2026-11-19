@@ -40,10 +40,22 @@ The `corro*` selectors sent to *stock* views (`corroSetFlex:`,
 `corroSetContentHugging:`, `corroSetMinWidth:`, `corroSetPinnedWidth:`) are
 added to `NSView` the same way, so they are real behaviour rather than a skip.
 
+The results list is a real `NSScrollView`, the counterpart of
+`GtkScrolledWindow`: the canvas is its document view, so it is clipped, has a
+scroller and scrolls with the wheel, and `scroll_to`/`set_policy` reach it
+instead of being no-ops. `Window::set_child` sizes the root view to the content
+view's bounds — AppKit does not lay a plain subview out, and without that the
+whole tree sat in a 0x0 box and the window rendered white. `FF_GUI_SCREENSHOT=<path>`
+writes a PNG of the window from inside the process, because a CI runner has no
+screen to photograph.
+
 The `GUI interactivity (macOS)` CI step proves that rather than asserting it:
 it presses the button with `-performClick:` and requires the Rust callback to
-fire exactly once, then renders the canvas into an `NSBitmapImageRep` and
-requires a non-blank image.
+fire exactly once, renders the canvas into an `NSBitmapImageRep` and requires a
+non-blank image, then builds the real results list with 40 rows and requires a
+vertical scroller, content taller than the viewport, a `scroll_to` that moves
+the clip view, and a non-blank render of the scrolled list. The screenshot step
+attaches the window itself.
 
 Still inert on AppKit: **alerts** (`corroAddAction:` has no runtime
 implementation, so `add_button` is a logged skip and a dialog would open with no

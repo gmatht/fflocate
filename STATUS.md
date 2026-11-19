@@ -476,10 +476,21 @@ These are deliberate and small; each is noted so the design stays honest.
    than CoreText, plus mouse clicks); the `corro*` selectors sent to *stock*
    views (`corroSetFlex:`, `corroSetContentHugging:`, `corroSetMinWidth:`,
    `corroSetPinnedWidth:`) are added to `NSView` the same way, before the tree
-   is built. `GUI interactivity (macOS)` proves it rather than asserting it: it
-   presses the button with `-performClick:` and requires the callback to fire
-   exactly once, then renders the canvas into an `NSBitmapImageRep` and requires
-   a non-blank image (320x120, 107 distinct colours on the run that landed it).
+   is built. The results list is a real `NSScrollView` — the counterpart of
+   `GtkScrolledWindow` — with the canvas as its document view, so it is clipped,
+   has a scroller, scrolls with the wheel, and `scroll_to`/`set_policy` reach it;
+   `Window::set_child` also sizes the root view to the content view, without
+   which the whole tree was laid out in a 0x0 box and the window rendered white
+   (the first CI screenshot showed exactly that). `GUI interactivity (macOS)`
+   proves it rather than asserting it: it presses the button with
+   `-performClick:` and requires the callback to fire exactly once, renders the
+   canvas and requires a non-blank image (320x120, 107 distinct colours), and
+   builds the real results list with 40 rows, requiring a vertical scroller,
+   826pt of content in a 640pt viewport, a `scroll_to` that moves the clip view
+   to 100pt, and a non-blank 640x200 render of the scrolled list. A separate
+   step pins a PNG of the window itself (`FF_GUI_SCREENSHOT`), since a runner
+   has no screen to photograph and annotations are the only channel readable
+   without a token.
 
    Still inert there, named as such: **alerts** (`corroAddAction:` has no
    runtime implementation, so `add_button` is a logged skip and a dialog would

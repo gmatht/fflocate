@@ -147,9 +147,14 @@ jobs:
             echo "::error title=GUI screenshot (macOS)::no png written; $(head -c 400 shot-run.log | tr -cd '[:print:]\n' | tr '\n' '|')"
             exit 1
           fi
-          bytes=$(stat -f%z /tmp/app.png)
-          b64=$(base64 -i /tmp/app.png | tr -d '\n')
-          echo "::notice title=GUI screenshot (macOS)::${bytes} bytes png, ${#b64} base64 chars: $(grep -o 'ff-gui: screenshot.*' shot-run.log | head -1)"
+          # Annotations cap each message at 4096 chars and only a handful of
+          # them reach the check, so a 960x640 PNG (44k base64 chars) lost its
+          # tail. Halving it keeps every pixel of the window in the report.
+          sips -Z 640 /tmp/app.png --out /tmp/shot.png >/dev/null 2>&1 || cp /tmp/app.png /tmp/shot.png
+          bytes=$(stat -f%z /tmp/shot.png)
+          size=$(sips -g pixelWidth -g pixelHeight /tmp/shot.png | grep pixel | tr -d ' \n')
+          b64=$(base64 -i /tmp/shot.png | tr -d '\n')
+          echo "::notice title=GUI screenshot (macOS)::${bytes} bytes png ${size}, ${#b64} base64 chars: $(grep -o 'ff-gui: screenshot.*' shot-run.log | head -1)"
           # 4000-char chunks: GitHub truncates longer annotation messages.
           i=0
           while [ -n "$b64" ]; do
