@@ -948,11 +948,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // hit-tested against -- a list that has never been drawn lays its columns
     // out for the default width and would sort by the wrong column.
     let holder_box = app.create_box(Orientation::Vertical, 2)?;
+    // Kept out here: the resize and scroll block below drives the same
+    // scrolled window a user's knob drag moves.
+    let painted = list.clone().into_scrolled()?;
+    let window_view = win.raw_handle();
     {
-        let painted = list.clone().into_scrolled()?;
         holder_box.append(&painted);
         win.set_child(&holder_box);
-        let window_view = win.raw_handle();
         send0v(window_view, "layoutSubtreeIfNeeded");
         // Ink inside the list, in pixels: the measure is the list against
         // itself with no rows, so the threshold does not depend on a font.
@@ -1002,6 +1004,286 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ink > 50,
             "the daemon's rows painted only {ink} px, so nothing reached the screen"
         );
+    }
+
+    // --- Resize reflow, the scroll offset and per-row ink ---
+    //
+    // What a user sees while dragging the window edge and the scroller: the
+    // rows that fit follow the viewport, the knob reflects content against
+    // viewport, and scrolling changes which rows are on screen. The geometry
+    // is `compat::reflow`'s, derived from the painter the canvas runs; the
+    // viewport and the offset are read back from AppKit's clip view after the
+    // window has been resized and drawn. Nothing here is compared against a
+    // stored image: every pixel comes from the window rendered in this run.
+    {
+        let sv = painted.inner.raw_handle();
+        let clip = send0(sv, "contentView");
+        let canvas_frame = || send_rect(list.raw_handle(), "frame");
+        let viewport = || send_rect(clip, "bounds");
+
+        // The list's canvas, in the capture: content y 0 is at `top` pixels
+        // down, and content y `cy` is at `top + cy`.
+        let canvas_in_capture = |shot_h: usize,
+                                 content_h: f64|
+         -> (usize, f64, f64, usize) {
+            let f = canvas_frame();
+            let mut x = f.x;
+            let mut y = f.y;
+            let mut v = send0(list.raw_handle(), "superview");
+            while !v.is_null() && v != window_view {
+                let parent = send_rect(v, "frame");
+                x += parent.x;
+                y += parent.y;
+                v = send0(v, "superview");
+            }
+            let band = shot_h as f64 - content_h;
+            let top = band + content_h - (y + f.h);
+            (x.max(0.0) as usize, x + f.w, top, f.h as usize)
+        };
+
+        // Per visible row, the dark pixels inside the row rect the geometry
+        // reports, read out of a fresh capture of the window.
+        let ink_rows = |geo: &rswidgets::compat::reflow::ListGeometry|
+         -> Result<Vec<usize>, Box<dyn std::error::Error>> {
+            let content = send_rect(window_view, "bounds");
+            let shot = rswidgets::backends_macos_adapter::capture(
+                window_view,
+                Some((content.w, content.h)),
+            )
+            .ok_or("the window produced no capture")?;
+            let (x0, x1f, top, _) = canvas_in_capture(shot.height as usize, content.h);
+            let x1 = (x1f.max(0.0) as usize).min(shot.width as usize);
+            let mut per_row = Vec::new();
+            for row in geo.visible_range() {
+                let cy = geo.header_height + row as f64 * geo.row_height - geo.offset;
+                let py = top + cy;
+                let y0 = py.max(0.0) as usize;
+                let y1 = ((py + geo.row_height).max(0.0) as usize).min(shot.height as usize);
+                let mut ink = 0usize;
+                for r in y0..y1 {
+                    for c in x0..x1 {
+                        let i = (r * shot.width as usize + c) * 4;
+                        if shot.rgba[i] < 200 || shot.rgba[i + 1] < 200 || shot.rgba[i + 2] < 200
+                        {
+                            ink += 1;
+                        }
+                    }
+                }
+                per_row.push(ink);
+            }
+            Ok(per_row)
+        };
+
+        // Grown: a window tall enough for every row the daemon returned.
+        let _ = rswidgets::backends_macos_adapter::capture(window_view, Some((1200.0, 760.0)));
+        send0v(window_view, "layoutSubtreeIfNeeded");
+        let f_big = canvas_frame();
+        let v_big = viewport();
+        let big = list.layout(f_big.w, v_big.h, v_big.y);
+        let ink_big = ink_rows(&big)?;
+
+        // Shrunk: the same rows, a viewport too short for all of them.
+        let _ = rswidgets::backends_macos_adapter::capture(window_view, Some((900.0, 60.0)));
+        send0v(window_view, "layoutSubtreeIfNeeded");
+        let f_small = canvas_frame();
+        let v_small = viewport();
+        let small = list.layout(f_small.w, v_small.h, v_small.y);
+        let ink_small = ink_rows(&small)?;
+
+        println!(
+            "probe: resize 1200x760 -> viewport {}pt, {}/{} row(s) visible, ink {:?}",
+            big.viewport_height, big.visible_rows, rows_after_typing, ink_big
+        );
+        println!(
+            "probe: resize 900x60 -> viewport {}pt, {}/{} row(s) visible, ink {:?}",
+            small.viewport_height, small.visible_rows, rows_after_typing, ink_small
+        );
+        assert!(
+            big.viewport_height > small.viewport_height,
+            "the viewport did not shrink with the window ({} then {})",
+            big.viewport_height,
+            small.viewport_height
+        );
+        assert_eq!(
+            big.visible_rows, rows_after_typing,
+            "a {}pt viewport shows {} of the daemon's {} rows",
+            big.viewport_height, big.visible_rows, rows_after_typing
+        );
+        assert_eq!(
+            small.visible_rows,
+            (((small.viewport_height - small.header_height) / small.row_height).ceil()).max(0.0)
+                as usize,
+            "a {}pt viewport shows {} rows, not the {} that fit",
+            small.viewport_height,
+            small.visible_rows,
+            ((small.viewport_height - small.header_height) / small.row_height).ceil()
+        );
+        assert!(
+            small.visible_rows < big.visible_rows,
+            "shrinking to a {}pt viewport still shows {} rows (grown showed {})",
+            small.viewport_height,
+            small.visible_rows,
+            big.visible_rows
+        );
+        assert_eq!(
+            small.row_rects.len(),
+            small.visible_rows,
+            "the row rects do not match the visible row count after shrinking"
+        );
+        assert_eq!(
+            small.content_height, big.content_height,
+            "the content height changed with the viewport: the rows were not the same"
+        );
+        assert!(
+            (f_small.h - small.content_height).abs() <= 8.0,
+            "the list's canvas is {}pt tall for {}pt of rows",
+            f_small.h,
+            small.content_height
+        );
+        for (i, ink) in ink_small.iter().enumerate() {
+            assert!(
+                *ink > 0,
+                "visible row {i} painted no ink at all in the smaller viewport"
+            );
+        }
+        assert!(
+            ink_big.iter().all(|ink| *ink > 0),
+            "a visible row painted no ink in the grown viewport: {ink_big:?}"
+        );
+
+        // An empty list: no rows, nothing to ink below the header.
+        {
+            let content = send_rect(window_view, "bounds");
+            list.set_rows(&[]);
+            let empty = list.layout(f_small.w, v_small.h, 0.0);
+            let shot = rswidgets::backends_macos_adapter::capture(
+                window_view,
+                Some((content.w, content.h)),
+            )
+            .ok_or("the window produced no capture")?;
+            let (x0, x1f, top, canvas_h) = canvas_in_capture(shot.height as usize, content.h);
+            let x1 = (x1f.max(0.0) as usize).min(shot.width as usize);
+            let mut ink = 0usize;
+            for r in (top + empty.header_height).max(0.0) as usize
+                ..((top + canvas_h as f64).max(0.0) as usize).min(shot.height as usize)
+            {
+                for c in x0..x1 {
+                    let i = (r * shot.width as usize + c) * 4;
+                    if shot.rgba[i] < 200 || shot.rgba[i + 1] < 200 || shot.rgba[i + 2] < 200 {
+                        ink += 1;
+                    }
+                }
+            }
+            println!(
+                "probe: empty list -> {} row(s) visible, {} px of ink below the header",
+                empty.visible_rows, ink
+            );
+            assert_eq!(empty.visible_rows, 0, "an empty list has visible rows");
+            assert_eq!(
+                empty.content_height, empty.header_height,
+                "an empty list is taller than its header"
+            );
+            assert_eq!(ink, 0, "an empty list painted {ink} px of row ink");
+        }
+
+        // A longer result set, so the knob has more content than viewport.
+        let dir = expected_names
+            .first()
+            .and_then(|_| daemon_paths.lock().unwrap().first().cloned())
+            .and_then(|p| p.rsplit_once('/').map(|(d, _)| d.to_string()))
+            .unwrap_or_else(|| "/tmp".to_string());
+        let long_paths: Vec<String> = (0..40)
+            .map(|i| format!("{dir}/file-{i:02}.rs"))
+            .collect();
+        list.set_rows(&cells_of(&long_paths));
+
+        let _ = rswidgets::backends_macos_adapter::capture(window_view, Some((900.0, 220.0)));
+        send0v(window_view, "layoutSubtreeIfNeeded");
+        let f2 = canvas_frame();
+        let v2 = viewport();
+        let top_geo = list.layout(f2.w, v2.h, v2.y);
+        let ink_top = ink_rows(&top_geo)?;
+        assert!(
+            top_geo.content_height > top_geo.viewport_height,
+            "40 rows are not taller than the viewport ({} <= {})",
+            top_geo.content_height,
+            top_geo.viewport_height
+        );
+        assert!(
+            top_geo.thumb_height < top_geo.track_height && top_geo.thumb_height > 0.0,
+            "the knob does not show content taller than the viewport: thumb {}pt in a {}pt track",
+            top_geo.thumb_height,
+            top_geo.track_height
+        );
+        assert_eq!(top_geo.first_row, 0, "the list does not start at its first row");
+
+        // Scrolled by two bands, through the same entry point a knob drag uses.
+        let want = top_geo.header_height + 2.0 * top_geo.row_height;
+        {
+            let content = send_rect(window_view, "bounds");
+            let before = rswidgets::backends_macos_adapter::capture(
+                window_view,
+                Some((content.w, content.h)),
+            )
+            .ok_or("the window produced no capture")?;
+            painted.scroll_to(0.0, 0.0, 0.0, want, top_geo.content_height, v2.h);
+            let offset = viewport().y;
+            let geo = list.layout(f2.w, viewport().h, offset);
+            let ink = ink_rows(&geo)?;
+            let after = rswidgets::backends_macos_adapter::capture(
+                window_view,
+                Some((content.w, content.h)),
+            )
+            .ok_or("the window produced no capture")?;
+
+            let changed = before
+                .rgba
+                .iter()
+                .zip(after.rgba.iter())
+                .filter(|(a, b)| a != b)
+                .count();
+            println!(
+                "probe: scrolled to {offset}pt (asked for {want}) -> first visible row {} (was {}), thumb at {:.0}pt of {:.0}pt, ink {:?}, {changed} px changed",
+                geo.first_row,
+                top_geo.first_row,
+                geo.thumb_top,
+                geo.track_height,
+                ink
+            );
+            assert!(
+                (offset - want).abs() < 0.5,
+                "scroll_to left the clip view at {offset}pt instead of {want}pt"
+            );
+            assert_eq!(
+                geo.first_row, 2,
+                "a two-band offset starts at row {}, not row 2",
+                geo.first_row
+            );
+            assert_ne!(
+                geo.visible_range(),
+                top_geo.visible_range(),
+                "scrolling did not change which rows are visible"
+            );
+            assert!(
+                geo.thumb_top > top_geo.thumb_top,
+                "the knob did not move down with the content: {:.1} then {:.1}",
+                top_geo.thumb_top,
+                geo.thumb_top
+            );
+            assert!(
+                ink.iter().all(|i| *i > 0),
+                "a visible row painted no ink after scrolling: {ink:?}"
+            );
+            assert!(
+                ink_top.iter().all(|i| *i > 0),
+                "a visible row painted no ink before scrolling: {ink_top:?}"
+            );
+            assert!(
+                changed > 1000,
+                "scrolling changed only {changed} px of the window: the rows did not move"
+            );
+        }
+        list.set_rows(&cells_of(&daemon_paths.lock().unwrap().clone()));
     }
 
     // --- The list's own click handling ---

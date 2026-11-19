@@ -92,7 +92,8 @@ fn typing_debounces_into_a_request_and_the_rows_repaint_then_clicks_land() {
     };
 
     let entry = app.create_entry().expect("entry");
-    let list = TreeView::new(&[("", true, false), ("Name", false, true), ("Path", false, true)])
+    // The app's own columns: all three headers sort, the icon column included.
+    let list = TreeView::new(&[("", true, true), ("Name", false, true), ("Path", false, true)])
         .expect("the results list could not be created");
 
     // The app's own debounce window, shortened so the test does not sleep for
@@ -211,5 +212,40 @@ fn typing_debounces_into_a_request_and_the_rows_repaint_then_clicks_land() {
         Some((1, true)),
         list.sort_state(),
         activated.borrow()
+    );
+
+    // The leftmost (icon) header sorts too, by the kind its glyph shows: a
+    // folder and a file arrive in name order here, and the click puts the file
+    // first because its glyph sorts before the folder's.
+    let mut mixed = cells(&["/rec/one.rs".to_string(), "/rec/two.md".to_string()]);
+    if let CellValue::Icon { name, fallback } = &mut mixed[1][0] {
+        *name = "folder".to_string();
+        *fallback = "d".to_string();
+    }
+    list.set_rows(&mixed);
+    assert_eq!(
+        names(&list),
+        vec!["two.md".to_string(), "one.rs".to_string()],
+        "the rows did not arrive in name order (sort state {:?})",
+        list.sort_state()
+    );
+    assert_eq!(
+        list.click_at(3.0, 6.0, 1),
+        None,
+        "a header click is not a row"
+    );
+    assert_eq!(
+        list.sort_state(),
+        Some((0, true)),
+        "a click on the leftmost header did not sort by the icon column"
+    );
+    assert_eq!(
+        names(&list),
+        vec!["one.rs".to_string(), "two.md".to_string()],
+        "the icon header sorted, but the rows did not reorder by kind"
+    );
+    println!(
+        "interaction: icon header (x=3) sorted by kind -> {:?}",
+        names(&list)
     );
 }

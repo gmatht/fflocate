@@ -26,6 +26,9 @@ use std::cell::{Cell, RefCell};
 use std::os::raw::c_void;
 use std::rc::Rc;
 
+/// The list's viewport geometry and offscreen per-row ink.
+pub mod reflow;
+
 /// One cell of a [`TreeView`] row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CellValue {
@@ -207,6 +210,85 @@ enum IconKind {
 ///
 /// The names are the freedesktop ones the search result carries; anything
 /// unrecognised is a plain document rather than nothing at all.
+/// Paint the whole list: header band, selection and every row.
+///
+/// Separate from the canvas callback so the same painting can be driven
+/// offscreen (a probe or a test paints into a `RecordingDrawContext`): the
+/// callback only supplies the width and the shared state.
+fn paint_list(
+    ctx: &mut dyn crate::core::DrawContext,
+    w: f64,
+    columns: &[(String, bool, bool)],
+    rows: &[Vec<CellValue>],
+    selected: Option<usize>,
+    _sort: Option<(usize, bool)>,
+) {
+    ctx.clear(1.0, 1.0, 1.0, 1.0);
+    // Header
+    ctx.fill_rect(0.0, 0.0, w, HEADER_HEIGHT, 0.93, 0.93, 0.95, 1.0);
+    let mut x = 4.0;
+    for (title, _icon, _sortable) in columns {
+        ctx.draw_text_styled(
+            x,
+            15.0,
+            title,
+            "sans",
+            12.0,
+            0.15,
+            0.15,
+            0.18,
+            1.0,
+            0,
+            1,
+        );
+        x += w * 0.32;
+    }
+    // Rows
+    for (i, row) in rows.iter().enumerate() {
+        let y = HEADER_HEIGHT + i as f64 * ROW_HEIGHT;
+        if selected == Some(i) {
+            ctx.fill_rect(0.0, y, w, ROW_HEIGHT, 0.22, 0.45, 0.85, 0.18);
+        }
+        let mut x = 4.0;
+        let icon_w = w * ICON_COLUMN_SHARE;
+        let text_w = (w - icon_w) / 2.0;
+        // A pictogram when the cell is an icon, its text otherwise:
+        // one letter per file kind read as "the icons are gone".
+        let drew_icon = row
+            .first()
+            .map(|cell| paint_icon(ctx, x, y + 4.5, 11.0, cell))
+            .unwrap_or(false);
+        if !drew_icon {
+            ctx.draw_text(
+                x,
+                y + 14.0,
+                &row.first().map(CellValue::render).unwrap_or_default(),
+                "sans",
+                11.0,
+                0.2,
+                0.2,
+                0.2,
+                1.0,
+            );
+        }
+        x += icon_w;
+        for cell in row.iter().skip(1).take(2) {
+            ctx.draw_text(
+                x,
+                y + 14.0,
+                &cell.render(),
+                "sans",
+                12.0,
+                0.1,
+                0.1,
+                0.1,
+                1.0,
+            );
+            x += text_w;
+        }
+    }
+}
+
 fn icon_kind(name: &str) -> IconKind {
     match name {
         "folder" => IconKind::Folder,
@@ -405,74 +487,12 @@ impl TreeView {
                 .map(|(t, icon, sortable)| (t.to_string(), *icon, *sortable))
                 .collect();
             let width = width.clone();
+            let sort = sort.clone();
             canvas.set_draw_callback(Box::new(move |ctx, w, _h| {
                 let w = if w > 0 { f64::from(w) } else { width.get() };
                 width.set(w);
-                ctx.clear(1.0, 1.0, 1.0, 1.0);
-                // Header
-                ctx.fill_rect(0.0, 0.0, w, HEADER_HEIGHT, 0.93, 0.93, 0.95, 1.0);
-                let mut x = 4.0;
-                for (title, _icon, _sortable) in &columns {
-                    ctx.draw_text_styled(
-                        x,
-                        15.0,
-                        title,
-                        "sans",
-                        12.0,
-                        0.15,
-                        0.15,
-                        0.18,
-                        1.0,
-                        0,
-                        1,
-                    );
-                    x += w * 0.32;
-                }
-                // Rows
                 let rows = rows.borrow();
-                for (i, row) in rows.iter().enumerate() {
-                    let y = HEADER_HEIGHT + i as f64 * ROW_HEIGHT;
-                    if selected.get() == Some(i) {
-                        ctx.fill_rect(0.0, y, w, ROW_HEIGHT, 0.22, 0.45, 0.85, 0.18);
-                    }
-                    let mut x = 4.0;
-                    let icon_w = w * ICON_COLUMN_SHARE;
-                    let text_w = (w - icon_w) / 2.0;
-                    // A pictogram when the cell is an icon, its text otherwise:
-                    // one letter per file kind read as "the icons are gone".
-                    let drew_icon = row
-                        .first()
-                        .map(|cell| paint_icon(ctx, x, y + 4.5, 11.0, cell))
-                        .unwrap_or(false);
-                    if !drew_icon {
-                        ctx.draw_text(
-                            x,
-                            y + 14.0,
-                            &row.first().map(CellValue::render).unwrap_or_default(),
-                            "sans",
-                            11.0,
-                            0.2,
-                            0.2,
-                            0.2,
-                            1.0,
-                        );
-                    }
-                    x += icon_w;
-                    for cell in row.iter().skip(1).take(2) {
-                        ctx.draw_text(
-                            x,
-                            y + 14.0,
-                            &cell.render(),
-                            "sans",
-                            12.0,
-                            0.1,
-                            0.1,
-                            0.1,
-                            1.0,
-                        );
-                        x += text_w;
-                    }
-                }
+                paint_list(ctx, w, &columns, &rows, selected.get(), sort.get());
             }));
         }
 
