@@ -80,22 +80,23 @@ jobs:
       # returning early like the display-gated tests above.
       - name: Row menu and clipboard (Linux, Xvfb)
         if: runner.os == 'Linux'
-        uses: coactions/setup-xvfb@v1
-        with:
-          run: |
-            # The annotation is emitted from inside this step: the action runs
-            # the script in a subshell of its own, so a later step cannot rely
-            # on files it left behind (an empty log was silently reported).
-            cargo test -p ff-gui --test row_menu_gtk -- --nocapture > row-menu.log 2>&1
-            status=$?
-            echo "row menu: exit ${status}; $(head -c 300 row-menu.log | tr -cd '[:print:]\n' | tr '\n' '|')"
-            lines=$(grep -E 'row menu:|clipboard holds|test result' row-menu.log | tr '\n' '|' | cut -c1-3500)
-            if [ "$status" -eq 0 ] && grep -q 'test result: ok' row-menu.log; then
-              echo "::notice title=row menu (Linux)::${lines}"
-              exit 0
-            fi
-            echo "::error title=row menu test (Linux)::$(grep -E 'panicked|assertion|^error|error\[' row-menu.log | head -12 | tr '\n' '|' | cut -c1-3000)"
-            exit 1
+        shell: bash
+        run: |
+          # xvfb-run is part of the ubuntu runner image; the action that wraps a
+          # script for us put the script outside this checkout, so its log never
+          # reached the next step.
+          command -v xvfb-run || { echo "::error title=row menu (Linux)::xvfb-run is not installed"; exit 1; }
+          status=0
+          xvfb-run -a -s "-screen 0 1280x1024x24" \
+            cargo test -p ff-gui --test row_menu_gtk -- --nocapture > row-menu.log 2>&1 || status=$?
+          echo "row menu: exit ${status}; $(head -c 400 row-menu.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+          lines=$(grep -E 'row menu:|clipboard holds|test result' row-menu.log | tr '\n' '|' | cut -c1-3500)
+          if [ "$status" -eq 0 ] && grep -q 'test result: ok' row-menu.log; then
+            echo "::notice title=row menu (Linux)::${lines}"
+            exit 0
+          fi
+          echo "::error title=row menu test (Linux)::$(grep -E 'panicked|assertion|^error|error\[|not found|No such' row-menu.log | head -12 | tr '\n' '|' | cut -c1-3000)"
+          exit 1
 
       - name: GUI launches (macOS)
         if: runner.os == 'macOS'
