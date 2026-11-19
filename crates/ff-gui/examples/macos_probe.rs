@@ -873,39 +873,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         win.set_child(&holder_box);
         let window_view = win.raw_handle();
         send0v(window_view, "layoutSubtreeIfNeeded");
-        let shot_rows = rswidgets::backends_macos_adapter::capture(window_view, Some((1350.0, 858.0)))
-            .ok_or("the window produced no capture after the rows were set")?;
-        let f = send_rect(list.raw_handle(), "frame");
-        let mut x = f.x;
-        let mut y = f.y;
-        let mut v = send0(list.raw_handle(), "superview");
-        while !v.is_null() && v != window_view {
-            let parent = send_rect(v, "frame");
-            x += parent.x;
-            y += parent.y;
-            v = send0(v, "superview");
-        }
-        let content_h2 = send_rect(window_view, "bounds").h;
-        let band2 = shot_rows.height as f64 - content_h2;
-        let x0 = x.max(0.0) as usize;
-        let x1 = ((x + f.w).max(0.0) as usize).min(shot_rows.width as usize);
-        let y0 = ((band2 + content_h2 - (y + f.h)).max(0.0) as usize).min(shot_rows.height as usize);
-        let y1 = (y0 + f.h.max(0.0) as usize).min(shot_rows.height as usize);
-        let mut ink = 0usize;
-        for row in y0..y1 {
-            for col in x0..x1 {
-                let i = (row * shot_rows.width as usize + col) * 4;
-                if shot_rows.rgba[i] < 200 || shot_rows.rgba[i + 1] < 200 || shot_rows.rgba[i + 2] < 200 {
-                    ink += 1;
+        // Ink inside the list, in pixels: the measure is the list against
+        // itself with no rows, so the threshold does not depend on a font.
+        let list_ink = |list: &rswidgets::compat::TreeView| -> Result<usize, Box<dyn std::error::Error>> {
+            let shot_rows =
+                rswidgets::backends_macos_adapter::capture(window_view, Some((1350.0, 858.0)))
+                    .ok_or("the window produced no capture")?;
+            let f = send_rect(list.raw_handle(), "frame");
+            let mut x = f.x;
+            let mut y = f.y;
+            let mut v = send0(list.raw_handle(), "superview");
+            while !v.is_null() && v != window_view {
+                let parent = send_rect(v, "frame");
+                x += parent.x;
+                y += parent.y;
+                v = send0(v, "superview");
+            }
+            let content_h2 = send_rect(window_view, "bounds").h;
+            let band2 = shot_rows.height as f64 - content_h2;
+            let x0 = x.max(0.0) as usize;
+            let x1 = ((x + f.w).max(0.0) as usize).min(shot_rows.width as usize);
+            let y0 =
+                ((band2 + content_h2 - (y + f.h)).max(0.0) as usize).min(shot_rows.height as usize);
+            let y1 = (y0 + f.h.max(0.0) as usize).min(shot_rows.height as usize);
+            let mut ink = 0usize;
+            for row in y0..y1 {
+                for col in x0..x1 {
+                    let i = (row * shot_rows.width as usize + col) * 4;
+                    if shot_rows.rgba[i] < 200
+                        || shot_rows.rgba[i + 1] < 200
+                        || shot_rows.rgba[i + 2] < 200
+                    {
+                        ink += 1;
+                    }
                 }
             }
-        }
+            Ok(ink)
+        };
+        list.set_rows(&[]);
+        let blank = list_ink(&list)?;
+        let rows = cells_of(&daemon_paths.lock().unwrap().clone());
+        list.set_rows(&rows);
+        let ink = list_ink(&list)?;
         println!(
-            "probe: the daemon's {rows_after_typing} row(s) painted {ink} px of ink in the list"
+            "probe: the daemon's {rows_after_typing} row(s) painted {ink} px of ink (empty list {blank} px)"
         );
         assert!(
-            ink > 500,
-            "the daemon's rows painted only {ink} px, so nothing reached the screen"
+            ink > blank + 50,
+            "the daemon's rows painted {ink} px against {blank} px for no rows, so nothing reached the screen"
         );
     }
 
