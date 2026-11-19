@@ -208,6 +208,70 @@ mod macos_adapter {
         }
     }
 
+    /// Give `view` a required width and height.
+    ///
+    /// Auto Layout otherwise fits a view to its subviews: the window's content
+    /// view shrank to a 32pt strip and the root box to one row, which squeezed
+    /// the list out of the window and left its scroller 17x0. The pair replaces
+    /// any earlier pair on `view`, so repeated calls do not stack constraints.
+    unsafe fn pin_size(view: *mut c_void, w: f64, h: f64) {
+        if view.is_null() {
+            return;
+        }
+        // SAFETY: a live view; `NSLayoutAttribute` width 7, height 8, and
+        // `NSLayoutRelationEqual` 0.
+        unsafe {
+            let constraint_cls = cls("NSLayoutConstraint");
+            if constraint_cls.is_null() {
+                return;
+            }
+            let existing = msg0(view, "constraints");
+            if !existing.is_null() {
+                let count = msg0i(existing, "count").max(0);
+                for i in 0..count {
+                    let c = msg1i(existing, "objectAtIndex:", i);
+                    if c.is_null() {
+                        continue;
+                    }
+                    let attr = msg0i(c, "firstAttribute");
+                    if msg0(c, "firstItem") == view && (attr == 7 || attr == 8) {
+                        msg1v(view, "removeConstraint:", c);
+                    }
+                }
+            }
+            msg1bv(view, "setTranslatesAutoresizingMaskIntoConstraints:", false);
+            for (attr, value) in [(7isize, w), (8isize, h)] {
+                let constraint: *mut c_void = raw_send!(
+                    constraint_cls,
+                    "constraintWithItem:attribute:relatedBy:toItem:attribute:multiplier:constant:",
+                    unsafe extern "C" fn(
+                        *mut c_void,
+                        *mut c_void,
+                        *mut c_void,
+                        isize,
+                        isize,
+                        *mut c_void,
+                        isize,
+                        f64,
+                        f64,
+                    ) -> *mut c_void,
+                    (
+                        view,
+                        attr,
+                        0isize,
+                        std::ptr::null_mut::<c_void>(),
+                        0isize,
+                        1.0f64,
+                        value,
+                    )
+                );
+                if !constraint.is_null() {
+                    msg1v(view, "addConstraint:", constraint);
+                }
+            }
+        }
+    }
+
     /// Size `child` to `content`'s bounds, inset by [`WINDOW_MARGIN`].
     ///
     /// AppKit does not lay a plain subview out by itself: a view added to the
@@ -244,6 +308,11 @@ mod macos_adapter {
                 child,
                 "setAutoresizingMask:",
                 NSVIEW_WIDTH_SIZABLE | NSVIEW_HEIGHT_SIZABLE,
+            );
+            pin_size(
+                child,
+                (bounds.width - 2.0 * WINDOW_MARGIN).max(1.0),
+                (bounds.height - 2.0 * WINDOW_MARGIN).max(1.0),
             );
         }
     }
@@ -3907,6 +3976,11 @@ mod macos_adapter {
                         "setFrame:",
                         0.0,
                         0.0,
+                        want_w,
+                        (want_h - chrome_h).max(1.0),
+                    );
+                    pin_size(
+                        view,
                         want_w,
                         (want_h - chrome_h).max(1.0),
                     );
