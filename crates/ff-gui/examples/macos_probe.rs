@@ -620,6 +620,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
+        // A collapsed section contributes nothing to the capture.
+        //
+        // `Expander::set_expanded(false)` hides the foldout's *body*, not the
+        // controls inside it, so each checkbox still answers "not hidden" to
+        // its own `isHidden`. The capture paints controls itself, outside
+        // AppKit's own visibility walk, so it has to ask the *ancestor*
+        // question — and that is the question that was missing when the
+        // reference capture came out with the three advanced-search
+        // checkboxes printed over the results grid (macos-gui.png). Both
+        // halves are asserted: the button is not hidden itself, which is why
+        // the old check passed, and it does have a hidden ancestor, which is
+        // what the capture now looks at.
+        {
+            let fold = app.create_expander("Advanced search")?;
+            let fold_body = app.create_box(Orientation::Vertical, 2)?;
+            let fold_cb = app.create_checkbutton("Case sensitive")?;
+            fold_body.append(&fold_cb);
+            fold.set_child(&fold_body);
+            fold.set_expanded(false);
+            let cb_view = fold_cb.raw_handle();
+            let own_hidden = send_bool(cb_view, "isHidden");
+            let ancestor_hidden = send_bool(cb_view, "isHiddenOrHasHiddenAncestor");
+            println!(
+                "probe: collapsed foldout checkbox hidden itself {own_hidden}, with its ancestors {ancestor_hidden}"
+            );
+            assert!(
+                !own_hidden,
+                "the collapsed foldout hid the checkbox itself, so the capture's ancestor check would go untested"
+            );
+            assert!(
+                ancestor_hidden,
+                "a checkbox inside a collapsed foldout reports no hidden ancestor, so the capture cannot tell it is invisible"
+            );
+            fold.set_expanded(true);
+            assert!(
+                !send_bool(cb_view, "isHiddenOrHasHiddenAncestor"),
+                "an expanded foldout's checkbox still reports a hidden ancestor, so nothing would be painted"
+            );
+        }
+
         // An expanding child takes the row's leftover width, as GTK's box does.
         let flex_entry_w = send_rect(flex_entry.raw_handle(), "frame").w;
         let flex_label_w = send_rect(flex_label.raw_handle(), "frame").w;

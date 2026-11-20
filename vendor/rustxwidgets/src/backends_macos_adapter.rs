@@ -4639,13 +4639,43 @@ mod macos_adapter {
         }
     }
 
+    /// Whether AppKit would draw `view` at all: it, or any view above it, is
+    /// hidden.
+    ///
+    /// The capture paints some controls itself (see `paint_controls`), so it
+    /// has to make the same decision the window does. Asking only the view's
+    /// own `isHidden` is not that decision: a collapsed disclosure's body is
+    /// hidden, its children are not, and painting them put the foldout's
+    /// checkboxes on top of the results grid in the reference capture.
+    unsafe fn hidden_with_ancestors(view: *mut c_void) -> bool {
+        if view.is_null() {
+            return true;
+        }
+        // SAFETY: a live view from this adapter's tree.
+        unsafe {
+            if responds(view, "isHiddenOrHasHiddenAncestor") {
+                return msg0i(view, "isHiddenOrHasHiddenAncestor") != 0;
+            }
+            // Older AppKit: walk the chain by hand.
+            let mut v = view;
+            while !v.is_null() {
+                if msg0i(v, "isHidden") != 0 {
+                    return true;
+                }
+                v = msg0(v, "superview");
+            }
+            false
+        }
+    }
+
     /// Draw the window's buttons into the capture.
     ///
     /// An `NSButton` draws through its cell, which the offscreen render leaves
     /// out entirely: the app's Search button and all three advanced checkboxes
     /// were in the window and absent from the bitmap. `drawWithFrame:inView:` is
     /// the cell's own drawing call, so what lands in the image is the control a
-    /// user sees, not a redrawn approximation.
+    /// user sees, not a redrawn approximation — including *not* drawing a
+    /// control whose section is collapsed (`hidden_with_ancestors`).
     unsafe fn paint_controls(view: *mut c_void, target: *mut c_void, context: *mut c_void) {
         if view.is_null() || context.is_null() {
             return;
@@ -4660,7 +4690,7 @@ mod macos_adapter {
                     unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool,
                     (button_cls)
                 );
-            if is_button && msg0i(view, "isHidden") == 0 {
+            if is_button && !hidden_with_ancestors(view) {
                 let cell = msg0(view, "cell");
                 if !cell.is_null() && responds(cell, "drawWithFrame:inView:") {
                     let bounds: CGRect = raw_send!(
@@ -4725,7 +4755,7 @@ mod macos_adapter {
                     unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool,
                     (scroll_cls)
                 );
-            if is_scroll_view && responds(view, "verticalScroller") {
+            if is_scroll_view && !hidden_with_ancestors(view) && responds(view, "verticalScroller") {
                 let scroller = msg0(view, "verticalScroller");
                 if !scroller.is_null() && !msg0(scroller, "superview").is_null() {
                     let bounds: CGRect = raw_send!(
