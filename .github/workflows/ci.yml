@@ -269,6 +269,12 @@ jobs:
               echo "::error title=daemon pixels (macOS)::exit ${pixels_status}: $(tail -c 1800 pixels.log | tr -cd '[:print:]\n' | tr '\n' '|')"
               exit 1
             fi
+            # A run that skipped for want of a daemon binary would still exit 0;
+            # this step built fflocated above, so the check has to have run.
+            if ! grep -q '^pixels: ok' pixels.log; then
+              echo "::error title=daemon pixels (macOS)::the pixel check did not run: $(grep -E '^pixels:|daemon_pixels_mac:' pixels.log | tr '\n' '|' | cut -c1-1200)"
+              exit 1
+            fi
             echo "::notice title=daemon pixels (macOS)::$(grep '^pixels:' pixels.log | tr '\n' '|')"
             exit 0
           fi
