@@ -17,6 +17,12 @@
 use ff_gui::RowAction;
 use rswidgets::compat::ContextMenu;
 
+/// Whether `path` is absolute — the row's path is what Copy puts on the
+/// clipboard, and a relative one would be useless in another application.
+fn copied_path_is_absolute(path: &str) -> bool {
+    path.starts_with('/')
+}
+
 /// The four actions a right-click offers, in menu order.
 fn row_actions() -> [RowAction; 4] {
     [
@@ -78,12 +84,22 @@ fn the_row_menu_model_dispatches_and_copy_path_copies_the_real_path() {
     eprintln!("row menu (appkit model): fired {lines:?}");
     assert_eq!(lines.len(), 4, "not every menu item ran its action");
     for (line, action) in lines.iter().zip(row_actions().iter()) {
+        // Copy reports what it copied ("copied <name>"), not its own label; the
+        // text it actually put on the clipboard is checked below.
+        if *action == RowAction::CopyPath {
+            assert!(line.starts_with("copied "), "Copy path reported {line:?}");
+            continue;
+        }
         assert!(
             line.starts_with(action.label()),
             "choosing {:?} ran {line:?}",
             action.label()
         );
     }
+    assert!(
+        copied_path_is_absolute(&path),
+        "the row's path {path:?} is not absolute, so copying it would not travel"
+    );
 
     let copied = copied.borrow().clone();
     assert_eq!(
