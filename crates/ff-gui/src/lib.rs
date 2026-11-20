@@ -1790,7 +1790,14 @@ where
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        Ok(_) => format!("{} → {}", action.label(), short_path(path)),
+        // Name the program: "Open containing folder → photo.png (dolphin)"
+        // says which helper actually ran, which is the difference between
+        // "the app did nothing" and "the app started a file manager".
+        Ok(_) => format!(
+            "{} → {} ({program})",
+            action.label(),
+            short_path(path)
+        ),
         Err(e) => format!("{} failed to start {program}: {e}", action.label()),
     }
 }
