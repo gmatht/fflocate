@@ -92,20 +92,27 @@ What that means in practice, stated rather than implied:
 
 * The results list **draws its own header and rows on a canvas** and hit-tests
   clicks by hand. The three columns line up and a click selects a row (so
-  Copy / Open act on the right file), the icon column shows a **glyph per file
-  kind** instead of a themed pixbuf, and the headers are **not click-to-sort** —
-  the canvas layer has no sorting UI. Row height is fixed.
-* **Right-click opens no menu.** `ContextMenu` collects its items, but popping
-  one up needs a native menu the merged toolkit does not expose, so
-  `popup_at_pointer` returns an error and the status line says so. Copy and
-  Open are still reachable from the **Search** menu, which acts on the selected
-  row.
+  Copy / Open act on the right file), the icon column shows a **letter per file
+  kind** instead of a themed pixbuf, and **clicking the Name or Path header
+  sorts by it** (a second click reverses it, and the title shows `^` or `v`).
+  The icon column does not sort. Row height is fixed. The letters are ASCII on
+  purpose: the canvas draws with the base sans font and has no glyph fallback,
+  so a symbol the font happens to lack draws as an empty box.
+* **Right-clicking a result opens its row menu.** The row under the cursor is
+  selected by the canvas hit-test, then a real menu (`GtkMenu` on GTK, `NSMenu`
+  on AppKit) offers *Open*, *Open containing folder*, *Copy full path* and
+  *Open in terminal*; each entry dispatches the handler the **Search** menu
+  uses, and *Copy full path* puts the row's absolute path on the system
+  clipboard, from where it can be read back.
 * **Drag-and-drop is unavailable** for the same reason: `enable_uri_drag_source`
   reports it (status line) rather than starting a drag that carries nothing.
-* The **Advanced search foldout** appends its body under the header; the
-  expander tracks the expanded flag but does not hide the body, because the
-  portable layer has no click callback to toggle it. Every control inside it
-  (case, fuzzy, max distance, count) works.
+* The **Advanced search foldout** starts collapsed and is opened from the
+  **Search** menu; hiding the body is what collapses it, and its header says
+  `(collapsed)` / `(expanded)`. The header itself is a label, not a button:
+  AppKit registers click handlers in a process-global table that requires
+  `Send`, and a widget handle cannot cross a thread, so click-to-toggle is not
+  available on both backends. Every control inside it (case, fuzzy, max
+  distance, count) works.
 * **Wheel stepping** of the max-distance field works where the backend delivers
   wheel events to an entry — GTK does; AppKit and the `zork` REPL report that
   they cannot, which the GUI swallows (the field simply ignores the wheel).
@@ -238,7 +245,8 @@ depend on a checkout outside this repository.
   app grids read a `.desktop` entry rather than the window, so `prepare()` also
   writes `~/.local/share/applications/fflocate.desktop` — `Icon=fflocate`,
   `StartupWMClass=ff-gui` (the window's `WM_CLASS`) and `Exec=` the binary that
-  is running.
+  is running. Only for an installed binary: a `target/` build artifact gets no
+  entry, since that path belongs to a working directory rather than an install.
 * Query box + Search button + a status line and a results list, driven by
   `App::run()`.
 * The window opens at 1000x700 and the results area takes the leftover height. The
@@ -248,11 +256,14 @@ depend on a checkout outside this repository.
   not drag: the canvas list has no per-column sizing UI.
 * Results are a **three-column list — Icon / Name / Path**, drawn on a canvas
   by `rswidgets::compat::TreeView`, so the columns line up on GTK and AppKit
-  alike and a click selects a row. The icon column shows a **glyph per file
-  kind** (folder, source, image, …) rather than a themed pixbuf, and the
-  headers are not click-to-sort. Clicking blank space below the rows does
+  alike and a click selects a row. The icon column shows a **letter per file
+  kind** (folder, source, image, …) rather than a themed pixbuf, and clicking
+  the Name or Path header sorts by it (again to reverse). Clicking blank space below the rows does
   nothing rather than acting on a neighbour; `(no matches)` stays an explicit
-  line. The `zork` fallback renders the same three columns as aligned text.
+  line. The list is handed its full content height, so more matches than fit
+  show the scrolled window's **scrollbar** and scroll with the wheel, while the
+  width stays the list's allocation so the columns re-flow with the window. The
+  `zork` fallback renders the same three columns as aligned text.
 * Press **Return** in either query field to search — the same code path as the
   Search button, so the two cannot diverge. (In the `zork` fallback, `enter`
   presses Return on the focused field.)

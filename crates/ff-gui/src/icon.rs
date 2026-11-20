@@ -3,36 +3,36 @@
 //! The art is the fflocate logo with the **wordmark cropped away**: at 16–32 px
 //! a wordmark is unreadable, and the taskbar already carries the window title,
 //! so only the mark — the magnifier with the `ff` — is kept. `assets/fflocate.png`
-//! is that mark at 1024², on a transparent background with even margins;
-//! `assets/hicolor/` holds the sizes GTK looks up by name.
+//! is that mark at 1024², on a transparent background with even margins, and is
+//! embedded on macOS only; `assets/hicolor/` holds the sizes GTK installs.
 //!
-//! Two things have to happen for the icon to actually show:
-//!
-//! * **GTK** resolves the icon through the *icon theme* on GTK4 (GTK3 can also
-//!   take a file), so the hicolor tree is installed into the per-user icon
-//!   directory — see [`prepare`]. That must happen before the toolkit starts,
-//!   because GTK reads the theme during initialisation; hence the separate call
-//!   from [`apply`], which runs once there is a window.
-//! * **macOS** has no window icon at all: the application owns one, so the Dock
-//!   image is set from the PNG bytes.
-//!
-//! A backend with neither (the `zork` terminal fallback, Windows, a browser
-//! tab) accepts the call and does nothing. No icon is ever an error: a
-//! read-only data directory costs the icon, not the GUI.
+//! GTK resolves a window icon through the *icon theme* on GTK4 (GTK3 can also
+//! take a file), so [`prepare`] installs the hicolor tree into the per-user icon
+//! directory before the toolkit starts — plus, for an installed binary only, the
+//! desktop entry a launcher or app grid actually reads. macOS has no window
+//! icon: the application owns one, so its `set_icon` takes the PNG bytes and
+//! sets the Dock image. No icon is ever an error: a read-only data directory
+//! costs the icon, not the GUI.
 
-use std::path::PathBuf;
 #[cfg(all(unix, not(target_os = "macos")))]
-use std::path::Path;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 
 /// Icon-theme name, and the file name each installed size is written under.
 pub const ICON_NAME: &str = "fflocate";
 
-/// The mark, cropped from the logo and centred on a transparent 1024² canvas.
+/// The mark, cropped from the logo and centred on a transparent 1024² canvas:
+/// what the macOS Dock draws. GTK takes the installed `HICOLOR` sizes instead,
+/// so this is compiled in on macOS only rather than sitting unused in Linux
+/// binaries.
+#[cfg(target_os = "macos")]
 pub const ICON_PNG: &[u8] = include_bytes!("../assets/fflocate.png");
 
-/// The hicolor sizes, ascending — the last entry is the file GTK3 is handed by
-/// path, so it is the largest.
+/// The size GTK3 is handed by path: the largest installed.
+#[cfg(all(unix, not(target_os = "macos")))]
+const LARGE_SIZE: &str = "512x512";
+
+/// The installed sizes, for the freedesktop layout GTK expects
+/// (`<size>x<size>/apps`); GTK picks the nearest to the size it needs.
 #[cfg(all(unix, not(target_os = "macos")))]
 const HICOLOR: &[(&str, &[u8])] = &[
     ("16x16", include_bytes!("../assets/hicolor/16x16/apps/fflocate.png")),
@@ -45,65 +45,117 @@ const HICOLOR: &[(&str, &[u8])] = &[
     ("512x512", include_bytes!("../assets/hicolor/512x512/apps/fflocate.png")),
 ];
 
-/// Where the installed 512 px PNG ended up, resolved once.
-static ICON_FILE: OnceLock<Option<PathBuf>> = OnceLock::new();
-
-/// Install the icon-theme files and the Linux desktop entry, and return the
-/// installed 512 px PNG's path (empty when there is none). Call this **before**
-/// the toolkit is initialised: GTK creates its icon theme while starting up, so
-/// an icon written afterwards would not be found by name.
+/// Install the icon files and return the largest installed PNG's path (empty
+/// when there is none), which GTK3 takes.
 ///
-/// A no-op off GTK's platforms, and safe to call more than once.
+/// Call this **before** the toolkit is initialised: GTK reads the icon theme
+/// while starting up, so an icon written afterwards is not found by name. Safe
+/// to call more than once; unchanged files are not rewritten.
 ///
-/// The result is then handed to the window with
-/// `win.set_icon(&path, ICON_NAME, ICON_PNG)`: GTK takes the file (GTK3) or the
-/// theme name (GTK4), macOS takes the PNG bytes and sets the Dock image. A
-/// plain function rather than a wrapper here because `App::create_window`
-/// returns each backend's own window type.
+/// Linux only: the other backends take the embedded PNG (macOS) or have no
+/// icon at all.
+#[cfg(all(unix, not(target_os = "macos")))]
 pub fn prepare() -> String {
-    icon_file()
+    install()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
-fn icon_file() -> Option<PathBuf> {
-    ICON_FILE.get_or_init(install).clone()
-}
-
-/// Write the hicolor tree into the per-user icon directory and return the
-/// 512 px file, for the backends that want a path.
-///
-/// Unchanged files are left alone (an ordinary launch costs a few `stat`s). If
-/// the data directory is not writable it falls back to a temp tree, and then to
-/// nothing: a window without an icon still works, so this never fails loudly.
-///
-/// The desktop entry is only written when the theme files reached the *real*
-/// data directory: an entry pointing at `Icon=fflocate` with no hicolor icons
-/// beside it would list the app with a blank icon instead of none.
+/// The per-user icon tree, falling back to a temp tree, then to nothing.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn install() -> Option<PathBuf> {
     if let Some(home) = data_home() {
-        if let Ok(path) = install_into(&home.join("icons").join("hicolor")) {
+        let hicolor = home.join("icons").join("hicolor");
+        if install_into(&hicolor).is_ok() {
             install_desktop_entry(&home);
-            return Some(path);
+            return Some(png_path(&hicolor, LARGE_SIZE));
         }
     }
-    install_into(&std::env::temp_dir().join("fflocate-icons").join("hicolor")).ok()
+    // A read-only data directory still leaves the *window* icon possible (GTK3
+    // takes a path), even though no launcher will find it there.
+    let tmp = std::env::temp_dir().join("fflocate-icons").join("hicolor");
+    install_into(&tmp).ok()?;
+    Some(png_path(&tmp, LARGE_SIZE))
 }
 
-/// Write the `.desktop` entry into the per-user applications directory.
-/// Best-effort: a launcher entry is a convenience, and the window icon does not
-/// depend on it, so a failure here is silent.
+/// One icon tree. All-or-nothing, so a full disk cannot leave a half-written
+/// theme behind for GTK to read.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn install_into(base: &Path) -> std::io::Result<()> {
+    for (size, png) in HICOLOR {
+        write_if_changed(&png_path(base, size), png)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn png_path(base: &Path, size: &str) -> PathBuf {
+    base.join(size).join("apps").join(format!("{ICON_NAME}.png"))
+}
+
+/// Write `bytes` to `path` unless that exact content is already there.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() == bytes.len() as u64 && std::fs::read(path).is_ok_and(|old| old == bytes) {
+            return Ok(());
+        }
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, bytes)
+}
+
+/// `$XDG_DATA_HOME`, else `~/.local/share` — where a user's icons live.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn data_home() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_DATA_HOME").filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(|home| PathBuf::from(home).join(".local").join("share"))
+}
+
+/// Write `applications/fflocate.desktop`, unless this is a cargo build
+/// artifact: a launcher pointing into `target/` would outlive the build, break
+/// on `cargo clean`, and name whichever checkout happened to run last.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn install_desktop_entry(data_home: &Path) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
+    if is_cargo_artifact(&exe) {
+        return;
+    }
     let Some(exe) = exe.to_str() else {
         return;
     };
     let path = data_home.join("applications").join("fflocate.desktop");
+    // Best-effort: a launcher entry is a convenience, and the window icon does
+    // not depend on it.
     let _ = write_if_changed(&path, desktop_entry(exe).as_bytes());
+}
+
+/// True when this binary is a `cargo` build artifact rather than an installed
+/// program.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn is_cargo_artifact(exe: &Path) -> bool {
+    // `cargo run` (and the test harness) export this for the child.
+    std::env::var_os("CARGO_MANIFEST_DIR").is_some() || is_under_target(exe)
+}
+
+/// `<workspace>/target/<profile>/ff-gui`, or a cross-compiled
+/// `target/<triple>/<profile>/…`: a `target` directory beside a `Cargo.toml`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn is_under_target(exe: &Path) -> bool {
+    exe.ancestors().any(|dir| {
+        dir.file_name().is_some_and(|name| name == "target")
+            && dir
+                .parent()
+                .is_some_and(|workspace| workspace.join("Cargo.toml").is_file())
+    })
 }
 
 /// The desktop entry that gives the icon a presence in a launcher/app grid.
@@ -119,13 +171,11 @@ fn desktop_entry(exec: &str) -> String {
          Type=Application\n\
          Version=1.0\n\
          Name=fflocate\n\
-         GenericName=File Search\n\
          Comment=Instant filename search over the fflocate index\n\
          Exec={}\n\
          Icon={ICON_NAME}\n\
          Terminal=false\n\
          Categories=Utility;FileTools;\n\
-         Keywords=find;locate;search;file;filename;\n\
          StartupWMClass=ff-gui\n",
         exec_quote(exec)
     )
@@ -151,59 +201,26 @@ fn exec_quote(path: &str) -> String {
     out
 }
 
-#[cfg(not(all(unix, not(target_os = "macos"))))]
-fn install() -> Option<PathBuf> {
-    None
-}
-
-/// One icon tree. All-or-nothing, so a full disk cannot leave a half-written
-/// theme behind for GTK to read. Returns the last (largest) file written.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn install_into(base: &Path) -> std::io::Result<PathBuf> {
-    let mut written = None;
-    for (size, png) in HICOLOR {
-        let path = base.join(size).join("apps").join(format!("{ICON_NAME}.png"));
-        write_if_changed(&path, png)?;
-        written = Some(path);
-    }
-    Ok(written.unwrap_or_default())
-}
-
-/// Write `bytes` to `path` unless that exact content is already there.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Ok(meta) = std::fs::metadata(path) {
-        if meta.len() == bytes.len() as u64 && std::fs::read(path).is_ok_and(|old| old == bytes) {
-            return Ok(());
-        }
-    }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(path, bytes)
-}
-
-/// `$XDG_DATA_HOME`, else `~/.local/share` — where a user's icon theme lives.
-#[cfg(all(unix, not(target_os = "macos")))]
-fn data_home() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME").filter(|d| !d.is_empty()) {
-        return Some(PathBuf::from(dir));
-    }
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(|home| PathBuf::from(home).join(".local").join("share"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The embedded asset is what the window gets on macOS, so it must be a
-    /// real PNG and not, say, a text placeholder.
+    /// The embedded asset is what the Dock draws, so it must be a real PNG and
+    /// not, say, a text placeholder.
     #[test]
+    #[cfg(target_os = "macos")]
     fn the_embedded_mark_is_a_png() {
         assert_eq!(&ICON_PNG[..8], b"\x89PNG\r\n\x1a\n");
         assert!(ICON_PNG.len() > 1024, "icon looks truncated: {} bytes", ICON_PNG.len());
+    }
+
+    /// Every size GTK is given is a real PNG too.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn every_hicolor_size_is_a_png() {
+        for (size, png) in HICOLOR {
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "{size} is not a PNG");
+        }
     }
 
     /// Every hicolor size is installed, and a second run rewrites nothing.
@@ -211,14 +228,26 @@ mod tests {
     #[cfg(all(unix, not(target_os = "macos")))]
     fn installs_every_hicolor_size_then_leaves_them_alone() {
         let dir = tempfile::tempdir().unwrap();
-        let large = install_into(dir.path()).unwrap();
-        assert!(large.ends_with("512x512/apps/fflocate.png"), "{large:?}");
+        install_into(dir.path()).unwrap();
         for (size, png) in HICOLOR {
-            let path = dir.path().join(size).join("apps").join("fflocate.png");
+            let path = png_path(dir.path(), size);
             assert_eq!(&std::fs::read(&path).unwrap(), png, "{size} differs");
         }
         // Idempotent: the second run finds identical bytes and succeeds.
-        assert_eq!(install_into(dir.path()).unwrap(), large);
+        install_into(dir.path()).unwrap();
+    }
+
+    /// A file of the right size but the wrong bytes is replaced, so a botched
+    /// earlier write cannot leave the wrong icon installed.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn replaces_a_different_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = png_path(dir.path(), "16x16");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"not the icon").unwrap();
+        install_into(dir.path()).unwrap();
+        assert_eq!(&std::fs::read(&path).unwrap(), HICOLOR[0].1);
     }
 
     /// The entry names the icon and the window class, i.e. the two things a
@@ -233,8 +262,6 @@ mod tests {
         assert!(entry.contains("\nExec=/home/me/.cargo/bin/ff-gui\n"), "{entry}");
         assert!(entry.contains("\nType=Application\n"), "{entry}");
         assert!(entry.ends_with('\n'), "{entry}");
-        // `Icon=` and the installed theme files must agree.
-        assert!(entry.contains(&format!("\nIcon={ICON_NAME}\n")));
     }
 
     /// A path with spaces or shell metacharacters is quoted; a plain one is
@@ -247,16 +274,21 @@ mod tests {
         assert_eq!(exec_quote("/tmp/a$b/ff-gui"), "\"/tmp/a\\$b/ff-gui\"");
     }
 
-    /// A file of the right size but the wrong bytes is replaced, so a botched
-    /// earlier write cannot leave the wrong icon installed.
+    /// `<workspace>/target/debug/ff-gui` is a build artifact; a binary under
+    /// `~/.cargo/bin` is not.
     #[test]
     #[cfg(all(unix, not(target_os = "macos")))]
-    fn replaces_a_different_file() {
+    fn a_target_directory_beside_a_cargo_toml_is_a_build_artifact() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("16x16").join("apps").join("fflocate.png");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"not the icon").unwrap();
-        install_into(dir.path()).unwrap();
-        assert_eq!(&std::fs::read(&path).unwrap(), HICOLOR[0].1);
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        assert!(is_under_target(&dir.path().join("target/debug/ff-gui")));
+        // Cross-compiled: target/<triple>/<profile>/ff-gui.
+        assert!(is_under_target(
+            &dir.path().join("target/aarch64-apple-darwin/debug/ff-gui")
+        ));
+        // An installed binary, and a `target` dir with no workspace beside it.
+        assert!(!is_under_target(&dir.path().join("bin/ff-gui")));
+        let other = tempfile::tempdir().unwrap();
+        assert!(!is_under_target(&other.path().join("target/debug/ff-gui")));
     }
 }

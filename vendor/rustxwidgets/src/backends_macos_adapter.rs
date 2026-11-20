@@ -424,13 +424,12 @@ mod macos_adapter {
         /// `NSApplication.applicationIconImage` from the PNG bytes rather than
         /// decorating a window. It matters for a bare Rust binary, which has no
         /// `.app` bundle to carry an `Info.plist` icon and would otherwise show
-        /// the generic executable icon in the Dock. `path`/`name` are for the
-        /// backends that decorate a window; unused here.
+        /// the generic executable icon in the Dock.
         ///
         /// No-op when AppKit is uninitialised, when there is no application (a
         /// headless session), and when the PNG cannot be turned into an
         /// `NSImage` — a missing icon must never take the GUI down.
-        pub fn set_icon(&self, _path: &str, _name: &str, png: &[u8]) {
+        pub fn set_icon(&self, png: &[u8]) {
             if png.is_empty() {
                 return;
             }
@@ -1729,8 +1728,8 @@ mod macos_adapter {
 
     /// Dispatch the second press of a double click at `(x, y)`.
     ///
-    /// A caller driving this by hand has to dispatch the single click first, as
-    /// AppKit does; the probe does exactly that.
+    /// The single-click callback still has to be dispatched first (as AppKit
+    /// does) when a caller drives this by hand; the probe does exactly that.
     pub fn dispatch_canvas_double_click(canvas_id: u64, x: f64, y: f64) {
         let raw = {
             let mut map = DOUBLE_CLICK_CALLBACKS.lock().unwrap();

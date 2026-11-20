@@ -50,9 +50,8 @@ mod gtk_adapter {
 
         /// Window icon for the taskbar / window switcher. `path` is a PNG on
         /// disk and `name` its icon-theme name; the loader picks whichever
-        /// this GTK version understands (see its `Window::set_icon`). `png` is
-        /// for backends that take the image itself (macOS); unused here.
-        pub fn set_icon(&self, path: &str, name: &str, _png: &[u8]) {
+        /// this GTK version understands (see its `Window::set_icon`).
+        pub fn set_icon(&self, path: &str, name: &str) {
             self.0.set_icon(path, name);
         }
 
@@ -1347,9 +1346,28 @@ mod gtk_adapter {
             self.drawing_area.set_size_request(w, h);
         }
 
+        /// Size the area the canvas draws over, so a `ScrolledWindow` around
+        /// it has something to scroll.
+        ///
+        /// GTK4 does this with `gtk_drawing_area_set_content_width/height`.
+        /// GTK3 exports neither symbol, so on GTK3 this used to be a silent
+        /// no-op: the canvas stayed viewport-sized, the scrolled window saw no
+        /// overflow, and the results list showed no scrollbar and could not be
+        /// wheeled past the first screenful. The GTK3 equivalent is a minimum
+        /// *height*; the width is deliberately left unconstrained (`-1`) so the
+        /// canvas keeps filling the viewport — a width request would pin it at
+        /// the width it had when the rows arrived and pop a horizontal
+        /// scrollbar as soon as the window was made narrower.
         pub fn set_content_size(&self, w: i32, h: i32) {
-            self.drawing_area.set_content_width(w);
-            self.drawing_area.set_content_height(h);
+            let gtk4 = crate::backends::gtk::loader()
+                .map(|loader| loader.symbols.gtk_drawing_area_set_content_height.is_some())
+                .unwrap_or(false);
+            if gtk4 {
+                self.drawing_area.set_content_width(w);
+                self.drawing_area.set_content_height(h);
+            } else {
+                self.drawing_area.set_size_request(-1, h);
+            }
         }
 
         /// Click with the button number and modifier state.

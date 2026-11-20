@@ -128,9 +128,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // icon theme while initialising, so an icon installed later would not be
     // found by name. See `ff_gui::icon::prepare`.
     //
-    // CFG: only GTK and macOS have an icon to set, so only they get the
-    // install and the `set_icon` call — the other backends have no such method.
-    #[cfg(all(unix, not(feature = "zork")))]
+    // CFG: only GTK and macOS have an icon to set, so only they get a call —
+    // the other backends have no such method.
+    #[cfg(all(unix, not(target_os = "macos"), not(feature = "zork")))]
     let icon_path = ff_gui::icon::prepare();
 
     trace_step!("app init");
@@ -144,12 +144,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The fflocate mark: the window/taskbar icon on GTK, the Dock icon on
     // macOS. Best-effort, and before `present()` — GTK applies the icon it
     // holds when the window is mapped, so one call here is enough.
-    #[cfg(all(unix, not(feature = "zork")))]
-    win.set_icon(
-        &icon_path,
-        ff_gui::icon::ICON_NAME,
-        ff_gui::icon::ICON_PNG,
-    );
+    #[cfg(all(unix, not(target_os = "macos"), not(feature = "zork")))]
+    win.set_icon(&icon_path, ff_gui::icon::ICON_NAME);
+    #[cfg(all(target_os = "macos", not(feature = "zork")))]
+    win.set_icon(ff_gui::icon::ICON_PNG);
 
     // Roomy enough that all three columns are visible on launch.
     win.set_default_size(DEFAULT_WINDOW_W, DEFAULT_WINDOW_H);
@@ -175,9 +173,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The results are a three-column list: icon, name, path. The compat
     // `TreeView` draws the header and rows on a canvas, hit-tests clicks and
     // tracks a selection on every backend, so the three columns align and the
-    // same code serves GTK and AppKit. (title, is_icon, sortable): the
-    // `sortable` flag is accepted for source compatibility — the canvas list
-    // has no click-to-sort headers.
+    // same code serves GTK and AppKit. (title, is_icon, sortable): clicking a
+    // sortable header sorts by it and a second click reverses the order. All
+    // three are sortable, the icon column included: its glyph groups the rows
+    // by kind, which is how you collect the folders at one end.
     trace_step!("results treeview");
     let results = app.create_treeview(&[
         ("", true, true),
@@ -243,7 +242,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     advanced_box.append(&opt_count);
     trace_step!("sensitive toggles");
     advanced.set_child(&advanced_box);
-    advanced.set_expanded(false);
+    // Collapsed, and it stays collapsed: `set_expanded(false)` is applied after
+    // `present()` below, because GTK's show_all would otherwise re-show the
+    // body (the expander hides it by hiding the box it lives in).
 
     // Fuzzy off => the distance field is inert; grey it out so it is clear the
     // value has no effect rather than being silently ignored.
@@ -386,8 +387,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     let shown: Vec<String> = outcome.paths.iter().take(MAX_ROWS).cloned().collect();
                     results.set_rows(&rows_to_cells(&shown));
-                    // Record only the rows actually shown.
-                    *current.borrow_mut() = shown;
+                    // Read the rows back rather than copying `shown`: the list
+                    // sorts its own rows once a header has been clicked, so
+                    // the order on screen is not the daemon's order.
+                    *current.borrow_mut() = results.displayed_column(PATH_COLUMN);
                 }
             }
             Err(e) => {
@@ -677,7 +680,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     let shown: Vec<String> =
                                         fresh_hits.iter().take(MAX_ROWS).cloned().collect();
                                     partial_results.set_rows(&rows_to_cells(&shown));
-                                    *partial_current.borrow_mut() = shown;
+                                    *partial_current.borrow_mut() =
+                                        partial_results.displayed_column(PATH_COLUMN);
                                     // The streaming line: hits are on screen,
                                     // the total is still being counted. No
                                     // invented "starting" wording — the daemon's
@@ -866,10 +870,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let cb_results = results.clone();
         let status_for_err = status.clone();
         if let Err(e) = results.connect_button_press_event(move |button, x, y, event| {
-            // Buttons arrive normalized (`normalize_press_button`): a
-            // middle-press is already button 1, so only the secondary button
-            // needs handling here — a primary click selects its row inside the
-            // compat list itself.
+            // A header click has just re-sorted the rows inside the list, so
+            // the row order `current` was built from is stale. Re-read it
+            // before any index is used. (Buttons arrive normalized
+            // (`normalize_press_button`): a middle-press is already button 1,
+            // so only the secondary button needs handling below — a primary
+            // click selects its row inside the compat list itself.)
+            *current.borrow_mut() = cb_results.displayed_column(PATH_COLUMN);
             if button != 3 {
                 return;
             }
@@ -937,16 +944,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // backend that can carry a URI.
     if let Err(e) = results.enable_uri_drag_source(|| None, || None) {
         status.set_text(&format!("drag and drop unavailable: {e}"));
-    }
-
-    // Double-clicking a row opens it. `ff_gui::connect_open_on_double_click` is
-    // the function the macOS probe installs too, so the probe exercises this
-    // handler rather than a stand-in; the status line reports what it did.
-    {
-        let status = status.clone();
-        ff_gui::connect_open_on_double_click(&results, PATH_COLUMN, move |line| {
-            status.set_text(&line);
-        });
     }
 
     // Menubar (File/Search/View/Help). Every item reuses a handler something
@@ -1164,6 +1161,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     win.set_child(&layout);
     trace_step!("present");
     win.present();
+    // After present, not before: presenting runs `show_all` on GTK, which would
+    // show the advanced-search body again. The foldout opens from the Search
+    // menu ("Advanced search"), which toggles this same call.
+    advanced.set_expanded(false);
     trace_step!("grab focus");
 
     // The Basic Search box owns the keyboard from the start: the window opens
@@ -1293,13 +1294,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// when the alternative target is zutty; see
 /// [`ff_gui::open_in_terminal_command`]).
 fn run_row_action(action: RowAction, path: &str, results: &impl TextViewLike) -> String {
-    // The runner lives in the library so the macOS probe drives exactly the
-    // handler the app installs; only the clipboard comes from this caller's
-    // widget (the GTK list and the compat tree view each own one).
-    ff_gui::run_row_action(action, path, |text| {
-        results.clipboard_set_text(text).map_err(|e| e.to_string())
-    })
+    // "Open in terminal" carries host-specific prefix flags: when the
+    // alternatives link resolves to zutty — whose `9x18` default aborts when
+    // `xfonts-base` is not installed — splice `-font <installed monospace>`
+    // in front of `-e` so the emulator starts at all. Every other action
+    // launches exactly what `RowAction::command` says.
+    let (program, args) = if action == RowAction::OpenInTerminal {
+        ff_gui::open_in_terminal_command(path)
+    } else {
+        action.command(path)
+    };
+    if program.is_empty() {
+        // Clipboard actions need no external command; they differ only in what
+        // they copy.
+        let text = match action {
+            RowAction::CopyFolderPath => containing_dir(path),
+            _ => path.to_string(),
+        };
+        return match results.clipboard_set_text(&text) {
+            Ok(()) => format!("copied {}", short_path(&text)),
+            Err(e) => format!("copy failed: {e}"),
+        };
+    }
+    match std::process::Command::new(program).args(&args).spawn() {
+        Ok(_) => format!("{} → {}", action.label(), short_path(path)),
+        Err(e) => format!("{} failed: {e}", action.label()),
+    }
 }
+
 /// Show a one-label dialog with a Close button. Failures go through `report`
 /// (usually the status line), like every other UI error here. `report` keeps
 /// this helper free of widget types, which differ per backend.
@@ -1528,22 +1550,30 @@ impl TextViewLike for rswidgets::compat::TreeView {
 /// The compat `TreeView` paints on a canvas, so it cannot load a themed pixbuf:
 /// the column shows one character per file kind. The theme name still travels
 /// with the cell (`CellValue::Icon::name`) for a backend that can use a real
-/// icon, and this is only the drawn fallback — which is why it is a glyph rather
-/// than the name spelled out.
+/// icon, and this is only the drawn fallback.
+///
+/// ASCII only, deliberately. The canvas draws with the base sans font and has
+/// no glyph fallback, so a symbol the font happens to lack (Noto Sans has no
+/// `\u{2261}`, for one) comes out as a blank box. A letter always renders.
 fn icon_glyph(icon: &str) -> &'static str {
     match icon {
-        "folder" => "\u{25b8}",
+        "folder" => "d",
         "text-x-rust" => "R",
         "text-x-python" => "P",
-        "text-x-javascript" | "text-x-typescript" | "application-json" => "{}",
-        "text-x-csrc" | "text-x-c++src" | "text-x-go" | "text-x-java" => "C",
+        "text-x-javascript" | "application-json" => "J",
+        "text-x-typescript" => "T",
+        "text-x-csrc" | "text-x-c++src" => "C",
+        "text-x-go" => "G",
+        "text-x-java" => "J",
         "text-x-ruby" => "r",
         "text-x-script" => "$",
-        "text-markdown" | "text-html" | "text-css" | "text-x-generic" => "\u{2261}",
-        "image-x-generic" => "\u{25a3}",
+        "text-markdown" => "M",
+        "text-html" => "H",
+        "text-css" => "s",
+        "image-x-generic" => "i",
         "application-pdf" => "p",
-        "package-x-generic" => "\u{25a4}",
-        _ => "\u{00b7}",
+        "package-x-generic" => "z",
+        _ => "-",
     }
 }
 
@@ -1727,21 +1757,24 @@ mod tests {
         match &cells[0][0] {
             CellValue::Icon { name, fallback } => {
                 assert_eq!(name, "folder");
-                // A folder draws a folder glyph, not a generic file one.
-                assert_eq!(fallback, "\u{25b8}");
+                // A folder draws its own glyph, not the generic-file one.
+                assert_eq!(fallback, "d");
             }
             _ => panic!("expected an icon"),
         }
     }
 
     #[test]
-    fn icon_glyphs_are_one_character_each() {
+    fn icon_glyphs_are_one_ascii_character_each() {
         // The icon column is a fixed narrow fraction of the list, so a glyph
-        // that is more than one character wide would be clipped.
+        // that is more than one character wide would be clipped. ASCII only:
+        // the canvas has no glyph fallback, so a symbol the base font lacks
+        // (\u{2261}, \u{25b8}, \u{25a3}) draws as an empty box.
         for icon in [
             "folder",
             "text-x-rust",
             "text-x-python",
+            "text-x-json",
             "text-x-generic",
             "image-x-generic",
             "package-x-generic",
@@ -1750,6 +1783,7 @@ mod tests {
         ] {
             let glyph = icon_glyph(icon);
             assert_eq!(glyph.chars().count(), 1, "{icon} -> {glyph:?}");
+            assert!(glyph.is_ascii(), "{icon} -> {glyph:?} is not ASCII");
         }
     }
 

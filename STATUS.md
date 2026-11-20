@@ -299,8 +299,9 @@ previously only parent-menu callbacks fired.
 The GUI uses the fflocate logo as its icon, **cropped to the mark**: the
 wordmark is removed (unreadable at 16–32 px, and the taskbar already carries
 the window title). `assets/fflocate.png` is the magnifier at 1024², centred on
-a transparent canvas; `assets/hicolor/<size>/apps/fflocate.png` is the same art
-at 16–512 px.
+a transparent canvas, and is embedded on macOS only (GTK has no use for it, so
+it is not carried in a Linux binary);
+`assets/hicolor/<size>/apps/fflocate.png` is the same art at 16–512 px.
 
 `icon::prepare()` runs **before** `App::init()`: GTK reads the icon theme while
 initialising, so the hicolor tree is installed under
@@ -314,11 +315,13 @@ bytes, as `NSApplication.applicationIconImage` — a bare Rust binary has no
 
 **Only those two adapters define `set_icon`.** Windows would need an `HICON`
 resource, and the zork fallback is a terminal, so rather than a no-op copy on
-every backend the call site itself is compiled out
-(`cfg(all(unix, not(feature = "zork")))` in `main.rs`) and `common::Window`
-carries no forward for it. `App::create_window` already returns each backend's
-own window type, so nothing in the portable layer has to know the method
-exists.
+every backend the call site itself is compiled out (in `main.rs`) and
+`common::Window` carries no forward for it. `App::create_window` already returns
+each backend's own window type, so nothing in the portable layer has to know
+the method exists — which is also why the two signatures are each just what the
+backend needs: GTK `set_icon(path, name)`, macOS `set_icon(png)`. `prepare()` is
+Linux-only for the same reason; macOS draws the Dock icon from the embedded
+PNG and needs nothing installed.
 
 A launcher or app grid does not read the window icon at all: it reads a
 `.desktop` entry. `prepare()` therefore also writes
@@ -330,11 +333,22 @@ spec when the path contains spaces. It is written only when its content would
 change, and only when the hicolor tree reached the *real* data directory: an
 entry whose `Icon=` resolves to nothing would list the app blank.
 
+It is also skipped for a **cargo build artifact** (`is_cargo_artifact`):
+`CARGO_MANIFEST_DIR` in the environment (how `cargo run` starts the child), or
+an executable under a `target/` directory that has a `Cargo.toml` beside it —
+which covers `target/debug`, `target/release` and cross-compiled
+`target/<triple>/<profile>` alike. A launcher pointing into `target/` would
+outlive the build, break on `cargo clean`, and name whichever checkout ran
+last. The theme files are still installed, because the window icon needs them;
+only the launcher entry is suppressed.
+
 Verified on Linux: the window of a real `ff-gui` carries the icon —
 `xprop -id <window> WM_HINTS` reports the `icon_pixmap`/`icon_mask` bitmap ids
-GTK3 set from the installed PNG — and the installed entry passes
-`desktop-file-validate` (no errors or warnings; `Categories=Utility;FileTools;`
-keeps to one main category) with the running binary's absolute path in `Exec`.
+GTK3 set from the installed PNG — and the entry written for a binary outside
+`target/` passes `desktop-file-validate` (no errors or warnings;
+`Categories=Utility;FileTools;` keeps to one main category) with the running
+binary's absolute path in `Exec`. A run from `target/debug` installs the theme
+files and writes **no** entry, as intended.
 Three honest limits: GTK3 in this XWayland session publishes the icon as
 `WM_HINTS` legacy pixmaps and **not** as `_NET_WM_ICON` (a plain `Gtk.Window`
 behaves identically — it is GTK/GDK, not this call); the GNOME app grid itself
@@ -458,8 +472,10 @@ These are deliberate and small; each is noted so the design stays honest.
    `vendor/rustxwidgets/src/compat.rs` rebuilds them on the portable layer, so
    `ff-gui` builds for Linux (GTK) and macOS (AppKit) from one source. The cost
    is fidelity, recorded in `crates/ff-gui/README.md`: the results list draws a
-   glyph per file kind instead of a themed icon and its headers do not sort,
-   and drag-and-drop is unavailable. The daemon and CLI are unaffected.
+   letter per file kind instead of a themed icon (ASCII: the canvas has no
+   glyph fallback, so a symbol the font lacks drew as an empty box), its Name
+   and Path headers sort on click, and drag-and-drop is unavailable. The daemon
+   and CLI are unaffected.
 
    On macOS the window is real, and so is what those shim classes provide.
    `ff-gui` creates its own `NSApplication` and `NSWindow`, builds the whole
