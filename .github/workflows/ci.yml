@@ -208,6 +208,17 @@ jobs:
           kill "$watchdog" 2>/dev/null || true
           if [ "$status" -eq 0 ]; then
             echo "::notice title=GUI interactivity (macOS)::$(grep '^probe:' probe.log | tr '\n' '|')"
+            # The AppKit menu-bar test is its own binary (harness = false), so it
+            # runs on the process's main thread — the only one AppKit lets call
+            # setMainMenu:. Its observed menu titles, enabled states, the item
+            # chosen and the state change that followed are re-emitted here.
+            menu_status=0
+            cargo test -p ff-gui --test menubar_mac > menubar.log 2>&1 || menu_status=$?
+            if [ "$menu_status" -ne 0 ]; then
+              echo "::error title=menu bar (macOS)::exit ${menu_status}: $(tail -c 1800 menubar.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+              exit 1
+            fi
+            echo "::notice title=menu bar (macOS)::$(grep '^menubar:' menubar.log | tr '\n' '|')"
             exit 0
           fi
           msg=$(tail -c 1800 probe.log | tr -cd '[:print:]\n' | tr '\n' '|')

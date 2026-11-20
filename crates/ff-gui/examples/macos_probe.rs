@@ -1994,19 +1994,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // --- The menu bar is a real NSMenu on the application ---
-    let menu_fired = Arc::new(AtomicUsize::new(0));
+    // --- The menu bar is the app's own NSMenu on the application ---
+    //
+    // Built from `ff_gui::menubar_model()` with each item's action registered
+    // the way `main.rs` registers it, installed through the adapter's own path
+    // (`setMainMenu:` with a `CorroMacMenuTarget` per item), then read back out
+    // of AppKit: every menu label, every item title, its enabled state and its
+    // target, and a choice that must change the widget state the action owns.
+    let advanced = rswidgets::compat::Expander::new("Advanced search")?;
+    let menu_ran: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut model = app.new_menu()?;
-    let mut menu = app.new_menu()?;
-    let action = app.new_simple_action("probe_menu_item")?;
-    {
-        let menu_fired = menu_fired.clone();
-        action.connect_activate(move |_| {
-            menu_fired.fetch_add(1, Ordering::SeqCst);
-        })?;
+    for (menu_label, items) in ff_gui::menubar_model() {
+        let mut sub = app.new_menu()?;
+        for (label, action) in items {
+            let ran = menu_ran.clone();
+            let advanced = advanced.clone();
+            let act = app.new_simple_action(action.action_name())?;
+            act.connect_activate(move |_| {
+                ran.lock().unwrap().push(label.to_string());
+                if action == ff_gui::MenuAction::ToggleAdvanced {
+                    advanced.set_expanded(!advanced.is_expanded());
+                }
+            })?;
+            sub.append(label, &format!("app.{}", action.action_name()));
+        }
+        model.append_submenu(menu_label, &sub);
     }
-    menu.append("Probe Item", "app.probe_menu_item");
-    model.append_submenu("Probe", &menu);
     let _bar = app.new_menubar(&model, std::ptr::null_mut())?;
     let nsapp = send0(
         rswidgets::backends::apple::cls("NSApplication"),
@@ -2017,22 +2031,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         !main_menu.is_null(),
         "the menu bar was not installed as the application's main menu"
     );
-    let submenus = send0i(main_menu, "numberOfItems");
-    assert!(submenus >= 1, "the main menu has no submenus");
-    let holder = send1i(main_menu, "itemAtIndex:", 0);
-    let installed = send0(holder, "submenu");
-    assert!(!installed.is_null(), "the first submenu is empty");
-    let items = send0i(installed, "numberOfItems");
-    assert_eq!(items, 1, "the submenu holds {items} items, not 1");
-    let item = send1i(installed, "itemAtIndex:", 0);
-    assert!(send_bool(item, "isEnabled"), "the menu item is disabled");
-    // The same path AppKit takes when the user picks the item.
-    send1iv(installed, "performActionForItemAtIndex:", 0);
-    let fired = menu_fired.load(Ordering::SeqCst);
+    let expected = ff_gui::menubar_model();
+    let submenus = send0i(main_menu, "numberOfItems") as usize;
     println!(
-        "probe: menu bar with {submenus} submenu(s), item enabled, choosing it fired {fired} time(s)"
+        "probe: menu bar {submenus} menu(s), model {}",
+        expected.len()
     );
-    assert_eq!(fired, 1, "choosing the menu item did not run its action");
+    assert_eq!(
+        submenus,
+        expected.len(),
+        "the installed bar has {submenus} menus, not the model's {}",
+        expected.len()
+    );
+    for (index, (menu_label, items)) in expected.iter().enumerate() {
+        let holder = send1i(main_menu, "itemAtIndex:", index as isize);
+        let holder_title = rswidgets::backends::apple::nsstring_to_rust(send0(holder, "title"))
+            .unwrap_or_default();
+        assert_eq!(&holder_title, menu_label, "menu {index} is titled {holder_title:?}");
+        let installed = send0(holder, "submenu");
+        assert!(!installed.is_null(), "{menu_label} has no submenu");
+        let count = send0i(installed, "numberOfItems") as usize;
+        assert_eq!(
+            count,
+            items.len(),
+            "{menu_label} holds {count} items, not the model's {}",
+            items.len()
+        );
+        let mut titles = Vec::new();
+        for (i, (label, _)) in items.iter().enumerate() {
+            let item = send1i(installed, "itemAtIndex:", i as isize);
+            let title = rswidgets::backends::apple::nsstring_to_rust(send0(item, "title"))
+                .unwrap_or_default();
+            assert_eq!(&title, label, "{menu_label}/{i} is titled {title:?}");
+            assert!(
+                send_bool(item, "isEnabled"),
+                "{menu_label}/{label} is disabled, so a user could not choose it"
+            );
+            assert!(
+                !send0(item, "target").is_null(),
+                "{menu_label}/{label} has no target, so its action would go nowhere"
+            );
+            titles.push(title);
+        }
+        println!("probe: menu bar {menu_label} {titles:?} (all enabled)");
+    }
+    // Chosen the way AppKit chooses it: `performActionForItemAtIndex:` sends the
+    // item's action to its `CorroMacMenuTarget`, which dispatches by name.
+    let view_index = expected
+        .iter()
+        .position(|(label, _)| *label == "View")
+        .expect("the model has no View menu");
+    let view_menu = send0(
+        send1i(main_menu, "itemAtIndex:", view_index as isize),
+        "submenu",
+    );
+    assert!(!advanced.is_expanded(), "the foldout started expanded");
+    send1iv(view_menu, "performActionForItemAtIndex:", 0);
+    let opened = advanced.is_expanded();
+    println!(
+        "probe: chose View → Advanced Search -> foldout expanded {opened}, actions ran {:?}",
+        menu_ran.lock().unwrap()
+    );
+    assert!(
+        opened,
+        "choosing View → Advanced Search did not expand the foldout"
+    );
+    assert_eq!(
+        menu_ran.lock().unwrap().as_slice(),
+        ["Advanced Search"],
+        "the choice did not dispatch through the menu target"
+    );
 
     // --- Copy: the pasteboard holds what the action stored ---
     {

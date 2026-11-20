@@ -10,6 +10,15 @@ description = "ff-gui: a file-search browser for the fflocate daemon."
 name = "ff-gui"
 path = "src/main.rs"
 
+# AppKit installs the menu bar on the process's main thread and refuses it from
+# any other, which the default harness cannot give a test (each one runs on a
+# spawned thread). This target therefore has its own `entry main` — the AppKit
+# counterpart of tests/menubar_gtk.rs.
+[[test]]
+name = "menubar_mac"
+path = "tests/menubar_mac.rs"
+harness = false
+
 [features]
 # Backend selection. On Linux the GUI defaults to the real widget toolkit
 # (GTK), which is what a user expects from `ff --gui`. The `zork` backend is a
