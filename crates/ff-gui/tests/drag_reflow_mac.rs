@@ -193,10 +193,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         k0.h
     );
     // The knob the user can grab and the knob the painter derives have to be
-    // the same one, or a drag is aimed at something that is not there.
+    // the same one, or a drag is aimed at something that is not there. They are
+    // compared as a share of the track: AppKit's track carries a few points of
+    // its own chrome, so the heights need not match to the point.
+    let agrees = |knob_h: f64, thumb: f64, track: f64| (knob_h - thumb).abs() <= track * 0.05;
     assert!(
-        (k0.h - geo0.thumb_height).abs() <= 3.0,
-        "AppKit's knob is {}pt tall but the layout derived {}pt",
+        agrees(k0.h, geo0.thumb_height, geo0.track_height),
+        "AppKit's knob covers {:.1}% of the track but the layout derived {:.1}% ({}pt vs {}pt)",
+        k0.h / geo0.track_height * 100.0,
+        geo0.thumb_height / geo0.track_height * 100.0,
         k0.h,
         geo0.thumb_height
     );
@@ -296,8 +301,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         k1.y
     );
     assert!(
-        (k1.h - geo1.thumb_height).abs() <= 3.0,
-        "after the drag AppKit's knob is {}pt but the layout derived {}pt",
+        agrees(k1.h, geo1.thumb_height, geo1.track_height),
+        "after the drag AppKit's knob covers {:.1}% of the track, the layout {:.1}% ({}pt vs {}pt)",
+        k1.h / geo1.track_height * 100.0,
+        geo1.thumb_height / geo1.track_height * 100.0,
         k1.h,
         geo1.thumb_height
     );
@@ -425,8 +432,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         k3.h
     );
     assert!(
-        (k3.h - geo3.thumb_height).abs() <= 3.0,
-        "after the resize AppKit's knob is {:.0}pt but the layout derived {:.0}pt",
+        agrees(k3.h, geo3.thumb_height, geo3.track_height),
+        "after the resize AppKit's knob covers {:.1}% of the track, the layout {:.1}% ({:.0}pt vs {:.0}pt)",
+        k3.h / geo3.track_height * 100.0,
+        geo3.thumb_height / geo3.track_height * 100.0,
         k3.h,
         geo3.thumb_height
     );
