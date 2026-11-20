@@ -129,7 +129,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // follow, which is what "sorted" means to a reader of the list.
     const HEADER_X: f64 = 400.0;
     let first_row = |list: &rswidgets::compat::TreeView| -> String {
-        list.cell_text(1, 0).unwrap_or_default()
+        // `cell_text(row, column)`: the Name column of the top row.
+        list.cell_text(0, 1).unwrap_or_default()
     };
     let before_state = list.sort_state();
     let before_first = first_row(&list);
