@@ -19,6 +19,13 @@ name = "menubar_mac"
 path = "tests/menubar_mac.rs"
 harness = false
 
+# Same reason: AppKit's event plumbing and windows want the main thread, and
+# this one synthesises the canvas events the sheet view receives.
+[[test]]
+name = "list_interaction_mac"
+path = "tests/list_interaction_mac.rs"
+harness = false
+
 [features]
 # Backend selection. On Linux the GUI defaults to the real widget toolkit
 # (GTK), which is what a user expects from `ff --gui`. The `zork` backend is a

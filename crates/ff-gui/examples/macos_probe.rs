@@ -1992,6 +1992,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "the row action that ran was {:?}",
             lines[0]
         );
+        // One line with all three observations, so the CI notice carries the
+        // list interaction next to the typing and menu-bar lines even when the
+        // annotation has already been truncated.
+        println!(
+            "probe: list interaction: click on row 1 -> selection {selected_by_click}; header click at (600.0, 6.0) -> sort {first_state:?} then {second_state:?}; double click -> {lines:?}"
+        );
     }
 
     // --- The menu bar is the app's own NSMenu on the application ---

@@ -208,6 +208,10 @@ jobs:
           kill "$watchdog" 2>/dev/null || true
           if [ "$status" -eq 0 ]; then
             echo "::notice title=GUI interactivity (macOS)::$(grep '^probe:' probe.log | tr '\n' '|')"
+            # The list-interaction lines get their own notice: the one above is
+            # capped at 4090 chars and the typing and menu-bar lines can fill
+            # it before these are reached.
+            echo "::notice title=list interaction (macOS, probe)::$(grep -E '^probe: (list canvas|clicks selected|header click sorted|click selected|list interaction)' probe.log | tr '\n' '|')"
             # The AppKit menu-bar test is its own binary (harness = false), so it
             # runs on the process's main thread — the only one AppKit lets call
             # setMainMenu:. Its observed menu titles, enabled states, the item
@@ -219,6 +223,17 @@ jobs:
               exit 1
             fi
             echo "::notice title=menu bar (macOS)::$(grep '^menubar:' menubar.log | tr '\n' '|')"
+            # The list-interaction test is the same shape: a harness-free binary
+            # that dispatches canvas presses at coordinates its own hit test
+            # found, so a wrong id, a header click that cannot sort or an open
+            # that never runs fails the job here rather than going unnoticed.
+            list_status=0
+            cargo test -p ff-gui --test list_interaction_mac > list.log 2>&1 || list_status=$?
+            if [ "$list_status" -ne 0 ]; then
+              echo "::error title=list interaction (macOS)::exit ${list_status}: $(tail -c 1800 list.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+              exit 1
+            fi
+            echo "::notice title=list interaction (macOS)::$(grep '^list:' list.log | tr '\n' '|')"
             exit 0
           fi
           msg=$(tail -c 1800 probe.log | tr -cd '[:print:]\n' | tr '\n' '|')
