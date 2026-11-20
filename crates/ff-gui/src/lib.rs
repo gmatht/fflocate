@@ -2789,6 +2789,12 @@ mod tests {
         assert_eq!(args, base_args);
     }
 
+    // Only the desktop backends route these anywhere; a `zork` build has no
+    // toolkit and says so, which is the arm this test exists to keep honest.
+    #[cfg(any(
+        all(feature = "gtk", target_os = "linux", not(feature = "zork")),
+        all(feature = "macos", target_os = "macos", not(feature = "zork"))
+    ))]
     #[test]
     fn the_row_menu_and_clipboard_route_into_a_real_backend() {
         // A build with no desktop toolkit answers these with "no ... without a

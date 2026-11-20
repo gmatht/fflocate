@@ -516,24 +516,20 @@ impl TreeView {
         Ok(sw)
     }
 
-    /// Make the list a drag source for a file path.
+    /// Dragging rows out as file URIs needs native drag-and-drop, which the
+    /// portable layer does not expose. Report it; the caller shows the reason.
     ///
     /// The argument shapes are the old `GtkTreeView` ones, so a client written
     /// against that surface compiles unchanged: `payload` yields the URI list
     /// plus the plain text, `icon` yields a theme name plus a drawn fallback.
-    /// `payload` is asked at drop time, so it can read whichever row is selected
-    /// when the drag ends its journey.
-    ///
-    /// The canvas is the widget that receives the press, so it is the widget
-    /// that has to own the drag (see `install_uri_drag_source`). A backend
-    /// without a drag source reports that, and the caller shows the reason,
-    /// rather than starting a drag that carries nothing.
-    pub fn enable_uri_drag_source<F, G>(&self, payload: F, icon: G) -> Result<(), Error>
+    pub fn enable_uri_drag_source<F, G>(&self, _payload: F, _icon: G) -> Result<(), Error>
     where
         F: FnMut() -> Option<(Vec<String>, String)> + 'static,
         G: FnMut() -> Option<(String, String)> + 'static,
     {
-        install_uri_drag_source(&self.canvas, Box::new(payload), Box::new(icon))
+        Err(Error::Backend(
+            "drag-and-drop is not available in this build".to_string(),
+        ))
     }
 
     pub fn clipboard_set_text(&self, text: &str) -> Result<(), Error> {
@@ -868,50 +864,6 @@ fn row_index_at(y: f64, row_count: usize) -> Option<usize> {
     }
 }
 
-/// Install a drag source on the canvas, on the backends that have one.
-#[cfg(all(
-    feature = "gtk",
-    target_os = "linux",
-    not(feature = "zork"),
-    not(feature = "gtk4-rs")
-))]
-fn install_uri_drag_source(
-    canvas: &Canvas,
-    payload: Box<dyn FnMut() -> Option<(Vec<String>, String)>>,
-    icon: Box<dyn FnMut() -> Option<(String, String)>>,
-) -> Result<(), Error> {
-    // `raw_handle` is a `Widget` trait method, and the trait is not otherwise
-    // in scope in this module.
-    use crate::core::Widget as _;
-    // SAFETY: the handle is this canvas's live widget, and GTK keeps both
-    // closures alive with the widget (the signal connection owns them).
-    unsafe {
-        crate::backends_gtk_adapter::enable_uri_drag_source(
-            canvas.inner.raw_handle(),
-            payload,
-            icon,
-        )
-    }
-}
-
-/// AppKit has no drag source on this layer yet, and a backend without one says
-/// so instead of accepting a drag that carries nothing.
-#[cfg(not(all(
-    feature = "gtk",
-    target_os = "linux",
-    not(feature = "zork"),
-    not(feature = "gtk4-rs")
-)))]
-fn install_uri_drag_source(
-    _canvas: &Canvas,
-    _payload: Box<dyn FnMut() -> Option<(Vec<String>, String)>>,
-    _icon: Box<dyn FnMut() -> Option<(String, String)>>,
-) -> Result<(), Error> {
-    Err(Error::Backend(
-        "dragging rows out of the window is not implemented on this backend".to_string(),
-    ))
-}
-
 /// Which desktop backend this build routes widgets through.
 ///
 /// Used by the messages for facilities a build without a desktop toolkit cannot
@@ -964,7 +916,7 @@ pub fn clipboard_set_text(_text: &str) -> Result<(), Error> {
     // wired to their platform's clipboard (CLIPBOARD selection / NSPasteboard).
     Err(Error::Backend(format!(
         "no system clipboard without a desktop backend ({} build)",
-        crate::compat::backend_label()
+        backend_label()
     )))
 }
 
@@ -989,7 +941,7 @@ pub fn clipboard_get_text() -> Result<String, Error> {
 pub fn clipboard_get_text() -> Result<String, Error> {
     Err(Error::Backend(format!(
         "no system clipboard without a desktop backend ({} build)",
-        crate::compat::backend_label()
+        backend_label()
     )))
 }
 
@@ -1201,7 +1153,7 @@ fn context_menu_build(
     // build a real native menu (GtkMenu / NSMenu).
     Err(Error::Backend(format!(
         "no native menu without a desktop backend ({} build)",
-        crate::compat::backend_label()
+        backend_label()
     )))
 }
 
@@ -1273,7 +1225,7 @@ fn context_menu_show(
     // build a real native menu (GtkMenu / NSMenu).
     Err(Error::Backend(format!(
         "no native menu without a desktop backend ({} build)",
-        crate::compat::backend_label()
+        backend_label()
     )))
 }
 
