@@ -1774,7 +1774,10 @@ where
             _ => path.to_string(),
         };
         return match copy(&text) {
-            Ok(()) => format!("copied {}", short_path(&text)),
+            // Name what is now on the clipboard: the whole path, because
+            // "copied notes.txt" says nothing about *which* notes.txt when a
+            // search returns several.
+            Ok(()) => format!("copied {text}"),
             Err(e) => format!("copy failed: {e}"),
         };
     }

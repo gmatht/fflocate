@@ -1308,7 +1308,10 @@ fn run_row_action(action: RowAction, path: &str, results: &impl TextViewLike) ->
             _ => path.to_string(),
         };
         return match results.clipboard_set_text(&text) {
-            Ok(()) => format!("copied {}", short_path(&text)),
+            // Name what is now on the clipboard: the whole path, because
+            // "copied notes.txt" says nothing about *which* notes.txt when a
+            // search returns several.
+            Ok(()) => format!("copied {text}"),
             Err(e) => format!("copy failed: {e}"),
         };
     }
@@ -1711,8 +1714,27 @@ mod tests {
         let view = FakeView(RefCell::new(None));
         let msg = run_row_action(RowAction::CopyPath, "/a/b/notes.txt", &view);
         assert_eq!(view.0.borrow().as_deref(), Some("/a/b/notes.txt"));
-        // The status names the file, not the whole path.
-        assert_eq!(msg, "copied notes.txt");
+        // The status names the exact text that is on the clipboard now.
+        assert_eq!(msg, "copied /a/b/notes.txt");
+
+        // "Copy folder path" copies the directory, and says so.
+        let view = FakeView(RefCell::new(None));
+        let msg = run_row_action(RowAction::CopyFolderPath, "/a/b/notes.txt", &view);
+        assert_eq!(view.0.borrow().as_deref(), Some("/a/b"));
+        assert_eq!(msg, "copied /a/b");
+
+        // A copy through the real toolkit must not answer with the "not wired
+        // up" fallback: that text belongs to a backend with no clipboard at
+        // all, and a GTK/macOS build reaching it would be a routing bug.
+        for msg in [
+            run_row_action(RowAction::CopyPath, "/a/b/notes.txt", &FakeView(RefCell::new(None))),
+            run_row_action(RowAction::CopyFolderPath, "/a/b/notes.txt", &FakeView(RefCell::new(None))),
+        ] {
+            assert!(
+                !msg.contains("not wired up"),
+                "the copy path fell through to the no-clipboard fallback: {msg}"
+            );
+        }
     }
 
     #[test]

@@ -130,11 +130,8 @@ fn row_menu_items_run_and_copy_reaches_the_clipboard() {
     let lines = ran.borrow().clone();
     eprintln!("row menu: fired {lines:?}");
     assert_eq!(lines.len(), 4, "not every menu item ran its action");
-    assert!(
-        lines[2].starts_with("copied "),
-        "Copy path ran {:?}",
-        lines[2]
-    );
+    // The menu item reports exactly what it put on the clipboard.
+    assert_eq!(lines[2], format!("copied {path}"), "Copy path ran {:?}", lines[2]);
 
     // The clipboard is the observable half of a copy: ask GTK for it with the
     // read that is not the write.

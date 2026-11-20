@@ -84,10 +84,10 @@ fn the_row_menu_model_dispatches_and_copy_path_copies_the_real_path() {
     eprintln!("row menu (appkit model): fired {lines:?}");
     assert_eq!(lines.len(), 4, "not every menu item ran its action");
     for (line, action) in lines.iter().zip(row_actions().iter()) {
-        // Copy reports what it copied ("copied <name>"), not its own label; the
-        // text it actually put on the clipboard is checked below.
+        // Copy reports the exact text it put on the clipboard, not its own
+        // label; the clipboard itself is checked below.
         if *action == RowAction::CopyPath {
-            assert!(line.starts_with("copied "), "Copy path reported {line:?}");
+            assert_eq!(*line, format!("copied {path}"), "Copy path reported {line:?}");
             continue;
         }
         assert!(
