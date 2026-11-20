@@ -1137,6 +1137,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             requests.lock().unwrap()
         );
         assert!(!debounce.pending(), "the debounce is still armed after erasing");
+
+        // Put the daemon's rows back on screen. This section deliberately
+        // emptied the list (that is what erasing does), and the blocks below
+        // measure the painted list: its row count, column widths and knob.
+        let paths = daemon_paths.lock().unwrap().clone();
+        list.set_rows(&cells_of(&paths));
+        let restored: Vec<String> = (0..).map_while(|row| list.cell_text(row, 1)).collect();
+        assert_eq!(
+            restored.len(),
+            3,
+            "the daemon's rows were not restored after the erase cases: {restored:?}"
+        );
     }
 
     // --- Return in the entry: the delegate's activate path ---
