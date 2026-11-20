@@ -7,7 +7,7 @@
 //! second copy of the layout arithmetic. A probe or a test can therefore paint
 //! the list offscreen and assert where the rows went, on any backend.
 
-use super::{paint_list, CellValue, TreeView, HEADER_HEIGHT, ROW_HEIGHT};
+use super::{paint_list, TreeView, HEADER_HEIGHT, ROW_HEIGHT};
 use crate::backends::headless::{DrawOp, RecordingDrawContext};
 
 /// The shortest a scroller's thumb is allowed to get, in points.

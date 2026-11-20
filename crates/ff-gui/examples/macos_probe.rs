@@ -940,6 +940,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "the list does not hold the rows the daemon returned"
     );
 
+    // --- Return in the entry: the delegate's activate path ---
+    //
+    // `connect_activate` is the Return-key path: the host's field-editor
+    // delegate calls `corro_macos_entry_activate(handle)`, which lands in
+    // `dispatch_entry_activate` and the registry this closure lives in. Nothing
+    // exercised it before; a broken registry would leave Return silently doing
+    // nothing, which no compile error shows.
+    let activates = Arc::new(AtomicUsize::new(0));
+    {
+        let activates = activates.clone();
+        query_entry.connect_activate(move |_| {
+            activates.fetch_add(1, Ordering::SeqCst);
+        })?;
+    }
+    rswidgets::backends_macos_adapter::dispatch_entry_activate(query_entry.raw_handle());
+    let activated = activates.load(Ordering::SeqCst);
+    println!("probe: Return in the entry fired its activate handler {activated} time(s)");
+    assert_eq!(
+        activated, 1,
+        "pressing Return in the entry did not reach connect_activate"
+    );
+
     // --- Pixels from the daemon's answer ---
     //
     // Rows the daemon actually returned, painted by the real list and read back
