@@ -145,9 +145,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     column.append(&painted);
     win.set_child(&column);
     win.present();
-    let window = win.raw_handle();
-    let _ = rswidgets::backends_macos_adapter::capture(window, Some((900.0, 240.0)));
-    send0v(window, "layoutSubtreeIfNeeded");
+    let window_view = win.raw_handle();
+    // `sendEvent:` and `windowNumber` belong to the window, not its content
+    // view; the frame reads below are the view's.
+    let window = send0(window_view, "window");
+    assert!(!window.is_null(), "the content view has no window");
+    let _ = rswidgets::backends_macos_adapter::capture(window_view, Some((900.0, 240.0)));
+    send0v(window_view, "layoutSubtreeIfNeeded");
 
     let scroll_view = painted.inner.raw_handle();
     let clip = send0(scroll_view, "contentView");
@@ -302,9 +306,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // Same events, aimed at the rows: a press in the canvas is a selection, not
     // a scrollbar drag, and the offset must not move at all.
+    // Beside the knob, over the rows: still in the scroll view, never on the
+    // scroller, and in the same window-coordinate space as the knob rect.
     let outside = Point {
-        x: f1.x + 80.0,
-        y: f1.y + 140.0,
+        x: k1.x - 120.0,
+        y: k1.y,
     };
     for step in 1..=4 {
         let p = Point {
@@ -339,8 +345,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // --- A resize reflows the list onto the new size ---
-    let _ = rswidgets::backends_macos_adapter::capture(window, Some((640.0, 430.0)));
-    send0v(window, "layoutSubtreeIfNeeded");
+    let _ = rswidgets::backends_macos_adapter::capture(window_view, Some((640.0, 430.0)));
+    send0v(window_view, "layoutSubtreeIfNeeded");
     let v3 = viewport();
     let f3 = canvas_frame();
     let geo3 = list.layout(f3.w, v3.h, v3.y);
