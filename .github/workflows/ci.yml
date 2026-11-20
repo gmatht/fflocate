@@ -259,6 +259,17 @@ jobs:
               exit 1
             fi
             echo "::notice title=row menu and clipboard (macOS)::$(grep -E '^(row menu|clipboard):' rowmenu.log | tr '\n' '|')"
+            # Daemon results -> rows -> pixels: a daemon child answers a query,
+            # its hits are rendered in a real window and captured through
+            # AppKit's own bitmap path, and two result sets and an empty list
+            # are compared pixel by pixel.
+            pixels_status=0
+            cargo test -p ff-gui --test daemon_pixels_mac > pixels.log 2>&1 || pixels_status=$?
+            if [ "$pixels_status" -ne 0 ]; then
+              echo "::error title=daemon pixels (macOS)::exit ${pixels_status}: $(tail -c 1800 pixels.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+              exit 1
+            fi
+            echo "::notice title=daemon pixels (macOS)::$(grep '^pixels:' pixels.log | tr '\n' '|')"
             exit 0
           fi
           msg=$(tail -c 1800 probe.log | tr -cd '[:print:]\n' | tr '\n' '|')
@@ -281,10 +292,21 @@ jobs:
           ulimit -c 0 || true
           cargo build -p ff-gui 2>&1 | tail -1
           rm -f /tmp/app.png
-          # The runner has no daemon, so the window is filled from the same row
-          # builder on the screenshot path only; a normal run shows real results
-          # or an empty list.
+          # Real rows: the screenshot path asks a daemon, so start one on a
+          # throwaway root with files to find and point the app at its socket.
+          # The picture is then the daemon -> rows -> pixels path, not a
+          # fixture; if the daemon answers nothing the step fails below.
+          shot_root=$(mktemp -d)/root
+          mkdir -p "$shot_root/src" "$shot_root/docs"
+          for i in $(seq -w 0 39); do : > "$shot_root/src/shot-file-$i.rs"; done
+          for i in $(seq -w 0 9); do : > "$shot_root/docs/shot-note-$i.md"; done
+          cargo build -p fflocated 2>&1 | tail -1
+          ./target/debug/fflocated --foreground --backend fake \
+            --root "$shot_root" --state-dir "$(mktemp -d)" \
+            --socket /tmp/ff-shot.sock >/dev/null 2>&1 &
+          daemon_pid=$!
           FF_GUI_SCREENSHOT=/tmp/app.png FF_GUI_SCREENSHOT_SIZE=1350x858 \
+          FFLOCATE_SOCKET=/tmp/ff-shot.sock FF_GUI_SCREENSHOT_QUERY=shot \
             ./target/debug/ff-gui >shot-run.log 2>&1 &
           pid=$!
           for _ in $(seq 1 30); do
@@ -293,8 +315,16 @@ jobs:
           done
           kill "$pid" 2>/dev/null || true
           wait "$pid" 2>/dev/null || true
+          kill "$daemon_pid" 2>/dev/null || true
+          wait "$daemon_pid" 2>/dev/null || true
           if [ ! -s /tmp/app.png ]; then
             echo "::error title=GUI screenshot (macOS)::no png written; $(head -c 400 shot-run.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            exit 1
+          fi
+          # The capture has to be of the daemon's rows: a screenshot of an
+          # empty list would mean the fixture was all it ever showed.
+          if ! grep -q 'ff-gui: screenshot rows: [1-9]' shot-run.log; then
+            echo "::error title=GUI screenshot (macOS)::the daemon's rows are not in the capture: $(grep -E 'ff-gui: screenshot|no daemon' shot-run.log | tr '\n' '|' | cut -c1-600)"
             exit 1
           fi
           full_dims=$(sips -g pixelWidth -g pixelHeight /tmp/app.png | grep pixel | tr -d ' \n')
@@ -325,7 +355,7 @@ jobs:
             b64=${b64:3800}
             i=$((i+1))
           done
-          echo "::notice title=GUI screenshot (macOS)::window ${full_dims}, 256-colour ${quant} bytes, sent ${size}, ${bytes} bytes, ${i} chunks: $(grep -o 'ff-gui: screenshot.*' shot-run.log | head -1)"
+          echo "::notice title=GUI screenshot (macOS)::window ${full_dims}, 256-colour ${quant} bytes, sent ${size}, ${bytes} bytes, ${i} chunks: $(grep -o 'ff-gui: screenshot.*' shot-run.log | tr '\n' '|')"
           last=8
           [ "$i" -lt 9 ] && last=$((i-1))
           for p in $(seq 0 "$last"); do

@@ -1188,84 +1188,56 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // been laid out by then, which is what makes the image match the window.
     #[cfg(all(target_os = "macos", feature = "macos", not(feature = "zork")))]
     if let Ok(path) = std::env::var("FF_GUI_SCREENSHOT") {
-        // The runner has no daemon, so the window would otherwise show an empty
-        // list and there would be nothing to compare with the Linux capture.
-        // Only on this path: a normal run never fabricates results, and these
-        // rows go through the same builder the daemon's paths do.
-        let demo_paths: Vec<String> = [
-            "/home/me/projects/fflocate/src/main.rs",
-            "/home/me/projects/fflocate/src/index.rs",
-            "/home/me/projects/fflocate/src/watch/fsevents.rs",
-            "/home/me/projects/fflocate/crates/ff/src/main.rs",
-            "/home/me/projects/fflocate/crates/ff-cli/src/lib.rs",
-            "/home/me/projects/rustxwidgets/src/backends/apple.rs",
-            "/home/me/projects/rustxwidgets/src/backends_macos_adapter.rs",
-            "/etc/systemd/system/fflocated.service",
-            "/etc/xdg/fflocate/config.toml",
-            "/usr/share/doc/fflocate/README.md",
-            "/home/me/notes/indexing-policy.md",
-            "/home/me/notes/case-folding.txt",
-            "/home/me/.config/fflocate/fflocate.conf",
-            "/tmp/fx/dir0/file-00.rs",
-            "/tmp/fx/dir1/file-01.rs",
-            "/tmp/fx/dir2/file-02.rs",
-            "/tmp/fx/dir3/file-03.rs",
-            "/tmp/fx/dir4/run-fsevents-smoke.sh",
-            "/tmp/fx/dir5/manifest.json",
-            "/tmp/fx/dir6/logo.png",
-            // More rows than the window holds, so the capture shows the list's
-            // scrollbar the way a real query with many matches does. The first
-            // twenty are the ones on screen, the same as the Linux capture.
-            "/tmp/fx/dir7/report-07.md",
-            "/tmp/fx/dir8/source-08.rs",
-            "/tmp/fx/dir9/config-09.toml",
-            "/tmp/fx/dir10/notes-10.txt",
-            "/tmp/fx/dir11/build-11.sh",
-            "/tmp/fx/dir12/data-12.json",
-            "/tmp/fx/dir13/image-13.png",
-            "/tmp/fx/dir14/header-14.h",
-            "/tmp/fx/dir15/module-15.rs",
-            "/tmp/fx/dir16/test-16.rs",
-            "/tmp/fx/dir17/bench-17.rs",
-            "/tmp/fx/dir18/readme-18.md",
-            "/tmp/fx/dir19/index-19.bin",
-            "/tmp/fx/dir20/script-20.py",
-            "/tmp/fx/dir21/entry-21.rs",
-            "/tmp/fx/dir22/lib-22.rs",
-            "/tmp/fx/dir23/main-23.rs",
-            "/tmp/fx/dir24/util-24.rs",
-            "/tmp/fx/dir25/docs-25.md",
-            "/tmp/fx/dir26/style-26.css",
-            "/tmp/fx/dir27/page-27.html",
-            "/tmp/fx/dir28/app-28.js",
-            "/tmp/fx/dir29/types-29.ts",
-            "/tmp/fx/dir30/schema-30.sql",
-            "/home/me/projects/fflocate/src/search/mod.rs",
-            "/home/me/projects/fflocate/src/search/parse.rs",
-            "/home/me/projects/fflocate/src/search/score.rs",
-            "/home/me/projects/fflocate/src/walk.rs",
-            "/home/me/projects/fflocate/src/daemon.rs",
-            "/home/me/projects/fflocate/src/protocol.rs",
-            "/home/me/projects/rustxwidgets/src/backends/gtk.rs",
-            "/home/me/projects/rustxwidgets/src/common.rs",
-            "/home/me/projects/rustxwidgets/src/lib.rs",
-            "/home/me/projects/corro/android/app/src/main/AndroidManifest.xml",
-            "/etc/fflocate/ignore.conf",
-            "/usr/share/man/man1/fflocate.1.gz",
-            "/var/lib/fflocate/index.db",
-            "/home/me/.cache/fflocate/roots.json",
-            "/home/me/notes/search-notes.md",
-            "/home/me/notes/parity-checklist.txt",
-        ]
-        .iter()
-        .map(|p| p.to_string())
-        .collect();
-        results.set_rows(&rows_to_cells(&demo_paths));
-        status.set_text(&format!(
-            "{} of {} matches (screenshot fixture: no daemon on this runner)",
-            demo_paths.len(),
-            demo_paths.len()
-        ));
+        // Real search results, not a fixture: ask the daemon the question a
+        // user's first search would and render what it answers, so this picture
+        // is the daemon -> rows -> pixels path. A host with no daemon captures
+        // the empty list it really has, and says so, instead of inventing rows.
+        let query =
+            std::env::var("FF_GUI_SCREENSHOT_QUERY").unwrap_or_else(|_| "ff".to_string());
+        let client = DaemonClient::new();
+        let waited = std::time::Instant::now();
+        let mut answered = None;
+        let mut last_error = String::new();
+        // The daemon binds before it has finished indexing, so ask again until
+        // it has hits to show; a missing daemon fails on this deadline instead
+        // of hanging the run.
+        while waited.elapsed() < std::time::Duration::from_secs(30) {
+            match client.search(&query, MAX_ROWS) {
+                Ok(outcome) if !outcome.paths.is_empty() => {
+                    answered = Some(outcome);
+                    break;
+                }
+                Ok(outcome) => answered = Some(outcome),
+                Err(e) => last_error = e.to_string(),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        match &answered {
+            Some(outcome) => {
+                let shown = outcome.paths.len().min(MAX_ROWS);
+                results.set_rows(&rows_to_cells(&outcome.paths[..shown]));
+                status.set_text(&format!(
+                    "{shown} of {} matches for {query:?} (screenshot from the daemon)",
+                    outcome.total
+                ));
+                eprintln!(
+                    "ff-gui: screenshot rows: {shown} of {} from the daemon for {query:?} at {}",
+                    outcome.total,
+                    client.socket().display()
+                );
+            }
+            None => {
+                results.set_rows(&[]);
+                status.set_text(&format!(
+                    "0 matches for {query:?} (screenshot: no daemon at {}: {last_error})",
+                    client.socket().display()
+                ));
+                eprintln!(
+                    "ff-gui: screenshot rows: 0 (no daemon at {}: {last_error})",
+                    client.socket().display()
+                );
+            }
+        }
         // Same window size as the Linux capture, when asked for, so the two
         // PNGs can be compared directly.
         let size = std::env::var("FF_GUI_SCREENSHOT_SIZE")

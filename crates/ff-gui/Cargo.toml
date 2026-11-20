@@ -40,6 +40,13 @@ name = "row_menu_interaction_mac"
 path = "tests/row_menu_interaction_mac.rs"
 harness = false
 
+# The capture is AppKit's own bitmap of the window, and it has to be taken on
+# the main thread after the rows are laid out.
+[[test]]
+name = "daemon_pixels_mac"
+path = "tests/daemon_pixels_mac.rs"
+harness = false
+
 [features]
 # Backend selection. On Linux the GUI defaults to the real widget toolkit
 # (GTK), which is what a user expects from `ff --gui`. The `zork` backend is a
