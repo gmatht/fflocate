@@ -2790,6 +2790,27 @@ mod tests {
     }
 
     #[test]
+    fn the_row_menu_and_clipboard_route_into_a_real_backend() {
+        // A build with no desktop toolkit answers these with "no ... without a
+        // desktop backend". Every other answer -- "GTK is not initialised", "no
+        // NSPasteboard on this system" -- means the call reached the real
+        // implementation, which is what this pins: neither facility may fall
+        // back to a stub on the platforms the app ships. Runs without a
+        // display, so it guards the routing on CI's macOS and Linux jobs.
+        let stubbed = |msg: &str| msg.contains("without a desktop backend");
+
+        if let Err(e) = rswidgets::compat::clipboard_set_text("/tmp/row.txt") {
+            assert!(!stubbed(&e.to_string()), "clipboard write is stubbed: {e}");
+        }
+        if let Err(e) = rswidgets::compat::clipboard_get_text() {
+            assert!(!stubbed(&e.to_string()), "clipboard read is stubbed: {e}");
+        }
+        if let Err(e) = rswidgets::compat::ContextMenu::new().build() {
+            assert!(!stubbed(&e.to_string()), "the row menu is stubbed: {e}");
+        }
+    }
+
+    #[test]
     fn row_actions_are_all_listed_in_menu_order() {
         // The menu and the tests iterate the same list, so the two cannot drift.
         let all = RowAction::all();
