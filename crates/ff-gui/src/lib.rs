@@ -1425,22 +1425,228 @@ pub fn terminal_monospace_font() -> Option<&'static str> {
 /// One entry point so the GUI and tests cannot disagree about what is
 /// launched: `RowAction::command` stays pure (no filesystem touch), and the
 /// environment-dependent part lives here.
-pub fn open_in_terminal_command(path: &str) -> (&'static str, Vec<String>) {
-    let (prog, base) = RowAction::OpenInTerminal.command(path);
-    (prog, with_terminal_font_args(base, terminal_font_arg()))
+/// Terminals "Open in terminal" knows how to start, most preferred first.
+///
+/// `x-terminal-emulator` is the Debian alternatives link; it does not exist on
+/// Fedora, Arch or openSUSE, where a KDE desktop ships `konsole` and nothing
+/// answers to that name. Listing the real binaries first is what makes the
+/// action work outside Debian at all — the alternatives link stays as one
+/// candidate rather than the only one.
+pub const TERMINAL_CANDIDATES: &[&str] = &[
+    "konsole",
+    "kgx",
+    "gnome-terminal",
+    "xfce4-terminal",
+    "kitty",
+    "alacritty",
+    "foot",
+    "wezterm",
+    "x-terminal-emulator",
+    "xterm",
+];
+
+/// Programs that open a directory in the desktop's file manager, most
+/// preferred first.
+///
+/// `xdg-open` delegates to whatever the desktop registered and is the right
+/// first choice; the rest are fallbacks for a system without xdg-utils, where
+/// the desktop's own file manager still is.
+pub const FOLDER_OPENER_CANDIDATES: &[&str] = &[
+    "xdg-open",
+    "kde-open5",
+    "kde-open",
+    "dolphin",
+    "nautilus",
+    "thunar",
+    "nemo",
+    "pcmanfm",
+];
+
+/// The entries of `candidates` that exist on `PATH`, in the same order.
+pub fn available_programs(candidates: &[&'static str]) -> Vec<&'static str> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|p| find_on_path(p).is_some())
+        .collect()
 }
 
-/// The `-font` family to pass, if any: only when the alternatives target is
-/// zutty (whose `9x18` default aborts when `xfonts-base` is missing) and an
-/// installed monospace family was found.
-pub fn terminal_font_arg() -> Option<&'static str> {
-    let is_zutty = terminal_emulator_basename()
-        .map(|b| is_zutty_basename(&b))
-        .unwrap_or(false);
-    if is_zutty {
+/// The terminal to start: `$TERMINAL` when it names a program, else the first
+/// candidate the system has.
+///
+/// `available` is `TERMINAL_CANDIDATES` filtered to what is on `PATH`, so
+/// "first" means first in preference order, not first alphabetically.
+pub fn pick_terminal(env_terminal: Option<&str>, available: &[&str]) -> Option<String> {
+    if let Some(t) = env_terminal.map(str::trim).filter(|t| !t.is_empty()) {
+        return Some(t.to_string());
+    }
+    available.first().map(|p| (*p).to_string())
+}
+
+/// The arguments that make `program` start in `dir`.
+///
+/// Terminals disagree on the flag: KDE's konsole wants `--workdir`, GNOME's
+/// kgx and gnome-terminal want `--working-directory`, kitty `--directory`,
+/// wezterm `start --cwd`. Anything else — the Debian alternatives link, xterm,
+/// zutty — gets the portable `-e sh -c 'cd …; exec $SHELL'`, which also works
+/// for a terminal whose flag is unknown.
+pub fn terminal_argv(program: &str, dir: &str) -> Vec<String> {
+    let name = Path::new(program)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| program.to_string())
+        .to_ascii_lowercase();
+    if name.starts_with("konsole") {
+        vec!["--workdir".to_string(), dir.to_string()]
+    } else if name.starts_with("kitty") {
+        vec!["--directory".to_string(), dir.to_string()]
+    } else if name.starts_with("wezterm") {
+        vec!["start".to_string(), "--cwd".to_string(), dir.to_string()]
+    } else if name.starts_with("kgx")
+        || name.starts_with("gnome-terminal")
+        || name.starts_with("xfce4-terminal")
+        || name.starts_with("alacritty")
+        || name.starts_with("foot")
+    {
+        vec!["--working-directory".to_string(), dir.to_string()]
+    } else {
+        vec![
+            "-e".to_string(),
+            "sh".to_string(),
+            "-c".to_string(),
+            terminal_shell_command(dir),
+        ]
+    }
+}
+
+/// The command "Open in terminal" runs.
+///
+/// macOS hands the directory to Terminal.app. Elsewhere the terminal is picked
+/// from `$TERMINAL` or [`TERMINAL_CANDIDATES`]: the alternatives link alone is
+/// absent on a KDE system, which is why the action did nothing there.
+pub fn open_in_terminal_command(path: &str) -> (String, Vec<String>) {
+    // macOS and Windows have one dispatcher each (`open -a`, `cmd /c start`);
+    // the terminal hunting below is the unix-without-a-dispatcher case.
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let (prog, base) = RowAction::OpenInTerminal.command(path);
+        return (prog.to_string(), base);
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        let available = available_programs(TERMINAL_CANDIDATES);
+        let env_terminal = std::env::var("TERMINAL").ok();
+        let program = pick_terminal(env_terminal.as_deref(), &available)
+            .unwrap_or_else(|| "x-terminal-emulator".to_string());
+        let dir = containing_dir(path);
+        let args = with_terminal_font_args(
+            terminal_argv(&program, &dir),
+            terminal_font_arg_for(&program),
+        );
+        (program, args)
+    }
+}
+
+/// The command "Open containing folder" runs.
+///
+/// macOS reveals the file in Finder. Elsewhere the directory is opened by the
+/// first available opener in [`FOLDER_OPENER_CANDIDATES`], so a system without
+/// xdg-utils still opens it in its own file manager.
+pub fn open_containing_folder_command(path: &str) -> (String, Vec<String>) {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        let (prog, base) = RowAction::OpenContainingFolder.command(path);
+        return (prog.to_string(), base);
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    {
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP").ok();
+        let order = folder_opener_order(desktop.as_deref());
+        let available: Vec<&'static str> = order
+            .into_iter()
+            .filter(|p| find_on_path(p).is_some())
+            .collect();
+        let program = available
+            .first()
+            .map(|p| (*p).to_string())
+            .unwrap_or_else(|| "xdg-open".to_string());
+        let args = folder_opener_argv(&program, path);
+        (program, args)
+    }
+}
+
+/// The openers to try, best first, for the desktop named in
+/// `$XDG_CURRENT_DESKTOP`.
+///
+/// `xdg-open` is a shell script that hands off to `kde-open`/`gio`, which on
+/// KDE keeps running after the window is up; going straight to the desktop's
+/// own file manager is one process, and it can highlight the file — which is
+/// what "open containing folder" is for. On a desktop that is not recognised,
+/// `xdg-open` stays first because it is the one name that dispatches correctly
+/// everywhere.
+pub fn folder_opener_order(desktop: Option<&str>) -> Vec<&'static str> {
+    let desktop = desktop.unwrap_or("").to_ascii_uppercase();
+    let preferred: &[&str] = if desktop.contains("KDE") {
+        &["dolphin", "kde-open5", "kde-open"]
+    } else if desktop.contains("GNOME") || desktop.contains("UNITY") || desktop.contains("CINNAMON") {
+        &["nautilus"]
+    } else if desktop.contains("XFCE") {
+        &["thunar"]
+    } else if desktop.contains("MATE") {
+        &["caja"]
+    } else {
+        &[]
+    };
+    // The desktop's own openers first, then the generic list, each name once:
+    // `Vec::dedup` only drops neighbours, and xdg-open sits in the middle of
+    // the generic list rather than at the end of the preferred one.
+    let mut order: Vec<&'static str> = Vec::new();
+    for program in preferred.iter().chain(FOLDER_OPENER_CANDIDATES.iter()) {
+        if !order.contains(program) {
+            order.push(program);
+        }
+    }
+    order
+}
+
+/// The arguments that open `path`'s directory in `program`.
+///
+/// `dolphin --select <file>` opens the folder *with the file highlighted*,
+/// which is the whole point of the action; everything else gets the directory
+/// and shows it, without a selection.
+pub fn folder_opener_argv(program: &str, path: &str) -> Vec<String> {
+    let name = Path::new(program)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| program.to_string())
+        .to_ascii_lowercase();
+    if name.starts_with("dolphin") {
+        vec!["--select".to_string(), path.to_string()]
+    } else {
+        vec![containing_dir(path)]
+    }
+}
+
+/// The `-font` family to pass, if any: only for zutty (whose `9x18` default
+/// aborts when `xfonts-base` is missing) and when an installed monospace
+/// family was found.
+pub fn terminal_font_arg_for(program: &str) -> Option<&'static str> {
+    let base = Path::new(program)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| program.to_string());
+    if is_zutty_basename(&base) {
         terminal_monospace_font()
     } else {
         None
+    }
+}
+
+/// The `-font` family for the Debian alternatives target, if it is zutty.
+pub fn terminal_font_arg() -> Option<&'static str> {
+    match terminal_emulator_basename() {
+        Some(base) if is_zutty_basename(&base) => terminal_monospace_font(),
+        _ => None,
     }
 }
 
@@ -1544,15 +1750,24 @@ pub fn extension_sort_key(name: &str) -> String {
 /// `copy` is how the caller puts text on the clipboard (the app passes the
 /// list's own clipboard, the probe passes the compat one), so the same runner
 /// serves both and the probe exercises the handler the app really uses.
+/// The program and arguments that carry out `action` on `path`, resolved
+/// against this host (which terminal exists, which opener exists).
+pub fn launch_command(action: RowAction, path: &str) -> (String, Vec<String>) {
+    match action {
+        RowAction::OpenInTerminal => open_in_terminal_command(path),
+        RowAction::OpenContainingFolder => open_containing_folder_command(path),
+        _ => {
+            let (prog, args) = action.command(path);
+            (prog.to_string(), args)
+        }
+    }
+}
+
 pub fn run_row_action<F>(action: RowAction, path: &str, copy: F) -> String
 where
     F: Fn(&str) -> Result<(), String>,
 {
-    let (program, args) = if action == RowAction::OpenInTerminal {
-        open_in_terminal_command(path)
-    } else {
-        action.command(path)
-    };
+    let (program, args) = launch_command(action, path);
     if program.is_empty() {
         let text = match action {
             RowAction::CopyFolderPath => containing_dir(path),
@@ -1563,9 +1778,20 @@ where
             Err(e) => format!("copy failed: {e}"),
         };
     }
-    match std::process::Command::new(program).args(&args).spawn() {
+    // The children own their own windows and are never read from: detaching
+    // stdio keeps them from holding this process's pipes open (a `dolphin` or
+    // `kde-open` that outlives the app would otherwise keep a shell waiting on
+    // the pipe for as long as the window is up) and keeps their diagnostics out
+    // of the app's output.
+    match std::process::Command::new(&program)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
         Ok(_) => format!("{} → {}", action.label(), short_path(path)),
-        Err(e) => format!("{} failed: {e}", action.label()),
+        Err(e) => format!("{} failed to start {program}: {e}", action.label()),
     }
 }
 
@@ -2338,27 +2564,41 @@ mod tests {
                 vec!["-a".to_string(), "Terminal".to_string(), "/a".to_string()]
             );
         }
-        // Unix: the one entry point is base `cd` body plus the optional font
-        // prefix in front of `-e`.
+        // Unix: whichever terminal this host has, launched in the file's
+        // directory. Which one is host-dependent ($TERMINAL, then what is
+        // installed), so the test pins the *contract*: a real terminal, and the
+        // directory reaching it either through the terminal's own flag or the
+        // portable `cd` body.
         #[cfg(all(not(windows), not(target_os = "macos")))]
         {
-            // On this machine the alternative is zutty with
-            // DejaVuSansMono installed, so the prefix is present — and the test
-            // would catch a caller that launched the base args raw.
             let (prog, args) = open_in_terminal_command("/a/b.rs");
-            assert_eq!(prog, "x-terminal-emulator");
-            let e = args
-                .iter()
-                .position(|a| a == "-e")
-                .expect("-e must be present");
-            assert!(args[e + 1..].join(" ").contains("cd '/a'"), "{args:?}");
-            if terminal_font_arg().is_some() {
-                assert_eq!(
-                    &args[..2],
-                    &["-font", terminal_font_arg().unwrap()],
-                    "{args:?}"
+            let env_terminal = std::env::var("TERMINAL").ok();
+            let available = available_programs(TERMINAL_CANDIDATES);
+            if env_terminal.is_some() || !available.is_empty() {
+                assert!(
+                    env_terminal.as_deref() == Some(prog.as_str())
+                        || available.contains(&prog.as_str()),
+                    "{prog} is neither $TERMINAL nor an installed candidate"
                 );
             }
+            assert_eq!(
+                args,
+                with_terminal_font_args(
+                    terminal_argv(&prog, "/a"),
+                    terminal_font_arg_for(&prog)
+                ),
+                "{args:?}"
+            );
+            // The directory is in there, one way or the other.
+            assert!(
+                args.iter().any(|a| a == "/a") || args.join(" ").contains("cd '/a'"),
+                "{args:?}"
+            );
+            // And nothing that starts a terminal in the wrong place: a trailing
+            // `-e` with no command, or an empty argument, would launch a bare
+            // shell in the GUI's own directory.
+            assert!(!args.is_empty());
+            assert!(args.iter().all(|a| !a.is_empty()), "{args:?}");
         }
         // Windows: no font dance — the entry point is the `cmd /c start`
         // launch, and the caller (`run_row_action`) uses it directly.
@@ -2368,6 +2608,175 @@ mod tests {
             assert_eq!(prog, "cmd");
             assert!(args.contains(&"/d".to_string()), "{args:?}");
         }
+    }
+
+    #[test]
+    fn terminal_argv_uses_each_terminals_own_flag() {
+        // The KDE case: konsole has no -e-with-a-command convention to rely on,
+        // and --workdir is the flag that actually lands in the directory.
+        assert_eq!(
+            terminal_argv("konsole", "/home/me/src"),
+            vec!["--workdir".to_string(), "/home/me/src".to_string()]
+        );
+        // A full path to the binary is the same terminal.
+        assert_eq!(
+            terminal_argv("/usr/bin/konsole", "/home/me/src"),
+            vec!["--workdir".to_string(), "/home/me/src".to_string()]
+        );
+        for program in ["kgx", "gnome-terminal", "xfce4-terminal", "alacritty", "foot"] {
+            assert_eq!(
+                terminal_argv(program, "/src"),
+                vec!["--working-directory".to_string(), "/src".to_string()],
+                "{program}"
+            );
+        }
+        assert_eq!(
+            terminal_argv("kitty", "/src"),
+            vec!["--directory".to_string(), "/src".to_string()]
+        );
+        assert_eq!(
+            terminal_argv("wezterm", "/src"),
+            vec![
+                "start".to_string(),
+                "--cwd".to_string(),
+                "/src".to_string()
+            ]
+        );
+        // Anything else gets the portable form, with the directory quoted so a
+        // path holding a quote or a $ cannot turn into shell code.
+        for program in ["x-terminal-emulator", "xterm", "zutty", "some-term"] {
+            let args = terminal_argv(program, "/a b");
+            assert_eq!(args[..3], ["-e", "sh", "-c"], "{program}: {args:?}");
+            assert_eq!(args[3], "cd '/a b'; exec \"${SHELL:-sh}\"", "{program}");
+        }
+    }
+
+    #[test]
+    fn pick_terminal_prefers_the_environment_then_the_list() {
+        // $TERMINAL wins even when another terminal comes first in the list: it
+        // is the user saying which one they want.
+        assert_eq!(
+            pick_terminal(Some("kitty"), &["konsole", "xterm"]).as_deref(),
+            Some("kitty")
+        );
+        // Blank and whitespace-only values are not a choice.
+        assert_eq!(
+            pick_terminal(Some("  "), &["konsole", "xterm"]).as_deref(),
+            Some("konsole")
+        );
+        assert_eq!(pick_terminal(None, &["konsole"]).as_deref(), Some("konsole"));
+        // Nothing installed and no $TERMINAL: the caller falls back to the
+        // alternatives name, which is what a Debian system needs.
+        assert_eq!(pick_terminal(None, &[]), None);
+    }
+
+    #[test]
+    fn containing_folder_action_is_resolved_against_this_host() {
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        {
+            let (prog, args) = open_containing_folder_command("/a/b.rs");
+            let desktop = std::env::var("XDG_CURRENT_DESKTOP").ok();
+            let available: Vec<&'static str> = folder_opener_order(desktop.as_deref())
+                .into_iter()
+                .filter(|p| find_on_path(p).is_some())
+                .collect();
+            if available.is_empty() {
+                // Nothing on PATH: the name is still xdg-open, which is right
+                // for every freedesktop system that has it installed.
+                assert_eq!(prog, "xdg-open");
+            } else {
+                // Otherwise it is the most preferred one present for this
+                // desktop — dolphin on KDE, xdg-open when that is all there is.
+                assert_eq!(prog, available[0]);
+                assert!(FOLDER_OPENER_CANDIDATES.contains(&prog.as_str()));
+            }
+            // The arguments open that program on this very file: diamond
+            // selects it, the rest get its directory.
+            assert_eq!(args, folder_opener_argv(&prog, "/a/b.rs"));
+            if prog.starts_with("dolphin") {
+                assert_eq!(args, vec!["--select".to_string(), "/a/b.rs".to_string()]);
+            } else {
+                assert_eq!(args, vec!["/a".to_string()]);
+            }
+        }
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            // The dispatcher platforms keep their single, native form.
+            let (prog, args) = open_containing_folder_command("/a/b.rs");
+            let (base_prog, base_args) = RowAction::OpenContainingFolder.command("/a/b.rs");
+            assert_eq!(prog, base_prog);
+            assert_eq!(args, base_args);
+        }
+    }
+
+    #[test]
+    fn folder_opener_order_follows_the_desktop() {
+        // KDE first, and not through xdg-open's shell wrapper: on KDE that
+        // wrapper keeps a kde-open process alive after the window opens.
+        let kde = folder_opener_order(Some("KDE"));
+        assert_eq!(kde[0], "dolphin");
+        assert_eq!(kde[1], "kde-open5");
+        assert!(kde.contains(&"xdg-open"), "{kde:?}");
+        // The case matters not: the variable is not spelled consistently.
+        assert_eq!(folder_opener_order(Some("kde")).first(), Some(&"dolphin"));
+        // GNOME's file manager, ahead of the generic dispatcher.
+        assert_eq!(folder_opener_order(Some("ubuntu:GNOME")).first(), Some(&"nautilus"));
+        assert_eq!(folder_opener_order(Some("XFCE")).first(), Some(&"thunar"));
+        // An unrecognised (or absent) desktop keeps xdg-open first: it is the
+        // one name that dispatches correctly everywhere.
+        assert_eq!(folder_opener_order(None).first(), Some(&"xdg-open"));
+        assert_eq!(folder_opener_order(Some("sway")).first(), Some(&"xdg-open"));
+        // No duplicates, so "first available" is unambiguous.
+        for desktop in [None, Some("KDE"), Some("GNOME"), Some("XFCE")] {
+            let order = folder_opener_order(desktop);
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(sorted.len(), order.len(), "{desktop:?}: {order:?}");
+        }
+    }
+
+    #[test]
+    fn folder_opener_argv_selects_the_file_where_it_can() {
+        // dolphin selects the row's file, which is what the action promises.
+        assert_eq!(
+            folder_opener_argv("dolphin", "/a/b.rs"),
+            vec!["--select".to_string(), "/a/b.rs".to_string()]
+        );
+        assert_eq!(
+            folder_opener_argv("/usr/bin/dolphin", "/a/b.rs"),
+            vec!["--select".to_string(), "/a/b.rs".to_string()]
+        );
+        // A dispatcher takes the directory; it has no selection flag to give.
+        for program in ["xdg-open", "kde-open5", "nautilus", "thunar"] {
+            assert_eq!(
+                folder_opener_argv(program, "/a/b.rs"),
+                vec!["/a".to_string()],
+                "{program}"
+            );
+        }
+        // A bare name has no usable parent, so its own directory is the answer.
+        assert_eq!(folder_opener_argv("xdg-open", "b.rs"), vec!["b.rs".to_string()]);
+    }
+
+    #[test]
+    fn launch_command_routes_the_two_environment_actions() {
+        // Both "Open containing folder" and "Open in terminal" must be resolved
+        // per host — a regression that sent them back through `RowAction::command`
+        // would launch the Debian-only alternatives name on a KDE box again.
+        for action in [RowAction::OpenContainingFolder, RowAction::OpenInTerminal] {
+            let (prog, args) = launch_command(action, "/a/b.rs");
+            let expected = match action {
+                RowAction::OpenContainingFolder => open_containing_folder_command("/a/b.rs"),
+                _ => open_in_terminal_command("/a/b.rs"),
+            };
+            assert_eq!((prog, args), expected, "{:?}", action.label());
+        }
+        // The other actions are exactly `RowAction::command`.
+        let (prog, args) = launch_command(RowAction::Open, "/a/b.rs");
+        let (base_prog, base_args) = RowAction::Open.command("/a/b.rs");
+        assert_eq!(prog, base_prog);
+        assert_eq!(args, base_args);
     }
 
     #[test]

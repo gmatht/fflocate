@@ -1299,11 +1299,7 @@ fn run_row_action(action: RowAction, path: &str, results: &impl TextViewLike) ->
     // `xfonts-base` is not installed — splice `-font <installed monospace>`
     // in front of `-e` so the emulator starts at all. Every other action
     // launches exactly what `RowAction::command` says.
-    let (program, args) = if action == RowAction::OpenInTerminal {
-        ff_gui::open_in_terminal_command(path)
-    } else {
-        action.command(path)
-    };
+    let (program, args) = ff_gui::launch_command(action, path);
     if program.is_empty() {
         // Clipboard actions need no external command; they differ only in what
         // they copy.
@@ -1316,9 +1312,20 @@ fn run_row_action(action: RowAction, path: &str, results: &impl TextViewLike) ->
             Err(e) => format!("copy failed: {e}"),
         };
     }
-    match std::process::Command::new(program).args(&args).spawn() {
+    // The children own their own windows and are never read from: detaching
+    // stdio keeps them from holding this process's pipes open (a `dolphin` or
+    // `kde-open` that outlives the app would otherwise keep a shell waiting on
+    // the pipe for as long as the window is up) and keeps their diagnostics out
+    // of the app's output.
+    match std::process::Command::new(&program)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
         Ok(_) => format!("{} → {}", action.label(), short_path(path)),
-        Err(e) => format!("{} failed: {e}", action.label()),
+        Err(e) => format!("{} failed to start {program}: {e}", action.label()),
     }
 }
 
