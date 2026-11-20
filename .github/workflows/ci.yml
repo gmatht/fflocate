@@ -214,6 +214,9 @@ jobs:
             echo "::notice title=list interaction (macOS, probe)::$(grep -E '^probe: (list canvas|clicks selected|header click sorted|click selected|list interaction)' probe.log | tr '\n' '|')"
             # The knob drag and the resize reflow, likewise in their own notice.
             echo "::notice title=drag and reflow (macOS, probe)::$(grep -E '^probe: (drag/reflow|reflow|knob dragged)' probe.log | tr '\n' '|')"
+            # The row menu and the pasteboard, from the probe's popup path too,
+            # in a notice of their own so the generic one's cap cannot hide them.
+            echo "::notice title=row menu and clipboard (macOS, probe)::$(grep -E '^probe: (row menu|choosing|pasteboard|clipboard|row menu popped)' probe.log | tr '\n' '|')"
             # The AppKit menu-bar test is its own binary (harness = false), so it
             # runs on the process's main thread — the only one AppKit lets call
             # setMainMenu:. Its observed menu titles, enabled states, the item
@@ -246,6 +249,16 @@ jobs:
               exit 1
             fi
             echo "::notice title=drag and reflow (macOS)::$(grep -E '^(drag|reflow):' drag.log | tr '\n' '|')"
+            # The row menu as AppKit holds it: four enabled NSMenuItems, each
+            # targeting CorroMacMenuTarget/corroFired:, and Copy path read back
+            # from NSPasteboard. A menu that only looks right fails here.
+            row_status=0
+            cargo test -p ff-gui --test row_menu_interaction_mac > rowmenu.log 2>&1 || row_status=$?
+            if [ "$row_status" -ne 0 ]; then
+              echo "::error title=row menu and clipboard (macOS)::exit ${row_status}: $(tail -c 1800 rowmenu.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+              exit 1
+            fi
+            echo "::notice title=row menu and clipboard (macOS)::$(grep -E '^(row menu|clipboard):' rowmenu.log | tr '\n' '|')"
             exit 0
           fi
           msg=$(tail -c 1800 probe.log | tr -cd '[:print:]\n' | tr '\n' '|')

@@ -33,6 +33,13 @@ name = "drag_reflow_mac"
 path = "tests/drag_reflow_mac.rs"
 harness = false
 
+# The row menu is a real NSMenu and Copy writes the NSPasteboard, so this too
+# has to run on the main thread with AppKit loaded.
+[[test]]
+name = "row_menu_interaction_mac"
+path = "tests/row_menu_interaction_mac.rs"
+harness = false
+
 [features]
 # Backend selection. On Linux the GUI defaults to the real widget toolkit
 # (GTK), which is what a user expects from `ff --gui`. The `zork` backend is a
