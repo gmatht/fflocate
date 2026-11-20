@@ -1653,8 +1653,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(selected, expected, "a click selected the wrong row");
     // A header click must reach the list too: that is the band a sort
     // triggers from, and a click that stopped at AppKit's event plumbing would
-    // never get there. (The committed list only selects rows; column sorting
-    // lives in the compat work that is not committed yet.)
+    // never get there. It lands in whichever column is drawn at x=200, so it
+    // may also sort -- the block below reads the sort state rather than
+    // assuming which.
     rswidgets::backends_macos_adapter::dispatch_canvas_click_button(canvas_id, 200.0, 6.0, 1, 0);
     let header_click = presses.borrow().last().copied();
     assert_eq!(
@@ -1687,26 +1688,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         list.select_row(0);
         list.selected_path(2).unwrap_or_default()
     };
+    // Clicking a column that is already ascending sorts it descending, and the
+    // reverse, so the direction the first click must produce is read from the
+    // state the earlier header click left behind rather than assumed.
+    let was_sorted = list.sort_state();
     let before_sort = first_row(&list);
+    let expect_first = Some((1, !(was_sorted == Some((1, true)))));
     rswidgets::backends_macos_adapter::dispatch_canvas_click_button(canvas_id, 600.0, 6.0, 1, 0);
-    let ascending_state = list.sort_state();
-    let ascending_first = first_row(&list);
+    let first_state = list.sort_state();
+    let first_first = first_row(&list);
     rswidgets::backends_macos_adapter::dispatch_canvas_click_button(canvas_id, 600.0, 6.0, 1, 0);
-    let descending_state = list.sort_state();
-    let descending_first = first_row(&list);
+    let second_state = list.sort_state();
+    let second_first = first_row(&list);
     println!(
-        "probe: header click sorted by {ascending_state:?} then {descending_state:?}; first row {before_sort} -> {ascending_first} -> {descending_first}"
+        "probe: header click sorted by {first_state:?} then {second_state:?} (was {was_sorted:?}); first row {before_sort} -> {first_first} -> {second_first}"
     );
     assert_eq!(
-        ascending_state,
-        Some((1, true)),
-        "the first header click did not sort ascending by Name"
+        first_state, expect_first,
+        "a header click on Name did not flip its direction from {was_sorted:?}"
     );
     assert_eq!(
-        descending_state,
-        Some((1, false)),
+        second_state,
+        Some((1, !expect_first.map(|(_, ascending)| ascending).unwrap_or(true))),
         "the second header click did not reverse the sort"
     );
+    // The click that produced ascending order is whichever direction the first
+    // one chose; that one must put alpha first and the other gamma.
+    let (ascending_first, descending_first) = if expect_first.map(|(_, a)| a).unwrap_or(true) {
+        (&first_first, &second_first)
+    } else {
+        (&second_first, &first_first)
+    };
     assert!(
         ascending_first.ends_with("alpha-probe.txt"),
         "sorting by Name ascending put {ascending_first} first"
@@ -1716,7 +1728,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "sorting by Name descending put {descending_first} first"
     );
     assert_ne!(
-        ascending_first, descending_first,
+        first_first, second_first,
         "the header click changed the flag but not the row order"
     );
 
@@ -1724,8 +1736,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // The handler installed here is `ff_gui::connect_open_on_double_click`, the
     // same function the app installs, so this exercises the app's Open action
-    // (command, spawn, status line) rather than a stand-in. The rows are in
-    // descending order from the check above, so row 1 is beta-probe.md.
+    // (command, spawn, status line) rather than a stand-in. The checks above
+    // restored the original row order, so the row under the click is read from
+    // the list rather than named here.
+    let second_row_name = list.cell_text(1, 1).unwrap_or_default();
+    assert!(
+        !second_row_name.is_empty(),
+        "the list has no second row for the double click to open"
+    );
     {
         let opened: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
             std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -1744,8 +1762,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "probe: click selected {selected_by_click}, double click activated {lines:?}"
         );
         assert!(
-            selected_by_click.ends_with("beta-probe.md"),
-            "a click on row 1 selected {selected_by_click}"
+            selected_by_click.ends_with(&second_row_name),
+            "a click on row 1 selected {selected_by_click}, not {second_row_name}"
         );
         assert_eq!(
             lines.len(),
@@ -1754,8 +1772,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             lines.len()
         );
         assert!(
-            lines[0].contains("beta-probe.md"),
-            "the open handler ran for {:?}, not the double-clicked row",
+            lines[0].contains(&second_row_name),
+            "the open handler ran for {:?}, not the double-clicked row {second_row_name}",
             lines[0]
         );
         assert!(
