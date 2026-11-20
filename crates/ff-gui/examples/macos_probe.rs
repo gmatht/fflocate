@@ -1893,6 +1893,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }),
             );
         }
+        /// The pasteboard's string, read through AppKit directly.
+        ///
+        /// Deliberately not `compat::clipboard_get_text`: Copy writes through
+        /// the adapter, so this asks `NSPasteboard` itself, the way another
+        /// application would.
+        unsafe fn pasteboard_text() -> Option<String> {
+            type Nullary = unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+            type Unary = unsafe extern "C" fn(
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+            ) -> *mut std::ffi::c_void;
+            let shim = rswidgets::backends::apple::msg_shim();
+            let nullary: Nullary = unsafe { std::mem::transmute(shim) };
+            let unary: Unary = unsafe { std::mem::transmute(shim) };
+            let pasteboard = unsafe {
+                nullary(
+                    rswidgets::backends::apple::cls("NSPasteboard"),
+                    rswidgets::backends::apple::selector("generalPasteboard"),
+                )
+            };
+            if pasteboard.is_null() {
+                return None;
+            }
+            // The type Copy stores under (see `clipboard_set_text`).
+            let kind = rswidgets::backends::apple::nsstring("public.utf8-plain-text");
+            let text = unsafe {
+                unary(
+                    pasteboard,
+                    rswidgets::backends::apple::selector("stringForType:"),
+                    kind,
+                )
+            };
+            rswidgets::backends::apple::nsstring_to_rust(text)
+        }
         let handle = menu.build().expect("the row menu could not be built");
         let items = rswidgets::compat::ContextMenu::items_of(handle);
         let labels: Vec<String> = items.iter().map(|(l, _)| l.clone()).collect();
@@ -1921,12 +1956,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     format!("copied {name}"),
                     "Copy path reported {line:?}"
                 );
-                let read_back = rswidgets::compat::clipboard_get_text()
-                    .expect("the clipboard holds no text after Copy path");
-                println!("probe: clipboard now holds {read_back:?}");
+                // Read the pasteboard straight from AppKit instead of through
+                // the call Copy used, so a stored string that never reached the
+                // system pasteboard cannot pass this.
+                let read_back = unsafe { pasteboard_text() }
+                    .expect("the pasteboard holds no text after Copy path");
+                println!("probe: pasteboard (read straight from AppKit) holds {read_back:?}");
                 assert_eq!(
                     read_back, row_path,
-                    "Copy path did not leave the row's path on the clipboard"
+                    "Copy path did not leave the row's path on the pasteboard"
+                );
+                assert!(
+                    std::fs::metadata(&read_back)
+                        .map(|m| m.is_file())
+                        .unwrap_or(false),
+                    "the copied path {read_back:?} is not a file on disk"
                 );
             } else {
                 assert!(
