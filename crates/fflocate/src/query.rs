@@ -1846,6 +1846,63 @@ mod tests {
     }
 
     #[test]
+    fn no_limit_emits_every_match_on_every_path() {
+        // The GUI's whole-set sort asks with `limit == 0` and relies on every
+        // emit path treating that as unlimited: a cap here would silently sort
+        // only the first page. `limit_counts_but_truncates` above is the other
+        // half of the contract (a nonzero limit still truncates).
+        let (ix, rp) = tree();
+        for raw in ["rs", "ext:rs", "path:src"] {
+            let q = Query::compile(raw).unwrap();
+            let all = execute(&ix, &rp, &q, 0, false);
+            let one = execute(&ix, &rp, &q, 1, false);
+            assert!(all.total >= 2, "{raw}: {}", all.total);
+            assert_eq!(
+                all.hits.len(),
+                all.total as usize,
+                "{raw}: limit 0 must emit every match"
+            );
+            assert_eq!(one.hits.len(), 1, "{raw}: limit 1 still truncates");
+        }
+
+        // The expression path (`ff --expr`): same contract.
+        let expr =
+            crate::expr::parse_query(&serde_json::json!({"expression": ["suffix", "rs"]})).unwrap();
+        let mut hits = 0usize;
+        let total = execute_expr_emit(
+            &ix,
+            &rp,
+            b"",
+            &expr,
+            0,
+            false,
+            &mut |ev| {
+                if matches!(ev, ScanEvent::Hit(_)) {
+                    hits += 1;
+                }
+                true
+            },
+            None,
+            false,
+        );
+        assert_eq!(total, Some(2));
+        assert_eq!(hits, 2, "limit 0 must emit every expression match");
+    }
+
+    #[cfg(feature = "trigram")]
+    #[test]
+    fn fuzzy_with_no_limit_emits_every_match() {
+        let (ix, rp) = tree();
+        let tg = TrigramIndex::build(&ix);
+        let q = Query::compile("rs").unwrap();
+        let all = execute_fuzzy(&ix, &rp, &q, 0, 0, false, Some(&tg));
+        assert_eq!(all.total, 2);
+        assert_eq!(all.hits.len(), 2, "limit 0 must emit every ranked match");
+        let one = execute_fuzzy(&ix, &rp, &q, 0, 1, false, Some(&tg));
+        assert_eq!(one.hits.len(), 1, "limit 1 still truncates a ranked scan");
+    }
+
+    #[test]
     fn limit_counts_but_truncates() {
         let (ix, rp) = tree();
         let q = Query::compile("rs").unwrap();

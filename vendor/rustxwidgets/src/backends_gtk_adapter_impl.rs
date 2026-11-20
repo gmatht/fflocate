@@ -535,6 +535,63 @@ mod gtk_adapter {
         Ok(BoxWidget(b))
     }
 
+    /// `GtkExpander`: GTK3's own disclosure widget, with the toolkit's arrow
+    /// and a header that folds the section out when it is clicked.
+    ///
+    /// The handle comes back raw because the caller (compat's `Expander`) keeps
+    /// it in the layout; GTK owns the widget from `gtk_expander_new` onwards.
+    /// GTK4 removed `GtkExpander`, so this reports that rather than accepting a
+    /// foldout that cannot fold.
+    pub fn create_expander(label: &str) -> Result<*mut c_void, Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK is not initialised".to_string()))?;
+        let new = loader.symbols.gtk_expander_new.ok_or_else(|| {
+            Error::Backend("this GTK has no GtkExpander (GTK4 removed it)".to_string())
+        })?;
+        let label = std::ffi::CString::new(label)
+            .map_err(|_| Error::Backend("expander label contains a NUL".to_string()))?;
+        let expander = unsafe { new(label.as_ptr() as *const u8) };
+        if expander.is_null() {
+            return Err(Error::Backend("gtk_expander_new returned NULL".to_string()));
+        }
+        Ok(expander)
+    }
+
+    /// Put `child` under a native expander's header (its one child).
+    pub fn expander_set_child(expander: *mut c_void, child: *mut c_void) {
+        if let Some(loader) = crate::backends::gtk::loader() {
+            if let Some(add) = loader.symbols.gtk_container_add {
+                if !child.is_null() {
+                    unsafe { add(expander, child) }
+                }
+            }
+        }
+    }
+
+    /// Fold the native expander out or shut.
+    pub fn expander_set_expanded(expander: *mut c_void, expanded: bool) {
+        if let Some(loader) = crate::backends::gtk::loader() {
+            if let Some(set) = loader.symbols.gtk_expander_set_expanded {
+                unsafe { set(expander, expanded as i32) }
+            }
+        }
+    }
+
+    /// Whether the native expander is folded out *now*.
+    ///
+    /// Asked of GTK rather than mirrored: clicking the header folds it out
+    /// without going through this layer, so a cached flag would be wrong the
+    /// moment the user clicks the arrow.
+    pub fn expander_get_expanded(expander: *mut c_void) -> bool {
+        match crate::backends::gtk::loader() {
+            Some(loader) => match loader.symbols.gtk_expander_get_expanded {
+                Some(get) => unsafe { get(expander) != 0 },
+                None => false,
+            },
+            None => false,
+        }
+    }
+
     pub fn create_grid() -> Result<Grid, Error> {
         let g = crate::backends::gtk::create_grid().map_err(|e| Error::Backend(format!("{}", e)))?;
         Ok(Grid(g))

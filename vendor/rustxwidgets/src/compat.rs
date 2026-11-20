@@ -14,9 +14,10 @@
 //!   did. Clicking a sortable header sorts by that column, a second click
 //!   reverses it, and the header shows the direction; its icon column paints a
 //!   pictogram per file kind (see `paint_icon`), not a themed pixbuf.
-//! * [`Expander`] is a header line plus a child box it shows or hides as one
-//!   unit. The header is a label, so the state is in its text; the caller
-//!   toggles it (see [`Expander::set_expanded`]).
+//! * [`Expander`] is the backend's own disclosure widget where it has one —
+//!   GTK3's `GtkExpander`, arrow and clickable header included — and elsewhere
+//!   a header line plus a child box, with the state in the header text and the
+//!   caller doing the toggling (see [`Expander::set_expanded`]).
 //! * [`ContextMenu`] collects items, but popping one up is *not* implemented in
 //!   this build: [`ContextMenu::popup_at_pointer`] returns an error, which
 //!   clients surface to the user. That is deliberate — a menu that silently
@@ -235,6 +236,17 @@ const BODY_SIZE: f64 = 12.0;
 const ICON_SIZE: f64 = 11.0;
 /// Header title size in logical pixels.
 const HEADER_SIZE: f64 = 12.0;
+/// Width of the list's own scrollbar strip, in logical pixels. Only drawn when
+/// the rows are taller than the canvas.
+const SCROLLBAR_WIDTH: f64 = 10.0;
+/// Rows one wheel notch moves the list.
+const WHEEL_ROWS: f64 = 3.0;
+/// The height the canvas asks for, in logical pixels.
+///
+/// The canvas is never sized to the content (a 600 000-row list would ask for
+/// 12 000 000 px, past what a `GdkWindow`/Cairo surface can hold), so it asks
+/// for a screenful and every backend stretches it to the viewport it is given.
+const CANVAS_REQUEST_H: i32 = 480;
 
 type PressHandler = Box<dyn FnMut(u32, f64, f64, *mut c_void)>;
 
@@ -254,6 +266,14 @@ pub struct TreeView {
     sort: Rc<Cell<Option<(usize, bool)>>>,
     /// Row-activation handlers, fed by the backend's double click.
     activate: Rc<RefCell<Vec<ActivateHandler>>>,
+    /// How far down the rows the canvas is scrolled, in pixels, in **content**
+    /// coordinates: row `i` sits at `HEADER_HEIGHT + i * ROW_HEIGHT - offset`.
+    offset: Rc<Cell<f64>>,
+    /// The height of the canvas being drawn (the viewport), which is how much
+    /// of the list is on screen and therefore all the painter draws.
+    viewport: Rc<Cell<f64>>,
+    /// True while the scrollbar's thumb is being dragged.
+    dragging: Rc<Cell<bool>>,
 }
 
 impl Clone for TreeView {
@@ -267,6 +287,9 @@ impl Clone for TreeView {
             width: self.width.clone(),
             sort: self.sort.clone(),
             activate: self.activate.clone(),
+            offset: self.offset.clone(),
+            viewport: self.viewport.clone(),
+            dragging: self.dragging.clone(),
         }
     }
 }
@@ -284,10 +307,13 @@ fn handle_press(
     width: f64,
     selected: &Rc<Cell<Option<usize>>>,
     press: &Rc<RefCell<Vec<PressHandler>>>,
+    offset: f64,
     x: f64,
     y: f64,
     button: u32,
 ) -> Option<usize> {
+    // The canvas is the viewport, so a press at `y` is at content `y + offset`.
+    let y = y + offset.max(0.0);
     let row = row_index_at(y, rows.borrow().len());
     if button == 1 {
         if y < HEADER_HEIGHT {
@@ -317,9 +343,10 @@ fn handle_double_click(
     rows: &Rc<RefCell<Vec<Vec<CellValue>>>>,
     selected: &Rc<Cell<Option<usize>>>,
     activate: &Rc<RefCell<Vec<ActivateHandler>>>,
+    offset: f64,
     y: f64,
 ) -> Option<usize> {
-    let row = row_index_at(y, rows.borrow().len())?;
+    let row = row_index_at(y + offset.max(0.0), rows.borrow().len())?;
     selected.set(Some(row));
     for handler in activate.borrow_mut().iter_mut() {
         handler(row);
@@ -336,7 +363,12 @@ impl TreeView {
         let width: Rc<Cell<f64>> = Rc::new(Cell::new(640.0));
         let sort: Rc<Cell<Option<(usize, bool)>>> = Rc::new(Cell::new(None));
         let activate: Rc<RefCell<Vec<ActivateHandler>>> = Rc::new(RefCell::new(Vec::new()));
-        canvas.set_content_size(720, 320);
+        let offset: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
+        let viewport: Rc<Cell<f64>> = Rc::new(Cell::new(f64::from(CANVAS_REQUEST_H)));
+        let dragging: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+        // A screenful, never the content: the list scrolls itself (see
+        // `paint_list`), so the canvas only has to be as tall as its viewport.
+        canvas.set_content_size(720, CANVAS_REQUEST_H);
 
         {
             let rows = rows.clone();
@@ -347,10 +379,30 @@ impl TreeView {
                 .map(|(t, icon, sortable)| (t.to_string(), *icon, *sortable))
                 .collect();
             let width = width.clone();
-            canvas.set_draw_callback(Box::new(move |ctx, w, _h| {
+            let offset = offset.clone();
+            let viewport = viewport.clone();
+            canvas.set_draw_callback(Box::new(move |ctx, w, h| {
                 let w = if w > 0 { f64::from(w) } else { width.get() };
                 width.set(w);
-                paint_list(ctx, w, &columns, &rows.borrow(), selected.get(), sort.get());
+                // `h` is the viewport: the canvas is never the content, so this
+                // is exactly how many rows are on screen.
+                if h > 0 {
+                    viewport.set(f64::from(h));
+                }
+                let vp = viewport.get();
+                let content = content_height(rows.borrow().len());
+                let off = clamp_offset(offset.get(), content, vp);
+                offset.set(off);
+                paint_list(
+                    ctx,
+                    w,
+                    &columns,
+                    &rows.borrow(),
+                    selected.get(),
+                    sort.get(),
+                    off,
+                    vp,
+                );
             }));
         }
 
@@ -362,23 +414,91 @@ impl TreeView {
             let width = width.clone();
             let canvas_for_redraw = canvas.clone();
             let sortable: Vec<bool> = columns.iter().map(|(_, _, sortable)| *sortable).collect();
+            let offset = offset.clone();
+            let viewport = viewport.clone();
+            let dragging = dragging.clone();
             canvas.on_click_button(Box::new(move |x, y, button, _state| {
+                let content = content_height(rows.borrow().len());
+                let vp = viewport.get();
+                // A press on the list's own scrollbar grabs the thumb there and
+                // starts a drag; it is not a row click.
+                if button == 1 && scrollbar_hit(width.get(), x, content, vp) {
+                    dragging.set(true);
+                    offset.set(offset_from_thumb(y, content, vp));
+                    canvas_for_redraw.queue_redraw();
+                    return;
+                }
+                dragging.set(false);
                 handle_press(
-                    &rows, &sort, &sortable, width.get(), &selected, &press, x, y, button,
+                    &rows,
+                    &sort,
+                    &sortable,
+                    width.get(),
+                    &selected,
+                    &press,
+                    offset.get(),
+                    x,
+                    y,
+                    button,
                 );
                 canvas_for_redraw.queue_redraw();
             }));
+        }
+
+        // Dragging the thumb: a press in the strip moves the window there, and
+        // motion follows the pointer until the button comes up.
+        {
+            let drag_flag = dragging.clone();
+            let offset = offset.clone();
+            let viewport = viewport.clone();
+            let rows = rows.clone();
+            let canvas_for_redraw = canvas.clone();
+            canvas.on_motion(Box::new(move |_x, y, _state| {
+                if !drag_flag.get() {
+                    return;
+                }
+                let content = content_height(rows.borrow().len());
+                offset.set(offset_from_thumb(y, content, viewport.get()));
+                canvas_for_redraw.queue_redraw();
+            }));
+            let drag_flag = dragging.clone();
+            canvas.on_release(Box::new(move |_x, _y, _button, _state| drag_flag.set(false)));
+        }
+
+        // The wheel: three rows a notch, clamped to the content.
+        {
+            let offset = offset.clone();
+            let viewport = viewport.clone();
+            let rows = rows.clone();
+            let canvas_for_redraw = canvas.clone();
+            install_wheel(
+                &canvas,
+                Box::new(move |dy: f64| {
+                    let content = content_height(rows.borrow().len());
+                    let vp = viewport.get();
+                    let next = clamp_offset(
+                        offset.get() + dy * WHEEL_ROWS * ROW_HEIGHT,
+                        content,
+                        vp,
+                    );
+                    if (next - offset.get()).abs() > 0.01 {
+                        offset.set(next);
+                        canvas_for_redraw.queue_redraw();
+                    }
+                }),
+            );
         }
 
         {
             let activate = activate.clone();
             let selected = selected.clone();
             let rows = rows.clone();
+            let offset = offset.clone();
             let canvas_for_redraw = canvas.clone();
             register_double_click(
                 &canvas,
                 Box::new(move |_x, y| {
-                    handle_double_click(&rows, &selected, &activate, y);
+                    handle_double_click(&rows, &selected, &activate, offset.get(), y);
                     canvas_for_redraw.queue_redraw();
                 }),
             );
@@ -396,6 +516,9 @@ impl TreeView {
             width,
             sort,
             activate,
+            offset,
+            viewport,
+            dragging,
         })
     }
 
@@ -413,6 +536,7 @@ impl TreeView {
             self.width.get(),
             &self.selected,
             &self.press,
+            self.offset.get(),
             x,
             y,
             button,
@@ -424,7 +548,13 @@ impl TreeView {
     /// Feed the second press of a double click at `y`, running the activation
     /// handlers exactly as the canvas' double-click registration does.
     pub fn double_click_at(&self, y: f64) -> Option<usize> {
-        let row = handle_double_click(&self.rows, &self.selected, &self.activate, y);
+        let row = handle_double_click(
+            &self.rows,
+            &self.selected,
+            &self.activate,
+            self.offset.get(),
+            y,
+        );
         self.canvas.queue_redraw();
         row
     }
@@ -436,18 +566,97 @@ impl TreeView {
     pub fn set_rows(&self, rows: &[Vec<CellValue>]) {
         let mut rows = rows.to_vec();
         sort_rows(&mut rows, self.sort.get());
-        let count = rows.len();
         *self.rows.borrow_mut() = rows;
+        self.after_rows_changed();
+    }
+
+    /// Scroll to `offset` pixels down the rows, clamped to the content.
+    pub fn set_offset(&self, offset: f64) {
+        let content = content_height(self.rows.borrow().len());
+        let next = clamp_offset(offset, content, self.viewport.get());
+        if (next - self.offset.get()).abs() > 0.01 {
+            self.offset.set(next);
+            self.canvas.queue_redraw();
+        }
+    }
+
+    /// How far down the rows the list is scrolled, in pixels.
+    pub fn offset(&self) -> f64 {
+        self.offset.get()
+    }
+
+    /// The height of the viewport the list was last drawn in.
+    pub fn viewport_height(&self) -> f64 {
+        self.viewport.get()
+    }
+
+    /// Scroll by `rows` rows (positive scrolls down), as the wheel does.
+    pub fn scroll_by_rows(&self, rows: f64) {
+        self.set_offset(self.offset.get() + rows * ROW_HEIGHT);
+    }
+
+    /// The offset that puts the thumb at `y` in the strip: a track click or a
+    /// drag. Exposed so a test drives the same arithmetic the canvas does.
+    pub fn offset_at_thumb_y(&self, y: f64) -> f64 {
+        let content = content_height(self.rows.borrow().len());
+        offset_from_thumb(y, content, self.viewport.get())
+    }
+
+    /// Whether the list is drawing its own scrollbar at this viewport height.
+    pub fn shows_scrollbar(&self) -> bool {
+        let content = content_height(self.rows.borrow().len());
+        content > self.viewport.get()
+    }
+
+    /// After the rows changed: keep the offset inside the content and repaint.
+    ///
+    /// The canvas is asked for a screenful, never for the content height: the
+    /// list scrolls itself, so the drawing area must stay bounded no matter how
+    /// many rows it holds.
+    fn after_rows_changed(&self) {
+        let content = content_height(self.rows.borrow().len());
+        self.offset
+            .set(clamp_offset(self.offset.get(), content, self.viewport.get()));
         self.canvas.set_content_size(
             self.width.get().max(320.0) as i32,
-            (HEADER_HEIGHT + count as f64 * ROW_HEIGHT) as i32 + 4,
+            CANVAS_REQUEST_H,
         );
         self.canvas.queue_redraw();
     }
 
+    /// Append `batch` to the rows, keeping the active sort's order, and keep at
+    /// most `limit` rows.
+    ///
+    /// The GUI's whole-set sort streams hits in crawl order: batches arrive
+    /// unsorted and far more numerous than the list can draw. Sorting each
+    /// batch and merging it ([`merge_rows`]) keeps the visible top `limit` rows
+    /// correct without ever re-sorting or cloning the rows already there, so a
+    /// reply with six figures of hits costs O(batch log batch + limit) per
+    /// batch instead of O(n log n) plus a full clone.
+    pub fn append_rows(&self, batch: &[Vec<CellValue>]) {
+        if batch.is_empty() {
+            return;
+        }
+        {
+            let mut rows = self.rows.borrow_mut();
+            merge_rows(&mut rows, batch, self.sort.get(), usize::MAX);
+        }
+        self.after_rows_changed();
+    }
+
+    /// Height of the header row, in canvas pixels.
+    ///
+    /// A press above this is a header click (which re-sorts) rather than a row
+    /// click, so a caller can tell the two apart without duplicating the
+    /// constant.
+    pub fn header_height(&self) -> f64 {
+        HEADER_HEIGHT
+    }
+
     /// The row index under `(x, y)`, or `None` for the header/blank space.
     pub fn row_at(&self, _x: f64, y: f64) -> Option<usize> {
-        row_index_at(y, self.rows.borrow().len())
+        // `y` is a viewport coordinate; the rows are laid out in content ones.
+        row_index_at(y + self.offset.get(), self.rows.borrow().len())
     }
 
     pub fn select_row(&self, row: usize) {
@@ -508,11 +717,34 @@ impl TreeView {
         Ok(())
     }
 
-    /// The scrolled container the old GTK tree view needed. The canvas scrolls
-    /// because the scrolled window is given its full content size.
+    /// The container the list lives in.
+    ///
+    /// The list scrolls **itself**: the canvas is the viewport, draws only the
+    /// band that is on screen and paints its own scrollbar, so the drawing area
+    /// stays a screenful tall however many rows it holds. A backend whose
+    /// scrolled window still produces a scroll value (macOS's `NSScrollView`
+    /// does) drives the offset through `on_scroll`; where it does not, the
+    /// wheel and the thumb drag do.
     pub fn into_scrolled(self) -> Result<ScrolledWindow, Error> {
         let sw = new_scrolled()?;
         sw.set_vexpand(true);
+        {
+            let offset = self.offset.clone();
+            let viewport = self.viewport.clone();
+            let rows = self.rows.clone();
+            let canvas = self.canvas.clone();
+            sw.on_scroll(Box::new(move |vertical, value| {
+                if !vertical {
+                    return;
+                }
+                let content = content_height(rows.borrow().len());
+                let next = clamp_offset(value, content, viewport.get());
+                if (next - offset.get()).abs() > 0.01 {
+                    offset.set(next);
+                    canvas.queue_redraw();
+                }
+            }));
+        }
         sw.set_child(&self.canvas);
         Ok(sw)
     }
@@ -737,11 +969,20 @@ fn paint_icon(ctx: &mut dyn DrawContext, x: f64, y: f64, size: f64, cell: &CellV
     true
 }
 
-/// Paint the whole list: header band, selection and every row.
+/// Paint the list's visible band: header strip, the rows on screen, and the
+/// list's own scrollbar.
+///
+/// `offset` and `viewport` are in content coordinates: row `i` sits at
+/// `HEADER_HEIGHT + i * ROW_HEIGHT`, and only the rows inside
+/// `[offset, offset + viewport)` are emitted, shifted by `-offset` so they land
+/// in the canvas. That is what makes a 600 000-row list cost the same per frame
+/// as a 30-row one, and why the canvas can stay a screenful tall.
 ///
 /// Separate from the canvas callback so the geometry can be driven offscreen
 /// (the tests below paint into a `RecordingDrawContext`): the callback only
-/// supplies the width and the shared state.
+/// supplies the width and the shared state. A caller that passes an infinite
+/// viewport (the offscreen probe does) gets every row, which is how the ink
+/// per row stays measurable.
 fn paint_list(
     ctx: &mut dyn DrawContext,
     w: f64,
@@ -749,20 +990,27 @@ fn paint_list(
     rows: &[Vec<CellValue>],
     selected: Option<usize>,
     sort: Option<(usize, bool)>,
+    offset: f64,
+    viewport: f64,
 ) {
     ctx.clear(1.0, 1.0, 1.0, 1.0);
 
     let column_x = column_starts(w);
+    let content = content_height(rows.len());
+    let band = visible_band(rows.len(), offset, viewport);
+    let shift = offset.max(0.0);
 
     // Header: each title over its own column, centred in the band, with the
-    // sort direction on the column the list is sorted by.
-    ctx.fill_rect(0.0, 0.0, w, HEADER_HEIGHT, 0.93, 0.93, 0.95, 1.0);
+    // sort direction on the column the list is sorted by. It scrolls with the
+    // rows, as it did when the scrolled window moved the whole canvas.
+    let header_top = -shift;
+    ctx.fill_rect(0.0, header_top, w, HEADER_HEIGHT, 0.93, 0.93, 0.95, 1.0);
     let title_top = centred_text_top(ink_height(ctx, HEADER_SIZE, 1), HEADER_HEIGHT);
     for (i, (title, _icon, _sortable)) in columns.iter().enumerate() {
         let x = column_x.get(i).copied().unwrap_or(PAD_X);
         ctx.draw_text_styled(
             x,
-            title_top,
+            header_top + title_top,
             &sorted_title(title, i, sort),
             FONT,
             HEADER_SIZE,
@@ -779,8 +1027,9 @@ fn paint_list(
     // the canvas takes — passing a baseline put the row text below its band.
     let body_top = centred_text_top(ink_height(ctx, BODY_SIZE, 0), ROW_HEIGHT);
     let icon_top = centred_text_top(ink_height(ctx, ICON_SIZE, 0), ROW_HEIGHT);
-    for (i, row) in rows.iter().enumerate() {
-        let y = HEADER_HEIGHT + i as f64 * ROW_HEIGHT;
+    for i in band.0..band.1 {
+        let row = &rows[i];
+        let y = HEADER_HEIGHT + i as f64 * ROW_HEIGHT - shift;
         if selected == Some(i) {
             ctx.fill_rect(0.0, y, w, ROW_HEIGHT, 0.22, 0.45, 0.85, 0.18);
         }
@@ -814,6 +1063,120 @@ fn paint_list(
                 1.0,
             );
         }
+    }
+
+    // The list's own scrollbar. The canvas is the viewport, so the scrolled
+    // window has no range to draw one from; this is the range, and the thumb is
+    // the viewport's share of the content, reaching the bottom when the offset
+    // reaches the end.
+    if viewport.is_finite() && viewport > 0.0 && content > viewport {
+        let x = w - SCROLLBAR_WIDTH;
+        ctx.fill_rect(x, 0.0, SCROLLBAR_WIDTH, viewport, 0.95, 0.95, 0.97, 1.0);
+        let (_track, thumb_top, thumb_height) =
+            reflow::scroll_thumb(content, viewport, shift);
+        ctx.fill_rect(
+            x + 2.0,
+            thumb_top,
+            SCROLLBAR_WIDTH - 4.0,
+            thumb_height,
+            0.60,
+            0.62,
+            0.68,
+            1.0,
+        );
+    }
+}
+
+/// The height of `rows` rows, header included: the list's content height.
+fn content_height(rows: usize) -> f64 {
+    HEADER_HEIGHT + rows as f64 * ROW_HEIGHT
+}
+
+/// `offset` clamped so the viewport stays inside the content.
+fn clamp_offset(offset: f64, content: f64, viewport: f64) -> f64 {
+    if !offset.is_finite() {
+        return 0.0;
+    }
+    offset.clamp(0.0, (content - viewport.max(0.0)).max(0.0))
+}
+
+/// The half-open range of rows the viewport `[offset, offset + viewport)` shows.
+///
+/// The same arithmetic `reflow::ListGeometry` publishes as `first_row` and
+/// `visible_rows`, so the band the painter emits and the geometry a test asserts
+/// cannot disagree. An infinite viewport means "all of them" (the offscreen
+/// probe), and an empty viewport means none.
+fn visible_band(rows: usize, offset: f64, viewport: f64) -> (usize, usize) {
+    if rows == 0 {
+        return (0, 0);
+    }
+    if !viewport.is_finite() {
+        return (0, rows);
+    }
+    if viewport <= 0.0 {
+        return (0, 0);
+    }
+    let top = offset.max(0.0);
+    let first = if top <= HEADER_HEIGHT {
+        0
+    } else {
+        (((top - HEADER_HEIGHT) / ROW_HEIGHT).floor() as usize).min(rows)
+    };
+    let end = top + viewport;
+    let last = if end <= HEADER_HEIGHT {
+        0
+    } else {
+        (((end - HEADER_HEIGHT) / ROW_HEIGHT).ceil() as usize).min(rows)
+    };
+    (first.min(last), last)
+}
+
+/// Whether a press at `x` is on the list's own scrollbar — only when there is
+/// one, i.e. when the rows are taller than the viewport.
+fn scrollbar_hit(w: f64, x: f64, content: f64, viewport: f64) -> bool {
+    content > viewport && viewport > 0.0 && x >= w - SCROLLBAR_WIDTH
+}
+
+/// The offset that centres the thumb on `y`: a click in the strip or a drag.
+fn offset_from_thumb(y: f64, content: f64, viewport: f64) -> f64 {
+    if content <= viewport || viewport <= 0.0 {
+        return 0.0;
+    }
+    let (_track, _top, thumb) = reflow::scroll_thumb(content, viewport, 0.0);
+    let travel = viewport - thumb;
+    if travel <= 0.0 {
+        return 0.0;
+    }
+    let frac = ((y - thumb / 2.0) / travel).clamp(0.0, 1.0);
+    frac * (content - viewport)
+}
+
+/// Install the wheel handler where the backend has a canvas scroll signal.
+///
+/// GTK (3), zork, wasm and nwg deliver the wheel as a `Gesture::Scroll`; macOS
+/// and GTK4 have no canvas scroll hook in the portable layer, so the method is
+/// `cfg`'d out there (exactly like `Canvas::on_double_click`). On those two the
+/// list is scrolled by its thumb and by `ScrolledWindow::on_scroll` where that
+/// backend produces a value.
+fn install_wheel(canvas: &Canvas, cb: Box<dyn FnMut(f64)>) {
+    #[cfg(any(
+        all(feature = "gtk", target_os = "linux", not(feature = "zork")),
+        feature = "zork",
+        target_arch = "wasm32",
+        windows
+    ))]
+    {
+        let mut cb = cb;
+        canvas.on_scroll(Box::new(move |_dx, dy| cb(dy)));
+    }
+    #[cfg(not(any(
+        all(feature = "gtk", target_os = "linux", not(feature = "zork")),
+        feature = "zork",
+        target_arch = "wasm32",
+        windows
+    )))]
+    {
+        let _ = (canvas, cb);
     }
 }
 
@@ -912,6 +1275,17 @@ fn apply_header_click(
     true
 }
 
+/// The text `column` renders for `row`, lowercased: the sort key.
+///
+/// The key is what the column *shows*, not what it stores: an icon cell sorts
+/// by its fallback glyph, so the pictogram column groups by kind.
+fn row_key(row: &[CellValue], column: usize) -> String {
+    row.get(column)
+        .map(CellValue::render)
+        .unwrap_or_default()
+        .to_lowercase()
+}
+
 /// Sort `rows` by the rendered text of `column`, ignoring case.
 ///
 /// Stable, so rows that compare equal keep the order the daemon sent them in.
@@ -922,14 +1296,7 @@ fn sort_rows(rows: &mut Vec<Vec<CellValue>>, sort: Option<(usize, bool)>) {
     };
     let mut keyed: Vec<(String, Vec<CellValue>)> = std::mem::take(rows)
         .into_iter()
-        .map(|row| {
-            let key = row
-                .get(column)
-                .map(CellValue::render)
-                .unwrap_or_default()
-                .to_lowercase();
-            (key, row)
-        })
+        .map(|row| (row_key(&row, column), row))
         .collect();
     keyed.sort_by(|a, b| {
         if ascending {
@@ -939,6 +1306,62 @@ fn sort_rows(rows: &mut Vec<Vec<CellValue>>, sort: Option<(usize, bool)>) {
         }
     });
     *rows = keyed.into_iter().map(|(_, row)| row).collect();
+}
+
+/// Merge an unsorted `batch` into `rows`, keeping `sort`'s order, and keep at
+/// most `limit` rows.
+///
+/// Both sides are ordered by the same key, so this is a linear merge rather
+/// than the re-sort plus full clone that [`TreeView::set_rows`] does. A row that
+/// sorts past the last kept one is dropped, which is what makes streaming a
+/// 600 k-hit reply cheap: the batch is sorted once, the merge is linear, at
+/// most `limit` rows survive, and the tails never cost anything.
+fn merge_rows(
+    rows: &mut Vec<Vec<CellValue>>,
+    batch: &[Vec<CellValue>],
+    sort: Option<(usize, bool)>,
+    limit: usize,
+) {
+    let mut incoming = batch.to_vec();
+    sort_rows(&mut incoming, sort);
+    let Some((column, ascending)) = sort else {
+        rows.extend(incoming);
+        rows.truncate(limit);
+        return;
+    };
+    let old = std::mem::take(rows);
+    let capacity = (old.len() + incoming.len()).min(limit);
+    let mut merged: Vec<Vec<CellValue>> = Vec::with_capacity(capacity);
+    // Move the rows rather than clone them: a 600 k-row list merged in 50 k
+    // batches would otherwise clone itself twelve times over.
+    let mut old_iter = old.into_iter().peekable();
+    let mut new_iter = incoming.into_iter().peekable();
+    while merged.len() < limit {
+        // Stable: on a tie the row already in the list stays first, so a batch
+        // cannot reorder rows that compare equal.
+        let take_old = match (old_iter.peek(), new_iter.peek()) {
+            (Some(a), Some(b)) => {
+                let (ka, kb) = (row_key(a, column), row_key(b, column));
+                if ascending {
+                    ka <= kb
+                } else {
+                    ka >= kb
+                }
+            }
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        match if take_old {
+            old_iter.next()
+        } else {
+            new_iter.next()
+        } {
+            Some(row) => merged.push(row),
+            None => break,
+        }
+    }
+    *rows = merged;
 }
 
 /// Register the double-click handler on the backend that reports a click count.
@@ -1100,42 +1523,79 @@ pub fn clipboard_get_text() -> Result<String, Error> {
     )))
 }
 
-/// A disclosure: a header line with a child box under it.
+/// A disclosure: a header line with a child under it.
+///
+/// GTK3 has a real one — `GtkExpander`, with the toolkit's arrow and a header
+/// that folds the section out when it is clicked — and this **uses it** rather
+/// than imitating it. The other backends have no foldout widget on this layer
+/// (AppKit's is an `NSButton` in a disclosing bezel, which this layer does not
+/// build), so they get the same shape made of a label and a box, with the
+/// state in the header text and [`Expander::set_expanded`] as the only way to
+/// change it.
 #[derive(Clone)]
 pub struct Expander {
-    root: WidgetBox,
-    header: Label,
-    /// The header text without its state marker.
+    /// What goes into the layout: the native expander, or the stand-in's box.
+    handle: *mut c_void,
+    /// Whether `handle` is a `GtkExpander` (see [`native_foldout`]).
+    native: bool,
+    /// The header text without its state marker (only a stand-in shows it).
     title: Rc<str>,
+    /// Mirrors the state where there is no native widget to ask.
     expanded: Rc<Cell<bool>>,
+    /// The stand-in's parts; `None` when the native widget is in use.
+    stand_in: Option<Rc<StandIn>>,
+}
+
+/// The label-and-box disclosure used where the backend has no foldout widget.
+///
+/// The header is a label rather than a button: AppKit's click callbacks go
+/// through a process-global registry that requires `Send`, and a widget handle
+/// cannot cross a thread, so this layer has no click callback that works on
+/// both desktops. The header therefore carries the state in its text, and the
+/// caller toggles with [`Expander::set_expanded`].
+struct StandIn {
+    /// Kept for the layout: the handle in [`Expander::handle`] points into it.
+    _root: WidgetBox,
+    header: Label,
     body: WidgetBox,
 }
 
 impl Expander {
     /// A titled section, starting collapsed.
     ///
-    /// The header is a label rather than a button: AppKit's click callbacks go
-    /// through a process-global registry that requires `Send`, and a widget
-    /// handle cannot cross a thread, so the portable layer has no click
-    /// callback that works on both. The header therefore carries the state in
-    /// its text and the caller toggles with [`Expander::set_expanded`] —
-    /// `ff-gui` drives it from its Search menu.
+    /// On GTK3 this is the toolkit's own `GtkExpander`, so the header is
+    /// clickable and the arrow is the real one. Elsewhere it is the stand-in
+    /// described on [`StandIn`].
     ///
     /// On GTK, apply the collapsed state *after* `Window::present`: presenting
     /// runs `show_all`, which would show the body again.
     pub fn new(label: &str) -> Result<Expander, Error> {
+        if let Some(handle) = native_foldout::new(label) {
+            return Ok(Expander {
+                handle,
+                native: true,
+                title: Rc::from(label),
+                expanded: Rc::new(Cell::new(false)),
+                stand_in: None,
+            });
+        }
         let root = new_vbox(2)?;
         let body = new_vbox(2)?;
         let header = new_label(&header_text(label, false))?;
         root.append(&header);
         root.append(&body);
         set_box_visible(&body, false);
+        let handle = *root.as_ref();
         Ok(Expander {
-            root,
-            header,
+            handle,
+            native: false,
             title: Rc::from(label),
             expanded: Rc::new(Cell::new(false)),
-            body,
+            stand_in: Some(Rc::new(StandIn {
+                _root: root,
+                header,
+                body,
+            })),
         })
     }
 
@@ -1143,36 +1603,108 @@ impl Expander {
     /// caller can pass the backend's own box type (what `App::create_box`
     /// returns) instead of this layer's wrapper.
     pub fn set_child(&self, child: &impl AsRef<*mut c_void>) {
-        self.body.append(child);
+        if self.native {
+            native_foldout::add_child(self.handle, *child.as_ref());
+        } else if let Some(parts) = &self.stand_in {
+            parts.body.append(child);
+        }
     }
 
-    /// Show or hide the body, and say which in the header.
+    /// Fold the section out or shut.
+    ///
+    /// On GTK this drives the native widget; a click on its header does the
+    /// same thing without coming through here, which is why
+    /// [`Expander::is_expanded`] asks the widget rather than a cached flag.
     pub fn set_expanded(&self, expanded: bool) {
         self.expanded.set(expanded);
-        set_box_visible(&self.body, expanded);
-        self.header.set_text(&header_text(&self.title, expanded));
+        if self.native {
+            native_foldout::set_expanded(self.handle, expanded);
+        }
+        if let Some(parts) = &self.stand_in {
+            set_box_visible(&parts.body, expanded);
+            parts.header.set_text(&header_text(&self.title, expanded));
+        }
     }
 
     /// Whether the section is expanded.
     pub fn is_expanded(&self) -> bool {
+        if self.native {
+            return native_foldout::is_expanded(self.handle);
+        }
         self.expanded.get()
     }
 }
 
-/// The header line for a disclosure in the given state.
+/// The backend's own disclosure widget, where it has one.
 ///
-/// Stated in words, not a `[+]`/`[-]` marker: the header is not clickable, and
-/// a triangle or plus sign would promise a toggle that is not there.
+/// Only GTK3 does: `GtkExpander` is what a GTK application uses, and hand-rolling
+/// one there cost the click on the header (a label is not a button) and the
+/// arrow, for no gain. The module is a pair so the call sites stay free of
+/// `cfg` — here it is real, in the `not(...)` copy below it reports "none".
+#[cfg(all(
+    feature = "gtk",
+    target_os = "linux",
+    not(feature = "zork"),
+    not(feature = "gtk4-rs")
+))]
+mod native_foldout {
+    use std::ffi::c_void;
+
+    pub fn new(label: &str) -> Option<*mut c_void> {
+        crate::backends_gtk_adapter::create_expander(label).ok()
+    }
+
+    pub fn add_child(expander: *mut c_void, child: *mut c_void) {
+        crate::backends_gtk_adapter::expander_set_child(expander, child)
+    }
+
+    pub fn set_expanded(expander: *mut c_void, expanded: bool) {
+        crate::backends_gtk_adapter::expander_set_expanded(expander, expanded)
+    }
+
+    pub fn is_expanded(expander: *mut c_void) -> bool {
+        crate::backends_gtk_adapter::expander_get_expanded(expander)
+    }
+}
+
+#[cfg(not(all(
+    feature = "gtk",
+    target_os = "linux",
+    not(feature = "zork"),
+    not(feature = "gtk4-rs")
+)))]
+mod native_foldout {
+    use std::ffi::c_void;
+
+    pub fn new(_label: &str) -> Option<*mut c_void> {
+        None
+    }
+
+    pub fn add_child(_expander: *mut c_void, _child: *mut c_void) {}
+
+    pub fn set_expanded(_expander: *mut c_void, _expanded: bool) {}
+
+    pub fn is_expanded(_expander: *mut c_void) -> bool {
+        false
+    }
+}
+
+/// The header line for a *stand-in* disclosure in the given state.
+///
+/// Stated in words, not a `[+]`/`[-]` marker: the stand-in's header is not
+/// clickable, and a triangle or plus sign would promise a toggle that is not
+/// there. The native `GtkExpander` needs none of this — its arrow is the
+/// state, and it is clickable.
 fn header_text(title: &str, expanded: bool) -> String {
     let state = if expanded { "expanded" } else { "collapsed" };
     format!("{title} ({state})")
 }
 
 /// The expander is itself a widget: it can be packed into a box like any
-/// other child (its handle is the root box's).
+/// other child (its handle is the native widget's, or the stand-in's box).
 impl AsRef<*mut c_void> for Expander {
     fn as_ref(&self) -> &*mut c_void {
-        self.root.as_ref()
+        &self.handle
     }
 }
 
@@ -1484,7 +2016,16 @@ mod tests {
         ]];
         let width = 1000.0;
         let mut dc = RecordingDrawContext::new();
-        paint_list(&mut dc, width, &columns, &rows, None, None);
+        paint_list(
+            &mut dc,
+            width,
+            &columns,
+            &rows,
+            None,
+            None,
+            0.0,
+            f64::INFINITY,
+        );
 
         let find = |needle: &str| -> (f64, f64) {
             dc.ops
@@ -1640,7 +2181,16 @@ mod tests {
         ]];
         let width = 1000.0;
         let mut dc = RecordingDrawContext::new();
-        paint_list(&mut dc, width, &columns, &rows, None, None);
+        paint_list(
+            &mut dc,
+            width,
+            &columns,
+            &rows,
+            None,
+            None,
+            0.0,
+            f64::INFINITY,
+        );
         let x = column_starts(width);
         // Header titles are drawn in the header band, and the icon column's own
         // title is empty; what matters is that no *row* draws text there.
@@ -2054,5 +2604,274 @@ mod tests {
         chunk(&mut png, b"IDAT", &zlib);
         chunk(&mut png, b"IEND", &[]);
         std::fs::write(path, png)
+    }
+}
+
+#[cfg(test)]
+mod append_rows_tests {
+    use super::*;
+
+    /// A row whose only meaningful text is `name`, in column 1: the column the
+    /// Name header sorts by.
+    fn named(name: &str) -> Vec<CellValue> {
+        vec![
+            CellValue::Text(String::new()),
+            CellValue::Text(name.to_string()),
+            CellValue::Text(format!("/tmp/{name}")),
+        ]
+    }
+
+    fn names(rows: &[Vec<CellValue>]) -> Vec<String> {
+        rows.iter()
+            .map(|r| r.get(1).map(CellValue::render).unwrap_or_default())
+            .collect()
+    }
+
+    #[test]
+    fn unsorted_batches_merge_into_the_active_sort_order() {
+        // The daemon streams hits in crawl order, so each batch arrives
+        // unsorted. Appending must not disturb the column's order.
+        let mut rows = vec![named("b"), named("d")];
+        merge_rows(&mut rows, &[named("a"), named("c")], Some((1, true)), 100);
+        assert_eq!(names(&rows), ["a", "b", "c", "d"]);
+        // A second batch, also out of order, merges the same way.
+        merge_rows(&mut rows, &[named("f"), named("e")], Some((1, true)), 100);
+        assert_eq!(names(&rows), ["a", "b", "c", "d", "e", "f"]);
+    }
+
+    #[test]
+    fn a_reverse_sort_merges_in_the_reverse_order() {
+        let mut rows = vec![named("d"), named("b")];
+        merge_rows(&mut rows, &[named("c"), named("a")], Some((1, false)), 100);
+        assert_eq!(names(&rows), ["d", "c", "b", "a"]);
+    }
+
+    #[test]
+    fn the_limit_keeps_the_sorted_prefix() {
+        // 1 000 rows is what the list can draw; a batch of hits that sorts past
+        // the end must cost nothing beyond the merge.
+        let mut rows = vec![named("b"), named("d")];
+        merge_rows(&mut rows, &[named("a"), named("c"), named("e")], Some((1, true)), 3);
+        assert_eq!(names(&rows), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn an_empty_batch_leaves_the_rows_alone() {
+        let mut rows = vec![named("b")];
+        merge_rows(&mut rows, &[], Some((1, true)), 10);
+        assert_eq!(names(&rows), ["b"]);
+    }
+
+    #[test]
+    fn without_a_sort_batches_are_appended_in_arrival_order() {
+        // No header has been clicked: the list keeps the daemon's order, and a
+        // later batch lands after the earlier one.
+        let mut rows = vec![named("z")];
+        merge_rows(&mut rows, &[named("a")], None, 10);
+        assert_eq!(names(&rows), ["z", "a"]);
+    }
+
+    #[test]
+    fn a_tie_keeps_the_rows_already_on_screen_first() {
+        // Stable: rows that compare equal stay in the order they arrived, so a
+        // batch cannot shuffle equal names in front of the ones on screen.
+        let mut rows = vec![named("same"), named("z")];
+        merge_rows(&mut rows, &[named("same")], Some((1, true)), 10);
+        assert_eq!(names(&rows), ["same", "same", "z"]);
+    }
+}
+
+#[cfg(test)]
+mod virtual_list_tests {
+    //! The list at a six-figure row count: only the band on screen is painted,
+    //! and the offset reaches the last row.
+
+    use super::*;
+    use crate::backends::headless::{DrawOp, RecordingDrawContext};
+
+    const BIG: usize = 600_000;
+
+    fn big_rows(n: usize) -> Vec<Vec<CellValue>> {
+        (0..n)
+            .map(|i| {
+                vec![
+                    CellValue::Text(String::new()),
+                    CellValue::Text(format!("file-{i:06}")),
+                    CellValue::Text(format!("/tmp/file-{i:06}")),
+                ]
+            })
+            .collect()
+    }
+
+    fn columns() -> Vec<(String, bool, bool)> {
+        vec![
+            ("".to_string(), true, true),
+            ("Name".to_string(), false, true),
+            ("Path".to_string(), false, true),
+        ]
+    }
+
+    /// The row numbers whose name cell the painter emitted.
+    fn painted(dc: &RecordingDrawContext) -> Vec<usize> {
+        let mut rows: Vec<usize> = dc
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DrawOp::Text { text, .. } => text
+                    .strip_prefix("file-")
+                    .and_then(|n| n.parse::<usize>().ok()),
+                _ => None,
+            })
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        rows
+    }
+
+    #[test]
+    fn the_band_is_the_rows_inside_the_viewport() {
+        // 600 000 rows, a 620pt viewport: ~31 rows, from wherever the offset is.
+        let (first, last) = visible_band(BIG, 0.0, 620.0);
+        assert_eq!(first, 0);
+        assert_eq!(last, 30, "620pt of rows is not 30 bands");
+
+        let (first, last) = visible_band(BIG, 6_000_000.0, 620.0);
+        assert_eq!(first, ((6_000_000.0 - HEADER_HEIGHT) / ROW_HEIGHT).floor() as usize);
+        assert!((29..=32).contains(&(last - first)), "the band is {} rows", last - first);
+
+        // The end of the content shows the last row and nothing past it.
+        let content = content_height(BIG);
+        let (first, last) = visible_band(BIG, content - 620.0, 620.0);
+        assert_eq!(last, BIG, "the last row is not in the band at the end");
+        assert!((29..=32).contains(&(last - first)), "the band is {} rows", last - first);
+
+        // An empty viewport paints nothing; an infinite one paints everything
+        // (the offscreen probe).
+        assert_eq!(visible_band(BIG, 0.0, 0.0), (0, 0));
+        assert_eq!(visible_band(BIG, 0.0, f64::INFINITY), (0, BIG));
+        assert_eq!(visible_band(0, 0.0, 620.0), (0, 0));
+    }
+
+    #[test]
+    fn a_six_figure_list_paints_only_the_visible_band() {
+        let rows = big_rows(BIG);
+        let columns = columns();
+
+        // Top: the first ~31 rows, not the other 599 969.
+        let mut dc = RecordingDrawContext::new();
+        paint_list(&mut dc, 900.0, &columns, &rows, None, Some((1, true)), 0.0, 620.0);
+        let top = painted(&dc);
+        assert_eq!(top.first().copied(), Some(0));
+        assert_eq!(top.len(), 30, "the top of the list painted {} rows", top.len());
+
+        // Middle: a window 6 000 000pt down, still ~31 rows.
+        let mut dc = RecordingDrawContext::new();
+        let mid_offset = 6_000_000.0;
+        paint_list(
+            &mut dc,
+            900.0,
+            &columns,
+            &rows,
+            None,
+            Some((1, true)),
+            mid_offset,
+            620.0,
+        );
+        let mid = painted(&dc);
+        let expected_first = ((mid_offset - HEADER_HEIGHT) / ROW_HEIGHT).floor() as usize;
+        assert_eq!(mid.first().copied(), Some(expected_first));
+        assert_eq!(mid.len(), 32, "the middle of the list painted {} rows", mid.len());
+        assert!(
+            mid.last().copied().unwrap() < expected_first + 32,
+            "the band ran past the viewport"
+        );
+
+        // End: the last row is painted, and it is the last one.
+        let content = content_height(BIG);
+        let mut dc = RecordingDrawContext::new();
+        paint_list(
+            &mut dc,
+            900.0,
+            &columns,
+            &rows,
+            None,
+            Some((1, true)),
+            content - 620.0,
+            620.0,
+        );
+        let end = painted(&dc);
+        assert_eq!(end.last().copied(), Some(BIG - 1), "the last row was not painted");
+        assert_eq!(end.len(), 31);
+    }
+
+    #[test]
+    fn the_scroller_travels_from_the_first_row_to_the_last() {
+        let content = content_height(BIG);
+        let viewport = 620.0;
+
+        // At the top the thumb sits at the top of the track.
+        let (track, top, thumb) = reflow::scroll_thumb(content, viewport, 0.0);
+        assert_eq!(track, viewport);
+        assert_eq!(top, 0.0);
+        assert!(thumb >= 12.0, "the thumb shrank to {thumb}pt");
+
+        // Scrolled to the end, the thumb's bottom is the track's bottom: the
+        // proportion reaches the last row rather than stopping short.
+        let max = content - viewport;
+        let (_track, top, thumb) = reflow::scroll_thumb(content, viewport, max);
+        assert!(
+            (top + thumb - track).abs() < 1e-9,
+            "the thumb ends at {} in a {}pt track: it cannot reach the last row",
+            top + thumb,
+            track
+        );
+
+        // Dragging the thumb to the bottom of the strip is the last row, and a
+        // click anywhere maps proportionally.
+        assert!((offset_from_thumb(viewport, content, viewport) - max).abs() < 1e-9);
+        assert!(offset_from_thumb(0.0, content, viewport).abs() < 1e-9);
+        let half = offset_from_thumb(viewport / 2.0, content, viewport);
+        assert!(half > 0.0 && half < max, "the middle of the strip is {half}");
+
+        // The offset is clamped, so a wheel or drag past the end stops at the
+        // last row instead of scrolling into nothing.
+        assert_eq!(clamp_offset(max + 10_000.0, content, viewport), max);
+        assert_eq!(clamp_offset(-50.0, content, viewport), 0.0);
+    }
+
+    #[test]
+    fn a_press_on_the_scrollbar_is_not_a_row_click() {
+        let content = content_height(BIG);
+        let viewport = 620.0;
+        // Inside the strip, only when there is something to scroll.
+        assert!(scrollbar_hit(900.0, 895.0, content, viewport));
+        assert!(!scrollbar_hit(900.0, 400.0, content, viewport));
+        assert!(!scrollbar_hit(900.0, 895.0, 620.0, viewport), "a short list has no strip");
+        assert!(!scrollbar_hit(900.0, 895.0, content, 0.0));
+    }
+
+    #[test]
+    fn a_press_maps_through_the_offset_to_a_content_row() {
+        // The canvas is the viewport, so the press that lands on the first
+        // visible row must select that row, not row 0.
+        let rows: Rc<RefCell<Vec<Vec<CellValue>>>> = Rc::new(RefCell::new(big_rows(50)));
+        let sort: Rc<Cell<Option<(usize, bool)>>> = Rc::new(Cell::new(None));
+        let selected: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+        let press: Rc<RefCell<Vec<PressHandler>>> = Rc::new(RefCell::new(Vec::new()));
+        let offset = 2.0 * ROW_HEIGHT;
+        let row = handle_press(
+            &rows,
+            &sort,
+            &[true, true, true],
+            900.0,
+            &selected,
+            &press,
+            offset,
+            400.0,
+            HEADER_HEIGHT + 2.0,
+            1,
+        );
+        assert_eq!(row, Some(2), "the press landed on the wrong row");
+        assert_eq!(selected.get(), Some(2));
     }
 }

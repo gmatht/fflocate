@@ -477,6 +477,24 @@ These are deliberate and small; each is noted so the design stays honest.
    and a row can be dragged out as a `text/uri-list` (GTK; AppKit has no drag
    source on this layer yet). The daemon and CLI are unaffected.
 
+   Clicking a header sorts the **whole** match set, not the first page: the app
+   re-asks the same query with `limit = 0` (the daemon's "everything", as `ff -l
+   0` documents) and merges the stream into the active sort as it arrives. The
+   ceiling is 1 000 000 rows. The cost is one full index scan per load, so the
+   index read lock is held for its duration and journal applies wait behind it —
+   the same trade the CLI's `ff -l 0` makes, and the reason the load starts only
+   when a header is actually clicked.
+
+   The list itself is **virtualised**: the canvas is a screenful (never the
+   content, which for 600 000 rows would be a 12 000 000 px surface), the painter
+   emits only the band on screen, and the list draws its own scrollbar and
+   scrolls on the wheel and by thumb drag. The canvas-wheel hook exists on GTK 3,
+   zork, wasm and nwg; macOS and GTK4 have no canvas scroll signal in the
+   portable layer, so there the scrollbar and thumb drag are the way through.
+   `crates/ff-gui/tests/reflow_gtk.rs` drives a 600 000-row list end to end (top,
+   middle offset, last row, thumb at the track's bottom) and asserts the
+   per-frame draw-op count, so the claim is measured rather than asserted.
+
    On macOS the window is real, and so is what those shim classes provide.
    `ff-gui` creates its own `NSApplication` and `NSWindow`, builds the whole
    widget tree and enters the AppKit run loop, and the `GUI launches (macOS)` CI

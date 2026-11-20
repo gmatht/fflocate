@@ -18,6 +18,7 @@
 //!   the status line — the tool must never silently show an empty list for a
 //!   broken connection.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -831,6 +832,149 @@ pub fn thousands(n: u64) -> String {
         out.push(c);
     }
     out
+}
+
+/// Most rows a whole-set sort load will pull before it stops.
+///
+/// The list draws every row it is given (it paints only the band on screen),
+/// but the load itself costs memory: a million paths is roughly 60-100 MB in
+/// this process (the dedupe set holds its own copy). Past that the load stops
+/// and the status line says so rather than growing without bound.
+pub const MAX_SORTED_ROWS: usize = 1_000_000;
+
+/// A whole-result-set load, started when a header click has to sort matches
+/// that the first page never fetched.
+///
+/// The daemon treats `limit == 0` as "no limit" (that is what `ff -l 0`
+/// documents), so one request returns every hit, streamed as they are found.
+/// One request rather than paging: the daemon's per-request cap means each
+/// extra page rescans from the start, so N pages cost O(N²/page) scans and N
+/// acquisitions of the index read lock. One unlimited request is one scan, one
+/// snapshot, and the hits arrive while it runs.
+#[derive(Debug)]
+pub struct FullSet {
+    query: String,
+    options: SearchOptions,
+    /// Matches the daemon reported. Seeded from the first page's `Done`, then
+    /// corrected by this reply's own `Done`.
+    total: u64,
+    /// Distinct hits absorbed so far.
+    loaded: usize,
+    cap: usize,
+    /// Paths already counted, so a hit is never shown twice.
+    seen: HashSet<String>,
+    done: bool,
+    capped: bool,
+    failed: Option<String>,
+}
+
+impl FullSet {
+    pub fn new(
+        query: impl Into<String>,
+        options: SearchOptions,
+        total: u64,
+        cap: usize,
+    ) -> Self {
+        Self {
+            query: query.into(),
+            options,
+            total,
+            loaded: 0,
+            cap,
+            seen: HashSet::new(),
+            done: false,
+            capped: false,
+            failed: None,
+        }
+    }
+
+    /// The request that returns every hit: the same query with `limit = 0`.
+    pub fn request(&self) -> Request {
+        DaemonClient::query_request(&self.query, 0, &self.options)
+    }
+
+    /// Fold one batch of reply records in, returning the paths worth showing.
+    ///
+    /// A duplicate is dropped: a hit is a path, and the same path twice in the
+    /// list is a bug the user can see. The cap is enforced by counting only —
+    /// the reply is still drained to its terminal record so `total` stays
+    /// right and the socket is closed on schedule.
+    pub fn absorb(&mut self, records: &[Response]) -> Vec<String> {
+        let mut fresh = Vec::new();
+        for r in records {
+            match r {
+                Response::Hit { path, .. } => {
+                    if self.loaded >= self.cap {
+                        self.capped = true;
+                        continue;
+                    }
+                    if self.seen.insert(path.clone()) {
+                        self.loaded += 1;
+                        fresh.push(path.clone());
+                    }
+                }
+                Response::Done { count, .. } => {
+                    self.total = (*count).max(self.total);
+                    self.done = true;
+                }
+                Response::Error { message } => {
+                    self.failed = Some(message.clone());
+                    self.done = true;
+                }
+                // A query reply carries Meta/Progress/Hit/Done only; anything
+                // else is not this reply's business.
+                _ => {}
+            }
+        }
+        fresh
+    }
+
+    /// Record a transport failure (the reply never reached `Done`).
+    pub fn fail(&mut self, message: &str) {
+        self.failed = Some(message.to_string());
+        self.done = true;
+    }
+
+    pub fn loaded(&self) -> usize {
+        self.loaded
+    }
+
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    pub fn done(&self) -> bool {
+        self.done
+    }
+
+    pub fn capped(&self) -> bool {
+        self.capped
+    }
+
+    pub fn failed(&self) -> bool {
+        self.failed.is_some()
+    }
+
+    /// The progress line, in the shapes the status bar uses.
+    pub fn status_line(&self) -> String {
+        if let Some(e) = &self.failed {
+            return format!("sort load failed: {e}");
+        }
+        if self.done {
+            // The cap is only the headline once the reply has ended: while it
+            // streams, the progress count is the more useful number.
+            if self.capped {
+                return format!("stopped at {} rows", thousands(self.cap as u64));
+            }
+            return format!("sorted {} matches", thousands(self.total));
+        }
+        format!(
+            "loading all matches: {} of {}",
+            thousands(self.loaded as u64),
+            thousands(self.total)
+        )
+    }
+
 }
 
 /// The `[daemon catching up…]` suffix for a status line, in seconds.
@@ -4249,5 +4393,104 @@ mod nonblocking_tests {
             Progress::Finished,
             "the whole line must still be sent"
         );
+    }
+}
+
+#[cfg(test)]
+mod full_set_tests {
+    //! The whole-set load a header click starts: the query it sends, the hits it
+    //! folds in, and the lines the status bar shows.
+
+    use super::*;
+
+    fn hit(id: u32, path: &str) -> Response {
+        Response::Hit {
+            path: path.to_string(),
+            id,
+        }
+    }
+
+    fn done(count: u64) -> Response {
+        Response::Done {
+            count,
+            cursor: "c:1:1".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_request_is_the_same_query_without_a_limit() {
+        // `limit == 0` is the daemon's "everything", the same as `ff -l 0`:
+        // that is what makes one request cover the whole set.
+        let opts = SearchOptions {
+            case_sensitive: true,
+            ..Default::default()
+        };
+        let set = FullSet::new("main", opts, 629_665, MAX_SORTED_ROWS);
+        match set.request() {
+            Request::Query {
+                q,
+                limit,
+                count,
+                case_sensitive,
+                progress,
+                fuzzy,
+                ..
+            } => {
+                assert_eq!(q, "main");
+                assert_eq!(limit, 0, "limit 0 asks for every match");
+                assert!(!count, "a sort load wants the paths, not just a count");
+                assert_eq!(case_sensitive, Some(true), "the search's options carry over");
+                assert!(!fuzzy, "the plain box is not a fuzzy search");
+                assert!(progress, "the load still reports scan progress");
+            }
+            _ => panic!("a whole-set load must send a query"),
+        }
+    }
+
+    #[test]
+    fn the_status_line_reports_progress_then_the_finished_count() {
+        let mut set = FullSet::new("rs", SearchOptions::default(), 629_665, MAX_SORTED_ROWS);
+        assert_eq!(set.status_line(), "loading all matches: 0 of 629 665");
+        let fresh = set.absorb(&[hit(1, "/a.rs"), hit(2, "/b.rs")]);
+        assert_eq!(fresh, ["/a.rs", "/b.rs"], "the caller gets what to show");
+        set.absorb(&[hit(3, "/c.rs")]);
+        assert_eq!(set.status_line(), "loading all matches: 3 of 629 665");
+        // `Done` carries the authoritative count.
+        set.absorb(&[done(629_665)]);
+        assert!(set.done());
+        assert_eq!(set.status_line(), "sorted 629 665 matches");
+    }
+
+    #[test]
+    fn a_repeated_path_is_absorbed_once() {
+        // A path twice in the list would be a bug the user can see.
+        let mut set = FullSet::new("rs", SearchOptions::default(), 2, MAX_SORTED_ROWS);
+        let fresh = set.absorb(&[hit(1, "/a"), hit(1, "/a"), hit(2, "/b"), hit(2, "/b")]);
+        assert_eq!(fresh, ["/a", "/b"]);
+        assert_eq!(set.loaded(), 2);
+    }
+
+    #[test]
+    fn the_ceiling_stops_counting_but_still_reaches_done() {
+        // Past the cap the paths are dropped, but the reply is read to its
+        // terminal record so the total stays honest and the socket closes.
+        let mut set = FullSet::new("rs", SearchOptions::default(), 5, 2);
+        let fresh = set.absorb(&[hit(1, "/a"), hit(2, "/b"), hit(3, "/c")]);
+        assert_eq!(fresh, ["/a", "/b"]);
+        assert_eq!(set.loaded(), 2);
+        assert!(set.capped());
+        assert_eq!(set.status_line(), "loading all matches: 2 of 5");
+        set.absorb(&[done(5)]);
+        assert!(set.done());
+        assert_eq!(set.status_line(), "stopped at 2 rows");
+    }
+
+    #[test]
+    fn a_failure_is_reported_rather_than_looking_empty() {
+        let mut set = FullSet::new("rs", SearchOptions::default(), 9, MAX_SORTED_ROWS);
+        set.fail("connection reset");
+        assert!(set.failed());
+        assert!(set.done(), "a failed load is over");
+        assert_eq!(set.status_line(), "sort load failed: connection reset");
     }
 }

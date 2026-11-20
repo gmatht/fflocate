@@ -284,6 +284,28 @@ macro_rules! common_types_mod {
             pub fn screen_origin(&self) -> Option<(i32, i32)> { self.inner.screen_origin() }
             pub fn on_motion(&self, cb: Box<dyn FnMut(f64, f64, u32)>) { self.inner.on_motion(cb); }
             pub fn on_release(&self, cb: Box<dyn FnMut(f64, f64, u32, u32)>) { self.inner.on_release(cb); }
+            /// Wheel notches over the canvas, as `(dx, dy)` in scroll units
+            /// (positive `dy` scrolls down).
+            ///
+            /// Delivered from the backend's gesture stream. Only the backends
+            /// that have a canvas scroll signal provide it — GTK 3, zork, wasm
+            /// and nwg; macOS and GTK4 have none in the portable layer, so the
+            /// method does not exist there and a caller that needs it must
+            /// `cfg` on the same condition (as with `on_double_click`).
+            #[cfg(any(
+                all(feature = "gtk", target_os = "linux", not(feature = "zork")),
+                feature = "zork",
+                target_arch = "wasm32",
+                windows
+            ))]
+            pub fn on_scroll(&self, cb: Box<dyn FnMut(f64, f64)>) {
+                let mut cb = cb;
+                self.inner.on_gesture(Box::new(move |g| {
+                    if let crate::core::Gesture::Scroll { delta, .. } = g {
+                        cb(delta.dx, delta.dy);
+                    }
+                }));
+            }
             pub fn set_visible(&self, v: bool) { self.inner.set_visible(v); }
             pub fn set_content_size(&self, w: i32, h: i32) { self.inner.set_content_size(w, h); }
             /// The size this canvas is drawn at, in the backend's drawing

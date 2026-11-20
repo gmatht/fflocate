@@ -113,12 +113,13 @@ What that means in practice, stated rather than implied:
   accepted, so it follows the row that is selected then. AppKit has no drag
   source on this layer yet and says so in the status line rather than starting a
   drag that carries nothing.
-* The **Advanced search foldout** starts collapsed and is opened from the
-  **Search** menu; hiding the body is what collapses it, and its header says
-  `(collapsed)` / `(expanded)`. The header itself is a label, not a button:
-  AppKit registers click handlers in a process-global table that requires
-  `Send`, and a widget handle cannot cross a thread, so click-to-toggle is not
-  available on both backends. Every control inside it (case, fuzzy, max
+* The **Advanced search foldout** starts collapsed. On GTK it is the toolkit's
+  own `GtkExpander`: its header and arrow are clickable, and the arrow shows the
+  state. `View → Advanced Search` toggles it on both desktops; on AppKit, which
+  has no foldout on this layer, the header is a label that says `(collapsed)` /
+  `(expanded)` and that menu item is the only way to toggle it (AppKit registers
+  click handlers in a process-global table that requires `Send`, and a widget
+  handle cannot cross a thread). Every control inside it (case, fuzzy, max
   distance, count) works.
 * **Wheel stepping** of the max-distance field works where the backend delivers
   wheel events to an entry — GTK does; AppKit and the `zork` REPL report that
@@ -271,6 +272,47 @@ depend on a checkout outside this repository.
   show the scrolled window's **scrollbar** and scroll with the wheel, while the
   width stays the list's allocation so the columns re-flow with the window. The
   `zork` fallback renders the same three columns as aligned text.
+
+  Clicking a header sorts **every match, not the page on screen**. A search
+  asks for 201 hits, so the app then re-asks the same query with `limit = 0` —
+  the "no limit" that `ff -l 0` documents — and merges the stream into the
+  active sort as it arrives (`TreeView::append_rows`). The status line says what
+  happened: `loading all matches: 240 000 of 629 665`, then
+  `sorted 629 665 matches`. One unlimited request rather than paging: the
+  daemon's per-request cap rescans from the start, so N pages would cost
+  O(N²/page) scans and N acquisitions of the index read lock. A second click on
+  the same header reverses the order locally — the set is already loaded, so
+  nothing is fetched again; a click on a *different* header does re-fetch, since
+  the rows kept are the whole set, in the previous order.
+  `ff_gui::MAX_SORTED_ROWS` (1 000 000) is the ceiling; past it the line reads
+  `stopped at 1 000 000 rows`. A new query, an emptied box or quitting aborts
+  the load, keeping whatever rows already arrived.
+
+  **The list is virtualised, so any number of rows scrolls.** The painter
+  (`compat::paint_list`) emits only the band inside `[offset, offset+viewport)`,
+  in content coordinates, and the canvas is sized to a *screenful*
+  (`CANVAS_REQUEST_H`), never to the content — 600 000 rows would be
+  12 000 000 px of `GdkWindow`/Cairo surface, far past the ~32 767 px limit.
+  Because the canvas no longer carries the content height, the list draws its
+  own scrollbar (`reflow::scroll_thumb`: the thumb is the viewport's share of
+  the content and reaches the bottom exactly when the offset does) and moves
+  itself on the wheel, on a click in the strip and on a thumb drag. Press
+  hit-testing adds the offset back, so the row under the pointer is the row
+  selected. A backend whose scrolled window still produces a value (macOS's
+  `NSScrollView`) also drives the offset through `ScrolledWindow::on_scroll`.
+  The wheel needs a canvas scroll signal, which the portable layer has on GTK 3,
+  zork, wasm and nwg (`Canvas::on_scroll`, `cfg`'d exactly like
+  `on_double_click`); **macOS and GTK4 have none**, so there the list scrolls by
+  its scrollbar and thumb drag only — the one place the wheel is missing.
+
+  **The cost is real and is the daemon's.** One such load is one full index
+  scan: the index read lock is held for its duration (~1.7 s for 3.6 M entries
+  on the reference machine; a regex or fuzzy query is much slower), so journal
+  applies wait behind it, and the GUI holds the paths it absorbed (roughly
+  150-250 MB at the 1 M-row ceiling — the merged rows, the dedupe set and their
+  strings). Painting stays cheap
+  whatever the row count: a 600 000-row list emits ~90 draw operations per frame,
+  the same as a 30-row one (`reflow_gtk` measures it).
 * Press **Return** in either query field to search — the same code path as the
   Search button, so the two cannot diverge. (In the `zork` fallback, `enter`
   presses Return on the focused field.)

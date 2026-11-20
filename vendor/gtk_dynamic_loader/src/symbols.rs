@@ -352,6 +352,12 @@ pub type GtkWidgetActivate = unsafe extern "C" fn(widget: *mut c_void);
 // GtkWidget get_visible — checks the widget's visible flag
 pub type GtkWidgetGetVisible = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 
+// GtkExpander — GTK3's own disclosure widget. GTK4 removed it, so every one
+// of these is optional and a caller has to have a fallback.
+pub type GtkExpanderNew = unsafe extern "C" fn(label: *const u8) -> *mut c_void;
+pub type GtkExpanderSetExpanded = unsafe extern "C" fn(expander: *mut c_void, expanded: i32);
+pub type GtkExpanderGetExpanded = unsafe extern "C" fn(expander: *mut c_void) -> i32;
+
 // GtkWidget activate_action — activates a named action on a widget
 pub type GtkWidgetActivateAction = unsafe extern "C" fn(widget: *mut c_void, detailed_name: *const u8, parameter: *mut c_void);
 
@@ -513,6 +519,11 @@ pub struct Symbols {
     pub gtk_widget_add_events: Option<GtkWidgetAddEvents>,
     pub gtk_widget_activate: Option<GtkWidgetActivate>,
     pub gtk_widget_get_visible: Option<GtkWidgetGetVisible>,
+    /// `GtkWidget* gtk_expander_new(const gchar*)` and its state accessors:
+    /// the toolkit's own foldout, with its arrow and its clickable header.
+    pub gtk_expander_new: Option<GtkExpanderNew>,
+    pub gtk_expander_set_expanded: Option<GtkExpanderSetExpanded>,
+    pub gtk_expander_get_expanded: Option<GtkExpanderGetExpanded>,
     pub gtk_widget_activate_action: Option<GtkWidgetActivateAction>,
     pub gtk_file_chooser_native_new: Option<GtkFileChooserNativeNew>,
     pub gtk_native_dialog_run: Option<GtkNativeDialogRun>,
@@ -909,6 +920,11 @@ impl Symbols {
         let gtk_widget_add_events = unsafe { sym::<GtkWidgetAddEvents>(gtk, "gtk_widget_add_events") };
         let gtk_widget_activate = unsafe { sym::<GtkWidgetActivate>(gtk, "gtk_widget_activate") };
         let gtk_widget_get_visible = unsafe { sym::<GtkWidgetGetVisible>(gtk, "gtk_widget_get_visible") };
+        let gtk_expander_new = unsafe { sym::<GtkExpanderNew>(gtk, "gtk_expander_new") };
+        let gtk_expander_set_expanded =
+            unsafe { sym::<GtkExpanderSetExpanded>(gtk, "gtk_expander_set_expanded") };
+        let gtk_expander_get_expanded =
+            unsafe { sym::<GtkExpanderGetExpanded>(gtk, "gtk_expander_get_expanded") };
         let gtk_widget_activate_action = unsafe { sym::<GtkWidgetActivateAction>(gtk, "gtk_widget_activate_action") };
         let gtk_init = unsafe { sym::<GtkInit>(gtk, "gtk_init") };
         let g_signal_emit_by_name = unsafe { sym::<GSignalEmitByName>(gobject, "g_signal_emit_by_name") };
@@ -1171,6 +1187,7 @@ impl Symbols {
             gtk_widget_set_margin_start, gtk_widget_set_margin_top, gtk_widget_add_events,
             gtk_fixed_new, gtk_fixed_put, gtk_fixed_move,
             gtk_widget_activate, gtk_widget_get_visible, gtk_widget_activate_action,
+            gtk_expander_new, gtk_expander_set_expanded, gtk_expander_get_expanded,
             gtk_init,
             g_signal_emit_by_name,
             gtk_label_get_text,

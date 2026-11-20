@@ -7,7 +7,7 @@
 //! second copy of the layout arithmetic. A probe or a test can therefore paint
 //! the list offscreen and assert where the rows went, on any backend.
 
-use super::{paint_list, TreeView, HEADER_HEIGHT, ROW_HEIGHT};
+use super::{paint_list, TreeView, HEADER_HEIGHT, ROW_HEIGHT, SCROLLBAR_WIDTH};
 use crate::backends::headless::{DrawOp, RecordingDrawContext};
 
 /// The shortest a scroller's thumb is allowed to get, in points.
@@ -53,9 +53,10 @@ impl ListGeometry {
 /// One offscreen paint of the list: the geometry, and the number of draw
 /// operations the painter put inside each row's band.
 ///
-/// The painter draws every row in content coordinates, so `ink[i]` is the ink
-/// of row `i` whether or not it is on screen; [`ListGeometry::visible_range`]
-/// says which of those the viewport actually shows.
+/// The probe drives the painter with the same `(offset, viewport_height)` the
+/// canvas does, so `ink[i]` is the ink of row `i` — and zero for the rows that
+/// are off screen, because the painter emits only the visible band.
+/// [`ListGeometry::visible_range`] says which rows those are.
 #[derive(Clone, Debug)]
 pub struct ListRender {
     pub geometry: ListGeometry,
@@ -72,7 +73,7 @@ pub struct ListRender {
 /// The thumb is the viewport's share of the content, never shorter than
 /// [`MIN_THUMB`], and it travels the rest of the track as the offset runs from
 /// the top of the content to its end — the way a real scrollbar behaves.
-fn scroll_thumb(content_height: f64, viewport_height: f64, offset: f64) -> (f64, f64, f64) {
+pub(super) fn scroll_thumb(content_height: f64, viewport_height: f64, offset: f64) -> (f64, f64, f64) {
     let track = viewport_height.max(0.0);
     if track <= 0.0 || content_height <= track {
         return (track, 0.0, track);
@@ -134,7 +135,12 @@ impl TreeView {
             &rows,
             self.selected.get(),
             self.sort.get(),
+            offset,
+            viewport_height,
         );
+
+        let content_height = HEADER_HEIGHT + rows.len() as f64 * ROW_HEIGHT;
+        let shows_scrollbar = content_height > viewport_height && width > SCROLLBAR_WIDTH;
 
         let mut header_ink = 0usize;
         let mut header_xs: Vec<f64> = Vec::new();
@@ -152,7 +158,18 @@ impl TreeView {
                 }
                 _ => continue,
             };
-            match band_of(top, rows.len()) {
+            // The painter draws in viewport coordinates; the bands are in
+            // content ones.
+            // The list's own scrollbar sits over the rows; its two rectangles
+            // are not row ink.
+            if shows_scrollbar {
+                if let Some(x) = x {
+                    if x >= width - SCROLLBAR_WIDTH {
+                        continue;
+                    }
+                }
+            }
+            match band_of(top + offset, rows.len()) {
                 Band::Header => {
                     header_ink += 1;
                     if let (Some(x), Some(text)) = (x, text) {
@@ -166,7 +183,6 @@ impl TreeView {
             }
         }
 
-        let content_height = HEADER_HEIGHT + rows.len() as f64 * ROW_HEIGHT;
         let first_row = if offset <= HEADER_HEIGHT {
             0
         } else {

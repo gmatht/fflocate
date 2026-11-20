@@ -212,10 +212,19 @@ fn resizing_reflows_and_scrolling_moves_the_visible_rows() {
             scrolled.ink[i] > 0,
             "row {i} is visible after scrolling but has no ink"
         );
-        assert_eq!(
-            scrolled.ink[i], top.ink[i],
-            "row {i}'s ink changed with the scroll offset: the row was repainted differently"
-        );
+        if top.geometry.visible_range().contains(&i) {
+            assert_eq!(
+                scrolled.ink[i], top.ink[i],
+                "row {i}'s ink changed with the scroll offset: the row was repainted differently"
+            );
+        } else {
+            // Only the visible band is painted, so a row scrolled into view is
+            // absent from the top render — that is the whole point of the band.
+            assert_eq!(
+                top.ink[i], 0,
+                "row {i} is off screen at the top but the painter drew it"
+            );
+        }
     }
 
     // The scrolled window is the widget whose adjustment a knob drag moves;
@@ -240,5 +249,146 @@ fn resizing_reflows_and_scrolling_moves_the_visible_rows() {
         empty.header_ink,
         scrolled.geometry.visible_range().start,
         scrolled.geometry.visible_range().end
+    );
+
+    six_figure_list_scrolls_from_the_first_row_to_the_last();
+}
+
+/// 600 000 rows, on a real GTK canvas: the list paints only the band on screen,
+/// its scrollbar and offset reach the last row, and the canvas is never sized to
+/// the content (the whole reason the canvas is the viewport).
+///
+/// The painter, the offsets and the thumb all come from `compat`, so this is
+/// the same code the window runs — measured offscreen, at a row count no
+/// content-sized canvas could survive.
+///
+/// Called from the test above rather than being a `#[test]` of its own: two
+/// tests run in parallel threads, and GTK is not thread-safe.
+fn six_figure_list_scrolls_from_the_first_row_to_the_last() {
+    let list = match TreeView::new(&[("", true, false), ("Name", false, true), ("Path", false, true)])
+    {
+        Ok(list) => list,
+        Err(e) => {
+            eprintln!("scroll: no results list ({e}), skipping");
+            return;
+        }
+    };
+    const BIG: usize = 600_000;
+    let big = (0..BIG)
+        .map(|i| {
+            vec![
+                CellValue::Text(String::new()),
+                CellValue::Text(format!("file-{i:06}.rs")),
+                CellValue::Text(format!("/tmp/fx/file-{i:06}.rs")),
+            ]
+        })
+        .collect::<Vec<_>>();
+    list.set_rows(&big);
+
+    // The canvas is a screenful, not the content: 600 000 rows would be
+    // 12 000 000pt and no GdkWindow/Cairo surface goes there.
+    assert!(
+        list.viewport_height() < 2000.0,
+        "the canvas was sized to the content: viewport is {}pt",
+        list.viewport_height()
+    );
+    assert!(list.shows_scrollbar(), "a 600k-row list has no scrollbar");
+
+    let wide = 1000.0;
+    let viewport = 620.0;
+    // The rows on screen at the top: the whole point of the band.
+    let top = list.render_offscreen(wide, viewport, 0.0);
+    assert_eq!(top.geometry.first_row, 0, "the list does not start at row 0");
+    assert!(
+        top.geometry.visible_rows <= 32,
+        "a 620pt viewport reported {} visible rows",
+        top.geometry.visible_rows
+    );
+    let band_ink: usize = top.ink.iter().sum();
+    assert!(
+        band_ink < 400,
+        "the top of a 600k-row list emitted {band_ink} draw operations: the painter walked every row"
+    );
+    assert!(top.ink[0] > 0, "the first row has no ink");
+
+    // The middle: a window deep in the set, at the same per-frame cost.
+    let content = top.geometry.content_height;
+    assert!(
+        (content - (top.geometry.header_height + BIG as f64 * top.geometry.row_height)).abs()
+            < 1e-6,
+        "the content height is not the header plus {BIG} rows"
+    );
+    let middle_offset = content / 2.0;
+    let middle = list.render_offscreen(wide, viewport, middle_offset);
+    assert!(
+        middle.geometry.first_row > BIG / 2 - 2,
+        "the middle of the list starts at row {}",
+        middle.geometry.first_row
+    );
+    let middle_ink: usize = middle.ink.iter().sum();
+    assert!(
+        middle_ink < 400,
+        "the middle of the list emitted {middle_ink} draw operations: the painter walked every row"
+    );
+    assert_eq!(middle.ink[0], 0, "row 0 was painted while scrolled to the middle");
+
+    // The end: the last row is on screen, and the thumb has reached the bottom
+    // of its track — the proportion covers the whole set.
+    let end_offset = content - viewport;
+    let end = list.render_offscreen(wide, viewport, end_offset);
+    assert_eq!(
+        end.geometry.visible_range().end,
+        BIG,
+        "the last row is not in the band at the end of the list"
+    );
+    assert!(end.ink[BIG - 1] > 0, "the last row was not painted");
+    assert!(
+        (end.geometry.thumb_top + end.geometry.thumb_height - end.geometry.track_height).abs()
+            < 1e-9,
+        "the thumb ends at {} in a {}pt track",
+        end.geometry.thumb_top + end.geometry.thumb_height,
+        end.geometry.track_height
+    );
+
+    // Scrolling the list: a wheel step, a jump to the end, a drag of the thumb.
+    // The widget's own viewport is what the list scrolls against (the 620pt
+    // above is the probe's), so the end offset is measured with it.
+    let vp = list.viewport_height();
+    let widget_end = content - vp;
+    list.set_offset(widget_end);
+    assert!(
+        (list.offset() - widget_end).abs() < 1.0,
+        "set_offset({widget_end}) landed at {}",
+        list.offset()
+    );
+    assert_eq!(
+        list.row_at(10.0, vp - 2.0),
+        Some(BIG - 1),
+        "the bottom row of the viewport is not the last row"
+    );
+    assert!(
+        (list.offset_at_thumb_y(vp) - widget_end).abs() < 1.0,
+        "dragging the thumb to the bottom is offset {}, not {widget_end}",
+        list.offset_at_thumb_y(vp)
+    );
+    // A drag to the top is the first row; a wheel past either end is clamped.
+    list.set_offset(list.offset_at_thumb_y(0.0));
+    assert_eq!(list.offset(), 0.0, "dragging the thumb to the top is not row 0");
+    assert_eq!(list.row_at(10.0, 22.0), Some(0));
+    list.scroll_by_rows(-10_000_000.0);
+    assert_eq!(list.offset(), 0.0, "scrolling up past the top did not stop");
+    list.scroll_by_rows(10_000_000.0);
+    assert!(
+        (list.offset() - widget_end).abs() < 1.0,
+        "scrolling down past the end stopped at {}, not {widget_end}",
+        list.offset()
+    );
+
+    println!(
+        "scroll: {BIG} rows; content {content:.0}pt, viewport {viewport}pt; top paints {} row(s) in {band_ink} ops; middle starts at row {}; end shows {}..{} with the thumb at the track's bottom",
+        top.geometry.visible_rows,
+        middle.geometry.first_row,
+        end.geometry.visible_range().start,
+        end.geometry.visible_range().end
     );
 }

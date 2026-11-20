@@ -44,7 +44,7 @@ use ff_gui::{
     render_count, rows_from_paths, scan_percent, search_label, searching_status_line,
     step_max_distance, streaming_status_line, DaemonClient, GuiError,
     MenuAction, PendingRequest, Progress, RowAction, SearchGate, SearchOptions, SearchOutcome,
-    StartupPoll, StartupProbe,
+    StartupPoll, StartupProbe, FullSet, MAX_SORTED_ROWS,
     WheelStep, WireResponse, ADVANCED_SYNTAX_HELP, DEFAULT_MAX_DISTANCE,
 };
 
@@ -79,7 +79,15 @@ const BACKEND: &str = if cfg!(feature = "zork") {
 const DEFAULT_WINDOW_W: i32 = 1000;
 const DEFAULT_WINDOW_H: i32 = 700;
 
-/// How many rows to render at most (the daemon may match millions).
+/// Column index of the full path in the results list: icon, name, path.
+///
+/// Module scope because `step_sort_load` reads the displayed order back, which
+/// needs the same column the render path uses.
+const PATH_COLUMN: usize = 2;
+
+/// How many rows to render at most from a first page (the daemon may match
+/// millions; sorting the whole set loads the rest, and the list draws only
+/// the rows on screen, so every one of them scrolls).
 const MAX_ROWS: usize = 200;
 /// How many hits to ask the daemon for (rows plus a little slack for the
 /// "of N matches" line).
@@ -183,8 +191,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ("Name", false, true),
         ("Path", false, true),
     ])?;
-    // Column index of the full path, which Copy / Open act on.
-    const PATH_COLUMN: usize = 2;
+    // `PATH_COLUMN` (module scope) is the column Copy / Open act on.
 
     // The list scrolls, and the scrolled container must expand with the window —
     // otherwise the results stay at their minimum height while the window grows.
@@ -314,6 +321,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let current: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     let live_menu: Rc<RefCell<Option<ContextMenu>>> = Rc::new(RefCell::new(None));
 
+    // ------------------------------------------------------------------
+    // Sorting the **whole** result set.
+    //
+    // A search asks for `FETCH_LIMIT` (201) hits, so a header click can only
+    // sort those. Sorting every match means asking the daemon for everything
+    // (`limit == 0`, as `ff -l 0` documents) and merging the stream into the
+    // list: one scan, one snapshot, hits arriving while it runs.
+    // ------------------------------------------------------------------
+    // The load in flight, if any.
+    let sort_load: Rc<RefCell<Option<SortLoad>>> = Rc::new(RefCell::new(None));
+    // The (query, options) of the last search, which a load has to re-ask.
+    let last_search: Rc<RefCell<Option<(String, SearchOptions)>>> = Rc::new(RefCell::new(None));
+    // Matches the last reply reported: a load is only worth starting when there
+    // are more of them than the list holds.
+    let last_total: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+    // "Fetch the whole set for the active sort." Set by a header click and by a
+    // finished search that is sorted; consumed by the pump, so a burst of
+    // clicks starts at most one load.
+    let want_full: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    // Which column the set now in the list was loaded for. Reversing that sort
+    // re-sorts locally instead of asking the daemon for the same 600 k paths
+    // again; a *different* column does need the set re-fetched, because the
+    // rows kept are only the top 1 000 of the previous order.
+    let loaded_column: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+
     // The daemon check is deferred past first paint: it rides the timer pump
     // (see `StartupProbe`), so the window appears immediately even when the
     // daemon is missing and a fresh spawn takes seconds to bind. Until the
@@ -348,6 +380,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let opt_fuzzy = opt_fuzzy.clone();
         let opt_count = opt_count.clone();
         let opt_distance = opt_distance.clone();
+        let last_search = last_search.clone();
         Rc::new(move || {
             let quick = query.get_text().unwrap_or_default();
             let adv = advanced_query.get_text().unwrap_or_default();
@@ -361,6 +394,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             })?;
             let opts = gather_options(&opt_case, &opt_fuzzy, &opt_count, &opt_distance);
             let req = DaemonClient::query_request(&q, FETCH_LIMIT, &opts);
+            // Remember exactly what was asked, so a whole-set load asks the
+            // same question with no limit rather than re-reading the boxes (the
+            // user may have typed on by the time it starts).
+            *last_search.borrow_mut() = Some((q.clone(), opts));
             encode_request(&req)
         })
     };
@@ -370,9 +407,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let results = results.clone();
         let current = current.clone();
         let opt_count = opt_count.clone();
+        let last_total = last_total.clone();
+        let want_full = want_full.clone();
         Rc::new(move |outcome| match outcome {
             Ok(outcome) => {
                 let count_only = opt_count.is_active();
+                last_total.set(outcome.total);
                 let line = outcome.status_line_opts(outcome.paths.len().min(MAX_ROWS), count_only);
                 status.set_text(&line);
                 if count_only {
@@ -391,6 +431,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     // sorts its own rows once a header has been clicked, so
                     // the order on screen is not the daemon's order.
                     *current.borrow_mut() = results.displayed_column(PATH_COLUMN);
+                    // Sorted, but only the page on screen is in the list: ask
+                    // for the rest so the sort really does cover every match.
+                    if results.sort_state().is_some() && outcome.total > shown.len() as u64 {
+                        want_full.set(true);
+                    }
                 }
             }
             Err(e) => {
@@ -477,6 +522,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let startup_status = status.clone();
             let quick_box = query.clone();
             let adv_box = advanced_query.clone();
+            let sort_load = sort_load.clone();
+            let last_search = last_search.clone();
+            let last_total = last_total.clone();
+            let want_full = want_full.clone();
+            let loaded_column = loaded_column.clone();
             // Partial renders paint rows directly (the `render` closure owns
             // its clones), so the pump holds its own.
             let partial_results = results.clone();
@@ -718,6 +768,85 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
+                    // 1c. The whole-set sort load. Clicking a header sorts the
+                    //     rows the list holds — the first page. This issues the
+                    //     same query with `limit = 0` (everything, as `ff -l 0`
+                    //     documents) and merges the stream into the list as it
+                    //     arrives, so the sort covers every match instead of
+                    //     the first 201. Bounded work per tick: a fast daemon
+                    //     can deliver hundreds of thousands of hits between
+                    //     ticks, and building that many rows at once would
+                    //     stall the window just as surely as a blocking read.
+                    {
+                        let mut load_ref = sort_load.borrow_mut();
+                        if let Some(load) = load_ref.as_mut() {
+                            let (over, line) =
+                                step_sort_load(load, &partial_results, &partial_current);
+                            if !line.is_empty() {
+                                startup_status.set_text(&line);
+                            }
+                            if over {
+                                // Done, or stopped at the ceiling: either way
+                                // there is nothing further to fetch for this
+                                // query and column, so a reverse click on the
+                                // same header re-sorts locally.
+                                if !load.set.failed() {
+                                    loaded_column.set(Some(load.column));
+                                }
+                                *load_ref = None;
+                            }
+                        } else if want_full.get() {
+                            want_full.set(false);
+                            // Nothing to do when no header is sorted, when the
+                            // set is already complete, or when the list
+                            // already holds every match.
+                            let sorted_column = partial_results.sort_state().map(|(c, _)| c);
+                            let worth_it = sorted_column.is_some()
+                                && loaded_column.get() != sorted_column
+                                && last_total.get() > partial_current.borrow().len() as u64;
+                            if worth_it {
+                                if let Some((q, opts)) = last_search.borrow().clone() {
+                                    let set = FullSet::new(
+                                        q,
+                                        opts,
+                                        last_total.get(),
+                                        MAX_SORTED_ROWS,
+                                    );
+                                    let started = encode_request(&set.request()).and_then(|line| {
+                                        let stream = connect_stream()?;
+                                        PendingRequest::start(stream, &line)
+                                    });
+                                    match started {
+                                        Ok(pending) => {
+                                            // The reply starts at hit 0 and
+                                            // carries no offset, so the rows
+                                            // on screen cannot be kept without
+                                            // showing hits twice: clear them
+                                            // and let the first hits
+                                            // repopulate (one tick later).
+                                            partial_results.set_rows(&[]);
+                                            partial_current.borrow_mut().clear();
+                                            startup_status.set_text(&set.status_line());
+                                            *load_ref = Some(SortLoad {
+                                                column: sorted_column.unwrap_or(PATH_COLUMN),
+                                                set,
+                                                pending,
+                                                consumed: 0,
+                                                staged: Vec::new(),
+                                                painted: std::time::Instant::now(),
+                                            });
+                                        }
+                                        Err(e) => {
+                                            startup_status.set_text(&format!(
+                                                "sort load failed: {e}"
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // 2. Start a new request if the debounce has elapsed (or the Search
                     //    button asked for one now). A newer keystroke *supersedes*
                     //    the in-flight scan: drop its socket and retire its
@@ -765,6 +894,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         // still be behind — say so rather than rendering a
                         // clean-looking "0 matches" from a stale view.
                         let remembered = *last_lag.borrow();
+                        // An emptied box abandons a whole-set load: its hits
+                        // belong to a query that no longer exists.
+                        *sort_load.borrow_mut() = None;
+                        loaded_column.set(None);
+                        want_full.set(false);
                         render(Ok(SearchOutcome {
                             catching_up: remembered.is_some(),
                             lag_ms: remembered,
@@ -788,6 +922,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         PendingRequest::start(stream, &line)
                     }) {
                         Ok(p) => {
+                            // A new query makes any whole-set load stale: its
+                            // hits are the previous query's. Keep the rows it
+                            // already loaded; drop the socket.
+                            *sort_load.borrow_mut() = None;
+                            loaded_column.set(None);
+                            want_full.set(false);
                             *pending.borrow_mut() = Some((
                                 ticket.seq,
                                 p,
@@ -869,6 +1009,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let live_menu = live_menu.clone();
         let cb_results = results.clone();
         let status_for_err = status.clone();
+        let want_full = want_full.clone();
         if let Err(e) = results.connect_button_press_event(move |button, x, y, event| {
             // A header click has just re-sorted the rows inside the list, so
             // the row order `current` was built from is stale. Re-read it
@@ -877,6 +1018,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // so only the secondary button needs handling below — a primary
             // click selects its row inside the compat list itself.)
             *current.borrow_mut() = cb_results.displayed_column(PATH_COLUMN);
+            // A header click re-sorted the rows the list holds, which is only
+            // the first page. Ask for the whole match set so the sort covers
+            // every hit; the pump starts it, and knows when the set is already
+            // loaded so that a reverse click just re-sorts locally.
+            if button == 1 && y < cb_results.header_height() {
+                want_full.set(true);
+            }
             if button != 3 {
                 return;
             }
@@ -1578,6 +1726,85 @@ fn icon_glyph(icon: &str) -> &'static str {
         "package-x-generic" => "z",
         _ => "-",
     }
+}
+
+/// A whole-set sort load in flight.
+struct SortLoad {
+    /// The column this set was loaded for, so a later click on the same header
+    /// (a reverse) can re-sort locally rather than fetch the set again.
+    column: usize,
+    /// The query state machine: what to ask, and how far it has got.
+    set: FullSet,
+    /// The reply being stepped from the 30 ms pump.
+    pending: PendingRequest,
+    /// Hits absorbed but not yet merged into the list.
+    staged: Vec<String>,
+    /// Reply records already folded in: `records()` keeps the whole reply, so
+    /// re-reading all of it every tick would be quadratic.
+    consumed: usize,
+    /// When the list was last repainted, which throttles the merging to ~4/s.
+    painted: std::time::Instant,
+}
+
+/// Step a whole-set sort load by one tick.
+///
+/// Returns `(over, status line)`. `over` means the reply has ended *and* every
+/// staged hit has been merged, so the caller may drop the load. Merging is
+/// bounded per call: hits are handed to `append_rows`, which sorts the batch and
+/// merges it into the rows already on screen (keeping the active sort). The
+/// list draws only the rows on screen, so holding six figures of rows costs
+/// nothing per frame.
+fn step_sort_load(
+    load: &mut SortLoad,
+    results: &rswidgets::compat::TreeView,
+    current: &Rc<RefCell<Vec<String>>>,
+) -> (bool, String) {
+    /// Hits merged per tick: big enough that a 600 k-hit reply finishes in a
+    /// handful of ticks, small enough that one tick stays a few milliseconds.
+    const MERGE_BATCH: usize = 50_000;
+    /// How often the list and the status line are refreshed while loading.
+    const REPAINT: std::time::Duration = std::time::Duration::from_millis(250);
+
+    let reply_over = match load.pending.advance() {
+        Ok(Progress::Finished) => true,
+        Ok(_) => false,
+        Err(e) => {
+            // The reply never reached Done. Say why in the status line and keep
+            // whatever rows already made it onto the list.
+            load.set.fail(&format!("{e}"));
+            true
+        }
+    };
+
+    // Fold in only the records that arrived since the last tick.
+    let consumed = load.consumed;
+    let arrived = load.pending.records().len();
+    if arrived > consumed {
+        let fresh = load.set.absorb(&load.pending.records()[consumed..]);
+        load.staged.extend(fresh);
+        load.consumed = arrived;
+    }
+
+    let due = reply_over || load.painted.elapsed() >= REPAINT || load.staged.len() >= MERGE_BATCH;
+    if due && !load.staged.is_empty() {
+        let take = MERGE_BATCH.min(load.staged.len());
+        let batch: Vec<String> = load.staged.drain(..take).collect();
+        results.append_rows(&rows_to_cells(&batch));
+        // The list sorted the batch into place, so read the order back rather
+        // than assuming it.
+        *current.borrow_mut() = results.displayed_column(PATH_COLUMN);
+        load.painted = std::time::Instant::now();
+    }
+
+    let over = reply_over && load.staged.is_empty();
+    // Repaint the status line at the same ~4/s rate as the rows: the pump runs
+    // every 30 ms and rewriting an unchanged line that often is pure churn.
+    let line = if due || over {
+        load.set.status_line()
+    } else {
+        String::new()
+    };
+    (over, line)
 }
 
 /// Build the three-column cells (icon, name, path) for a list of paths.
