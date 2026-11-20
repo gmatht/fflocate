@@ -194,9 +194,18 @@ jobs:
           cargo build -p fflocated 2>&1 | tail -1
           # The probe pops a real NSMenu up and dismisses it with a queued
           # Escape; a menu whose tracking loop never ends would otherwise hold
-          # the job open until GitHub's six-hour limit, so the run is bounded
-          # and a timeout reads as a failure like any other.
-          timeout 300 cargo run -p ff-gui --example macos_probe >probe.log 2>&1 || status=$?
+          # the job open until GitHub's six-hour limit. `timeout` is not on the
+          # macOS runner (that is GNU coreutils), so the bound is a watchdog
+          # around the probe binary itself -- built first, so the pid that is
+          # killed is the probe and not cargo.
+          cargo build -p ff-gui --example macos_probe 2>&1 | tail -1
+          ./target/debug/examples/macos_probe >probe.log 2>&1 &
+          probe_pid=$!
+          ( sleep 300; kill -TERM "$probe_pid" 2>/dev/null; sleep 5; kill -KILL "$probe_pid" 2>/dev/null ) &
+          watchdog=$!
+          status=0
+          wait "$probe_pid" || status=$?
+          kill "$watchdog" 2>/dev/null || true
           if [ "$status" -eq 0 ]; then
             echo "::notice title=GUI interactivity (macOS)::$(grep '^probe:' probe.log | tr '\n' '|')"
             exit 0
