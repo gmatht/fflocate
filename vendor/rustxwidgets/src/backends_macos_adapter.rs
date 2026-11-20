@@ -5638,24 +5638,112 @@ mod macos_adapter {
         true
     }
 
+    /// A right-mouse-down event at the pointer, in `view`'s own window.
+    ///
+    /// AppKit positions a context menu from the event it is handed, and the
+    /// portable click path carries no `NSEvent` (the canvas dispatch has the
+    /// button and the coordinates, not the event). `mouseLocationOutsideOfEventStream`
+    /// is already in window coordinates, which is exactly what
+    /// `mouseEventWithType:location:...` takes, so the menu lands under the
+    /// cursor instead of at the window's origin. Returns null when the view has
+    /// no window yet.
+    unsafe fn pointer_event(view: *mut c_void) -> *mut c_void {
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Point {
+            x: f64,
+            y: f64,
+        }
+        let window = msg0(view, "window");
+        if window.is_null() {
+            return std::ptr::null_mut();
+        }
+        let location: Point = raw_send!(
+            window,
+            "mouseLocationOutsideOfEventStream",
+            unsafe extern "C" fn(*mut c_void, *mut c_void) -> Point,
+            ()
+        );
+        let number: isize = raw_send!(
+            window,
+            "windowNumber",
+            unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize,
+            ()
+        );
+        // NSEventTypeRightMouseDown is 3.
+        raw_send!(
+            cls("NSEvent"),
+            "mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:",
+            unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                usize,
+                Point,
+                usize,
+                f64,
+                isize,
+                *mut c_void,
+                isize,
+                isize,
+                f32,
+            ) -> *mut c_void,
+            (
+                3usize,
+                location,
+                0usize,
+                0.0f64,
+                number,
+                std::ptr::null_mut(),
+                0isize,
+                1isize,
+                1.0f32
+            )
+        )
+    }
+
     /// Show a built menu at the click that opened it.
     ///
     /// `+[NSMenu popUpContextMenu:withEvent:forView:]` positions the menu at
     /// the event and tracks it; the chosen item's action fires before it
     /// returns, so the caller's handler has already run when this is done.
+    ///
+    /// The event the caller passes may be null: a portable widget callback on
+    /// this backend is not given the `NSEvent`. In that case the event being
+    /// dispatched is taken from the application (a real right-click always has
+    /// one), and with no event in flight at all one is synthesized at the
+    /// pointer -- a null event would put the menu at the window's origin, and
+    /// refusing to show it is what left the row menu dead on this backend.
     pub fn context_menu_show(
         handle: usize,
         view: *mut c_void,
         event: *mut c_void,
     ) -> Result<(), Error> {
         let menu = handle as *mut c_void;
-        if menu.is_null() || view.is_null() || event.is_null() {
+        if menu.is_null() || view.is_null() {
             return Err(Error::Backend(
-                "no menu, view or event to show the menu from".to_string(),
+                "no menu or view to show the menu from".to_string(),
             ));
         }
-        // SAFETY: AppKit's own context-menu entry point.
+        // SAFETY: AppKit's own context-menu entry point; the menu is one this
+        // module built, the view is the caller's own, and the event is either
+        // the caller's, the one being dispatched, or one built here.
         unsafe {
+            let event = if event.is_null() {
+                let nsapp = msg0(cls("NSApplication"), "sharedApplication");
+                let current = msg0(nsapp, "currentEvent");
+                if current.is_null() {
+                    pointer_event(view)
+                } else {
+                    current
+                }
+            } else {
+                event
+            };
+            if event.is_null() {
+                return Err(Error::Backend(
+                    "no event to show the menu from".to_string(),
+                ));
+            }
             let menu_cls = cls("NSMenu");
             raw_send!(
                 menu_cls,

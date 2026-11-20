@@ -1941,18 +1941,91 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
-        // The popup is modal, so headless CI cannot track it; what can be shown
-        // is that the path no longer reports the feature missing — without an
-        // event it fails on the event.
-        let err = menu
-            .popup_at_pointer(list.raw_handle(), std::ptr::null_mut())
-            .err()
-            .map(|e| format!("{e}"));
-        println!("probe: popup with no event -> {err:?}");
-        if let Some(e) = &err {
-            assert!(
-                !e.contains("not available") && !e.contains("not wired up"),
-                "the popup still reports the feature missing: {e}"
+        // The popup itself, with no NSEvent — which is exactly what the app's
+        // click callback hands it, so this drives the path the app takes. The
+        // adapter takes the event being dispatched or synthesizes one at the
+        // pointer; AppKit's tracking loop is modal, so an Escape is queued first
+        // to close the menu (twice: the first can be consumed before tracking
+        // starts) and the CI step bounds the run so a menu that never closes
+        // fails the job instead of hanging it.
+        {
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            struct Point {
+                x: f64,
+                y: f64,
+            }
+            /// `-postEvent:atStart:` with AppKit's BOOL (a signed char).
+            unsafe fn post_event(app: *mut std::ffi::c_void, ev: *mut std::ffi::c_void) {
+                type F = unsafe extern "C" fn(
+                    *mut std::ffi::c_void,
+                    *mut std::ffi::c_void,
+                    *mut std::ffi::c_void,
+                    bool,
+                );
+                let f: F = unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+                unsafe { f(app, rswidgets::backends::apple::selector("postEvent:atStart:"), ev, true) }
+            }
+            type KeyFn = unsafe extern "C" fn(
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                usize,
+                Point,
+                usize,
+                f64,
+                isize,
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                bool,
+                u16,
+            ) -> *mut std::ffi::c_void;
+            unsafe fn escape_event(window_number: isize) -> *mut std::ffi::c_void {
+                let f: KeyFn = unsafe {
+                    std::mem::transmute(rswidgets::backends::apple::msg_shim())
+                };
+                let chars = rswidgets::backends::apple::nsstring("\u{1b}");
+                unsafe {
+                    f(
+                        rswidgets::backends::apple::cls("NSEvent"),
+                        rswidgets::backends::apple::selector(
+                            "keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:",
+                        ),
+                        // NSKeyDown, no modifiers, Escape.
+                        10,
+                        Point { x: 0.0, y: 0.0 },
+                        0,
+                        0.0,
+                        window_number,
+                        std::ptr::null_mut(),
+                        chars,
+                        chars,
+                        false,
+                        53,
+                    )
+                }
+            }
+            let nsapp = send0(
+                rswidgets::backends::apple::cls("NSApplication"),
+                "sharedApplication",
+            );
+            let window_number = send0i(send0(list.raw_handle(), "window"), "windowNumber");
+            unsafe {
+                for _ in 0..2 {
+                    post_event(nsapp, escape_event(window_number));
+                }
+            }
+            let before_popup = status.borrow().clone();
+            let popup = menu.popup_at_pointer(list.raw_handle(), std::ptr::null_mut());
+            println!(
+                "probe: row menu popped up at the pointer ({} items) and Escape closed it: {popup:?}",
+                labels.len()
+            );
+            assert!(popup.is_ok(), "the row menu did not pop up: {popup:?}");
+            assert_eq!(
+                *status.borrow(),
+                before_popup,
+                "closing the menu without choosing an item ran an action"
             );
         }
     }
