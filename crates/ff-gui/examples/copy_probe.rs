@@ -21,10 +21,11 @@ use ff_gui::RowAction;
 // `raw_handle` comes from the widget trait, as it does in the app.
 use rswidgets::core::Widget as _;
 
-/// The GTK clipboard route this probe demonstrates; on a target without the
-/// GTK backend (macOS uses the AppKit pasteboard) there is nothing to drive, so
-/// the example compiles to a note instead of failing the cross-check.
-#[cfg(target_os = "linux")]
+/// The GTK clipboard route this probe demonstrates. On a build without that
+/// backend (macOS's AppKit pasteboard, the `zork` fallback, an Android target)
+/// there is nothing to drive, so the example compiles to a note instead of
+/// failing a cross-check or the `--no-default-features --features zork` build.
+#[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 fn main() {
     if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
         eprintln!("copy probe: no display");
@@ -124,8 +125,8 @@ fn main() {
     app.run();
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]
 fn main() {
-    eprintln!("copy probe: needs the GTK backend (linux)");
+    eprintln!("copy probe: needs the GTK clipboard backend");
     std::process::exit(2);
 }

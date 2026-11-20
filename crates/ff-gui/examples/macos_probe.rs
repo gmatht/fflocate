@@ -1953,7 +1953,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if *action == ff_gui::RowAction::CopyPath {
                 assert_eq!(
                     line,
-                    format!("copied {name}"),
+                    format!("copied {row_path}"),
                     "Copy path reported {line:?}"
                 );
                 // Read the pasteboard straight from AppKit instead of through
