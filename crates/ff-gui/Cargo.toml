@@ -26,6 +26,13 @@ name = "list_interaction_mac"
 path = "tests/list_interaction_mac.rs"
 harness = false
 
+# The scroller is a real NSScroller and a resize is AppKit's own layout pass, so
+# these too have to drive the main thread.
+[[test]]
+name = "drag_reflow_mac"
+path = "tests/drag_reflow_mac.rs"
+harness = false
+
 [features]
 # Backend selection. On Linux the GUI defaults to the real widget toolkit
 # (GTK), which is what a user expects from `ff --gui`. The `zork` backend is a

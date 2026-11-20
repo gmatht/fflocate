@@ -1492,6 +1492,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let shot_small = shot_window()?;
         let ink_small = ink_rows_shot(&small, &shot_small)?;
         let grew_or_shrank = changed(&shot_big, &shot_small);
+        // The reflow itself: the canvas and viewport the resize produced, how
+        // many rows are visible at each size, and where the header columns
+        // landed -- the geometry that has to follow the new width.
+        println!(
+            "probe: reflow canvas {:.0}x{:.0} -> {:.0}x{:.0}, viewport {:.0} -> {:.0}, visible rows {} -> {}, header x {:?} -> {:?}",
+            f_big.w,
+            f_big.h,
+            f_small.w,
+            f_small.h,
+            big.viewport_height,
+            small.viewport_height,
+            big.visible_rows,
+            small.visible_rows,
+            list.render_offscreen(f_big.w, v_big.h, v_big.y)
+                .header_xs
+                .iter()
+                .map(|x| x.round())
+                .collect::<Vec<_>>(),
+            list.render_offscreen(f_small.w, v_small.h, v_small.y)
+                .header_xs
+                .iter()
+                .map(|x| x.round())
+                .collect::<Vec<_>>()
+        );
 
         println!(
             "probe: window capture {}x{} at {}x backing, {}pt content: grown {}pt viewport -> {}/{} row(s) visible, ink {:?}",
@@ -1803,6 +1827,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             assert!(
                 ink_after.iter().all(|ink| *ink > 0),
                 "a visible row painted no ink after the drag: {ink_after:?}"
+            );
+            // One line with both ends of the drag, so the CI notice carries the
+            // knob rect, the clip offset and the first drawn row next to the
+            // typing, menu-bar and list lines.
+            println!(
+                "probe: drag/reflow knob rect ({:.0}, {:.0}) {:.0}x{:.0} -> ({:.0}, {:.0}) {:.0}x{:.0}; offset {:.0} -> {:.0}; first row {} -> {}",
+                before.x,
+                before.y,
+                before.w,
+                before.h,
+                knob_after.x,
+                knob_after.y,
+                knob_after.w,
+                knob_after.h,
+                start.y,
+                after.y,
+                top_geo.first_row,
+                geo.first_row
             );
         }
 

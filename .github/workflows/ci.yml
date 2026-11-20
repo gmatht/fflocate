@@ -212,6 +212,8 @@ jobs:
             # capped at 4090 chars and the typing and menu-bar lines can fill
             # it before these are reached.
             echo "::notice title=list interaction (macOS, probe)::$(grep -E '^probe: (list canvas|clicks selected|header click sorted|click selected|list interaction)' probe.log | tr '\n' '|')"
+            # The knob drag and the resize reflow, likewise in their own notice.
+            echo "::notice title=drag and reflow (macOS, probe)::$(grep -E '^probe: (drag/reflow|reflow|knob dragged)' probe.log | tr '\n' '|')"
             # The AppKit menu-bar test is its own binary (harness = false), so it
             # runs on the process's main thread — the only one AppKit lets call
             # setMainMenu:. Its observed menu titles, enabled states, the item
@@ -234,6 +236,16 @@ jobs:
               exit 1
             fi
             echo "::notice title=list interaction (macOS)::$(grep '^list:' list.log | tr '\n' '|')"
+            # The knob drag and the resize reflow: a real NSScroller's tracking
+            # loop and AppKit's layout pass, so a drag that never reaches the
+            # scroller or a list that keeps its old geometry fails the job.
+            drag_status=0
+            cargo test -p ff-gui --test drag_reflow_mac > drag.log 2>&1 || drag_status=$?
+            if [ "$drag_status" -ne 0 ]; then
+              echo "::error title=drag and reflow (macOS)::exit ${drag_status}: $(tail -c 1800 drag.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+              exit 1
+            fi
+            echo "::notice title=drag and reflow (macOS)::$(grep -E '^(drag|reflow):' drag.log | tr '\n' '|')"
             exit 0
           fi
           msg=$(tail -c 1800 probe.log | tr -cd '[:print:]\n' | tr '\n' '|')
