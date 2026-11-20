@@ -381,6 +381,80 @@ pub extern "C" fn gtk_compat_destroy_notify_draw_gtk4(data: *mut c_void, _closur
     }
 }
 
+// trampoline for the GTK3 drag source's "drag-data-get" signal:
+// (widget, GdkDragContext*, GtkSelectionData*, info, time, user_data) -> void.
+//
+// GTK calls this once per format the destination accepts, with `info` copied
+// from the `GtkTargetEntry` that format was advertised under — which is how the
+// handler tells a URI-list request from a plain-text one.
+#[no_mangle]
+pub extern "C" fn gtk_compat_trampoline_drag_data_get(
+    _widget: *mut c_void,
+    _context: *mut c_void,
+    selection: *mut c_void,
+    info: u32,
+    _time: u32,
+    user_data: *mut c_void,
+) {
+    unsafe {
+        if user_data.is_null() {
+            return;
+        }
+        let inner_ptr = user_data as *mut Box<dyn FnMut(*mut c_void, u32)>;
+        if inner_ptr.is_null() {
+            return;
+        }
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let closure_ref: &mut dyn FnMut(*mut c_void, u32) = &mut **inner_ptr;
+            closure_ref(selection, info);
+        }));
+        if let Err(err) = r {
+            log_trampoline_panic("drag_data_get", err);
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn gtk_compat_destroy_notify_drag_data_get(
+    data: *mut c_void,
+    _closure: *mut c_void,
+) {
+    unsafe {
+        if data.is_null() {
+            return;
+        }
+        let inner_ptr = data as *mut Box<dyn FnMut(*mut c_void, u32)>;
+        let _boxed: Box<Box<dyn FnMut(*mut c_void, u32)>> = Box::from_raw(inner_ptr);
+    }
+}
+
+/// Connect a GTK3 `drag-data-get` handler: the closure gets the
+/// `GtkSelectionData*` to fill and the `info` of the requested target.
+pub unsafe fn connect_signal_drag_data_get(
+    lib_symbols: &crate::symbols::Symbols,
+    instance: *mut c_void,
+    cb: Box<dyn FnMut(*mut c_void, u32)>,
+) -> Result<u64, String> {
+    let boxed: Box<Box<dyn FnMut(*mut c_void, u32)>> = Box::new(Box::new(cb));
+    let raw = Box::into_raw(boxed) as *mut c_void;
+    let sig_name = CString::new("drag-data-get").unwrap();
+    if let Some(gscd) = lib_symbols.g_signal_connect_data {
+        let handler_ptr = gtk_compat_trampoline_drag_data_get as *const () as *mut c_void;
+        let destroy_ptr = Some(
+            gtk_compat_destroy_notify_drag_data_get
+                as unsafe extern "C" fn(*mut c_void, *mut c_void),
+        );
+        let id = gscd(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw, destroy_ptr, 0);
+        Ok(id)
+    } else if let Some(gsc) = lib_symbols.g_signal_connect {
+        let handler_ptr = gtk_compat_trampoline_drag_data_get as *const () as *mut c_void;
+        let id = gsc(instance, sig_name.as_ptr() as *const u8, handler_ptr, raw);
+        Ok(id)
+    } else {
+        Err("no g_signal_connect available".into())
+    }
+}
+
 #[cfg(test)]
 mod key_release_tests {
     use super::*;

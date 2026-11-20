@@ -12,8 +12,8 @@
 //! * [`TreeView`] draws its header and rows on a canvas, hit-tests clicks,
 //!   tracks a selection and exposes the same calls the old GtkTreeView wrapper
 //!   did. Clicking a sortable header sorts by that column, a second click
-//!   reverses it, and the header shows the direction; its icon column draws a
-//!   glyph, not a themed pixbuf.
+//!   reverses it, and the header shows the direction; its icon column paints a
+//!   pictogram per file kind (see `paint_icon`), not a themed pixbuf.
 //! * [`Expander`] is a header line plus a child box it shows or hides as one
 //!   unit. The header is a label, so the state is in its text; the caller
 //!   toggles it (see [`Expander::set_expanded`]).
@@ -36,9 +36,10 @@ pub mod reflow;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CellValue {
     Text(String),
-    /// A themed icon, named as the old backend named it. The canvas draws
-    /// `fallback` (a character or short word) because a themed pixbuf is not
-    /// reachable from the portable layer.
+    /// A themed icon, named as the old backend named it. The canvas paints a
+    /// pictogram from `name`, because a themed pixbuf is not reachable from the
+    /// portable layer; `fallback` (a character or short word) is what a backend
+    /// with no canvas — the `zork` text fallback — prints instead.
     Icon { name: String, fallback: String },
 }
 
@@ -516,20 +517,24 @@ impl TreeView {
         Ok(sw)
     }
 
-    /// Dragging rows out as file URIs needs native drag-and-drop, which the
-    /// portable layer does not expose. Report it; the caller shows the reason.
+    /// Make the list a drag source for a file path.
     ///
     /// The argument shapes are the old `GtkTreeView` ones, so a client written
     /// against that surface compiles unchanged: `payload` yields the URI list
     /// plus the plain text, `icon` yields a theme name plus a drawn fallback.
-    pub fn enable_uri_drag_source<F, G>(&self, _payload: F, _icon: G) -> Result<(), Error>
+    /// `payload` is asked at drop time, so it can read whichever row is selected
+    /// when the drag ends its journey.
+    ///
+    /// The canvas is the widget that receives the press, so it is the widget
+    /// that has to own the drag (see `install_uri_drag_source`). A backend
+    /// without a drag source reports that, and the caller shows the reason,
+    /// rather than starting a drag that carries nothing.
+    pub fn enable_uri_drag_source<F, G>(&self, payload: F, icon: G) -> Result<(), Error>
     where
         F: FnMut() -> Option<(Vec<String>, String)> + 'static,
         G: FnMut() -> Option<(String, String)> + 'static,
     {
-        Err(Error::Backend(
-            "drag-and-drop is not available in this build".to_string(),
-        ))
+        install_uri_drag_source(&self.canvas, Box::new(payload), Box::new(icon))
     }
 
     pub fn clipboard_set_text(&self, text: &str) -> Result<(), Error> {
@@ -547,7 +552,12 @@ impl TreeView {
 enum IconKind {
     Folder,
     Code,
+    Script,
     Image,
+    Audio,
+    Video,
+    Spreadsheet,
+    Binary,
     Archive,
     Document,
     Pdf,
@@ -560,7 +570,12 @@ enum IconKind {
 fn icon_kind(name: &str) -> IconKind {
     match name {
         "folder" => IconKind::Folder,
+        "text-x-script" => IconKind::Script,
         "image-x-generic" => IconKind::Image,
+        "audio-x-generic" => IconKind::Audio,
+        "video-x-generic" => IconKind::Video,
+        "x-office-spreadsheet" => IconKind::Spreadsheet,
+        "application-x-executable" | "application-x-object" => IconKind::Binary,
         "package-x-generic" => IconKind::Archive,
         "application-pdf" => IconKind::Pdf,
         "text-x-rust"
@@ -573,7 +588,6 @@ fn icon_kind(name: &str) -> IconKind {
         | "text-x-go"
         | "text-x-java"
         | "text-x-ruby"
-        | "text-x-script"
         | "text-html"
         | "text-css" => IconKind::Code,
         _ => IconKind::Document,
@@ -610,24 +624,114 @@ fn paint_icon(ctx: &mut dyn DrawContext, x: f64, y: f64, size: f64, cell: &CellV
             ctx.fill_rect(x + s * 0.22, y + s * 0.30, s * 0.56, s * 0.10, 1.0, 1.0, 1.0, 1.0);
             ctx.fill_rect(x + s * 0.22, y + s * 0.52, s * 0.40, s * 0.10, 1.0, 1.0, 1.0, 1.0);
         }
-        // A framed picture: a sun over a horizon bar.
+        // A script: a page carrying a shell prompt — a stepped chevron with a
+        // cursor bar — instead of the ruled lines source code gets. Rust, so it
+        // is not mistaken for the amber folder at this size.
+        IconKind::Script => {
+            let (r, g, b) = (0.78, 0.40, 0.14);
+            ctx.fill_rect(x + s * 0.10, y + s * 0.08, s * 0.80, s * 0.84, r, g, b, 1.0);
+            // The chevron, in steps: the canvas has no paths.
+            ctx.fill_rect(x + s * 0.24, y + s * 0.30, s * 0.12, s * 0.10, 1.0, 1.0, 1.0, 1.0);
+            ctx.fill_rect(x + s * 0.34, y + s * 0.40, s * 0.12, s * 0.10, 1.0, 1.0, 1.0, 1.0);
+            ctx.fill_rect(x + s * 0.34, y + s * 0.50, s * 0.12, s * 0.10, 1.0, 1.0, 1.0, 1.0);
+            ctx.fill_rect(x + s * 0.24, y + s * 0.60, s * 0.12, s * 0.10, 1.0, 1.0, 1.0, 1.0);
+            // The cursor a prompt ends with.
+            ctx.fill_rect(x + s * 0.54, y + s * 0.62, s * 0.26, s * 0.08, 1.0, 1.0, 1.0, 1.0);
+        }
+        // A photo: a thick green frame around a white sky with a sun in it and
+        // a mountain range rising from the frame's bottom edge. The mark this
+        // replaces — a thin outline with a bar across the lower half and a small
+        // square at the top right — read as a computer (screen, stand, badge).
         IconKind::Image => {
             let (r, g, b) = (0.20, 0.58, 0.36);
-            ctx.stroke_rect(x, y + s * 0.12, s, s * 0.72, r, g, b, 1.0, 1.0);
-            ctx.fill_rect(x + s * 0.14, y + s * 0.56, s * 0.70, s * 0.16, r, g, b, 1.0);
-            ctx.fill_rect(x + s * 0.62, y + s * 0.24, s * 0.20, s * 0.20, r, g, b, 1.0);
+            // The frame, then the sky it surrounds.
+            ctx.fill_rect(x + s * 0.04, y + s * 0.12, s * 0.92, s * 0.76, r, g, b, 1.0);
+            ctx.fill_rect(x + s * 0.12, y + s * 0.21, s * 0.76, s * 0.58, 1.0, 1.0, 1.0, 1.0);
+            // The sun, high on the right where the mountain cannot reach it.
+            ctx.fill_rect(x + s * 0.62, y + s * 0.26, s * 0.16, s * 0.16, r, g, b, 1.0);
+            // The mountain: bars that widen towards the base, since the canvas
+            // has no paths. The widest sits exactly on the sky's bottom edge.
+            for (i, w) in [0.14, 0.30, 0.46, 0.62].iter().enumerate() {
+                let w = s * w;
+                ctx.fill_rect(
+                    x + s * 0.46 - w / 2.0,
+                    y + s * (0.31 + i as f64 * 0.12),
+                    w,
+                    s * 0.12,
+                    r,
+                    g,
+                    b,
+                    1.0,
+                );
+            }
         }
-        // A box with a band across it: an archive.
+        // A gear: a slotted square with one tooth per side, which is what a
+        // program or an object file gets. Deliberately not a page — a page in
+        // this column already means source code or a plain document.
+        IconKind::Binary => {
+            let (r, g, b) = (0.26, 0.31, 0.40);
+            ctx.fill_rect(x + s * 0.18, y + s * 0.18, s * 0.64, s * 0.64, r, g, b, 1.0);
+            // The hole in the middle, and a tooth on each edge.
+            ctx.fill_rect(x + s * 0.38, y + s * 0.38, s * 0.24, s * 0.24, 1.0, 1.0, 1.0, 1.0);
+            ctx.fill_rect(x + s * 0.06, y + s * 0.42, s * 0.12, s * 0.16, r, g, b, 1.0);
+            ctx.fill_rect(x + s * 0.82, y + s * 0.42, s * 0.12, s * 0.16, r, g, b, 1.0);
+            ctx.fill_rect(x + s * 0.42, y + s * 0.06, s * 0.16, s * 0.12, r, g, b, 1.0);
+            ctx.fill_rect(x + s * 0.42, y + s * 0.82, s * 0.16, s * 0.12, r, g, b, 1.0);
+        }
+        // An archive: a carton — a lid wider than the body under it — with the
+        // zip's cut down the middle of the lid.
+        //
+        // Drawn from `icon_sheet` renders rather than guessed: at 11 px the
+        // original (one box with one band through the middle) read as a
+        // struck-through square; three fine track segments with alternating
+        // teeth vanished into an indistinct mark; a centred slider over a
+        // track read as the letter T, and a split track as the letter H. The
+        // silhouette of a box is what survives, so the zip is now a single
+        // white cut in the lid.
         IconKind::Archive => {
             let (r, g, b) = (0.52, 0.36, 0.70);
-            ctx.fill_rect(x + s * 0.04, y + s * 0.16, s * 0.92, s * 0.68, r, g, b, 1.0);
-            ctx.fill_rect(x + s * 0.04, y + s * 0.40, s * 0.92, s * 0.12, 1.0, 1.0, 1.0, 1.0);
+            ctx.fill_rect(x + s * 0.06, y + s * 0.18, s * 0.88, s * 0.16, r, g, b, 1.0);
+            ctx.fill_rect(x + s * 0.14, y + s * 0.34, s * 0.72, s * 0.52, r, g, b, 1.0);
+            ctx.fill_rect(x + s * 0.46, y + s * 0.18, s * 0.08, s * 0.16, 1.0, 1.0, 1.0, 1.0);
         }
         // A red page, so a PDF is told apart from a text file at this size.
         IconKind::Pdf => {
             ctx.fill_rect(x + s * 0.06, y + s * 0.08, s * 0.88, s * 0.84, 0.72, 0.18, 0.18, 1.0);
             ctx.fill_rect(x + s * 0.22, y + s * 0.30, s * 0.56, s * 0.10, 1.0, 1.0, 1.0, 1.0);
             ctx.fill_rect(x + s * 0.22, y + s * 0.52, s * 0.40, s * 0.10, 1.0, 1.0, 1.0, 1.0);
+        }
+        // A note: head, stem and flag. Pink, which no other kind uses.
+        IconKind::Audio => {
+            let (r, g, b) = (0.78, 0.26, 0.55);
+            ctx.fill_rect(x + s * 0.16, y + s * 0.54, s * 0.34, s * 0.26, r, g, b, 1.0);
+            ctx.fill_rect(x + s * 0.46, y + s * 0.14, s * 0.10, s * 0.46, r, g, b, 1.0);
+            ctx.fill_rect(x + s * 0.46, y + s * 0.14, s * 0.28, s * 0.12, r, g, b, 1.0);
+        }
+        // A play mark in a frame. The canvas has no paths, so the triangle is a
+        // stack of bars that widen towards the middle.
+        IconKind::Video => {
+            let (r, g, b) = (0.12, 0.45, 0.66);
+            ctx.stroke_rect(x + s * 0.04, y + s * 0.16, s * 0.92, s * 0.68, r, g, b, 1.0, 1.0);
+            for (i, w) in [0.14, 0.26, 0.38, 0.26, 0.14].iter().enumerate() {
+                ctx.fill_rect(
+                    x + s * 0.30,
+                    y + s * (0.24 + i as f64 * 0.12),
+                    s * w,
+                    s * 0.12,
+                    r,
+                    g,
+                    b,
+                    1.0,
+                );
+            }
+        }
+        // A ruled sheet: a page with a grid on it.
+        IconKind::Spreadsheet => {
+            let (r, g, b) = (0.28, 0.42, 0.14);
+            ctx.fill_rect(x + s * 0.08, y + s * 0.10, s * 0.84, s * 0.80, r, g, b, 1.0);
+            ctx.fill_rect(x + s * 0.08, y + s * 0.38, s * 0.84, s * 0.06, 1.0, 1.0, 1.0, 1.0);
+            ctx.fill_rect(x + s * 0.08, y + s * 0.60, s * 0.84, s * 0.06, 1.0, 1.0, 1.0, 1.0);
+            ctx.fill_rect(x + s * 0.46, y + s * 0.10, s * 0.06, s * 0.80, 1.0, 1.0, 1.0, 1.0);
         }
     }
     true
@@ -864,6 +968,57 @@ fn row_index_at(y: f64, row_count: usize) -> Option<usize> {
     }
 }
 
+/// Install a drag source on the canvas, on the backends that have one.
+#[cfg(all(
+    feature = "gtk",
+    target_os = "linux",
+    not(feature = "zork"),
+    not(feature = "gtk4-rs")
+))]
+fn install_uri_drag_source(
+    canvas: &Canvas,
+    payload: Box<dyn FnMut() -> Option<(Vec<String>, String)>>,
+    icon: Box<dyn FnMut() -> Option<(String, String)>>,
+) -> Result<(), Error> {
+    // `raw_handle` is a `Widget` trait method, and the trait is not otherwise
+    // in scope in this module.
+    use crate::core::Widget as _;
+    // SAFETY: the handle is this canvas's live widget, and GTK keeps both
+    // closures alive with the widget (the signal connection owns them).
+    unsafe {
+        let r = crate::backends_gtk_adapter::enable_uri_drag_source(
+            canvas.inner.raw_handle(),
+            payload,
+            icon,
+        );
+        // The row-click handler consumes presses, and a consumed press never
+        // reaches the drag source's own handler, so the canvas has to let them
+        // through from now on. Only after the source is actually installed.
+        if r.is_ok() {
+            canvas.inner.mark_uri_drag_source();
+        }
+        r
+    }
+}
+
+/// AppKit has no drag source on this layer yet, and a backend without one says
+/// so instead of accepting a drag that carries nothing.
+#[cfg(not(all(
+    feature = "gtk",
+    target_os = "linux",
+    not(feature = "zork"),
+    not(feature = "gtk4-rs")
+)))]
+fn install_uri_drag_source(
+    _canvas: &Canvas,
+    _payload: Box<dyn FnMut() -> Option<(Vec<String>, String)>>,
+    _icon: Box<dyn FnMut() -> Option<(String, String)>>,
+) -> Result<(), Error> {
+    Err(Error::Backend(
+        "dragging rows out of the window is not implemented on this backend".to_string(),
+    ))
+}
+
 /// Which desktop backend this build routes widgets through.
 ///
 /// Used by the messages for facilities a build without a desktop toolkit cannot
@@ -916,7 +1071,7 @@ pub fn clipboard_set_text(_text: &str) -> Result<(), Error> {
     // wired to their platform's clipboard (CLIPBOARD selection / NSPasteboard).
     Err(Error::Backend(format!(
         "no system clipboard without a desktop backend ({} build)",
-        backend_label()
+        crate::compat::backend_label()
     )))
 }
 
@@ -941,7 +1096,7 @@ pub fn clipboard_get_text() -> Result<String, Error> {
 pub fn clipboard_get_text() -> Result<String, Error> {
     Err(Error::Backend(format!(
         "no system clipboard without a desktop backend ({} build)",
-        backend_label()
+        crate::compat::backend_label()
     )))
 }
 
@@ -1153,7 +1308,7 @@ fn context_menu_build(
     // build a real native menu (GtkMenu / NSMenu).
     Err(Error::Backend(format!(
         "no native menu without a desktop backend ({} build)",
-        backend_label()
+        crate::compat::backend_label()
     )))
 }
 
@@ -1225,7 +1380,7 @@ fn context_menu_show(
     // build a real native menu (GtkMenu / NSMenu).
     Err(Error::Backend(format!(
         "no native menu without a desktop backend ({} build)",
-        backend_label()
+        crate::compat::backend_label()
     )))
 }
 
@@ -1435,7 +1590,12 @@ mod tests {
         let names = [
             "folder",
             "text-x-rust",
+            "text-x-script",
             "image-x-generic",
+            "audio-x-generic",
+            "video-x-generic",
+            "x-office-spreadsheet",
+            "application-x-executable",
             "package-x-generic",
             "text-x-generic",
             "application-pdf",
@@ -1446,6 +1606,13 @@ mod tests {
                 assert_ne!(a, b, "{} and {} look the same", names[i], names[j]);
             }
         }
+        // Object files share the program pictogram on purpose — one kind, two
+        // theme names, so a real icon theme can still tell them apart.
+        assert_eq!(
+            first_colour("application-x-executable"),
+            first_colour("application-x-object"),
+            "the two binary names must draw the same picture"
+        );
         // A cell that is not an icon is not painted as one.
         let mut dc = RecordingDrawContext::new();
         assert!(!paint_icon(&mut dc, 0.0, 0.0, 11.0, &CellValue::Text("x".into())));
@@ -1625,5 +1792,267 @@ mod tests {
         assert!(menu.activate("Open"));
         assert_eq!(hits.get(), 1);
         assert!(!menu.activate("Missing"));
+    }
+
+    /// A raster target for [`icon_sheet`]: coordinates scaled by `k` and written
+    /// straight over the pixels, which is sound because every pictogram op is
+    /// opaque.
+    struct Raster {
+        w: usize,
+        h: usize,
+        k: f64,
+        px: Vec<[f64; 3]>,
+    }
+
+    impl Raster {
+        fn new(w: usize, h: usize, k: f64) -> Raster {
+            Raster {
+                w,
+                h,
+                k,
+                px: vec![[1.0; 3]; w * h],
+            }
+        }
+
+        fn put(&mut self, x: f64, y: f64, w: f64, h: f64, c: [f64; 3]) {
+            let x0 = (x * self.k).floor().max(0.0) as usize;
+            let y0 = (y * self.k).floor().max(0.0) as usize;
+            let x1 = (((x + w) * self.k).ceil().max(0.0) as usize).min(self.w);
+            let y1 = (((y + h) * self.k).ceil().max(0.0) as usize).min(self.h);
+            for row in y0..y1 {
+                for col in x0..x1 {
+                    self.px[row * self.w + col] = c;
+                }
+            }
+        }
+    }
+
+    impl crate::core::DrawContext for Raster {
+        fn fill_rect(&mut self, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, _a: f64) {
+            self.put(x, y, w, h, [r, g, b]);
+        }
+
+        fn stroke_rect(
+            &mut self,
+            x: f64,
+            y: f64,
+            w: f64,
+            h: f64,
+            r: f64,
+            g: f64,
+            b: f64,
+            _a: f64,
+            lw: f64,
+        ) {
+            let c = [r, g, b];
+            self.put(x, y, w, lw, c);
+            self.put(x, y + h - lw, w, lw, c);
+            self.put(x, y, lw, h, c);
+            self.put(x + w - lw, y, lw, h, c);
+        }
+
+        // The icon column paints no text; these only satisfy the trait.
+        fn draw_text_styled(
+            &mut self,
+            _x: f64,
+            _y: f64,
+            _text: &str,
+            _font: &str,
+            _size: f64,
+            _r: f64,
+            _g: f64,
+            _b: f64,
+            _a: f64,
+            _slant: i32,
+            _weight: i32,
+        ) {
+        }
+
+        fn text_extents_styled(
+            &self,
+            _text: &str,
+            _font: &str,
+            _size: f64,
+            _slant: i32,
+            _weight: i32,
+        ) -> (f64, f64, f64, f64) {
+            (0.0, 0.0, 0.0, 0.0)
+        }
+
+        fn clear(&mut self, r: f64, g: f64, b: f64, _a: f64) {
+            for p in &mut self.px {
+                *p = [r, g, b];
+            }
+        }
+
+        fn save(&mut self) {}
+        fn restore(&mut self) {}
+        fn clip(&mut self, _x: f64, _y: f64, _w: f64, _h: f64) {}
+    }
+
+    /// Every icon kind, rendered at the list's real 11 pt, into a PNG.
+    ///
+    /// Run it with the output path; without that variable it does nothing, so an
+    /// ordinary `cargo test` writes no files:
+    ///
+    /// ```text
+    /// ICON_SHEET=/tmp/icons.png cargo test --manifest-path vendor/rustxwidgets/Cargo.toml \
+    ///     --no-default-features --features gtk,macos --lib -- icon_sheet --nocapture
+    /// ```
+    ///
+    /// Each mark is drawn at 8× and box-filtered down — what the canvas' own
+    /// antialiasing does to it — then blown back up 6× with hard pixels so the
+    /// 11 px result can be looked at, with the same pixels repeated at 1:1 in a
+    /// strip underneath. A test rather than an example because `paint_icon` is
+    /// private to this module.
+    #[test]
+    fn icon_sheet() {
+        let Ok(out) = std::env::var("ICON_SHEET") else {
+            return;
+        };
+        const NAMES: &[&str] = &[
+            "folder",
+            "text-x-rust",
+            "text-x-script",
+            "text-x-generic",
+            "image-x-generic",
+            "audio-x-generic",
+            "video-x-generic",
+            "x-office-spreadsheet",
+            "application-x-executable",
+            "package-x-generic",
+            "application-pdf",
+        ];
+        const SS: usize = 8; // supersampling
+        let px = ICON_SIZE as usize; // 11: what a row actually draws
+        let zoom = 6; // display magnification
+        let cell = px * zoom + 12;
+        let w = cell * NAMES.len();
+        let h = cell + px + 8;
+        let mut rgba = vec![255u8; w * h * 4];
+        println!("icon sheet column order: {NAMES:?}");
+
+        for (i, name) in NAMES.iter().enumerate() {
+            let cell_value = CellValue::Icon {
+                name: (*name).into(),
+                fallback: "?".into(),
+            };
+            let mut big = Raster::new(px * SS, px * SS, SS as f64);
+            assert!(
+                paint_icon(&mut big, 0.0, 0.0, ICON_SIZE, &cell_value),
+                "{name} did not paint"
+            );
+            // Down to the real 11 px: average each 8×8 block.
+            let mut small = vec![[255.0f64; 3]; px * px];
+            for y in 0..px {
+                for x in 0..px {
+                    let mut acc = [0.0f64; 3];
+                    for sy in 0..SS {
+                        for sx in 0..SS {
+                            let p = big.px[(y * SS + sy) * px * SS + x * SS + sx];
+                            for c in 0..3 {
+                                acc[c] += p[c] / (SS * SS) as f64;
+                            }
+                        }
+                    }
+                    small[y * px + x] = acc;
+                }
+            }
+            let rgb = |p: [f64; 3]| {
+                [
+                    (p[0] * 255.0).round() as u8,
+                    (p[1] * 255.0).round() as u8,
+                    (p[2] * 255.0).round() as u8,
+                ]
+            };
+            for y in 0..px {
+                for x in 0..px {
+                    let colour = rgb(small[y * px + x]);
+                    // The zoomed copy...
+                    for dy in 0..zoom {
+                        for dx in 0..zoom {
+                            let ox = i * cell + 6 + x * zoom + dx;
+                            let oy = 6 + y * zoom + dy;
+                            let o = (oy * w + ox) * 4;
+                            rgba[o..o + 3].copy_from_slice(&colour);
+                        }
+                    }
+                    // ...and the same pixel at 1:1 underneath it.
+                    let o = ((cell + 8 + y) * w + i * cell + 6 + x) * 4;
+                    rgba[o..o + 3].copy_from_slice(&colour);
+                }
+            }
+        }
+
+        write_png(&out, w, h, &rgba).expect("the icon sheet could not be written");
+        println!("icon sheet written to {out} ({w}x{h})");
+    }
+
+    /// A minimal PNG writer: 8-bit RGBA, no filtering, and uncompressed
+    /// ("stored") deflate blocks so a debugging sheet needs no dependency.
+    fn write_png(path: &str, w: usize, h: usize, rgba: &[u8]) -> std::io::Result<()> {
+        fn crc32(data: &[u8]) -> u32 {
+            let mut crc = 0xffff_ffffu32;
+            for &byte in data {
+                crc ^= byte as u32;
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 {
+                        (crc >> 1) ^ 0xedb8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        fn adler32(data: &[u8]) -> u32 {
+            let (mut a, mut b) = (1u32, 0u32);
+            for &byte in data {
+                a = (a + byte as u32) % 65521;
+                b = (b + a) % 65521;
+            }
+            (b << 16) | a
+        }
+        fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) {
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            let mut crc_input = Vec::with_capacity(4 + body.len());
+            crc_input.extend_from_slice(kind);
+            crc_input.extend_from_slice(body);
+            out.extend_from_slice(kind);
+            out.extend_from_slice(body);
+            out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+        }
+
+        let mut raw = Vec::with_capacity(h * (1 + w * 4));
+        for y in 0..h {
+            raw.push(0); // filter type: none
+            raw.extend_from_slice(&rgba[y * w * 4..(y + 1) * w * 4]);
+        }
+        let mut zlib = vec![0x78, 0x01]; // deflate, default window, no dictionary
+        let mut rest: &[u8] = &raw;
+        loop {
+            let n = rest.len().min(65535);
+            let last = n == rest.len();
+            zlib.push(if last { 1 } else { 0 });
+            zlib.extend_from_slice(&(n as u16).to_le_bytes());
+            zlib.extend_from_slice(&(!(n as u16)).to_le_bytes());
+            zlib.extend_from_slice(&rest[..n]);
+            rest = &rest[n..];
+            if last {
+                break;
+            }
+        }
+        zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+        let mut png = Vec::new();
+        png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&(w as u32).to_be_bytes());
+        ihdr.extend_from_slice(&(h as u32).to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        chunk(&mut png, b"IHDR", &ihdr);
+        chunk(&mut png, b"IDAT", &zlib);
+        chunk(&mut png, b"IEND", &[]);
+        std::fs::write(path, png)
     }
 }

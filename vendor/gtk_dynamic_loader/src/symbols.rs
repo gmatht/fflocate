@@ -145,6 +145,28 @@ pub type GtkClipboardGet = unsafe extern "C" fn(atom: *mut c_void) -> *mut c_voi
 pub type GtkClipboardSetText =
     unsafe extern "C" fn(clipboard: *mut c_void, text: *const u8, len: i32);
 pub type GtkClipboardWaitForText = unsafe extern "C" fn(clipboard: *mut c_void) -> *mut u8;
+// Drag source (GTK3: GTK4 replaced `gtk_drag_source_set` with a controller).
+// `info` on a `GtkTargetEntry` is the number the `drag-data-get` handler gets,
+// so the target table doubles as the protocol for which format was asked for.
+#[repr(C)]
+pub struct GtkTargetEntry {
+    pub target: *mut u8,
+    pub flags: u32,
+    pub info: u32,
+}
+pub type GtkDragSourceSet = unsafe extern "C" fn(
+    widget: *mut c_void,
+    start_button_mask: i32,
+    targets: *const GtkTargetEntry,
+    n_targets: i32,
+    actions: i32,
+);
+pub type GtkDragSourceSetIconName =
+    unsafe extern "C" fn(widget: *mut c_void, icon_name: *const u8);
+pub type GtkSelectionDataSetUris =
+    unsafe extern "C" fn(selection: *mut c_void, uris: *mut *mut u8) -> i32;
+pub type GtkSelectionDataSetText =
+    unsafe extern "C" fn(selection: *mut c_void, text: *const u8, len: i32) -> i32;
 pub type GdkAtomIntern = unsafe extern "C" fn(name: *const u8, only_if_exists: i32) -> *mut c_void;
 // gdk event helpers
 pub type GdkEventGetKeyval = unsafe extern "C" fn(event: *mut c_void, keyval: *mut u32) -> i32;
@@ -702,6 +724,11 @@ pub struct Symbols {
     pub gtk_clipboard_get: Option<GtkClipboardGet>,
     pub gtk_clipboard_set_text: Option<GtkClipboardSetText>,
     pub gtk_clipboard_wait_for_text: Option<GtkClipboardWaitForText>,
+    // Drag source (GTK3 only; absent from a GTK4 library).
+    pub gtk_drag_source_set: Option<GtkDragSourceSet>,
+    pub gtk_drag_source_set_icon_name: Option<GtkDragSourceSetIconName>,
+    pub gtk_selection_data_set_uris: Option<GtkSelectionDataSetUris>,
+    pub gtk_selection_data_set_text: Option<GtkSelectionDataSetText>,
     pub gdk_atom_intern: Option<GdkAtomIntern>,
     /// Coordinates of a widget's top-left in screen space. Used to place a
     /// context menu (a right-click on a sheet tab) at the pointer.
@@ -1075,6 +1102,14 @@ impl Symbols {
             unsafe { sym::<GtkClipboardSetText>(gtk, "gtk_clipboard_set_text") };
         let gtk_clipboard_wait_for_text =
             unsafe { sym::<GtkClipboardWaitForText>(gtk, "gtk_clipboard_wait_for_text") };
+        let gtk_drag_source_set =
+            unsafe { sym::<GtkDragSourceSet>(gtk, "gtk_drag_source_set") };
+        let gtk_drag_source_set_icon_name =
+            unsafe { sym::<GtkDragSourceSetIconName>(gtk, "gtk_drag_source_set_icon_name") };
+        let gtk_selection_data_set_uris =
+            unsafe { sym::<GtkSelectionDataSetUris>(gtk, "gtk_selection_data_set_uris") };
+        let gtk_selection_data_set_text =
+            unsafe { sym::<GtkSelectionDataSetText>(gtk, "gtk_selection_data_set_text") };
         let gdk_atom_intern = open_sym_try!(libs, "libgdk", GdkAtomIntern, "gdk_atom_intern")
             .or_else(|| unsafe { sym::<GdkAtomIntern>(gtk, "gdk_atom_intern") });
         let gtk_widget_get_next_sibling = unsafe { sym::<GtkWidgetGetNextSibling>(gtk, "gtk_widget_get_next_sibling") };
@@ -1187,7 +1222,7 @@ impl Symbols {
             gtk_editable_get_position,
             gtk_widget_unparent, gtk_widget_get_parent,
             gtk_widget_get_first_child, gtk_widget_get_next_sibling,
-            gtk_container_get_children, gtk_container_foreach, gtk_menu_item_activate, g_list_free, gtk_menu_item_get_submenu, gtk_widget_is_visible, gtk_menu_popup, gtk_clipboard_get, gtk_clipboard_set_text, gtk_clipboard_wait_for_text, gdk_atom_intern,
+            gtk_container_get_children, gtk_container_foreach, gtk_menu_item_activate, g_list_free, gtk_menu_item_get_submenu, gtk_widget_is_visible, gtk_menu_popup, gtk_clipboard_get, gtk_clipboard_set_text, gtk_clipboard_wait_for_text, gtk_drag_source_set, gtk_drag_source_set_icon_name, gtk_selection_data_set_uris, gtk_selection_data_set_text, gdk_atom_intern,
             gtk_widget_translate_coordinates, gtk_widget_get_window, gdk_window_get_origin,
             gtk_popover_menu_bar_item_get_popover, gtk_popover_get_child, gtk_popover_new, gtk_popover_set_child,
             gtk_menu_button_get_label, gtk_menu_button_set_active,

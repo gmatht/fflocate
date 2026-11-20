@@ -777,6 +777,128 @@ mod gtk_adapter {
         }
     }
 
+    /// Make `widget` a drag source that hands out a file path, as GTK3 does.
+    ///
+    /// Two formats are advertised: `text/uri-list` (what a terminal's drop
+    /// handler and every file manager read) and `UTF8_STRING` (plain text, for
+    /// a destination that takes nothing else). `payload` is asked at *drop*
+    /// time, not when the drag starts, which is what lets the caller read the
+    /// row that is selected now rather than copying a row it may not use.
+    ///
+    /// GTK4 removed `gtk_drag_source_set` (a drag source became an event
+    /// controller there), so this reports that instead of installing a source
+    /// that never begins a drag.
+    pub unsafe fn enable_uri_drag_source(
+        widget: *mut c_void,
+        payload: Box<dyn FnMut() -> Option<(Vec<String>, String)>>,
+        icon: Box<dyn FnMut() -> Option<(String, String)>>,
+    ) -> Result<(), Error> {
+        let loader = crate::backends::gtk::loader()
+            .ok_or_else(|| Error::Backend("GTK is not initialised".to_string()))?;
+        let syms = &loader.symbols;
+        let (Some(set_source), Some(set_icon_name), Some(set_uris), Some(set_text)) = (
+            syms.gtk_drag_source_set,
+            syms.gtk_drag_source_set_icon_name,
+            syms.gtk_selection_data_set_uris,
+            syms.gtk_selection_data_set_text,
+        ) else {
+            return Err(Error::Backend(
+                "this GTK build has no drag-source API (GTK4 removed it)".to_string(),
+            ));
+        };
+        // The `info` numbers are the protocol between this table and the
+        // handler below: 0 asks for the URI list, 1 for plain text.
+        const INFO_URIS: u32 = 0;
+        const INFO_TEXT: u32 = 1;
+        // Leaked on purpose: `gtk_drag_source_set` copies the target strings,
+        // but the table of entries has to outlive the call, and one small leak
+        // per window is cheaper than a self-referential store for it.
+        let targets: &'static mut [gtk_dynamic_loader::GtkTargetEntry] = Box::leak(Box::new([
+            gtk_dynamic_loader::GtkTargetEntry {
+                target: b"text/uri-list\0".as_ptr() as *mut u8,
+                flags: 0,
+                info: INFO_URIS,
+            },
+            gtk_dynamic_loader::GtkTargetEntry {
+                target: b"UTF8_STRING\0".as_ptr() as *mut u8,
+                flags: 0,
+                info: INFO_TEXT,
+            },
+            gtk_dynamic_loader::GtkTargetEntry {
+                target: b"text/plain;charset=utf-8\0".as_ptr() as *mut u8,
+                flags: 0,
+                info: INFO_TEXT,
+            },
+            // Exact-atom match: a destination that asks for plain `text/plain`
+            // does not accept `text/plain;charset=utf-8` (target atoms are
+            // compared uninterpreted), and `set_text` fills either one.
+            gtk_dynamic_loader::GtkTargetEntry {
+                target: b"text/plain\0".as_ptr() as *mut u8,
+                flags: 0,
+                info: INFO_TEXT,
+            },
+        ]));
+        // GDK_BUTTON1_MASK is 1 << 8, *not* 1: GDK's button bits live at
+        // shift 8 in `GdkModifierType` (1 is GDK_SHIFT_MASK). GTK starts a
+        // drag only when `(event->button.state & start_button_mask) ==
+        // start_button_mask`, so passing 1 made a drag need Shift held and a
+        // plain left-drag do nothing -- no cursor, no drag.
+        const GDK_BUTTON1_MASK: i32 = 1 << 8;
+        // GDK_ACTION_COPY = 2 (a drop copies the path; nothing is moved).
+        const GDK_ACTION_COPY: i32 = 2;
+        set_source(
+            widget,
+            GDK_BUTTON1_MASK,
+            targets.as_ptr(),
+            targets.len() as i32,
+            GDK_ACTION_COPY,
+        );
+
+        // The drag image: the caller's themed name when it has one, else GTK's
+        // default icon (GTK uses one for any drag that never set an image).
+        let mut icon = icon;
+        if let Some((name, _fallback)) = icon() {
+            if let Ok(name) = std::ffi::CString::new(name) {
+                set_icon_name(widget, name.as_ptr() as *const u8);
+            }
+        }
+
+        let mut payload = payload;
+        let handler: Box<dyn FnMut(*mut c_void, u32)> = Box::new(move |selection, info| {
+            if selection.is_null() {
+                return;
+            }
+            let Some((uris, text)) = payload() else {
+                return;
+            };
+            // The closure is its own body, so the `unsafe fn` above does not
+            // make it an unsafe context.
+            if info == INFO_URIS {
+                // `gtk_selection_data_set_uris` takes a NULL-terminated array
+                // and copies it, so the CStrings only have to live for the call.
+                let owned: Vec<std::ffi::CString> = uris
+                    .iter()
+                    .filter_map(|u| std::ffi::CString::new(u.as_str()).ok())
+                    .collect();
+                let mut ptrs: Vec<*mut u8> = owned
+                    .iter()
+                    .map(|c| c.as_ptr() as *mut u8)
+                    .collect();
+                ptrs.push(std::ptr::null_mut());
+                unsafe {
+                    set_uris(selection, ptrs.as_mut_ptr());
+                }
+            } else {
+                unsafe {
+                    set_text(selection, text.as_ptr(), text.len() as i32);
+                }
+            }
+        });
+        gtk_dynamic_loader::connect_signal_drag_data_get(syms, widget, handler)
+            .map(|_| ())
+            .map_err(Error::Backend)
+    }
+
     pub fn create_simple_action(name: &str) -> Result<SimpleAction, Error> {
         let a = crate::backends::gtk::create_simple_action(name).map_err(|e| Error::Backend(format!("{}", e)))?;
         Ok(SimpleAction(a))
@@ -1073,6 +1195,16 @@ mod gtk_adapter {
         /// the other callbacks so a caller can use one handler instead of three.
         gesture: Option<Box<dyn FnMut(crate::core::Gesture)>>,
         installed: bool,
+        /// Whether GTK owns a drag source on this widget.
+        ///
+        /// A drag source begins its drag from the widget's own
+        /// `button-press-event` handler, which GTK connects when the source is
+        /// set. Event signals stop emitting at the first handler that returns
+        /// TRUE, so a consuming click handler connected earlier (the table's
+        /// row selection) would hide every press from the drag source and no
+        /// drag would ever start. When this is set, a press is reported to the
+        /// callbacks but not consumed, so the drag source still sees it.
+        drag_source: bool,
     }
 
     impl PressHandlers {
@@ -1457,7 +1589,7 @@ mod gtk_adapter {
                         };
                         let button = gtk_dynamic_loader::gdk_event_get_button(&l2, ev).unwrap_or(1);
                         let state = gtk_dynamic_loader::gdk_event_get_state(&l2, ev).unwrap_or(0);
-                        let consumed = {
+                        let (consumed, has_drag_source) = {
                             let mut h = handlers.borrow_mut();
                             h.dispatch_gesture(crate::core::Gesture::Button {
                                 button: PressHandlers::map_button(button),
@@ -1466,9 +1598,11 @@ mod gtk_adapter {
                                 y,
                                 mods: PressHandlers::map_state(state),
                             });
-                            h.dispatch(x, y, button, state)
+                            (h.dispatch(x, y, button, state), h.drag_source)
                         };
-                        if consumed { 1 } else { 0 }
+                        // A drag source needs the press to reach its own
+                        // handler; claiming it here would stop the emission.
+                        if consumed && !has_drag_source { 1 } else { 0 }
                     }),
                 );
             }
@@ -1834,6 +1968,15 @@ mod gtk_adapter {
             }
         }
 
+
+        /// Record that GTK owns a drag source on this canvas, so the click
+        /// handler stops consuming presses and the drag can start.
+        ///
+        /// Called by the drag-source installer once `gtk_drag_source_set` has
+        /// succeeded; see [`PressHandlers::drag_source`].
+        pub fn mark_uri_drag_source(&self) {
+            self.click_handlers.borrow_mut().drag_source = true;
+        }
 
         /// This canvas's top-left in screen coordinates, for placing a context
         /// menu at a widget-relative click point.

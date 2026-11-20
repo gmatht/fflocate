@@ -92,20 +92,27 @@ What that means in practice, stated rather than implied:
 
 * The results list **draws its own header and rows on a canvas** and hit-tests
   clicks by hand. The three columns line up and a click selects a row (so
-  Copy / Open act on the right file), the icon column shows a **letter per file
-  kind** instead of a themed pixbuf, and **clicking the Name or Path header
-  sorts by it** (a second click reverses it, and the title shows `^` or `v`).
-  The icon column does not sort. Row height is fixed. The letters are ASCII on
-  purpose: the canvas draws with the base sans font and has no glyph fallback,
-  so a symbol the font happens to lack draws as an empty box.
+  Copy / Open act on the right file), the icon column paints a **pictogram per
+  file kind** — folder, source, script, document, image, audio, video,
+  spreadsheet, binary, archive, PDF — built from rectangles, since a themed
+  pixbuf is not reachable from the portable canvas, and **clicking the Name or
+  Path header sorts by it** (a second click reverses it, and the title shows `^`
+  or `v`). The icon column does not sort. Row height is fixed. `ICON_SHEET=<path>
+  cargo test --manifest-path vendor/rustxwidgets/Cargo.toml --no-default-features
+  --features gtk,macos --lib -- icon_sheet` renders every mark to a PNG
+  (`icon-sheet.png`) at the size a row uses.
 * **Right-clicking a result opens its row menu.** The row under the cursor is
   selected by the canvas hit-test, then a real menu (`GtkMenu` on GTK, `NSMenu`
   on AppKit) offers *Open*, *Open containing folder*, *Copy full path* and
   *Open in terminal*; each entry dispatches the handler the **Search** menu
   uses, and *Copy full path* puts the row's absolute path on the system
   clipboard, from where it can be read back.
-* **Drag-and-drop is unavailable** for the same reason: `enable_uri_drag_source`
-  reports it (status line) rather than starting a drag that carries nothing.
+* **Dragging a result out of the list carries its path** on GTK: the canvas owns
+  a `text/uri-list` source (plus `UTF8_STRING`), so dropping a row on a terminal
+  or a file manager hands it the path. The payload is read when the drop is
+  accepted, so it follows the row that is selected then. AppKit has no drag
+  source on this layer yet and says so in the status line rather than starting a
+  drag that carries nothing.
 * The **Advanced search foldout** starts collapsed and is opened from the
   **Search** menu; hiding the body is what collapses it, and its header says
   `(collapsed)` / `(expanded)`. The header itself is a label, not a button:
@@ -256,9 +263,9 @@ depend on a checkout outside this repository.
   not drag: the canvas list has no per-column sizing UI.
 * Results are a **three-column list — Icon / Name / Path**, drawn on a canvas
   by `rswidgets::compat::TreeView`, so the columns line up on GTK and AppKit
-  alike and a click selects a row. The icon column shows a **letter per file
-  kind** (folder, source, image, …) rather than a themed pixbuf, and clicking
-  the Name or Path header sorts by it (again to reverse). Clicking blank space below the rows does
+  alike and a click selects a row. The icon column paints a **pictogram per file
+  kind** (folder, source, script, image, archive, …) rather than a themed
+  pixbuf, and clicking the Name or Path header sorts by it (again to reverse). Clicking blank space below the rows does
   nothing rather than acting on a neighbour; `(no matches)` stays an explicit
   line. The list is handed its full content height, so more matches than fit
   show the scrolled window's **scrollbar** and scroll with the wheel, while the

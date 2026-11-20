@@ -471,11 +471,11 @@ These are deliberate and small; each is noted so the design stays honest.
    rustxWidgets backends dropped `TreeView`, `Expander` and `ContextMenu`;
    `vendor/rustxwidgets/src/compat.rs` rebuilds them on the portable layer, so
    `ff-gui` builds for Linux (GTK) and macOS (AppKit) from one source. The cost
-   is fidelity, recorded in `crates/ff-gui/README.md`: the results list draws a
-   letter per file kind instead of a themed icon (ASCII: the canvas has no
-   glyph fallback, so a symbol the font lacks drew as an empty box), its Name
-   and Path headers sort on click, and drag-and-drop is unavailable. The daemon
-   and CLI are unaffected.
+   is fidelity, recorded in `crates/ff-gui/README.md`: the results list paints a
+   pictogram per file kind out of rectangles instead of loading a themed icon
+   (the portable canvas has no pixbuf), its Name and Path headers sort on click,
+   and a row can be dragged out as a `text/uri-list` (GTK; AppKit has no drag
+   source on this layer yet). The daemon and CLI are unaffected.
 
    On macOS the window is real, and so is what those shim classes provide.
    `ff-gui` creates its own `NSApplication` and `NSWindow`, builds the whole

@@ -1709,9 +1709,8 @@ pub fn context_menu_target(button: u32, row: Option<i32>, current: &[String]) ->
 /// One row of the results, as three columns: icon, name, path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
-    /// Icon *name* to look up in the icon theme (e.g. `folder`,
-    /// `text-x-generic`). The GUI loads it; the terminal fallback maps it to a
-    /// glyph.
+    /// Icon *name* for the file kind (e.g. `folder`, `text-x-generic`). The
+    /// canvas list paints a pictogram from it; a text backend prints a glyph.
     pub icon: String,
     /// The file name (last path component).
     pub name: String,
@@ -1881,13 +1880,26 @@ pub fn icon_name_for(name: &str, is_dir: bool) -> &'static str {
         "go" => "text-x-go",
         "java" => "text-x-java",
         "rb" => "text-x-ruby",
-        "sh" | "bash" | "zsh" => "text-x-script",
+        "sh" | "bash" | "zsh" | "fish" | "ksh" | "csh" | "tcsh" | "bat" | "cmd" | "ps1"
+        | "psm1" | "vbs" => "text-x-script",
         "md" | "markdown" => "text-markdown",
         "json" => "application-json",
         "toml" | "yaml" | "yml" | "ini" | "cfg" => "text-x-generic",
         "html" | "htm" => "text-html",
         "css" => "text-css",
         "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "bmp" => "image-x-generic",
+        "mp3" | "wav" | "flac" | "ogg" | "oga" | "opus" | "m4a" | "aac" | "wma" | "aiff"
+        | "aif" | "alac" | "ape" | "mid" | "midi" | "amr" => "audio-x-generic",
+        // `.ts` is TypeScript here, so the video set leaves it out (as do
+        // `.m2ts` and `.ogv`, which no other kind claims).
+        "mp4" | "mkv" | "avi" | "mov" | "webm" | "flv" | "wmv" | "mpg" | "mpeg" | "m4v"
+        | "3gp" | "m2ts" | "vob" | "ogv" => "video-x-generic",
+        "csv" | "tsv" | "xls" | "xlsx" | "ods" => "x-office-spreadsheet",
+        // Machine code: programs, and the object/library files they are built
+        // from. Both draw the same pictogram; the name still says which it is.
+        "exe" | "com" | "dll" | "so" | "dylib" | "bin" | "elf" | "out" | "app"
+        | "appimage" | "ko" | "sys" | "run" | "msc" => "application-x-executable",
+        "o" | "obj" | "a" | "lib" => "application-x-object",
         "pdf" => "application-pdf",
         "zip" | "gz" | "xz" | "tar" | "zst" | "bz2" => "package-x-generic",
         "txt" | "log" => "text-x-generic",
@@ -2046,6 +2058,21 @@ mod tests {
         assert_eq!(icon_name_for("notes.md", false), "text-markdown");
         assert_eq!(icon_name_for("data.json", false), "application-json");
         assert_eq!(icon_name_for("logo.png", false), "image-x-generic");
+        assert_eq!(icon_name_for("song.mp3", false), "audio-x-generic");
+        assert_eq!(icon_name_for("clip.MKV", false), "video-x-generic");
+        assert_eq!(icon_name_for("sheet.csv", false), "x-office-spreadsheet");
+        // A `.ts` file is TypeScript, not a video transport stream.
+        assert_eq!(icon_name_for("app.ts", false), "text-x-typescript");
+        assert_eq!(icon_name_for("setup.exe", false), "application-x-executable");
+        // `.dll` and `.so` are shared libraries, but they are still code, not
+        // text: they group with the programs rather than with documents.
+        assert_eq!(icon_name_for("ffi.DLL", false), "application-x-executable");
+        assert_eq!(icon_name_for("libff.so", false), "application-x-executable");
+        assert_eq!(icon_name_for("main.o", false), "application-x-object");
+        assert_eq!(icon_name_for("libff.a", false), "application-x-object");
+        assert_eq!(icon_name_for("build.sh", false), "text-x-script");
+        assert_eq!(icon_name_for("run.BAT", false), "text-x-script");
+        assert_eq!(icon_name_for("deploy.ps1", false), "text-x-script");
         assert_eq!(icon_name_for("README", false), "text-x-generic");
         assert_eq!(icon_name_for("src", true), "folder");
         // Extension matching is case-insensitive.

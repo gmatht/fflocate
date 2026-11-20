@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ff_gui::{
-    box_change_clears, containing_dir, context_menu_target, effective_query, encode_request,
+    box_change_clears, containing_dir, context_menu_target, drag_payload, effective_query, encode_request,
     render_count, rows_from_paths, scan_percent, search_label, searching_status_line,
     step_max_distance, streaming_status_line, DaemonClient, GuiError,
     MenuAction, PendingRequest, Progress, RowAction, SearchGate, SearchOptions, SearchOutcome,
@@ -175,8 +175,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // tracks a selection on every backend, so the three columns align and the
     // same code serves GTK and AppKit. (title, is_icon, sortable): clicking a
     // sortable header sorts by it and a second click reverses the order. All
-    // three are sortable, the icon column included: its glyph groups the rows
-    // by kind, which is how you collect the folders at one end.
+    // three are sortable, the icon column included: its pictogram groups the
+    // rows by kind, which is how you collect the folders at one end.
     trace_step!("results treeview");
     let results = app.create_treeview(&[
         ("", true, true),
@@ -937,13 +937,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Dragging a row out of the window is not available in this build: the
-    // compat list has no native drag source, so this asks it and reports the
-    // reason instead of starting a drag that carries nothing. The
-    // `enable_uri_drag_source` surface and `ff_gui::drag_payload` stay for a
-    // backend that can carry a URI.
-    if let Err(e) = results.enable_uri_drag_source(|| None, || None) {
-        status.set_text(&format!("drag and drop unavailable: {e}"));
+    // Dragging a row out of the window hands its path to whatever is under the
+    // pointer: a `file://` URI for a terminal or file manager, and the plain
+    // path as text. The payload is read at drop time, so it follows a header
+    // click's re-sort and the current selection.
+    {
+        let drag_results = results.clone();
+        if let Err(e) = results.enable_uri_drag_source(
+            move || {
+                drag_results
+                    .selected_path(PATH_COLUMN)
+                    .map(|path| drag_payload(&path))
+            },
+            || None,
+        ) {
+            status.set_text(&format!("drag and drop unavailable: {e}"));
+        }
     }
 
     // Menubar (File/Search/View/Help). Every item reuses a handler something
@@ -1562,12 +1571,12 @@ impl TextViewLike for rswidgets::compat::TreeView {
     }
 }
 
-/// The glyph the icon column draws for a themed icon name.
+/// The character an icon name falls back to when there is no canvas to paint on.
 ///
-/// The compat `TreeView` paints on a canvas, so it cannot load a themed pixbuf:
-/// the column shows one character per file kind. The theme name still travels
-/// with the cell (`CellValue::Icon::name`) for a backend that can use a real
-/// icon, and this is only the drawn fallback.
+/// The results list does **not** use these: `rswidgets::compat::TreeView` paints
+/// a pictogram per file kind (`paint_icon`). This is what a text backend — the
+/// `zork` fallback, which renders the list as aligned text — prints in the icon
+/// column, and it is why the glyphs are one ASCII character each.
 ///
 /// ASCII only, deliberately. The canvas draws with the base sans font and has
 /// no glyph fallback, so a symbol the font happens to lack (Noto Sans has no
@@ -1588,6 +1597,11 @@ fn icon_glyph(icon: &str) -> &'static str {
         "text-html" => "H",
         "text-css" => "s",
         "image-x-generic" => "i",
+        "audio-x-generic" => "a",
+        "video-x-generic" => "v",
+        "x-office-spreadsheet" => "t",
+        "application-x-executable" => "x",
+        "application-x-object" => "o",
         "application-pdf" => "p",
         "package-x-generic" => "z",
         _ => "-",
@@ -1810,9 +1824,15 @@ mod tests {
             "folder",
             "text-x-rust",
             "text-x-python",
+            "text-x-script",
             "text-x-json",
             "text-x-generic",
             "image-x-generic",
+            "audio-x-generic",
+            "video-x-generic",
+            "x-office-spreadsheet",
+            "application-x-executable",
+            "application-x-object",
             "package-x-generic",
             "application-pdf",
             "something-new",
