@@ -79,6 +79,23 @@ jobs:
           echo "::error title=GUI build/test failure (${RUNNER_OS})::${msg}"
           exit 1
 
+      # `cargo test -p ff-gui` above already runs the macOS-only tests, but a
+      # green step does not say which of them ran. This names them, so the job
+      # log shows the AppKit side's model tests instead of leaving them implied.
+      - name: Mac GUI model tests (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          status=0
+          cargo test -p ff-gui --test macos_gui_parts >macos-parts.log 2>&1 || status=$?
+          lines=$(grep -E '^test |test result' macos-parts.log | tr '\n' '|' | cut -c1-1500)
+          if [ "$status" -eq 0 ]; then
+            echo "::notice title=mac gui model tests (macOS)::${lines}"
+            exit 0
+          fi
+          echo "::error title=mac gui model tests (macOS)::$(tail -c 1200 macos-parts.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+          exit 1
+
       # The build step's own annotations can be dropped when it fails, so a
       # failed build is also reported from its log file by this step.
       - name: GUI build log (macOS)
