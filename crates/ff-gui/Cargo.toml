@@ -47,6 +47,13 @@ name = "daemon_pixels_mac"
 path = "tests/daemon_pixels_mac.rs"
 harness = false
 
+# The GTK counterpart: one GTK thread, and its own main so the capture runs
+# once after the window has been laid out.
+[[test]]
+name = "daemon_pixels_gtk"
+path = "tests/daemon_pixels_gtk.rs"
+harness = false
+
 [features]
 # Backend selection. On Linux the GUI defaults to the real widget toolkit
 # (GTK), which is what a user expects from `ff --gui`. The `zork` backend is a
@@ -89,5 +96,8 @@ embed-manifest = "1"
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true
 # The display-gated GTK regression tests reach the raw loader directly
-# (tests/menubar_gtk.rs, tests/startup_gtk.rs).
+# (tests/menubar_gtk.rs, tests/startup_gtk.rs), and daemon_pixels_gtk.rs loads
+# GTK's synchronous widget draw and Cairo's image surface to capture pixels:
+# the GTK build has no capture call of its own to reach through the loader.
 gtk_dynamic_loader = { path = "../../vendor/gtk_dynamic_loader" }
+libloading = "0.8"

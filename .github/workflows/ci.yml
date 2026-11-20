@@ -122,20 +122,31 @@ jobs:
           command -v xvfb-run || { echo "::error title=interaction (Linux)::xvfb-run is not installed"; exit 1; }
           status=0
           : > interaction.log
+          # The pixel test spawns a real daemon; build it so the test runs
+          # instead of skipping for want of a binary.
+          cargo build -p fflocated 2>&1 | tail -1
           # One xvfb-run (and one process) per test binary: the menu tests spin a
           # GTK main loop, and two of them in one session have been seen to wait
           # on each other. Each is bounded so a hang fails the job instead of
           # stalling it.
-          for t in row_menu_gtk interaction_gtk typing_gtk reflow_gtk menubar_gtk; do
+          for t in row_menu_gtk interaction_gtk typing_gtk reflow_gtk menubar_gtk daemon_pixels_gtk; do
             printf '=== %s ===\n' "$t" >> interaction.log
             xvfb-run -a -s "-screen 0 1280x1024x24" \
               timeout 180 cargo test -p ff-gui --test "$t" -- --nocapture >> interaction.log 2>&1 \
               || status=1
           done
           echo "interaction tests: exit ${status}; $(grep -E 'test result' interaction.log | tr '\n' '|')"
-          lines=$(grep -E 'row menu:|clipboard holds|interaction:|typing:|reflow:|menu bar:|test result' interaction.log | tr '\n' '|' | cut -c1-3500)
+          lines=$(grep -E 'row menu:|clipboard holds|pixels:|interaction:|typing:|reflow:|menu bar:|test result' interaction.log | tr '\n' '|' | cut -c1-3500)
           if [ "$status" -eq 0 ]; then
+            # The pixel check must have run, not skipped for want of a display
+            # or a daemon: Xvfb is up and this step builds nothing else, so a
+            # missing line means it silently did nothing.
+            if ! grep -q '^pixels: ok' interaction.log; then
+              echo "::error title=daemon pixels (Linux)::the pixel check did not run: $(grep -E '^(pixels|daemon_pixels_gtk):' interaction.log | tr '\n' '|' | cut -c1-1200)"
+              exit 1
+            fi
             echo "::notice title=interaction (Linux)::${lines}"
+            echo "::notice title=daemon pixels (Linux)::$(grep '^pixels:' interaction.log | tr '\n' '|')"
             exit 0
           fi
           echo "::error title=interaction test (Linux)::$(grep -E 'panicked|assertion|^error|error\[|not found|No such|timed out' interaction.log | head -12 | tr '\n' '|' | cut -c1-3000)"
