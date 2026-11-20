@@ -906,12 +906,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The GUI's own debounce type, shortened so the probe does not wait 150 ms.
     let debounce = std::rc::Rc::new(ff_gui::Debounce::new(std::time::Duration::from_millis(120)));
     let query_entry = app.create_entry()?;
+    // How many edits cleared the box (the app renders nothing there at once).
+    let cleared = Arc::new(AtomicUsize::new(0));
     {
         let typed = typed.clone();
         let debounce = debounce.clone();
+        let boxed = query_entry.clone();
+        let cleared_list = list.clone();
+        let cleared = cleared.clone();
         query_entry.connect_changed(move || {
             typed.fetch_add(1, Ordering::SeqCst);
-            // A keystroke only arms the deadline; it must never send a request.
+            // main.rs' own decision: an emptied box renders no rows at once and
+            // arms nothing; any other edit only arms the deadline and must
+            // never send a request. The deadline a previous keystroke armed is
+            // deliberately left alone — the pump must not issue for it.
+            let text = boxed.get_text().unwrap_or_default();
+            if ff_gui::box_change_clears(&text, "") {
+                cleared_list.set_rows(&Vec::new());
+                cleared.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
             debounce.arm();
         })?;
     }
@@ -979,6 +993,151 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         painted_names, expected_names,
         "the list does not hold the rows the daemon returned"
     );
+
+    // --- Rapid keystrokes collapse into one request, not one per character ---
+    //
+    // Each `setText:` plus `controlTextDidChange:` is one keystroke, and there
+    // are four of them here: none may send a request on its own.
+    {
+        let changes_before = typed.load(Ordering::SeqCst);
+        let requests_before = requests.lock().unwrap().len();
+        for prefix in ["p", "pr", "pro", "prob"] {
+            query_entry.set_text(prefix);
+            rswidgets::backends_macos_adapter::dispatch_text_changed(query_entry.raw_handle());
+        }
+        let keystrokes = typed.load(Ordering::SeqCst) - changes_before;
+        assert_eq!(
+            keystrokes, 4,
+            "{keystrokes} of the 4 keystrokes reached the change callback"
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            requests_before,
+            "a request went out while the user was still typing: {:?}",
+            requests.lock().unwrap()
+        );
+        assert!(
+            debounce.pending(),
+            "typing did not re-arm the debounce after the first search"
+        );
+
+        // The window elapses: exactly one request, carrying the last text.
+        let mut issued = false;
+        for _ in 0..200 {
+            if debounce.due() {
+                let query = query_entry.get_text().unwrap_or_default();
+                assert_eq!(query, "prob", "the request would carry {query:?}");
+                requests.lock().unwrap().push(query.clone());
+                let client = ff_gui::DaemonClient::with_socket(socket.clone());
+                let outcome = client.search(&query, 10).expect("the daemon refused the query");
+                *daemon_paths.lock().unwrap() = outcome.paths.clone();
+                typed_rows.store(outcome.paths.len(), Ordering::SeqCst);
+                list.set_rows(&cells_of(&outcome.paths));
+                debounce.clear();
+                issued = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(issued, "the window never elapsed after the second round of typing");
+        let sent = requests.lock().unwrap().clone();
+        println!(
+            "probe: {keystrokes} keystroke(s) -> one request {:?} -> {} row(s)",
+            sent.last(),
+            typed_rows.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            sent,
+            vec!["probe".to_string(), "prob".to_string()],
+            "the keystrokes did not collapse into a single second request"
+        );
+        let painted_after: Vec<String> = (0..)
+            .map_while(|row| list.cell_text(row, 1))
+            .collect();
+        assert_eq!(
+            painted_after.len(),
+            3,
+            "the second search drew {} row(s), not the daemon's 3",
+            painted_after.len()
+        );
+    }
+
+    // --- Clearing the box: no rows, and no request ---
+    {
+        let requests_before = requests.lock().unwrap().len();
+        query_entry.set_text("");
+        rswidgets::backends_macos_adapter::dispatch_text_changed(query_entry.raw_handle());
+        let rows: Vec<String> = (0..).map_while(|row| list.cell_text(row, 1)).collect();
+        println!(
+            "probe: box cleared -> {} row(s) left, {} clear render(s), requests {:?}",
+            rows.len(),
+            cleared.load(Ordering::SeqCst),
+            requests.lock().unwrap()
+        );
+        assert!(
+            rows.is_empty(),
+            "clearing the box left rows on screen: {rows:?}"
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            requests_before,
+            "clearing the box sent a request: {:?}",
+            requests.lock().unwrap()
+        );
+        assert!(
+            !debounce.pending(),
+            "clearing the box left the debounce armed"
+        );
+    }
+
+    // --- Typing, then erasing before the window: nothing may repaint ---
+    {
+        query_entry.set_text("pro");
+        rswidgets::backends_macos_adapter::dispatch_text_changed(query_entry.raw_handle());
+        assert!(
+            debounce.pending(),
+            "typing again did not arm the debounce"
+        );
+        let requests_before = requests.lock().unwrap().len();
+        query_entry.set_text("");
+        rswidgets::backends_macos_adapter::dispatch_text_changed(query_entry.raw_handle());
+        // The erased keystroke leaves the earlier deadline armed; the pump's
+        // step is what must notice the box is empty and clear instead of
+        // asking the daemon for a query the user has already deleted.
+        let mut ticked = false;
+        for _ in 0..200 {
+            if debounce.due() {
+                let query = query_entry.get_text().unwrap_or_default();
+                assert!(
+                    ff_gui::box_change_clears(&query, ""),
+                    "the box held {query:?} when the erased deadline elapsed"
+                );
+                debounce.clear();
+                list.set_rows(&Vec::new());
+                ticked = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(ticked, "the erased deadline never elapsed, so nothing was decided");
+        let rows: Vec<String> = (0..).map_while(|row| list.cell_text(row, 1)).collect();
+        println!(
+            "probe: typed \"pro\" then erased before the window -> {} row(s), requests {:?}",
+            rows.len(),
+            requests.lock().unwrap()
+        );
+        assert!(
+            rows.is_empty(),
+            "the list was repainted for a query the user erased: {rows:?}"
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            requests_before,
+            "the erased query reached the daemon: {:?}",
+            requests.lock().unwrap()
+        );
+        assert!(!debounce.pending(), "the debounce is still armed after erasing");
+    }
 
     // --- Return in the entry: the delegate's activate path ---
     //
