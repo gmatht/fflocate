@@ -9,7 +9,12 @@ use std::path::PathBuf;
 
 /// The on-disk format version. Bumping it migrates or recrawls instead of
 /// corrupting (§15).
-pub const FORMAT_VERSION: u32 = 2;
+///
+/// 3 adds each entry's creation time (minutes since the epoch, `u32`) to the
+/// snapshot and the journal's `add` record. Older stores live in their own
+/// versioned state dir and are left alone; a bump therefore starts from a fresh
+/// crawl, which is also what populates the new field.
+pub const FORMAT_VERSION: u32 = 3;
 
 pub fn runtime_dir() -> PathBuf {
     if let Ok(d) = std::env::var("XDG_RUNTIME_DIR") {

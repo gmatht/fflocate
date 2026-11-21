@@ -221,10 +221,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     advanced_query.set_placeholder_text(ADVANCED_SYNTAX_HELP);
 
     // The created-date range: two inclusive `YYYY-MM-DD` fields, either blank
-    // for unbounded. The index stores no timestamps, so the daemon cannot
-    // answer this — the GUI filters the rows it gets (see
-    // `ff_gui::filter_by_created`) and the status line says exactly what it
-    // checked. A file whose filesystem reports no birth time never matches.
+    // for unbounded. Each hit carries the entry's creation minute as the daemon
+    // stored it, so the GUI filters the rows it gets without a `stat` per row
+    // (see `ff_gui::apply_created_range`); a row the daemon could not date falls
+    // back to `ff_gui::created_secs`. The status line says exactly what was
+    // checked, and a file whose filesystem reports no birth time never matches.
     //
     // The row is built by `ff_gui::created_ui` rather than here: `main.rs` is a
     // binary, so the GTK regression test can only drive the same widgets if

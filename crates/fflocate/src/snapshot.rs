@@ -23,8 +23,14 @@
 //! ...     ...   names blob (names_len bytes)
 //! ...     ...   entries (entry_count * 12 bytes: name_off u32, name_len u16,
 //!                              parent u32, flags u8)
+//! ...     ...   created (entry_count * 4 bytes: minutes since the epoch, u32,
+//!                              0 = unknown; version 3 and later)
 //! EOF-4   4     crc32 of everything before it
 //! ```
+//!
+//! Version 3 adds the `created` array. A version-2 snapshot still loads (its
+//! entries read as "creation time unknown") so a format bump never has to
+//! throw away data it can still understand; the next write is version 3.
 //!
 //! On load we prefer a real `mmap` (MAP_PRIVATE) so a 10 M-entry snapshot does
 //! not block on a copy; the returned [`LoadedSnapshot`] owns the mapping. The
@@ -39,7 +45,11 @@ use crate::roots::{MountCaps, Root};
 use crate::util::crc32;
 
 pub const MAGIC: &[u8; 4] = b"FNX2";
-pub const VERSION: u32 = 2;
+/// Oldest snapshot version this build can read. Version 2 had no creation
+/// times; version 3 appends a `u32`-per-entry created array.
+pub const MIN_VERSION: u32 = 2;
+/// Version this build writes.
+pub const VERSION: u32 = 3;
 const ENTRY_SIZE: usize = 12;
 
 /// A loaded snapshot, either memory-mapped or owned (write path/tests).
@@ -98,6 +108,13 @@ pub fn encode(index: &Index, roots: &[Root]) -> Vec<u8> {
         out.extend_from_slice(&e.name_len.to_le_bytes());
         out.extend_from_slice(&e.parent.to_le_bytes());
         out.push(e.flags);
+    }
+    // One minute-resolution creation time per entry, aligned with the entries
+    // array by index (and padded here, so a caller-built index can never write
+    // a short block).
+    let created = index.created_array();
+    for i in 0..index.entries.len() {
+        out.extend_from_slice(&created.get(i).copied().unwrap_or(0).to_le_bytes());
     }
     let sum = crc32(&out);
     out.extend_from_slice(&sum.to_le_bytes());
@@ -181,7 +198,7 @@ pub fn decode(bytes: &[u8]) -> io::Result<(Index, Vec<Root>)> {
     let mut r = Cursor::new(body);
     r.skip(4);
     let version = r.u32()?;
-    if version != VERSION {
+    if !(MIN_VERSION..=VERSION).contains(&version) {
         return Err(corrupt(&format!("unsupported snapshot version {version}")));
     }
     let next_id = r.u32()?;
@@ -228,12 +245,20 @@ pub fn decode(bytes: &[u8]) -> io::Result<(Index, Vec<Root>)> {
             flags,
         });
     }
+    // Version 3 appends the creation array; a version-2 body simply ends here
+    // and every entry reads as "unknown".
+    let mut created = Vec::with_capacity(entry_count);
+    if version >= 3 {
+        for _ in 0..entry_count {
+            created.push(r.u32()?);
+        }
+    }
     if r.remaining() != 0 {
         return Err(corrupt("trailing bytes in snapshot body"));
     }
     index_integrity(&names, &entries)?;
 
-    let mut index = Index::new_reconstructed(names, entries);
+    let mut index = Index::new_reconstructed(names, entries, created);
     index.set_next_id(next_id);
     index.set_generation(generation);
     index.set_last_lsn(last_lsn);
@@ -356,7 +381,9 @@ mod tests {
             EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
         );
         let s = ix.insert(r, b"src", EntryFlags::EMPTY.with_dir(true));
-        ix.insert(s, b"main.rs", EntryFlags::EMPTY);
+        let main = ix.insert(s, b"main.rs", EntryFlags::EMPTY);
+        // 2026-01-02T00:00:00Z in whole minutes.
+        ix.set_created(main, 29_455_200);
         ix.insert(r, b"README.md", EntryFlags::EMPTY);
         ix.set_last_lsn(99);
         ix.set_generation(4);
@@ -378,12 +405,39 @@ mod tests {
         assert_eq!(ix2.live_count(), ix.live_count());
         assert_eq!(ix2.names, ix.names);
         assert_eq!(ix2.entries, ix.entries);
+        // Creation times survive the round trip, minute-resolution and all.
+        assert_eq!(ix2.created_array(), ix.created_array());
+        assert_eq!(ix2.created_secs(3), Some(29_455_200 * 60));
+        assert_eq!(ix2.created_min(4), None, "an undated entry stays unknown");
         assert_eq!(r2.len(), 1);
         assert_eq!(r2[0].path, PathBuf::from("/home/me/proj"));
         assert_eq!(r2[0].dev, 42);
         assert!(r2[0].caps.writable);
         assert_eq!(r2[0].caps.fstype, "ext4");
         assert_eq!(r2[0].last_full_crawl, crate::cursor::Cursor::new(4, 90));
+    }
+
+    #[test]
+    fn version_two_snapshot_still_loads_with_unknown_creation_times() {
+        // The format bump must not make an older store unreadable: drop the
+        // created block from a version-3 file, mark it version 2, and decode it.
+        let (ix, roots) = sample();
+        let bytes = encode(&ix, &roots);
+        let n = bytes.len();
+        let entry_count =
+            u64::from_le_bytes(bytes[28..36].try_into().unwrap()) as usize;
+        let mut body = bytes[..n - 4].to_vec();
+        body.truncate(body.len() - entry_count * 4);
+        body[4..8].copy_from_slice(&2u32.to_le_bytes());
+        let sum = crc32(&body);
+        body.extend_from_slice(&sum.to_le_bytes());
+
+        let (ix2, _) = decode(&body).expect("a version-2 snapshot must still load");
+        assert_eq!(ix2.entries, ix.entries, "names and ids are untouched");
+        assert_eq!(ix2.created_array().len(), ix2.len());
+        for id in 0..ix2.len() as u32 {
+            assert_eq!(ix2.created_min(id), None, "v2 carried no creation time");
+        }
     }
 
     #[test]
@@ -424,15 +478,27 @@ mod tests {
 
     #[test]
     fn rejects_forward_parent() {
-        let (ix, roots) = sample();
-        let mut bytes = encode(&ix, &roots);
-        // Find the entries block: recompute offset is fiddly, so flip a middle
-        // entry's parent to a huge value and re-checksum; decode must reject.
-        // We just corrupt and expect *some* error (crc or integrity).
-        let n = bytes.len();
-        bytes[n - 8] = 0xFF;
-        let sum = crc32(&bytes[..n - 4]);
-        bytes[n - 4..].copy_from_slice(&sum.to_le_bytes());
-        assert!(decode(&bytes).is_err());
+        // The chain must be acyclic in id order: an entry may only point at an
+        // earlier id (parents are created before children). `index_integrity` is
+        // the gate `decode` runs, so test it where the rule lives rather than
+        // hunting byte offsets inside a serialized file.
+        let names = b"pabc".to_vec();
+        let entry = |off: u32, parent: u32| Entry {
+            name_off: off,
+            name_len: 1,
+            parent,
+            flags: 0,
+        };
+        let entries = vec![
+            Entry::default(), // slot 0, the virtual root
+            entry(0, ROOT_ID),
+            entry(1, 3), // parent is *later*: corrupt
+            entry(2, 1),
+        ];
+        let err = index_integrity(&names, &entries).expect_err("a forward parent must be rejected");
+        assert!(
+            err.to_string().contains("forward"),
+            "expected a forward-parent refusal, got {err}"
+        );
     }
 }

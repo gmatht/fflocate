@@ -33,6 +33,10 @@ Headless, realtime filename index for Linux (macOS later). Daemon (`fflocated`) 
 
 - Content search. Content writes generate zero index work; only namespace ops (create/delete/rename) matter.
 - Per-file metadata (size/mtime) in the core index — lazy sidecar in v2.
+  Creation time is the deliberate exception: the crawl's existing `stat`
+  already yields it, so it is stored as one `u32` of minutes since the epoch
+  per entry (format 3) — that is what makes `since … otime` answer from the
+  index and a created-date range cost no `stat` per row.
 - Triggers/run-on-change (v3 at earliest), project-root scoping (that's Watchman's model, not ours).
 
 ---

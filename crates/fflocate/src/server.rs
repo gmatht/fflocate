@@ -274,6 +274,7 @@ pub fn handle_query_streaming(
                 if !emit(Response::Hit {
                     path: bytes_to_string(path),
                     id: *id,
+                    created: created_of(ctx, *id),
                 }) {
                     return false;
                 }
@@ -651,6 +652,14 @@ pub fn handle_fuzzy_streaming(
 /// filter reads the index, which must never nest under a scan guard.
 ///
 /// Returns `false` (without emitting `Done`) on the first refused emit.
+/// An entry's stored creation time, for the batched paths that hold its id but
+/// no `query::Hit`. Those paths run guard-free (the scan guard is dropped before
+/// emitting, precisely so the ownership filter can read the index), so this
+/// takes the index read lock without nesting it under anything.
+fn created_of(ctx: &ServerCtx, id: u32) -> Option<u32> {
+    ctx.shared.index.read().unwrap().created_min(id)
+}
+
 fn emit_filtered_results(
     ctx: &ServerCtx,
     res: query::Results,
@@ -680,6 +689,7 @@ fn emit_filtered_results(
         if !emit(Response::Hit {
             path: bytes_to_string(&h.path),
             id: h.id,
+            created: h.created_min,
         }) {
             return false;
         }
@@ -812,6 +822,7 @@ pub fn handle_expr_streaming(
                 if !emit(Response::Hit {
                     path: bytes_to_string(path),
                     id: *id,
+                    created: created_of(ctx, *id),
                 }) {
                     return false;
                 }
@@ -1173,6 +1184,7 @@ fn forward_scan_event(
         query::ScanEvent::Hit(hit) => emit(Response::Hit {
             path: bytes_to_string(&hit.path),
             id: hit.id,
+            created: hit.created_min,
         }),
         query::ScanEvent::Progress { scanned, total } => {
             if !want {

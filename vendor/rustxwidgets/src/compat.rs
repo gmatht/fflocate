@@ -864,7 +864,15 @@ fn paint_icon(ctx: &mut dyn DrawContext, x: f64, y: f64, size: f64, cell: &CellV
     let CellValue::Icon { name, .. } = cell else {
         return false;
     };
-    let s = size.max(6.0);
+    // Snap to whole pixels before drawing. The row's icon column starts at a
+    // fractional x (and a row's top can land anywhere in a device pixel), and
+    // a fractional origin antialiases a one-pixel tooth into a pale lavender
+    // smear — the archive's zip then cannot be seen at all in the list, even
+    // though the 11 px sheet (drawn at 0,0) looks right. Rounding moves the
+    // mark by less than a pixel and makes every edge land on the grid.
+    let x = x.round();
+    let y = y.round();
+    let s = size.max(6.0).round();
     match icon_kind(name) {
         // A folder: a tab behind a wider body, the way a file manager draws it.
         IconKind::Folder => {
@@ -872,15 +880,29 @@ fn paint_icon(ctx: &mut dyn DrawContext, x: f64, y: f64, size: f64, cell: &CellV
             ctx.fill_rect(x, y + s * 0.16, s * 0.44, s * 0.18, r, g, b, 1.0);
             ctx.fill_rect(x, y + s * 0.28, s, s * 0.56, r, g, b, 1.0);
         }
-        // A page with two ruled lines; code files get the blue tint.
-        IconKind::Code | IconKind::Document => {
-            let (r, g, b) = match icon_kind(name) {
-                IconKind::Code => (0.22, 0.44, 0.78),
-                _ => (0.45, 0.47, 0.52),
-            };
+        // A plain page with two ruled lines.
+        IconKind::Document => {
+            let (r, g, b) = (0.45, 0.47, 0.52);
             ctx.fill_rect(x + s * 0.06, y + s * 0.08, s * 0.88, s * 0.84, r, g, b, 1.0);
             ctx.fill_rect(x + s * 0.22, y + s * 0.30, s * 0.56, s * 0.10, 1.0, 1.0, 1.0, 1.0);
             ctx.fill_rect(x + s * 0.22, y + s * 0.52, s * 0.40, s * 0.10, 1.0, 1.0, 1.0, 1.0);
+        }
+        // Source code: the blue page, marked with a bracket pair instead of the
+        // document's ruled lines. Colour alone cannot carry the distinction for
+        // a colourblind reader, and at 11 px a pair of square brackets stays
+        // legible where a `< >` or a slash would blur into the page.
+        IconKind::Code => {
+            let (r, g, b) = (0.22, 0.44, 0.78);
+            ctx.fill_rect(x + s * 0.06, y + s * 0.08, s * 0.88, s * 0.84, r, g, b, 1.0);
+            // `[`: a bar with a tick at each end. The ticks stop well short of
+            // the centre so the pair never closes into a box.
+            ctx.fill_rect(x + s * 0.22, y + s * 0.28, s * 0.10, s * 0.42, 1.0, 1.0, 1.0, 1.0);
+            ctx.fill_rect(x + s * 0.22, y + s * 0.28, s * 0.22, s * 0.10, 1.0, 1.0, 1.0, 1.0);
+            ctx.fill_rect(x + s * 0.22, y + s * 0.60, s * 0.22, s * 0.10, 1.0, 1.0, 1.0, 1.0);
+            // ...and `]`, the mirror of it.
+            ctx.fill_rect(x + s * 0.68, y + s * 0.28, s * 0.10, s * 0.42, 1.0, 1.0, 1.0, 1.0);
+            ctx.fill_rect(x + s * 0.56, y + s * 0.28, s * 0.22, s * 0.10, 1.0, 1.0, 1.0, 1.0);
+            ctx.fill_rect(x + s * 0.56, y + s * 0.60, s * 0.22, s * 0.10, 1.0, 1.0, 1.0, 1.0);
         }
         // A script: a page carrying a shell prompt — a stepped chevron with a
         // cursor bar — instead of the ruled lines source code gets. Rust, so it
@@ -936,27 +958,63 @@ fn paint_icon(ctx: &mut dyn DrawContext, x: f64, y: f64, size: f64, cell: &CellV
             ctx.fill_rect(x + s * 0.42, y + s * 0.06, s * 0.16, s * 0.12, r, g, b, 1.0);
             ctx.fill_rect(x + s * 0.42, y + s * 0.82, s * 0.16, s * 0.12, r, g, b, 1.0);
         }
-        // An archive: a carton — a lid wider than the body under it — with the
-        // zip's cut down the middle of the lid.
+        // An archive: a carton — a lid wider than the body under it — closed
+        // by a zip running down the front: a slider sitting on the lid, then
+        // teeth below it that alternate either side of the seam.
         //
         // Drawn from `icon_sheet` renders rather than guessed: at 11 px the
         // original (one box with one band through the middle) read as a
         // struck-through square; three fine track segments with alternating
         // teeth vanished into an indistinct mark; a centred slider over a
         // track read as the letter T, and a split track as the letter H. The
-        // silhouette of a box is what survives, so the zip is now a single
-        // white cut in the lid.
+        // silhouette of a box survives, so the teeth are made as chunky as the
+        // 11 px grid allows — a tooth is a block, not a dash, and the pair of
+        // columns they zigzag between is what stops the seam reading as a
+        // ladder or a letter I.
         IconKind::Archive => {
             let (r, g, b) = (0.52, 0.36, 0.70);
-            ctx.fill_rect(x + s * 0.06, y + s * 0.18, s * 0.88, s * 0.16, r, g, b, 1.0);
-            ctx.fill_rect(x + s * 0.14, y + s * 0.34, s * 0.72, s * 0.52, r, g, b, 1.0);
-            ctx.fill_rect(x + s * 0.46, y + s * 0.18, s * 0.08, s * 0.16, 1.0, 1.0, 1.0, 1.0);
+            // Laid out on the 11 px pixel grid (`pixel(n)` is n/11 of the box),
+            // because fractional edges were the bug: a tooth half a pixel tall
+            // averaged across two rows into a pale smear and the zip vanished
+            // in the row. On the grid a tooth is a solid white pixel row.
+            let pixel = |n: f64| s * (n / 11.0);
+            // Carton: the lid (rows 2–4), then the body (rows 4–9).
+            ctx.fill_rect(x + pixel(1.0), y + pixel(2.0), pixel(9.0), pixel(2.0), r, g, b, 1.0);
+            ctx.fill_rect(x + pixel(2.0), y + pixel(4.0), pixel(7.0), pixel(5.0), r, g, b, 1.0);
+            // The seam where the zip starts: a one-pixel notch in the lid, so
+            // the box keeps its silhouette instead of being cut in two.
+            ctx.fill_rect(x + pixel(5.0), y + pixel(2.0), pixel(1.0), pixel(2.0), 1.0, 1.0, 1.0, 1.0);
+            // Teeth: four one-pixel rows of two pixels each, stepping left,
+            // right, left, right. A pixel of carton stays on either side, so
+            // the mark is a zip across a box rather than a hole in it.
+            for (row, col) in [(4.0, 3.0), (5.0, 5.0), (6.0, 3.0), (7.0, 5.0)] {
+                ctx.fill_rect(
+                    x + pixel(col),
+                    y + pixel(row),
+                    pixel(2.0),
+                    pixel(1.0),
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                );
+            }
         }
-        // A red page, so a PDF is told apart from a text file at this size.
+        // A red page with a folded-over corner. The dog-ear is what tells a PDF
+        // from a text file when the colour is gone: the page's silhouette is
+        // cut in two steps at the top right, which survives even at 11 px.
         IconKind::Pdf => {
-            ctx.fill_rect(x + s * 0.06, y + s * 0.08, s * 0.88, s * 0.84, 0.72, 0.18, 0.18, 1.0);
-            ctx.fill_rect(x + s * 0.22, y + s * 0.30, s * 0.56, s * 0.10, 1.0, 1.0, 1.0, 1.0);
-            ctx.fill_rect(x + s * 0.22, y + s * 0.52, s * 0.40, s * 0.10, 1.0, 1.0, 1.0, 1.0);
+            let (r, g, b) = (0.72, 0.18, 0.18);
+            ctx.fill_rect(x + s * 0.06, y + s * 0.08, s * 0.88, s * 0.84, r, g, b, 1.0);
+            // The cut corner: two overlapping squares make the diagonal.
+            ctx.fill_rect(x + s * 0.66, y + s * 0.08, s * 0.28, s * 0.20, 1.0, 1.0, 1.0, 1.0);
+            ctx.fill_rect(x + s * 0.80, y + s * 0.28, s * 0.14, s * 0.12, 1.0, 1.0, 1.0, 1.0);
+            // The fold itself: the page's edge left along the diagonal.
+            ctx.fill_rect(x + s * 0.66, y + s * 0.24, s * 0.14, s * 0.08, r, g, b, 1.0);
+            ctx.fill_rect(x + s * 0.80, y + s * 0.36, s * 0.14, s * 0.08, r, g, b, 1.0);
+            // Its ruled lines, shorter so they clear the fold.
+            ctx.fill_rect(x + s * 0.20, y + s * 0.38, s * 0.40, s * 0.09, 1.0, 1.0, 1.0, 1.0);
+            ctx.fill_rect(x + s * 0.20, y + s * 0.58, s * 0.32, s * 0.09, 1.0, 1.0, 1.0, 1.0);
         }
         // A note: head, stem and flag. Pink, which no other kind uses.
         IconKind::Audio => {

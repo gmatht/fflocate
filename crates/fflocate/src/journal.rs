@@ -47,12 +47,14 @@ impl OpKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Record {
     /// Insert/upsert a child under a parent. `name` is raw bytes (never UTF-8
-    /// coerced). `id` is the id the applier assigned.
+    /// coerced). `id` is the id the applier assigned. `created` is the entry's
+    /// creation time in minutes since the unix epoch, 0 when unknown.
     Add {
         id: u32,
         parent: u32,
         name: Vec<u8>,
         flags: u8,
+        created: u32,
     },
     /// Tombstone an entry by id.
     Del { id: u32 },
@@ -88,12 +90,14 @@ impl Record {
                 parent,
                 name,
                 flags,
+                created,
             } => {
                 p.extend_from_slice(&id.to_le_bytes());
                 p.extend_from_slice(&parent.to_le_bytes());
                 p.push(*flags);
                 p.extend_from_slice(&(name.len() as u32).to_le_bytes());
                 p.extend_from_slice(name);
+                p.extend_from_slice(&created.to_le_bytes());
             }
             Record::Del { id } => p.extend_from_slice(&id.to_le_bytes()),
             Record::Move {
@@ -121,11 +125,16 @@ impl Record {
                 let flags = r.u8()?;
                 let nlen = r.u32()? as usize;
                 let name = r.bytes(nlen)?;
+                // A journal written before the field existed ends after the
+                // name: read the absent creation time as "unknown" rather than
+                // rejecting every old record.
+                let created = r.u32().unwrap_or(0);
                 Record::Add {
                     id,
                     parent,
                     name: name.to_vec(),
                     flags,
+                    created,
                 }
             }
             OpKind::Del => Record::Del { id: r.u32()? },
@@ -388,7 +397,8 @@ mod tests {
                 id: 5,
                 parent: 1,
                 name: b"a.rs".to_vec(),
-                flags: 0
+                flags: 0,
+                created: 29_455_200
             })
             .unwrap(),
             1
@@ -416,6 +426,32 @@ mod tests {
         assert_eq!(seen.len(), 5);
         assert_eq!(seen[0].0, 1);
         assert_eq!(seen[4].1, Record::Mark { tag: 42 });
+        match &seen[0].1 {
+            Record::Add { created, .. } => assert_eq!(
+                *created, 29_455_200,
+                "the creation minute must survive the journal"
+            ),
+            other => panic!("first record should be the add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_old_add_record_without_a_creation_field_reads_as_unknown() {
+        // A journal written before v3 ended an `add` after its name. Decoding
+        // must not reject it: the missing minute is "unknown", not an error.
+        let mut p = Vec::new();
+        p.extend_from_slice(&7u32.to_le_bytes());
+        p.extend_from_slice(&1u32.to_le_bytes());
+        p.push(0u8);
+        p.extend_from_slice(&5u32.to_le_bytes());
+        p.extend_from_slice(b"a.txt");
+        match Record::decode_payload(OpKind::Add, &p).expect("old payload decodes") {
+            Record::Add { id, created, .. } => {
+                assert_eq!(id, 7);
+                assert_eq!(created, 0, "an absent creation field means unknown");
+            }
+            other => panic!("wrong record: {other:?}"),
+        }
     }
 
     #[test]
@@ -497,6 +533,7 @@ mod tests {
             parent: 1,
             name: name.clone(),
             flags: 0,
+            created: 0,
         })
         .unwrap();
         j.sync().unwrap();

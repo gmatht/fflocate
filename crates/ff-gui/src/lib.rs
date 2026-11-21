@@ -18,7 +18,7 @@
 //!   the status line — the tool must never silently show an empty list for a
 //!   broken connection.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -191,6 +191,7 @@ impl DaemonClient {
     /// two cannot interpret a reply differently.
     pub fn outcome_from_records(&self, resp: &[Response]) -> Result<SearchOutcome, GuiError> {
         let mut paths = Vec::new();
+        let mut created: HashMap<String, u32> = HashMap::new();
         let mut total = 0u64;
         let mut fresh = true;
         let mut stale: Vec<String> = Vec::new();
@@ -226,7 +227,15 @@ impl DaemonClient {
                     crawl_entries = *ce;
                     crawl_dirs_pending = *cdp;
                 }
-                Response::Hit { path, .. } => paths.push(path.clone()),
+                Response::Hit { path, created: c, .. } => {
+                    // The daemon's own creation time for this entry (minutes
+                    // since the epoch). Kept beside the path so the created-date
+                    // filter never has to `stat` a row the daemon already dated.
+                    if let Some(min) = c {
+                        created.insert(path.clone(), *min);
+                    }
+                    paths.push(path.clone())
+                }
                 Response::Done { count, .. } => total = *count,
                 Response::Error { message } => {
                     // A version rejection means a *stale daemon* is running:
@@ -247,6 +256,7 @@ impl DaemonClient {
         }
         Ok(SearchOutcome {
             paths,
+            created,
             total,
             fresh,
             stale_roots: stale,
@@ -702,9 +712,12 @@ pub struct SearchOptions {
 /// The advanced foldout's **created from / to** range.
 ///
 /// Both bounds are inclusive unix seconds; `None` means that end is unbounded.
-/// The index stores no timestamps (a v1 entry is 12 bytes of name/parent/flags),
-/// so the daemon cannot answer this: the GUI applies the range to the rows the
-/// daemon returned (see [`filter_by_created`]) and says so in the status line.
+/// The index stores each entry's creation time in whole minutes since the epoch
+/// and the daemon sends it with the hit (protocol v5), so the usual range is
+/// filtered from data that already arrived — no per-row `stat`. A daemon that
+/// predates the field, or an entry whose filesystem has no birth time, falls
+/// back to [`created_secs`]; [`filter_by_created`] takes whichever clock it is
+/// given and the caller decides.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CreatedRange {
     pub from: Option<i64>,
@@ -852,11 +865,15 @@ pub fn parse_created_range(from_text: &str, to_text: &str) -> Result<Option<Crea
     }
 }
 
-/// A file's creation (birth) time in unix seconds.
+/// A file's creation (birth) time in unix seconds, read with `stat`.
 ///
-/// `None` when the path is gone or the filesystem does not record a birth
-/// time — an unknown time never matches a range, and the status line counts
-/// those rows separately rather than silently dropping them.
+/// This is the fallback now that hits carry the daemon's stored creation time:
+/// it answers for a daemon that predates protocol v5, and for entries the
+/// filesystem would not date at index time (the file may have been created
+/// since, or an older index may simply not know). `None` when the path is gone
+/// or the filesystem does not record a birth time — an unknown time never
+/// matches a range, and the status line counts those rows separately rather
+/// than silently dropping them.
 pub fn created_secs(path: &str) -> Option<i64> {
     let md = std::fs::metadata(path).ok()?;
     let created = md.created().ok()?;
@@ -969,7 +986,17 @@ pub fn apply_created_range(
     // it: "more matches not checked" is about rows the reply never held, so it
     // must not count the ones the range itself hid.
     let fetched = outcome.paths.len();
-    let stats = filter_by_created(&mut outcome.paths, &range, created_secs);
+    // The daemon dated these rows at index time; only a row it could not date
+    // costs a `stat`. Taking the map out first keeps the closure from borrowing
+    // `outcome` twice, and it is put back so the field stays meaningful.
+    let times = std::mem::take(&mut outcome.created);
+    let stats = filter_by_created(&mut outcome.paths, &range, |path| {
+        times
+            .get(path)
+            .map(|min| *min as i64 * 60)
+            .or_else(|| created_secs(path))
+    });
+    outcome.created = times;
     created_note(&range, &stats, fetched, outcome.total, false)
 }
 
@@ -1105,6 +1132,11 @@ pub mod created_ui {
 #[derive(Clone, Debug, Default)]
 pub struct SearchOutcome {
     pub paths: Vec<String>,
+    /// Creation time per returned path, in whole minutes since the unix epoch,
+    /// as the daemon reported it. Absent for a path the daemon could not date
+    /// (or a daemon too old to send it); [`apply_created_range`] falls back to a
+    /// `stat` for those only.
+    pub created: HashMap<String, u32>,
     pub total: u64,
     /// False when the daemon's generation moved on: results are a fresh view.
     pub fresh: bool,
@@ -4056,6 +4088,7 @@ mod tests {
             Response::Hit {
                 path: "/a/b".into(),
                 id: 9,
+                created: None,
             },
             Response::Progress {
                 scanned: 1000,
@@ -4681,6 +4714,7 @@ mod nonblocking_tests {
         Response::Hit {
             path: path.into(),
             id,
+            created: None,
         }
     }
 
@@ -4942,6 +4976,7 @@ mod full_set_tests {
         Response::Hit {
             path: path.to_string(),
             id,
+            created: None,
         }
     }
 
@@ -5101,6 +5136,33 @@ mod created_range_tests {
             }
         );
         assert_eq!(stats.outside(), 2);
+    }
+
+    #[test]
+    fn created_range_prefers_the_daemons_minute_over_a_stat() {
+        // These paths do not exist, so a `stat` would report "undated". Keeping
+        // the dated one proves the answer came from the hit's `created`.
+        let mut o = SearchOutcome {
+            paths: vec![
+                "/nonexistent/ff-gui/dated".into(),
+                "/nonexistent/ff-gui/other".into(),
+            ],
+            total: 2,
+            fresh: true,
+            ..Default::default()
+        };
+        let day = 29_455_200u32; // 2026-01-02, in minutes since the epoch
+        o.created.insert("/nonexistent/ff-gui/dated".into(), day);
+        let range = CreatedRange {
+            from: Some(day as i64 * 60),
+            to: Some(day as i64 * 60 + 86_399),
+        };
+        let note = apply_created_range(&mut o, Some(range), false);
+        assert_eq!(o.paths, vec!["/nonexistent/ff-gui/dated"]);
+        assert!(note.contains("1 of 2 matched"), "{note}");
+        assert!(note.contains("1 had no creation time"), "{note}");
+        // The map survives the filter, so a later pass can reuse it.
+        assert_eq!(o.created.get("/nonexistent/ff-gui/dated"), Some(&day));
     }
 
     #[test]

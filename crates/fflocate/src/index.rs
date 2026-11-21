@@ -9,6 +9,14 @@
 //! }
 //! ```
 //!
+//! Beside the entries sits a parallel `created: Vec<u32>` of creation (birth)
+//! times in **minutes since the unix epoch**, 0 meaning unknown. It is 4 bytes
+//! per entry rather than 8 (or 12, with nanoseconds) because the only consumers
+//! compare calendar days or whole seconds at a coarse `since` boundary, and a
+//! minute is fine enough for both; a `u32` of minutes lasts past the year 10000.
+//! Keeping it out of `Entry` leaves the on-disk entry record at 12 bytes and
+//! costs nothing for the queries that never look at time.
+//!
 //! `IS_EXEC` means "any execute bit set" (`find -perm /111`), deliberately
 //! *not* effective access for the querying user: the system daemon serves many
 //! users from one index, and per-user executability needs the full
@@ -121,6 +129,12 @@ pub struct Index {
     /// names arena: all names concatenated, back to back, no separators.
     pub names: Vec<u8>,
     pub entries: Vec<Entry>,
+    /// Creation (birth) time per entry, in minutes since the unix epoch;
+    /// `0` means unknown (no birth time on this filesystem, or before 1970).
+    /// Parallel to `entries`: the two are always the same length, and a caller
+    /// that appends an entry must append a slot here. Read through
+    /// [`Index::created_min`] so the `0` sentinel never leaks as a real time.
+    created: Vec<u32>,
     /// parallel liveness bitset (1 = not tombstoned), 1 bit per entry id.
     /// A bitvec rather than `Vec<bool>` (which costs a full byte per entry):
     /// at 3M entries this is ~0.4 MiB instead of ~3 MiB. Derived from the
@@ -149,6 +163,7 @@ impl Index {
         let mut idx = Index {
             names: Vec::new(),
             entries: Vec::new(),
+            created: Vec::new(),
             alive: Vec::new(),
             alive_len: 0,
             next_id: 1,
@@ -158,16 +173,23 @@ impl Index {
         };
         // Slot 0: the virtual root. Unnameable, always dead to queries.
         idx.entries.push(Entry::default());
+        idx.created.push(0);
         idx.alive_push(false);
         idx
     }
 
     /// Rebuild an index from decoded snapshot arrays. Derives the liveness
     /// bitset and live count from the tombstone flags.
-    pub fn new_reconstructed(names: Vec<u8>, entries: Vec<Entry>) -> Self {
+    ///
+    /// `created` is padded (or truncated) to the entry count: a snapshot from a
+    /// format that predates creation times decodes with none, which reads as
+    /// "unknown" rather than failing to load.
+    pub fn new_reconstructed(names: Vec<u8>, entries: Vec<Entry>, mut created: Vec<u32>) -> Self {
+        created.resize(entries.len(), 0);
         let mut idx = Index {
             names,
             entries,
+            created,
             alive: Vec::new(),
             alive_len: 0,
             next_id: 1,
@@ -285,6 +307,39 @@ impl Index {
         &mut self.entries[id as usize]
     }
 
+    /// Record an entry's creation time, in minutes since the unix epoch.
+    /// `0` clears it back to "unknown".
+    pub fn set_created(&mut self, id: u32, minutes: u32) {
+        if self.created.len() < self.entries.len() {
+            self.created.resize(self.entries.len(), 0);
+        }
+        if let Some(slot) = self.created.get_mut(id as usize) {
+            *slot = minutes;
+        }
+    }
+
+    /// An entry's creation time in minutes since the epoch, or `None` when the
+    /// index does not know it (stored as 0).
+    pub fn created_min(&self, id: u32) -> Option<u32> {
+        self.created
+            .get(id as usize)
+            .copied()
+            .filter(|m| *m != 0)
+    }
+
+    /// An entry's creation time in unix seconds, or `None` when unknown.
+    ///
+    /// Minute resolution is deliberate: the stored value *is* the minute, so a
+    /// query comparing seconds sees the start of that minute.
+    pub fn created_secs(&self, id: u32) -> Option<i64> {
+        self.created_min(id).map(|m| m as i64 * 60)
+    }
+
+    /// The raw creation array, for the snapshot encoder and diagnostics.
+    pub fn created_array(&self) -> &[u32] {
+        &self.created
+    }
+
     pub fn is_alive(&self, id: u32) -> bool {
         self.alive_get(id as usize)
     }
@@ -327,6 +382,7 @@ impl Index {
             parent,
             flags: flags.0,
         });
+        self.created.push(0);
         self.alive_push(!flags.is_tombstone());
         if !flags.is_tombstone() {
             self.live_count += 1;
@@ -390,6 +446,7 @@ impl Index {
                     parent: ROOT_ID,
                     flags: flags::TOMBSTONE,
                 });
+                self.created.push(0);
                 self.alive_push(false);
             }
         }
@@ -544,6 +601,10 @@ impl Index {
             let new_parent = map[e.parent as usize];
             let name = self.name_of_entry(&e).to_vec();
             let id = out.insert(new_parent, &name, EntryFlags(e.flags));
+            // `.get` rather than `[]`: a hand-built index (tests, a future
+            // loader) may carry a short array, and "unknown" is the safe
+            // reading of a missing slot rather than a panic mid-compaction.
+            out.set_created(id, self.created.get(old).copied().unwrap_or(0));
             map[old] = id;
         }
         out.set_next_id(self.next_id);
@@ -774,19 +835,65 @@ mod tests {
             ix.len()
         );
         // Reconstructed index derives the same bits from flags alone.
-        let ix2 = Index::new_reconstructed(ix.names.clone(), ix.entries.clone());
+        let ix2 = Index::new_reconstructed(
+            ix.names.clone(),
+            ix.entries.clone(),
+            ix.created_array().to_vec(),
+        );
         for i in 0..ix.len() {
             assert_eq!(ix2.is_alive(i as u32), ix.is_alive(i as u32), "id {i}");
         }
     }
 
     #[test]
-    fn root_of_and_flags_bits() {        let mut ix = Index::new();
+    fn root_of_and_flags_bits() {
+        let mut ix = Index::new();
         let root = ix.insert(ROOT_ID, b"p", dir().with_root_dir(true));
         let sub = ix.insert(root, b"s", dir());
         let f = ix.insert(sub, b"f", file().with_symlink(true));
         assert_eq!(ix.root_of(f), Some(root));
         assert!(ix.entry(f).unwrap().flags().is_symlink());
         assert!(!ix.entry(f).unwrap().flags().is_dir());
+    }
+
+    #[test]
+    fn creation_minutes_are_parallel_and_survive_compaction() {
+        let mut ix = Index::new();
+        let root = ix.insert(ROOT_ID, b"p", dir().with_root_dir(true));
+        let dated = ix.insert(root, b"old.txt", file());
+        let undated = ix.insert(root, b"unknown.txt", file());
+        // 2026-01-02T00:00:00Z, in whole minutes.
+        let minutes: u32 = 29_455_200;
+        ix.set_created(dated, minutes);
+        assert_eq!(ix.created_min(dated), Some(minutes));
+        assert_eq!(ix.created_secs(dated), Some(minutes as i64 * 60));
+        // A fresh entry is "unknown", never the epoch itself.
+        assert_eq!(ix.created_min(undated), None);
+        assert_eq!(ix.created_array().len(), ix.len(), "parallel to entries");
+
+        // Compaction renumbers ids; the time must follow the file, not the slot.
+        let (c, map) = ix.compacted();
+        let moved = map[dated as usize];
+        assert_eq!(c.created_min(moved), Some(minutes));
+        assert_eq!(c.created_secs(moved), Some(minutes as i64 * 60));
+        // A tombstoned id maps to no slot.
+        ix.remove(undated);
+        let (c2, map2) = ix.compacted();
+        assert_eq!(map2[undated as usize], 0);
+        assert_eq!(c2.created_min(moved), Some(minutes));
+    }
+
+    #[test]
+    fn reconstruction_pads_missing_creation_array() {
+        // A snapshot from a format without creation times decodes with none:
+        // the slot count must still match, and every read reports "unknown".
+        let mut ix = Index::new();
+        let root = ix.insert(ROOT_ID, b"p", dir().with_root_dir(true));
+        ix.insert(root, b"a", file());
+        let ix2 = Index::new_reconstructed(ix.names.clone(), ix.entries.clone(), Vec::new());
+        assert_eq!(ix2.created_array().len(), ix2.len());
+        for id in 0..ix2.len() as u32 {
+            assert_eq!(ix2.created_min(id), None);
+        }
     }
 }

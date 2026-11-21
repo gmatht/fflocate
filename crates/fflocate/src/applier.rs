@@ -47,6 +47,17 @@ pub trait FsView: Send + Sync {
     fn attr(&self, _abs_path: &Path) -> io::Result<Option<crate::ownership::Attr>> {
         Ok(None)
     }
+
+    /// The two per-entry facts an event's target needs from one `stat`: the
+    /// execute bit and the creation minute.
+    ///
+    /// Defaults to the real filesystem helper. A model or fake view overrides
+    /// this so an event-driven upsert can report a date (and an exec bit)
+    /// without the path existing on disk; the crawl path takes the same facts
+    /// from [`DirItem`], which every view already fills in.
+    fn facts(&self, abs_path: &Path, is_dir: bool, is_symlink: bool) -> (bool, u32) {
+        fs_facts(abs_path, is_dir, is_symlink)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,6 +70,11 @@ pub struct DirItem {
     /// every link); always false for directories (`type:exec` answers "is
     /// this file executable"). Unstatable entries read false.
     pub is_exec: bool,
+    /// Creation (birth) time in whole minutes since the unix epoch, `0` when
+    /// the filesystem has none or the entry is unstatable. Captured from the
+    /// same `stat` that decides `is_exec`, so the crawl does not pay a second
+    /// syscall for it.
+    pub created_min: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +84,9 @@ pub struct StatInfo {
     /// `st_dev`/`st_ino`; zero when unavailable.
     pub dev: u64,
     pub ino: u64,
+    /// Creation (birth) time in whole minutes since the unix epoch; `0` when
+    /// unknown.
+    pub created_min: u32,
 }
 
 /// The real filesystem, using `getdents64` for speed but `stat` for identity.
@@ -87,11 +106,13 @@ impl FsView for RealFs {
             let ft = ent.file_type()?;
             let is_dir = ft.is_dir();
             let is_symlink = ft.is_symlink();
+            let (is_exec, created_min) = fs_facts(&ent.path(), is_dir, is_symlink);
             out.push(DirItem {
                 name,
                 is_dir,
                 is_symlink,
-                is_exec: is_executable(&ent.path(), is_dir, is_symlink),
+                is_exec,
+                created_min,
             });
         }
         Ok(out)
@@ -111,6 +132,7 @@ impl FsView for RealFs {
                         is_symlink: md.file_type().is_symlink(),
                         dev: md.dev(),
                         ino: md.ino(),
+                        created_min: created_minutes(&md),
                     }))
                 }
                 #[cfg(not(unix))]
@@ -120,6 +142,7 @@ impl FsView for RealFs {
                         is_symlink: md.file_type().is_symlink(),
                         dev: 0,
                         ino: 0,
+                        created_min: created_minutes(&md),
                     }))
                 }
             }
@@ -169,22 +192,51 @@ pub fn os_str_bytes(s: &std::ffi::OsStr) -> Vec<u8> {
 /// mode — `lstat` claims 0777 for every link. Directories are never
 /// executable (`type:exec` is a file predicate); unstatable entries and
 /// non-unix platforms read false rather than failing the whole listing.
-pub fn is_executable(path: &Path, is_dir: bool, _is_symlink: bool) -> bool {
-    if is_dir {
-        return false;
-    }
+pub fn is_executable(path: &Path, is_dir: bool, is_symlink: bool) -> bool {
+    fs_facts(path, is_dir, is_symlink).0
+}
+
+/// The two per-entry facts the crawl needs from `stat`: the execute bit and the
+/// creation time. One call, one syscall: the crawl already paid for the `stat`
+/// to decide `is_exec`, and a second one for the birth time would double it.
+///
+/// Unstatable entries read `(false, 0)` — no execute bit, no known creation
+/// time — exactly the fail-quiet behaviour `is_executable` had.
+pub fn fs_facts(path: &Path, is_dir: bool, _is_symlink: bool) -> (bool, u32) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         match std::fs::metadata(path) {
-            Ok(md) => md.is_file() && md.mode() & 0o111 != 0,
-            Err(_) => false,
+            Ok(md) => (
+                !is_dir && md.is_file() && md.mode() & 0o111 != 0,
+                created_minutes(&md),
+            ),
+            Err(_) => (false, 0),
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
-        false
+        let _ = (path, is_dir);
+        (false, 0)
+    }
+}
+
+/// A metadata entry's creation (birth) time as whole minutes since the unix
+/// epoch, or 0 when the platform/filesystem does not record one.
+fn created_minutes(md: &std::fs::Metadata) -> u32 {
+    match md.created() {
+        Ok(t) => created_minutes_at(t),
+        Err(_) => 0,
+    }
+}
+
+/// A timestamp as whole minutes since the unix epoch, saturating at `u32::MAX`
+/// (year 10136 — the field is 32 bits, not a 1970-2106 `time_t`). A time before
+/// the epoch, or a clock that cannot be related to it, reads as unknown (0).
+pub fn created_minutes_at(t: SystemTime) -> u32 {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => u32::try_from(d.as_secs() / 60).unwrap_or(u32::MAX),
+        Err(_) => 0,
     }
 }
 
@@ -931,10 +983,11 @@ impl Applier {
         // file that arrives via event (not crawl) must carry its real bit
         // from birth, not only after the next rescan. The parent path was
         // just cached above, so this is one `stat`, not a walk.
-        let exec_hint = self
+        let fs = self.fs.clone();
+        let (exec_hint, created_min) = self
             .abs_path_for(parent)
             .map(|p| {
-                is_executable(
+                fs.facts(
                     &p.join(std::ffi::OsString::from(
                         String::from_utf8_lossy(&name).into_owned(),
                     )),
@@ -942,11 +995,11 @@ impl Applier {
                     false,
                 )
             })
-            .unwrap_or(false);
+            .unwrap_or((false, 0));
         let flags = EntryFlags::EMPTY.with_dir(is_dir_hint).with_exec(exec_hint);
         let mut ix = self.shared.index.write().unwrap();
         let lookup = ix.lookup(parent, &name);
-        let (created_id, existing_id) = match lookup {
+        let (created_id, refreshed, existing_id) = match lookup {
             Some(id) => {
                 // Refresh the type if it changed (e.g. file → dir via rename).
                 let cur = ix.entry(id).unwrap().flags();
@@ -954,11 +1007,34 @@ impl Applier {
                     let nf = EntryFlags(cur.0).with_dir(is_dir_hint);
                     ix.entry_mut(id).flags = nf.0;
                 }
-                (None, Some(id))
+                // A deleted-and-recreated file keeps its id but has a new birth
+                // time. Refresh it in place and journal it as the same `Add` a
+                // fresh entry gets, so the new minute is durable in the same
+                // append as the name instead of waiting for a snapshot (or a
+                // rescan that relearns it). Never overwrite a known time with
+                // "unknown" (a filesystem that does not report birth times),
+                // and only when it actually changed: a create event for an
+                // unchanged file must not grow the journal.
+                let refreshed = if created_min != 0 && ix.created_min(id) != Some(created_min) {
+                    ix.set_created(id, created_min);
+                    // The *live* flags, not the event's hint: this id already
+                    // carries IS_SYMLINK / IS_ROOT_DIR bits the hint omits, and
+                    // replay resurrects the entry with exactly this record.
+                    Some(Record::Add {
+                        id,
+                        parent,
+                        name: name.clone(),
+                        flags: ix.entry(id).unwrap().flags().0,
+                        created: created_min,
+                    })
+                } else {
+                    None
+                };
+                (None, refreshed, Some(id))
             }
             None => {
                 let id = ix.insert(parent, &name, flags);
-                (Some(id), None)
+                (Some(id), None, None)
             }
         };
         drop(ix);
@@ -968,7 +1044,12 @@ impl Applier {
                 parent,
                 name: name.clone(),
                 flags: flags.0,
+                created: created_min,
             };
+            self.emit(rec);
+        } else if let Some(rec) = refreshed {
+            // `emit` notes ownership for an Add as well, so the refresh needs
+            // no separate call here.
             self.emit(rec);
         } else if let Some(id) = existing_id {
             // An upsert for an entry we already have. The name is unchanged, but
@@ -1164,6 +1245,7 @@ impl Applier {
                     parent: dir,
                     name: it.name.clone(),
                     flags: flags.0,
+                    created: it.created_min,
                 });
                 if it.is_dir && !it.is_symlink {
                     // Watch before enumerating: install a watch, then queue the
@@ -1334,6 +1416,7 @@ impl Applier {
                         parent: dir,
                         name: name.clone(),
                         flags: flags.0,
+                        created: it.created_min,
                     });
                     if it.is_dir && !it.is_symlink {
                         let child_abs = abs.join(std::ffi::OsString::from(
@@ -1368,6 +1451,36 @@ impl Applier {
                             let nf = cur.with_exec(it.is_exec);
                             self.shared.index.write().unwrap().entry_mut(*id).flags = nf.0;
                         }
+                        // A rescan can *learn* a creation time the index never
+                        // had, or see a new one after a replace that no create
+                        // event reached us for. It must never erase one it
+                        // knows: `0` means unknown, not "the epoch".
+                        //
+                        // Only a change to an *already known* minute is
+                        // journaled (below). A first learn is memory-only: the
+                        // first rescan of a store that predates creation times
+                        // learns a date for every entry at once, and one `Add`
+                        // per entry would append a record for the whole index
+                        // to re-derive state the next snapshot carries anyway.
+                        // A learned minute is still live in the index at once,
+                        // and is relearned by the next rescan after a restart
+                        // until a snapshot pins it.
+                        let prev_created = {
+                            let ix = self.shared.index.read().unwrap();
+                            ix.created_min(*id)
+                        };
+                        let created_changed = matches!(
+                            prev_created,
+                            Some(prev) if it.created_min != 0 && prev != it.created_min
+                        );
+                        let created_learned = prev_created.is_none() && it.created_min != 0;
+                        if created_changed || created_learned {
+                            self.shared
+                                .index
+                                .write()
+                                .unwrap()
+                                .set_created(*id, it.created_min);
+                        }
                         // A survivor's ownership can have changed even though its
                         // name did not (a chown or a replaced file), and after a
                         // restart the record may be missing entirely. Either way a
@@ -1377,6 +1490,28 @@ impl Applier {
                             String::from_utf8_lossy(name).into_owned(),
                         ));
                         self.note_ownership(*id, &survivor_abs);
+                        if created_changed {
+                            // Replay treats this Add as an upsert at `*id`: the
+                            // name and flags are rewritten and the slot
+                            // resurrected, then `set_created` lands the minute —
+                            // the same record a fresh entry gets. (A first
+                            // learn is not journaled here; see above.)
+                            let flags = self
+                                .shared
+                                .index
+                                .read()
+                                .unwrap()
+                                .entry(*id)
+                                .map(|e| e.flags().0)
+                                .unwrap_or(0);
+                            self.emit(Record::Add {
+                                id: *id,
+                                parent: dir,
+                                name: name.clone(),
+                                flags,
+                                created: it.created_min,
+                            });
+                        }
                         // Recurse into surviving directories — but never across a
                         // mount boundary: beneath one only legacy leakage can
                         // exist (nothing current is ever inserted there), so
@@ -2185,6 +2320,7 @@ mod replay_tests {
                         parent: r0,
                         name: b"x".to_vec(),
                         flags: 0,
+                        created: 0,
                     },
                 ),
                 (
@@ -2194,6 +2330,7 @@ mod replay_tests {
                         parent: r0,
                         name: b"y".to_vec(),
                         flags: 0,
+                        created: 0,
                     },
                 ),
                 (3, Record::Del { id: x }),
@@ -2237,6 +2374,7 @@ mod replay_tests {
                     parent: r0,
                     name: b"x".to_vec(),
                     flags: 0,
+                    created: 0,
                 },
             )],
             100,
@@ -2361,6 +2499,57 @@ mod replay_tests {
     }
 
     /// Replaying twice is safe: records are idempotent (`Add` re-applied,
+    #[test]
+    fn creation_minutes_are_whole_and_before_epoch_is_unknown() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(super::created_minutes_at(UNIX_EPOCH), 0);
+        assert_eq!(super::created_minutes_at(UNIX_EPOCH + Duration::from_secs(59)), 0);
+        assert_eq!(super::created_minutes_at(UNIX_EPOCH + Duration::from_secs(60)), 1);
+        assert_eq!(
+            super::created_minutes_at(UNIX_EPOCH + Duration::from_secs(29_491_680 * 60)),
+            29_491_680,
+            "2026-01-02 rounds down to its own minute"
+        );
+        assert_eq!(
+            super::created_minutes_at(UNIX_EPOCH - Duration::from_secs(60)),
+            0,
+            "before the epoch reads as unknown, not as a giant number"
+        );
+    }
+
+    #[test]
+    fn a_real_file_carries_its_birth_minute_out_of_read_dir() {
+        use std::time::UNIX_EPOCH;
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("dated.txt");
+        std::fs::write(&p, b"x").unwrap();
+        let (_, created) = super::fs_facts(&p, false, false);
+        if created == 0 {
+            // No birth time on this filesystem/kernel: the documented
+            // degradation is "unknown", and there is nothing to assert beyond
+            // that it did not invent a time.
+            eprintln!("this filesystem reports no birth time; skipping the dated half");
+            return;
+        }
+        let now_min = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            / 60;
+        assert!(
+            now_min.saturating_sub(created as u64) <= 5,
+            "a file written just now should be dated now, got {created} vs {now_min}"
+        );
+        // The crawl's own listing must carry the same fact — that is the path
+        // the index is populated from.
+        let listing = <RealFs as FsView>::read_dir(&RealFs, d.path()).unwrap();
+        let item = listing
+            .iter()
+            .find(|i| i.name == b"dated.txt")
+            .expect("the file is in the listing");
+        assert_eq!(item.created_min, created);
+    }
+
     /// `Del` of a tombstone a no-op), so a crash mid-replay converges.
     #[test]
     fn replay_is_idempotent() {
@@ -2374,6 +2563,7 @@ mod replay_tests {
                     parent: r0,
                     name: b"x".to_vec(),
                     flags: 0,
+                    created: 0,
                 },
             ),
             (2, Record::Del { id: x }),
@@ -2427,6 +2617,7 @@ mod replay_clock_tests {
             parent: r0,
             name: b"live".to_vec(),
             flags: 0,
+            created: 0,
         });
         shared.lsn.store(100, Ordering::Release);
 
@@ -2443,6 +2634,7 @@ mod replay_clock_tests {
                         parent: r0,
                         name: b"x".to_vec(),
                         flags: 0,
+                        created: 0,
                     },
                 ),
                 (2, Record::Del { id: x }),
@@ -2459,6 +2651,409 @@ mod replay_clock_tests {
             shared.snapshot_lsn(),
             100,
             "shared clock is a high-water mark: live 100 beats replay 2"
+        );
+    }
+
+    /// A view whose entries carry creation minutes and exec bits the test can
+    /// change, so a create event can report a *new* birth time (a file deleted
+    /// and recreated under the same name) without waiting a minute on a real
+    /// disk, and without the model's "no clock" reading 0.
+    struct DatedFs {
+        inner: crate::modelfs::ModelFs,
+        /// name -> (created minute, exec)
+        facts: std::sync::Mutex<HashMap<Vec<u8>, (u32, bool)>>,
+    }
+
+    impl DatedFs {
+        fn new(inner: crate::modelfs::ModelFs, name: &[u8], created: u32, exec: bool) -> DatedFs {
+            let mut facts = HashMap::new();
+            facts.insert(name.to_vec(), (created, exec));
+            DatedFs {
+                inner,
+                facts: std::sync::Mutex::new(facts),
+            }
+        }
+
+        fn set(&self, name: &[u8], created: u32, exec: bool) {
+            self.facts
+                .lock()
+                .unwrap()
+                .insert(name.to_vec(), (created, exec));
+        }
+    }
+
+    impl FsView for DatedFs {
+        fn read_dir(&self, abs_path: &Path) -> io::Result<Vec<DirItem>> {
+            let mut items = self.inner.read_dir(abs_path)?;
+            let facts = self.facts.lock().unwrap();
+            for it in &mut items {
+                if let Some((created, exec)) = facts.get(&it.name) {
+                    it.created_min = *created;
+                    it.is_exec = *exec;
+                }
+            }
+            Ok(items)
+        }
+
+        fn stat(&self, abs_path: &Path) -> io::Result<Option<StatInfo>> {
+            self.inner.stat(abs_path)
+        }
+
+        fn facts(&self, abs_path: &Path, _is_dir: bool, _is_symlink: bool) -> (bool, u32) {
+            let name = abs_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned().into_bytes())
+                .unwrap_or_default();
+            self.facts
+                .lock()
+                .unwrap()
+                .get(&name)
+                .map(|(created, exec)| (*exec, *created))
+                .unwrap_or((false, 0))
+        }
+    }
+
+    /// The durability contract for a recreated entry: the refreshed minute is
+    /// an `Add` keyed to the same id, written with the name, so replaying the
+    /// journal alone (no snapshot) restores the row with its id, its new
+    /// minute, and its flags. A rescan that learns nothing writes nothing.
+    #[test]
+    fn a_recreated_entrys_new_minute_is_journaled_with_its_name_and_survives_replay() {
+        use crate::modelfs::{ModelFs, Node};
+        use crate::persist::{apply_record, Store};
+        use crate::roots::Root;
+        use crate::sync::SyncRegistry;
+        use std::sync::Arc;
+
+        let first = 29_455_200u32; // 2026-01-02, in minutes
+        let second = first + 1_440; // ...one day later
+
+        let dir = tempfile::tempdir().unwrap();
+        let statedir = dir.path().join("state");
+        let store = Store::open(&statedir).unwrap();
+        let mut ix = Index::new();
+        let r0 = ix.insert(
+            ROOT_ID,
+            b"/model",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        let shared = Shared::new(ix, vec![Root::new(0, PathBuf::from("/model"))]);
+        let fs = Arc::new(DatedFs::new(
+            ModelFs::with([("keep.txt", Node::File)]),
+            b"keep.txt",
+            first,
+            false,
+        ));
+        let view: Arc<dyn FsView> = fs.clone();
+        let mut a = Applier::new(shared.clone(), store, view, SyncRegistry::new());
+        a.rebuild_dir_cache();
+        a.pending_mut().enqueue_crawl(r0);
+        a.drain();
+
+        let keep = shared
+            .index
+            .read()
+            .unwrap()
+            .lookup(r0, b"keep.txt")
+            .expect("the crawl must index keep.txt");
+        assert_eq!(
+            shared.index.read().unwrap().created_min(keep),
+            Some(first),
+            "the crawl must store the first birth minute"
+        );
+        let after_crawl = a.store().journal.count();
+
+        // A rescan that sees the same names, minutes and flags must append
+        // nothing, or idle rescans would grow the journal forever.
+        a.pending_mut()
+            .enqueue_rescan(r0, crate::event::RescanCause::Manual);
+        a.drain();
+        assert_eq!(
+            a.store().journal.count(),
+            after_crawl,
+            "a no-op rescan grew the journal"
+        );
+        assert_eq!(shared.index.read().unwrap().created_min(keep), Some(first));
+
+        // The same name is recreated (a replace no delete event reached us
+        // for), with a new birth minute. The create path must keep the id and
+        // journal the new minute with the name, and the record it writes must
+        // carry the *live* flags — the event hint is not authoritative for an
+        // entry that already exists.
+        let live_flags = shared.index.read().unwrap().entry(keep).unwrap().flags().0;
+        fs.set(b"keep.txt", second, false);
+        a.apply_event(FsEvent::Upsert {
+            parent: crate::event::DirKey::new(r0),
+            name: b"keep.txt".to_vec(),
+            is_dir: false,
+        });
+        assert_eq!(
+            a.store().journal.count(),
+            after_crawl + 1,
+            "the refresh must be exactly one record"
+        );
+        {
+            let ix = shared.index.read().unwrap();
+            assert_eq!(
+                ix.lookup(r0, b"keep.txt"),
+                Some(keep),
+                "the recreated entry must keep its id"
+            );
+            assert_eq!(ix.created_min(keep), Some(second));
+            assert_eq!(
+                ix.entry(keep).unwrap().flags().0,
+                live_flags,
+                "the refresh record must carry the live flags, not the hint"
+            );
+        }
+        drop(a);
+
+        // Rebuild from the journal alone: a fresh index seeded only with the
+        // root entry (the one thing a snapshot would supply), then every
+        // record. No snapshot exists in this store.
+        let mut store2 = Store::open(&statedir).unwrap();
+        assert!(
+            store2.load_snapshot().unwrap().is_none(),
+            "the test must prove the journal alone carries the minute"
+        );
+        let mut ix2 = Index::new();
+        let r0b = ix2.insert(
+            ROOT_ID,
+            b"/model",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        assert_eq!(r0b, r0);
+        let mut applied: Vec<(u64, Record)> = Vec::new();
+        store2
+            .replay(&mut ix2, |lsn, rec| applied.push((lsn, rec.clone())))
+            .unwrap();
+        for (_, rec) in &applied {
+            apply_record(&mut ix2, rec);
+        }
+        let replayed = ix2
+            .lookup(r0, b"keep.txt")
+            .expect("replay must restore keep.txt");
+        assert_eq!(replayed, keep, "replay must keep the entry's id");
+        assert_eq!(
+            ix2.created_min(replayed),
+            Some(second),
+            "replay lost the refreshed creation minute"
+        );
+        assert_eq!(
+            ix2.entry(replayed).unwrap().flags().0,
+            live_flags,
+            "the same record must restore the flags too"
+        );
+        assert_eq!(ix2.iter_live().count(), 2, "no duplicate slot may be created");
+    }
+
+    /// The first rescan of a store that predates creation times learns a date
+    /// for *every* entry. That is a learn, not a change, so it must not turn
+    /// into one journal record per file; but the minutes must still be live in
+    /// the index at once, and a later change to one of them must still be
+    /// journaled (one record), because a restart would otherwise resurrect the
+    /// old date.
+    #[test]
+    fn an_upgrade_rescan_learns_every_date_without_a_journal_burst() {
+        use crate::modelfs::{ModelFs, Node};
+
+        let dir = tempfile::tempdir().unwrap();
+        let statedir = dir.path().join("state");
+        let store = Store::open(&statedir).unwrap();
+        let mut ix = Index::new();
+        let r0 = ix.insert(
+            ROOT_ID,
+            b"/model",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        let shared = Shared::new(ix, vec![Root::new(0, PathBuf::from("/model"))]);
+        // A view with no dates yet: the crawl behaves as a build that never
+        // stored creation times did.
+        let fs = Arc::new(DatedFs::new(
+            ModelFs::with([
+                ("a.txt", Node::File),
+                ("b.txt", Node::File),
+                ("c.txt", Node::File),
+            ]),
+            b"a.txt",
+            0,
+            false,
+        ));
+        let view: Arc<dyn FsView> = fs.clone();
+        let mut a = Applier::new(shared.clone(), store, view, SyncRegistry::new());
+        a.rebuild_dir_cache();
+        a.pending_mut().enqueue_crawl(r0);
+        a.drain();
+
+        let mut crawled: Vec<(Vec<u8>, u32)> = Vec::new();
+        for name in [b"a.txt".as_slice(), b"b.txt", b"c.txt"] {
+            let ix = shared.index.read().unwrap();
+            let id = ix.lookup(r0, name).expect("the crawl must index every file");
+            assert_eq!(
+                ix.created_min(id),
+                None,
+                "the store starts out undated, as a pre-v3 snapshot leaves it"
+            );
+            crawled.push((name.to_vec(), id));
+        }
+        let after_crawl = a.store().journal.count();
+
+        // First rescan after the upgrade: every entry gets a date. One `Add`
+        // per entry here would journal the entire index for re-derived state.
+        fs.set(b"a.txt", 1_000, false);
+        fs.set(b"b.txt", 1_001, false);
+        fs.set(b"c.txt", 1_002, false);
+        a.pending_mut()
+            .enqueue_rescan(r0, crate::event::RescanCause::Manual);
+        a.drain();
+        assert_eq!(
+            a.store().journal.count(),
+            after_crawl,
+            "the first rescan of an undated store must not journal every file"
+        );
+        let b_id = {
+            let ix = shared.index.read().unwrap();
+            // The learn must reach the *survivor* branch: a re-insert would
+            // journal an Add and hand out new ids.
+            for (name, id) in &crawled {
+                assert_eq!(
+                    ix.lookup(r0, name),
+                    Some(*id),
+                    "the rescan must keep the crawl's ids, not re-insert"
+                );
+            }
+            let b_id = ix.lookup(r0, b"b.txt").unwrap();
+            for (id, minute) in [
+                (ix.lookup(r0, b"a.txt").unwrap(), 1_000u32),
+                (b_id, 1_001),
+                (ix.lookup(r0, b"c.txt").unwrap(), 1_002),
+            ] {
+                assert_eq!(
+                    ix.created_min(id),
+                    Some(minute),
+                    "the learned date must be live in the index immediately"
+                );
+            }
+            b_id
+        };
+
+        // A rescan that learns nothing new writes nothing...
+        a.pending_mut()
+            .enqueue_rescan(r0, crate::event::RescanCause::Manual);
+        a.drain();
+        assert_eq!(
+            a.store().journal.count(),
+            after_crawl,
+            "a rescan that learns nothing new grew the journal"
+        );
+
+        // ... and a filesystem that cannot report a birth time must not erase
+        // one the index already knows: `0` is unknown, not the epoch.
+        fs.set(b"b.txt", 0, false);
+        a.pending_mut()
+            .enqueue_rescan(r0, crate::event::RescanCause::Manual);
+        a.drain();
+        assert_eq!(
+            a.store().journal.count(),
+            after_crawl,
+            "an unknown minute must not be journaled over a known one"
+        );
+        assert_eq!(
+            shared.index.read().unwrap().created_min(b_id),
+            Some(1_001),
+            "a known minute must never be clobbered back to unknown"
+        );
+
+        // A minute that *changed* is still durable: exactly one record.
+        fs.set(b"b.txt", 2_000, false);
+        a.pending_mut()
+            .enqueue_rescan(r0, crate::event::RescanCause::Manual);
+        a.drain();
+        assert_eq!(
+            a.store().journal.count(),
+            after_crawl + 1,
+            "a changed minute must be exactly one record"
+        );
+        assert_eq!(
+            shared.index.read().unwrap().created_min(b_id),
+            Some(2_000)
+        );
+        drop(a);
+
+        // Rebuild from the journal alone: the changed minute survives a
+        // restart under the entry's original id.
+        let mut store2 = Store::open(&statedir).unwrap();
+        let mut ix2 = Index::new();
+        let r0b = ix2.insert(
+            ROOT_ID,
+            b"/model",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        assert_eq!(r0b, r0);
+        let mut applied: Vec<Record> = Vec::new();
+        store2
+            .replay(&mut ix2, |_, rec| applied.push(rec.clone()))
+            .unwrap();
+        for rec in &applied {
+            crate::persist::apply_record(&mut ix2, rec);
+        }
+        let replayed = ix2
+            .lookup(r0, b"b.txt")
+            .expect("replay must restore b.txt");
+        assert_eq!(replayed, b_id, "replay must keep the entry's id");
+        assert_eq!(
+            ix2.created_min(replayed),
+            Some(2_000),
+            "replay lost the changed minute"
+        );
+        assert_eq!(
+            ix2.iter_live().count(),
+            4,
+            "replay must not duplicate slots: one root plus three files"
+        );
+    }
+
+    /// The refresh record is an upsert on replay, not an insert: a slot that is
+    /// a tombstone in the rebuilt index comes back alive under the same id,
+    /// with the record's name, flags and minute.
+    #[test]
+    fn replaying_an_add_over_a_tombstoned_slot_resurrects_it_with_the_records_flags() {
+        use crate::persist::apply_record;
+
+        let mut ix = Index::new();
+        let r0 = ix.insert(
+            ROOT_ID,
+            b"/model",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        let id = ix.insert(r0, b"gone.txt", EntryFlags::EMPTY);
+        ix.set_created(id, 10);
+        assert!(ix.remove(id));
+        assert!(!ix.is_alive(id));
+
+        apply_record(
+            &mut ix,
+            &Record::Add {
+                id,
+                parent: r0,
+                name: b"gone.txt".to_vec(),
+                flags: EntryFlags::EMPTY.with_exec(true).0,
+                created: 20,
+            },
+        );
+
+        assert!(
+            ix.is_alive(id),
+            "replay must resurrect the slot, not pad a new one"
+        );
+        assert_eq!(ix.lookup(r0, b"gone.txt"), Some(id), "the id must be kept");
+        assert_eq!(ix.name(id), b"gone.txt".as_slice());
+        assert_eq!(ix.created_min(id), Some(20));
+        assert!(ix.entry(id).unwrap().flags().is_exec());
+        assert_eq!(
+            ix.iter_live().count(),
+            2,
+            "no duplicate slot may be created"
         );
     }
 }

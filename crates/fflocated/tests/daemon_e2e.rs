@@ -73,6 +73,18 @@ fn crawl_indexes_a_real_tree() {
     std::fs::write(root.join("src/deep/nested.txt"), b"y").unwrap();
     std::fs::write(root.join("README.md"), b"z").unwrap();
 
+    // Whether this filesystem records birth times at all; if it does, the
+    // daemon's hits must carry the minute the crawl read (see the assertion
+    // below). On a filesystem without them the documented result is "unknown".
+    // Minutes since the epoch is also what the reply must carry, so the
+    // filesystem's own answer is captured here, while `root` is still ours.
+    let birth_minutes = std::fs::metadata(root.join("src/main.rs"))
+        .and_then(|m| m.created())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| (d.as_secs() / 60) as u32);
+    let fs_has_btime = birth_minutes.is_some();
+
     let cfg = test_config(d.path(), root);
     let mut daemon = Daemon::build(cfg).unwrap();
     daemon.start().unwrap();
@@ -87,6 +99,80 @@ fn crawl_indexes_a_real_tree() {
             _ => None,
         })
         .collect();
+
+    // The end-to-end chain for creation times: the crawl's `stat` records the
+    // birth minute in the index, and the reply carries it on the hit, so a
+    // created-date query costs no `stat` of its own.
+    let dated: Vec<Option<u32>> = out
+        .iter()
+        .filter_map(|r| match r {
+            Response::Hit { path, created, .. } if path.ends_with("/src/main.rs") => {
+                Some(*created)
+            }
+            _ => None,
+        })
+        .collect();
+    if fs_has_btime {
+        assert!(
+            dated.iter().flatten().next().is_some(),
+            "the crawl dated a file the filesystem dates: {dated:?}"
+        );
+
+        // ...and the number is the filesystem's own birth time in whole minutes
+        // since the epoch. Seconds would be 60x larger, so this pins the unit
+        // the index stores and the wire carries, not just that some date came
+        // through.
+        let expected = birth_minutes.expect("fs_has_btime said this file is dated");
+        for got in dated.iter().flatten() {
+            assert_eq!(
+                *got, expected,
+                "created must be minutes since the epoch, not seconds or a day index"
+            );
+        }
+
+        // A query whose **only** predicate is a created-time range — no name
+        // term, no glob, no `allof` — must return every indexed entry: the
+        // stored minute decides it, and the missing name drops nothing.
+        // `["true"]` is the same engine's "everything" count, so equality is
+        // the check that nothing was lost.
+        let count_expr = |e: serde_json::Value| -> u64 {
+            let req = Request::Query {
+                q: String::new(),
+                limit: 0,
+                json: false,
+                count: true,
+                expression: Some(e),
+                glob: None,
+                glob_includedotfiles: None,
+                glob_noescape: None,
+                suffix: None,
+                path: None,
+                relative_root: None,
+                case_sensitive: None,
+                fuzzy: false,
+                max_distance: None,
+                progress: false,
+            };
+            fflocate::server::handle_request(&ctx, &req)
+                .iter()
+                .find_map(|r| match r {
+                    Response::Done { count, .. } => Some(*count),
+                    _ => None,
+                })
+                .expect("a Done record")
+        };
+        let all = count_expr(serde_json::json!(["true"]));
+        let dated_only = count_expr(serde_json::json!(["since", 0, "oclock"]));
+        assert_eq!(
+            dated_only, all,
+            "a time-only query must return every entry, not a subset"
+        );
+        assert_eq!(
+            count_expr(serde_json::json!(["since", 4_000_000_000i64, "oclock"])),
+            0,
+            "nothing in this tree was created in 2096"
+        );
+    }
     assert!(
         paths.iter().any(|p| p.ends_with("/src/main.rs")),
         "got {paths:?}"

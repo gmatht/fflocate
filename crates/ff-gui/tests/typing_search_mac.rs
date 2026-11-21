@@ -258,6 +258,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let resp = serde_json::to_string(&fflocate::proto::Response::Hit {
                         path: (*path).clone(),
                         id: id as u32,
+                        created: None,
                     })
                     .expect("serialise a hit");
                     let _ = writeln!(stream, "{resp}");

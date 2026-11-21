@@ -737,6 +737,11 @@ pub struct Hit {
     /// (§10/§17). Only fuzzy search sets it; every other path leaves it 0, which
     /// keeps `Hit` comparable and ordering in index order unchanged.
     pub score: u32,
+    /// Creation (birth) time in whole minutes since the unix epoch, `None` when
+    /// the index does not know it. Carried on the hit so a client can answer a
+    /// created-date question without `stat`ting every path it was shown, and
+    /// so the streaming path can report it without a nested index read.
+    pub created_min: Option<u32>,
 }
 
 /// Run `q` over `index`, attributing paths using each root dir's stored path.
@@ -1064,7 +1069,12 @@ pub fn execute_fuzzy_abortable(
     let hits = scored
         .into_iter()
         .take(if limit == 0 { usize::MAX } else { limit })
-        .map(|(score, path, id)| Hit { id, path, score })
+        .map(|(score, path, id)| Hit {
+            id,
+            path,
+            score,
+            created_min: index.created_min(id),
+        })
         .collect();
     Some(Results { hits, total })
 }
@@ -1443,7 +1453,12 @@ fn consider_emit(
         None => return true,
     };
     *emitted += 1;
-    emit(ScanEvent::Hit(Hit { id, path, score: 0 }))
+    emit(ScanEvent::Hit(Hit {
+        id,
+        path,
+        score: 0,
+        created_min: index.created_min(id),
+    }))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1520,10 +1535,12 @@ pub fn execute_expr(
             is_dir: entry.flags().is_dir(),
             is_symlink: entry.flags().is_symlink(),
             is_exec: entry.flags().is_exec(),
-            // v1 does not carry sizes or timestamps; `size`/`empty`/`since`
-            // terms see `None`.
+            // Sizes and the other clocks are still not carried; the one
+            // timestamp the index does hold is each entry's creation time, so
+            // `since ... otime`/`oclock` answers from the index rather than
+            // from a `stat` per candidate.
             size: None,
-            otime: None,
+            otime: index.created_secs(id),
             ctime: None,
             mtime: None,
             fs_case_insensitive: false,
@@ -1544,6 +1561,7 @@ pub fn execute_expr(
             id,
             path: abs,
             score: 0,
+            created_min: index.created_min(id),
         });
     }
     results
@@ -1631,7 +1649,7 @@ pub fn execute_expr_emit(
             is_symlink: entry.flags().is_symlink(),
             is_exec: entry.flags().is_exec(),
             size: None,
-            otime: None,
+            otime: index.created_secs(id),
             ctime: None,
             mtime: None,
             fs_case_insensitive: false,
@@ -1651,6 +1669,7 @@ pub fn execute_expr_emit(
             id,
             path: abs,
             score: 0,
+            created_min: index.created_min(id),
         })) {
             return None;
         }
@@ -1679,6 +1698,149 @@ mod tests {
         ix.insert(r, b"Notes.TXT", EntryFlags::EMPTY);
         let root_path = b"/home/me/proj".to_vec();
         (ix, vec![(r, root_path)])
+    }
+
+    #[test]
+    fn since_oclock_answers_from_the_stored_creation_minute() {
+        // `oclock` is the creation-time clock (Watchman's stat field `otime`).
+        // It used to see `None` for every candidate (the v1 index carried no
+        // clocks); now it reads the stored minute, with no `stat` in the query
+        // path.
+        let (mut ix, roots) = tree();
+        let main = ix.lookup(2, b"main.rs").expect("main.rs in src");
+        // 2026-01-02T00:00:00Z in whole minutes.
+        let jan2: u32 = 29_455_200;
+        let jan2_secs = jan2 as i64 * 60;
+        ix.set_created(main, jan2);
+
+        use crate::expr::{ClockSpec, Expr, SinceField};
+        let since_otime = |ts: i64| Expr::Since {
+            spec: ClockSpec::Timestamp(ts),
+            field: SinceField::Oclock,
+        };
+        let expr = Expr::AllOf(vec![
+            since_otime(jan2_secs),
+            Expr::Suffix {
+                suffixes: vec![b".rs".to_vec()],
+            },
+        ]);
+        assert_eq!(
+            paths(&execute_expr(&ix, &roots, b"", &expr, 0, false)),
+            vec!["/home/me/proj/src/main.rs"],
+            "the whole set, including the one dated file"
+        );
+
+        // One second past the stored minute excludes it: the comparison is
+        // minute-resolution, and the stored value is the start of that minute.
+        let expr = since_otime(jan2_secs + 1);
+        assert!(paths(&execute_expr(&ix, &roots, b"", &expr, 0, false)).is_empty());
+
+        // An undated entry never matches, even against the epoch: "unknown"
+        // is not "created in 1970".
+        let expr = since_otime(0);
+        assert_eq!(
+            paths(&execute_expr(&ix, &roots, b"", &expr, 0, false)),
+            vec!["/home/me/proj/src/main.rs"]
+        );
+
+        // The streaming engine must report the same minute on its hits, so a
+        // client never has to stat the file it was just told about.
+        let mut hits = Vec::new();
+        let mut emit = |ev: ScanEvent| {
+            if let ScanEvent::Hit(h) = ev {
+                hits.push(h);
+            }
+            true
+        };
+        execute_scan_emit(
+            &ix,
+            &roots,
+            &Query::compile("main").unwrap(),
+            0,
+            false,
+            &mut emit,
+            None,
+            false,
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].created_min, Some(jan2));
+    }
+
+    #[test]
+    fn a_time_only_query_returns_every_dated_entry() {
+        // The point of storing the creation minute: a request whose **only**
+        // predicate is a time range — no name, no glob, no `allof` wrapper — is
+        // answered from the stored column, over every entry in the index.
+        use crate::expr::{ClockSpec, Expr, SinceField};
+        let (mut ix, roots) = tree();
+        let src = ix.lookup(1, b"src").expect("src under the root dir (id 1)");
+        let main = ix.lookup(src, b"main.rs").expect("main.rs");
+        let readme = ix.lookup(1, b"README.md").expect("README.md");
+        // 2026-01-02 and the minute after it.
+        let jan2: u32 = 29_455_200;
+        ix.set_created(main, jan2);
+        ix.set_created(readme, jan2 + 1);
+
+        let since = |ts: i64| Expr::Since {
+            spec: ClockSpec::Timestamp(ts),
+            field: SinceField::Oclock,
+        };
+        // The bound is the start of the stored minute, in seconds.
+        let got = paths(&execute_expr(
+            &ix,
+            &roots,
+            b"",
+            &since(jan2 as i64 * 60),
+            0,
+            false,
+        ));
+        assert_eq!(
+            got,
+            vec!["/home/me/proj/src/main.rs", "/home/me/proj/README.md"],
+            "every dated entry, in index order, and nothing undated"
+        );
+
+        // A wide bound (the epoch) keeps exactly that membership: "undated"
+        // is not "created in 1970", so the undated entries still do not appear.
+        assert_eq!(
+            paths(&execute_expr(&ix, &roots, b"", &since(0), 0, false)),
+            got
+        );
+
+        // The bound is inclusive at minute resolution: the file whose stored
+        // minute *is* the bound stays, the one a minute earlier does not.
+        assert_eq!(
+            paths(&execute_expr(
+                &ix,
+                &roots,
+                b"",
+                &since((jan2 as i64 + 1) * 60),
+                0,
+                false
+            )),
+            vec!["/home/me/proj/README.md"]
+        );
+        // ...and one minute past it drops both.
+        assert!(paths(&execute_expr(
+            &ix,
+            &roots,
+            b"",
+            &since((jan2 as i64 + 2) * 60),
+            0,
+            false
+        ))
+        .is_empty());
+
+        // The streaming engine is what the server uses; it must agree.
+        let mut streamed = Vec::new();
+        let mut emit = |ev: ScanEvent| {
+            if let ScanEvent::Hit(h) = ev {
+                streamed.push(String::from_utf8_lossy(&h.path).into_owned());
+            }
+            true
+        };
+        execute_expr_emit(&ix, &roots, b"", &since(0), 0, false, &mut emit, None, false);
+        assert_eq!(streamed, got, "streaming returns the same time-only set");
     }
 
     #[test]

@@ -65,6 +65,9 @@ QUERY:
       ff --expr '{\"expression\": [\"allof\", [\"type\",\"f\"], [\"suffix\",\"rs\"]]}'
       ff --expr '[\"match\", \"**/*.rs\", \"wholename\"]'
       ff --expr '{\"glob\": [\"**/*.rs\"], \"relative_root\": \"src\"}'
+      ff --expr '{\"expression\": [\"since\", 1795255980, \"oclock\"]}'
+        # created at/after that unix time (minute resolution), any name;
+        # `oclock` is the creation clock, answered from the stored minute
 
 UPDATE:
     ff update reconciles every root with the filesystem (rescan, then

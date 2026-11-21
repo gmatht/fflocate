@@ -18,8 +18,10 @@ use serde::{Deserialize, Serialize};
 /// ignored it. v3 marks the behaviour change so an old daemon rejects the
 /// request instead of quietly doing the wrong thing. v4 adds the daemon's
 /// self-reported `phase` + crawl progress to `Meta`/`stats`, which clients key
-/// their "what is it doing" wording on.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// their "what is it doing" wording on. v5 adds `Hit.created`: each index entry
+/// now carries its creation time, so a created-date query is answered from the
+/// index instead of one `stat` per hit.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// A client request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -154,7 +156,16 @@ pub enum Response {
         entries: Option<u64>,
     },
     /// One search hit.
-    Hit { path: String, id: u32 },
+    Hit {
+        path: String,
+        id: u32,
+        /// Creation (birth) time in whole minutes since the unix epoch; absent
+        /// when the filesystem reports none for that entry (or the daemon
+        /// predates the field). Clients render date questions from it and only
+        /// fall back to `stat` when it is missing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        created: Option<u32>,
+    },
     /// Scan-fraction progress: `scanned` of `total` index entries visited so
     /// far (entries *visited*, including tombstones and skips — not matches).
     /// Emitted only when the query asked with `progress: true`, between `Meta`
@@ -240,7 +251,7 @@ mod tests {
     #[test]
     fn parse_query() {
         let r =
-            Request::from_line(r#"{"v":4,"op":"query","q":"src ext:rs","limit":50,"json":true}"#)
+            Request::from_line(r#"{"v":5,"op":"query","q":"src ext:rs","limit":50,"json":true}"#)
                 .unwrap();
         match r {
             Request::Query {
@@ -384,12 +395,12 @@ mod tests {
         // Opt-in: the flag is always on the wire (like `fuzzy`), and an old
         // line without it parses with progress off — an old daemon's reply
         // shape and a new client's default both mean "no Progress records".
-        let r = Request::from_line(r#"{"v":4,"op":"query","q":"comp","progress":true}"#).unwrap();
+        let r = Request::from_line(r#"{"v":5,"op":"query","q":"comp","progress":true}"#).unwrap();
         match r {
             Request::Query { progress, .. } => assert!(progress),
             _ => panic!("wrong request"),
         }
-        let r = Request::from_line(r#"{"v":4,"op":"query","q":"comp"}"#).unwrap();
+        let r = Request::from_line(r#"{"v":5,"op":"query","q":"comp"}"#).unwrap();
         match r {
             Request::Query { progress, .. } => assert!(!progress),
             _ => panic!("wrong request"),
@@ -418,6 +429,56 @@ mod tests {
                 total: 2214992
             }
         ));
+    }
+
+    #[test]
+    fn hit_created_rides_the_wire_as_u32_minutes_since_the_epoch() {
+        // The stored value is minutes, not seconds and not a timestamp type:
+        // the wire has to say the same thing the index holds, or a client that
+        // divides by 60 would be off by the same factor twice.
+        let day = 29_455_200u32; // 2026-01-02T00:00Z, in minutes since 1970
+        let hit = Response::Hit {
+            path: "/home/me/report.zip".into(),
+            id: 42,
+            created: Some(day),
+        };
+        let line = hit.to_line();
+        assert!(
+            line.contains("\"created\":29455200"),
+            "minutes go on the wire as a bare u32: {line}"
+        );
+        // The number is exactly one minute-count, not seconds on the same
+        // field: seconds would be 60x larger and would overflow a u32 in 2106.
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["created"].as_u64(), Some(day as u64));
+        assert_eq!(day as u64 * 60, 1_767_312_000);
+        assert!(day.checked_mul(60).is_some(), "a u32 of minutes fits in seconds for our era");
+
+        // Round trip: the daemon's line and the client's value agree exactly.
+        let back: Response = serde_json::from_str(&line).unwrap();
+        match back {
+            Response::Hit { created, id, .. } => {
+                assert_eq!(created, Some(day));
+                assert_eq!(id, 42);
+            }
+            other => panic!("expected a hit, got {other:?}"),
+        }
+
+        // An entry the filesystem would not date carries no field at all, so an
+        // older client sees the same line shape it always did.
+        let undated = Response::Hit {
+            path: "/home/me/no-birthtime".into(),
+            id: 7,
+            created: None,
+        };
+        let line = undated.to_line();
+        assert!(!line.contains("created"), "undated hits omit the field: {line}");
+        // And a daemon that predates the field decodes as "unknown", not 1970.
+        let old: Response = serde_json::from_str(r#"{"type":"hit","path":"/x","id":7}"#).unwrap();
+        match old {
+            Response::Hit { created, .. } => assert_eq!(created, None),
+            other => panic!("expected a hit, got {other:?}"),
+        }
     }
 
     #[test]

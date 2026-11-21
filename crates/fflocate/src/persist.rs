@@ -264,8 +264,10 @@ pub fn apply_record(index: &mut Index, rec: &Record) {
             parent,
             name,
             flags,
+            created,
         } => {
             index.apply_add(*id, *parent, name, EntryFlags(*flags));
+            index.set_created(*id, *created);
         }
         Record::Del { id } => {
             index.remove(*id);
@@ -303,6 +305,7 @@ mod tests {
                 parent: ROOT_ID,
                 name: b"p".to_vec(),
                 flags: EntryFlags::EMPTY.with_dir(true).with_root_dir(true).0,
+                created: 0,
             })
             .unwrap();
         let f = ix.insert(r, b"a", EntryFlags::EMPTY);
@@ -312,6 +315,7 @@ mod tests {
                 parent: r,
                 name: b"a".to_vec(),
                 flags: 0,
+                created: 0,
             })
             .unwrap();
         ix.set_last_lsn(store.journal.count());
@@ -327,6 +331,33 @@ mod tests {
             .replay(&mut snap.index, |_, _rec: &crate::journal::Record| {})
             .unwrap();
         assert_eq!(out.replayed, 0);
+    }
+
+    #[test]
+    fn replay_restores_a_creation_time() {
+        let mut ix = Index::new();
+        let r = ix.insert(
+            ROOT_ID,
+            b"p",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        let f = ix.insert(r, b"a", EntryFlags::EMPTY);
+        assert_eq!(ix.created_min(f), None);
+        apply_record(
+            &mut ix,
+            &Record::Add {
+                id: f,
+                parent: r,
+                name: b"a".to_vec(),
+                flags: 0,
+                created: 29_455_200,
+            },
+        );
+        assert_eq!(
+            ix.created_min(f),
+            Some(29_455_200),
+            "a replayed add must restore the creation minute"
+        );
     }
 
     #[test]
@@ -349,6 +380,7 @@ mod tests {
                 parent: r,
                 name: b"a".to_vec(),
                 flags: 0,
+                created: 0,
             })
             .unwrap();
         store.append(&Record::Del { id: a }).unwrap();
@@ -488,6 +520,7 @@ mod tests {
             parent: ROOT_ID,
             name: b"p".to_vec(),
             flags: EntryFlags::EMPTY.with_dir(true).with_root_dir(true).0,
+            created: 0,
         };
         apply_record(&mut ix, &rec);
         let before = ix.live_count();

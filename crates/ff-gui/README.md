@@ -97,10 +97,12 @@ What that means in practice, stated rather than implied:
   spreadsheet, binary, archive, PDF — built from rectangles, since a themed
   pixbuf is not reachable from the portable canvas, and **clicking the Name or
   Path header sorts by it** (a second click reverses it, and the title shows `^`
-  or `v`). The icon column does not sort. Row height is fixed. `ICON_SHEET=<path>
-  cargo test --manifest-path vendor/rustxwidgets/Cargo.toml --no-default-features
-  --features gtk,macos --lib -- icon_sheet` renders every mark to a PNG
-  (`icon-sheet.png`) at the size a row uses.
+  or `v`). The icon column does not sort. Row height is fixed. From the repo
+  root, `ICON_SHEET=$PWD/icon-sheet.png cargo test --manifest-path
+  vendor/rustxwidgets/Cargo.toml --no-default-features --features gtk,macos --lib
+  -- icon_sheet` renders every mark to `icon-sheet.png` at the size a row uses.
+  The path has to be absolute: `cargo test` runs the test with the vendor
+  crate's directory as its working directory, so a relative path lands there.
 * **Right-clicking a result opens its row menu.** The row under the cursor is
   selected by the canvas hit-test, then a real menu (`GtkMenu` on GTK, `NSMenu`
   on AppKit) offers *Open*, *Open containing folder*, *Copy full path* and
@@ -341,13 +343,17 @@ depend on a checkout outside this repository.
   matches". Ticking them changes what is searched; they are not decoration.
 * **Created from / to** in the foldout narrow the list to files whose creation
   time falls in the inclusive `YYYY-MM-DD` range; either end may be left blank.
-  The index carries no timestamps (a v1 entry is 12 bytes of name, parent and
-  flags), so the daemon cannot filter on them: the GUI applies the range to the
-  rows the daemon returned, and the status line states what it checked —
-  `[created 2026-01-02–2026-01-03: 12 of 50 matched]`, plus `N had no creation
-  time` and `N more matches not checked` when those apply. A date that does not
-  parse, or a `from` after the `to`, is refused in the status line instead of
-  being silently ignored.
+  Each index entry stores its creation (birth) time as a `u32` of **minutes
+  since the epoch** (0 = unknown), captured by the crawl from the same `stat`
+  that decides the execute bit, so the daemon sends it with every hit
+  (protocol v5) and the range is applied to data that already arrived — no
+  per-row `stat`. The GUI filters the rows the daemon returned and the status
+  line states what it checked — `[created 2026-01-02–2026-01-03: 12 of 50
+  matched]`, plus `N had no creation time` and `N more matches not checked`
+  when those apply. A row the daemon could not date (or a daemon older than v5)
+  still works: the client falls back to its own `stat` for that row only. A
+  date that does not parse, or a `from` after the `to`, is refused in the
+  status line instead of being silently ignored.
 * **Right-clicking a result opens its row menu.** The row under the cursor is
   selected by the canvas hit-test, then a real menu (`GtkMenu` on GTK, `NSMenu`
   on AppKit) offers *Open*, *Open containing folder*, *Copy full path* and

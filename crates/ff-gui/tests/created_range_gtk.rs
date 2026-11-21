@@ -153,6 +153,10 @@ impl FakeDaemon {
                     let hit = Response::Hit {
                         path: path.clone(),
                         id: i as u32,
+                        // This fake daemon is deliberately old-style here: no
+                        // creation minute, so the client must fall back to its
+                        // own `stat` (which is what this test exercises).
+                        created: None,
                     };
                     let _ = writeln!(stream, "{}", hit.to_line());
                 }

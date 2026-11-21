@@ -21,7 +21,7 @@ it is a status note.
 | §10 Query engine | done | `crates/fflocate/src/query.rs` |
 | §10/§17 **v2 trigram accelerator** | done | `crates/fflocate/src/trigram.rs`, `query.rs` (`execute_with_trigram`), `applier.rs` (`Shared::trigram_index`); tests `tests/trigram_differential.rs`; bench `examples/trigram_bench.rs` |
 | §10 **fuzzy search** | done | `crates/fflocate/src/fuzzy.rs`, `query.rs` (`execute_fuzzy`), `proto.rs`/`server.rs`/`fx` (`--fuzzy`, `--distance`) |
-| §11 IPC protocol v2 (wire v4: daemon `phase` + crawl progress in `Meta`/`stats`) | done | `crates/fflocate/src/proto.rs`, `server.rs`, `health.rs` |
+| §11 IPC protocol v2 (wire v5: `Hit.created`, the entry's creation minute; v4: daemon `phase` + crawl progress in `Meta`/`stats`) | done | `crates/fflocate/src/proto.rs`, `server.rs`, `health.rs` |
 | §12 CLI | done | `crates/fx/src/{main,client,service}.rs` (binary `ff`; the `fx` name collides with the snap JSON viewer. Crate dir kept as `crates/fx`.) |
 | §13 Concurrency model | done | `crates/fflocate/src/applier.rs`, `crates/fflocated/src/daemon.rs` |
 | §14 Testing | done (§14.1–.5) | `crates/fflocate/tests/*`, `crates/fflocated/tests/*`, `scripts/e2e.sh` |
@@ -494,6 +494,30 @@ These are deliberate and small; each is noted so the design stays honest.
    `crates/ff-gui/tests/reflow_gtk.rs` drives a 600 000-row list end to end (top,
    middle offset, last row, thumb at the track's bottom) and asserts the
    per-frame draw-op count, so the claim is measured rather than asserted.
+
+   **Creation times are indexed rather than statted per query.** The crawl's
+   `stat` (the one already taken for the execute bit) also yields the birth
+   time; it is stored as a `u32` of **minutes since the epoch** in a parallel
+   array beside the 12-byte entries — 4 bytes per entry, 0 meaning unknown —
+   carried in the journal's `add` record and in snapshot format 3. That makes
+   `since ... otime`/`oclock` answer from the index (it previously saw `None`
+   for every candidate, so it matched nothing), and each hit now reports its
+   `created` minute, so the GUI's created-date range filters the page it was
+   given instead of `stat`ting every row. A filesystem without birth times, a
+   row indexed before the format bump, or a daemon older than protocol v5 all
+   read as "unknown" and fall back to the client's own `stat`. Snapshot format
+   3 is read alongside 2, but the state dir is versioned (`FORMAT_VERSION` 3),
+   so an existing install starts from a fresh crawl — which is also what
+   populates the field. Minute resolution is deliberate: a day range and a
+   coarse `since` boundary do not need seconds, and 32 bits of minutes lasts
+   past the year 10000.
+
+   Because `oclock` reads that stored minute, a request whose **only**
+   predicate is the range — `ff --expr '{"expression":["since",<unix-time>,"oclock"]}'`,
+   no name or glob term at all — returns every dated entry, and nothing is
+   dropped for want of a name. A bound of `0` is the wide range: it keeps every
+   dated entry and still excludes the undated, because "unknown" is not
+   "created in 1970".
 
    On macOS the window is real, and so is what those shim classes provide.
    `ff-gui` creates its own `NSApplication` and `NSWindow`, builds the whole

@@ -232,7 +232,7 @@ impl Client {
                         }
                     }
                 }
-                Response::Hit { path, id } => {
+                Response::Hit { path, id, .. } => {
                     printed += 1;
                     if json {
                         let obj = serde_json::json!({"path": path, "id": id});
