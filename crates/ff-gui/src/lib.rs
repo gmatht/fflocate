@@ -699,6 +699,235 @@ pub struct SearchOptions {
     pub count_only: bool,
 }
 
+/// The advanced foldout's **created from / to** range.
+///
+/// Both bounds are inclusive unix seconds; `None` means that end is unbounded.
+/// The index stores no timestamps (a v1 entry is 12 bytes of name/parent/flags),
+/// so the daemon cannot answer this: the GUI applies the range to the rows the
+/// daemon returned (see [`filter_by_created`]) and says so in the status line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CreatedRange {
+    pub from: Option<i64>,
+    pub to: Option<i64>,
+}
+
+impl CreatedRange {
+    /// Whether `secs` (unix seconds) falls inside the range.
+    pub fn contains(&self, secs: i64) -> bool {
+        self.from.map_or(true, |f| secs >= f) && self.to.map_or(true, |t| secs <= t)
+    }
+
+    /// The range as the status line spells it: `2026-01-02–2026-02-01`,
+    /// `since 2026-01-02`, or `until 2026-02-01`.
+    pub fn label(&self) -> String {
+        match (self.from, self.to) {
+            (Some(f), Some(t)) => format!("{}–{}", format_day(f), format_day(t)),
+            (Some(f), None) => format!("since {}", format_day(f)),
+            (None, Some(t)) => format!("until {}", format_day(t)),
+            (None, None) => String::new(),
+        }
+    }
+}
+
+/// What one [`filter_by_created`] pass examined and kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CreatedStats {
+    /// Rows the range was tested against.
+    pub examined: usize,
+    /// Rows that fell inside it.
+    pub kept: usize,
+    /// Rows whose filesystem reported no creation time (excluded: an unknown
+    /// time is not a match, the same rule `size`/`since` terms follow).
+    pub undated: usize,
+}
+
+impl CreatedStats {
+    /// Rows that had a creation time outside the range.
+    pub fn outside(&self) -> usize {
+        self.examined - self.kept - self.undated
+    }
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's
+/// `days_from_civil`), so the calendar arithmetic is exact without a date crate.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The inverse of [`days_from_civil`]: `(year, month, day)` for a day number.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// `YYYY-MM-DD` for a unix timestamp, in UTC like the bounds themselves.
+fn format_day(secs: i64) -> String {
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Parse one bound: the first second of the day, or its last (`end_of_day`).
+fn parse_day_bound(text: &str, field: &str, end_of_day: bool) -> Result<Option<i64>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let bad = || format!("{field}: \"{text}\" is not a date — use YYYY-MM-DD");
+    let bytes = text.as_bytes();
+    // Validate the shape on bytes first, so every slice below is ASCII (a
+    // multi-byte character can never split a date string then).
+    let shaped = bytes.len() == 10
+        && bytes.iter().enumerate().all(|(i, b)| {
+            if i == 4 || i == 7 {
+                *b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        });
+    if !shaped {
+        return Err(bad());
+    }
+    let (y, m, d) = match (
+        text[0..4].parse::<i64>(),
+        text[5..7].parse::<i64>(),
+        text[8..10].parse::<i64>(),
+    ) {
+        (Ok(y), Ok(m), Ok(d)) => (y, m, d),
+        _ => return Err(bad()),
+    };
+    if m < 1 || m > 12 || d < 1 || d > days_in_month(y, m) {
+        return Err(bad());
+    }
+    let start = days_from_civil(y, m, d) * 86_400;
+    Ok(Some(if end_of_day { start + 86_399 } else { start }))
+}
+
+/// Parse the foldout's two created-date fields.
+///
+/// Both are `YYYY-MM-DD` in UTC, blank for unbounded, and the range is
+/// inclusive at the day level (the `to` day's last second is included). A
+/// blank pair means no range at all (`Ok(None)`). Errors name the field and
+/// the offending text so the status line can repeat them verbatim.
+pub fn parse_created_range(from_text: &str, to_text: &str) -> Result<Option<CreatedRange>, String> {
+    let from = parse_day_bound(from_text, "created from", false)?;
+    let to = parse_day_bound(to_text, "created to", true)?;
+    match (from, to) {
+        (None, None) => Ok(None),
+        (f, t) => {
+            if let (Some(f), Some(t)) = (f, t) {
+                if f > t {
+                    return Err(format!(
+                        "created range: from {} is after to {}",
+                        format_day(f),
+                        format_day(t)
+                    ));
+                }
+            }
+            Ok(Some(CreatedRange { from: f, to: t }))
+        }
+    }
+}
+
+/// A file's creation (birth) time in unix seconds.
+///
+/// `None` when the path is gone or the filesystem does not record a birth
+/// time — an unknown time never matches a range, and the status line counts
+/// those rows separately rather than silently dropping them.
+pub fn created_secs(path: &str) -> Option<i64> {
+    let md = std::fs::metadata(path).ok()?;
+    let created = md.created().ok()?;
+    let since_epoch = created
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    i64::try_from(since_epoch.as_secs()).ok()
+}
+
+/// Keep only the paths whose creation time falls in `range`.
+///
+/// The clock is injected so the rule can be tested without creating files with
+/// chosen birth times (which no portable API allows): production passes
+/// [`created_secs`]. Order is preserved, so the daemon's hit order survives.
+pub fn filter_by_created(
+    paths: &mut Vec<String>,
+    range: &CreatedRange,
+    created: impl Fn(&str) -> Option<i64>,
+) -> CreatedStats {
+    let mut stats = CreatedStats::default();
+    paths.retain(|path| {
+        stats.examined += 1;
+        match created(path) {
+            Some(t) if range.contains(t) => {
+                stats.kept += 1;
+                true
+            }
+            Some(_) => false,
+            None => {
+                stats.undated += 1;
+                false
+            }
+        }
+    });
+    stats
+}
+
+/// The status-line suffix for an active created range.
+///
+/// It states what was actually checked, because the daemon's `total` is the
+/// count for the *name* query: the range can only be applied to the page that
+/// came back. `fetched` is how many paths the reply held and `total` the
+/// daemon's match count; when the reply was truncated the suffix says how many
+/// further matches went unchecked instead of letting the filtered count read
+/// as the total. A count-only search has no paths to filter, so the suffix says
+/// the range was not applied rather than implying it was.
+pub fn created_note(
+    range: &CreatedRange,
+    stats: &CreatedStats,
+    fetched: usize,
+    total: u64,
+    count_only: bool,
+) -> String {
+    if count_only {
+        return "  [created range not applied to a count-only search]".to_string();
+    }
+    let mut s = format!("  [created {}", range.label());
+    if stats.kept != stats.examined {
+        s.push_str(&format!(": {} of {} matched", stats.kept, stats.examined));
+    }
+    if stats.undated > 0 {
+        s.push_str(&format!("; {} had no creation time", stats.undated));
+    }
+    let unread = total.saturating_sub(fetched as u64);
+    if unread > 0 {
+        s.push_str(&format!("; {unread} more matches not checked"));
+    }
+    s.push(']');
+    s
+}
+
 /// What a search returned, including the consistency metadata (§11).
 #[derive(Clone, Debug, Default)]
 pub struct SearchOutcome {
@@ -4492,5 +4721,124 @@ mod full_set_tests {
         assert!(set.failed());
         assert!(set.done(), "a failed load is over");
         assert_eq!(set.status_line(), "sort load failed: connection reset");
+    }
+}
+
+#[cfg(test)]
+mod created_range_tests {
+    use super::*;
+
+    #[test]
+    fn a_full_day_is_inclusive_at_both_ends() {
+        let r = parse_created_range("2026-01-02", "2026-01-03").unwrap().unwrap();
+        let start = days_from_civil(2026, 1, 2) * 86_400;
+        assert!(r.contains(start), "the from day's first second");
+        assert!(r.contains(start + 172_799), "the to day's last second");
+        assert!(!r.contains(start + 172_800), "the next day");
+        assert!(!r.contains(start - 1), "the day before");
+        assert_eq!(r.label(), "2026-01-02–2026-01-03");
+    }
+
+    #[test]
+    fn either_end_may_be_open() {
+        let from_only = parse_created_range("2026-01-02", " ").unwrap().unwrap();
+        assert!(from_only.contains(days_from_civil(2030, 5, 5) * 86_400));
+        assert_eq!(from_only.label(), "since 2026-01-02");
+        let to_only = parse_created_range("", "2026-01-02").unwrap().unwrap();
+        assert!(to_only.contains(0));
+        assert_eq!(to_only.label(), "until 2026-01-02");
+        assert_eq!(parse_created_range("  ", "\t").unwrap(), None);
+    }
+
+    #[test]
+    fn bad_and_inverted_dates_name_the_field() {
+        let e = parse_created_range("yesterday", "").unwrap_err();
+        assert!(e.starts_with("created from:"), "{e}");
+        let e = parse_created_range("", "2026-02-30").unwrap_err();
+        assert!(e.starts_with("created to:"), "{e}");
+        let e = parse_created_range("2026-2-1", "").unwrap_err();
+        assert!(e.contains("YYYY-MM-DD"), "{e}");
+        let e = parse_created_range("2026-03-01", "2026-02-01").unwrap_err();
+        assert_eq!(e, "created range: from 2026-03-01 is after to 2026-02-01");
+    }
+
+    #[test]
+    fn leap_days_are_dates_and_the_rest_of_february_is_not() {
+        assert!(parse_created_range("2024-02-29", "").is_ok());
+        assert!(parse_created_range("2026-02-29", "").is_err());
+        assert!(parse_created_range("2026-13-01", "").is_err());
+    }
+
+    #[test]
+    fn filtering_keeps_in_range_paths_in_order() {
+        let range = parse_created_range("2026-01-02", "2026-01-03").unwrap().unwrap();
+        let jan2 = days_from_civil(2026, 1, 2) * 86_400;
+        let mut paths = vec![
+            "/old".to_string(),
+            "/in".to_string(),
+            "/undated".to_string(),
+            "/new".to_string(),
+        ];
+        let stats = filter_by_created(&mut paths, &range, |p| match p {
+            "/old" => Some(jan2 - 1),
+            "/in" => Some(jan2 + 60),
+            "/new" => Some(jan2 + 200_000),
+            _ => None,
+        });
+        assert_eq!(paths, ["/in"]);
+        assert_eq!(
+            stats,
+            CreatedStats {
+                examined: 4,
+                kept: 1,
+                undated: 1
+            }
+        );
+        assert_eq!(stats.outside(), 2);
+    }
+
+    #[test]
+    fn the_note_says_what_it_checked() {
+        let range = parse_created_range("2026-01-02", "2026-01-03").unwrap().unwrap();
+        let all = CreatedStats {
+            examined: 3,
+            kept: 3,
+            undated: 0,
+        };
+        assert_eq!(
+            created_note(&range, &all, 3, 3, false),
+            "  [created 2026-01-02–2026-01-03]"
+        );
+        let some = CreatedStats {
+            examined: 50,
+            kept: 12,
+            undated: 2,
+        };
+        assert_eq!(
+            created_note(&range, &some, 50, 50, false),
+            "  [created 2026-01-02–2026-01-03: 12 of 50 matched; 2 had no creation time]"
+        );
+        assert_eq!(
+            created_note(&range, &some, 50, 900, false),
+            "  [created 2026-01-02–2026-01-03: 12 of 50 matched; 2 had no creation time; 850 more matches not checked]"
+        );
+        assert_eq!(
+            created_note(&range, &all, 0, 900, true),
+            "  [created range not applied to a count-only search]"
+        );
+    }
+
+    #[test]
+    fn a_real_file_is_dated_or_the_filesystem_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.txt");
+        std::fs::write(&path, b"x").unwrap();
+        match created_secs(path.to_str().unwrap()) {
+            Some(secs) => assert!(secs > 0),
+            // A filesystem without birth times is not an error: the status
+            // line counts those rows as undated.
+            None => eprintln!("no creation time on this filesystem; range cannot match files here"),
+        }
+        assert_eq!(created_secs("/nonexistent/ff-gui/created"), None);
     }
 }

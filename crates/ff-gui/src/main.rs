@@ -40,12 +40,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ff_gui::{
-    box_change_clears, containing_dir, context_menu_target, drag_payload, effective_query, encode_request,
-    render_count, rows_from_paths, scan_percent, search_label, searching_status_line,
-    step_max_distance, streaming_status_line, DaemonClient, GuiError,
-    MenuAction, PendingRequest, Progress, RowAction, SearchGate, SearchOptions, SearchOutcome,
-    StartupPoll, StartupProbe, FullSet, MAX_SORTED_ROWS,
-    WheelStep, WireResponse, ADVANCED_SYNTAX_HELP, DEFAULT_MAX_DISTANCE,
+    box_change_clears, containing_dir, context_menu_target, created_note, created_secs, drag_payload,
+    effective_query, encode_request, filter_by_created, parse_created_range, render_count,
+    rows_from_paths, scan_percent, search_label, searching_status_line, step_max_distance,
+    streaming_status_line, CreatedRange, DaemonClient, GuiError, MenuAction, PendingRequest,
+    Progress, RowAction, SearchGate, SearchOptions, SearchOutcome, StartupPoll, StartupProbe,
+    FullSet, MAX_SORTED_ROWS, WheelStep, WireResponse, ADVANCED_SYNTAX_HELP, DEFAULT_MAX_DISTANCE,
 };
 
 /// A search's result.
@@ -220,6 +220,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // or is selected for typing.
     advanced_query.set_placeholder_text(ADVANCED_SYNTAX_HELP);
 
+    // The created-date range: two inclusive `YYYY-MM-DD` fields, either blank
+    // for unbounded. The index stores no timestamps, so the daemon cannot
+    // answer this — the GUI filters the rows it gets (see
+    // `ff_gui::filter_by_created`) and the status line says exactly what it
+    // checked. A file whose filesystem reports no birth time never matches.
+    trace_step!("created from entry");
+    let created_from = app.create_entry()?;
+    created_from.set_text("");
+    created_from.set_placeholder_text("YYYY-MM-DD");
+    trace_step!("created to entry");
+    let created_to = app.create_entry()?;
+    created_to.set_text("");
+    created_to.set_placeholder_text("YYYY-MM-DD");
+    trace_step!("created row");
+    let created_from_label = app.create_label("created from:")?;
+    let created_to_label = app.create_label("to:")?;
+    let created_row = app.create_box(Orientation::Horizontal, 2)?;
+    created_row.append(&created_from_label);
+    created_row.append(&created_from);
+    created_row.append(&created_to_label);
+    created_row.append(&created_to);
+
     trace_step!("case checkbutton");
     let opt_case = app.create_checkbutton("Case sensitive")?;
     opt_case.set_active(false);
@@ -243,6 +265,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     trace_step!("advanced box");
     let advanced_box = app.create_box(Orientation::Vertical, 2)?;
     advanced_box.append(&advanced_query);
+    advanced_box.append(&created_row);
     advanced_box.append(&opt_case);
     advanced_box.append(&opt_fuzzy);
     advanced_box.append(&distance_row);
@@ -345,6 +368,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // again; a *different* column does need the set re-fetched, because the
     // rows kept are only the top 1 000 of the previous order.
     let loaded_column: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    // The created-date range in force, parsed once per search in
+    // `build_request`. The renderer reads it back instead of re-reading the
+    // boxes, so a reply is never filtered by a half-typed date, and the pump's
+    // streaming rows are filtered by the same range the final render uses.
+    let created_range: Rc<RefCell<Option<CreatedRange>>> = Rc::new(RefCell::new(None));
 
     // The daemon check is deferred past first paint: it rides the timer pump
     // (see `StartupProbe`), so the window appears immediately even when the
@@ -380,6 +408,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let opt_fuzzy = opt_fuzzy.clone();
         let opt_count = opt_count.clone();
         let opt_distance = opt_distance.clone();
+        let created_from = created_from.clone();
+        let created_to = created_to.clone();
+        let created_range = created_range.clone();
         let last_search = last_search.clone();
         Rc::new(move || {
             let quick = query.get_text().unwrap_or_default();
@@ -393,7 +424,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
             })?;
             let opts = gather_options(&opt_case, &opt_fuzzy, &opt_count, &opt_distance);
+            // A bad or inverted date refuses the search here, so the status
+            // says which field is wrong instead of the list quietly ignoring
+            // the range.
+            let created = parse_created_range(
+                &created_from.get_text().unwrap_or_default(),
+                &created_to.get_text().unwrap_or_default(),
+            )
+            .map_err(GuiError::Protocol)?;
             let req = DaemonClient::query_request(&q, FETCH_LIMIT, &opts);
+            *created_range.borrow_mut() = created;
             // Remember exactly what was asked, so a whole-set load asks the
             // same question with no limit rather than re-reading the boxes (the
             // user may have typed on by the time it starts).
@@ -409,11 +449,33 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let opt_count = opt_count.clone();
         let last_total = last_total.clone();
         let want_full = want_full.clone();
+        let created_range = created_range.clone();
         Rc::new(move |outcome| match outcome {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
                 let count_only = opt_count.is_active();
                 last_total.set(outcome.total);
-                let line = outcome.status_line_opts(outcome.paths.len().min(MAX_ROWS), count_only);
+                // The created range is applied to the page the daemon returned:
+                // the index has no timestamps to filter on server-side. The
+                // suffix then states how much of that page it hid, so the
+                // filtered count never passes for the daemon's total.
+                let range = *created_range.borrow();
+                let stats = match (&range, count_only) {
+                    (Some(r), false) => {
+                        Some(filter_by_created(&mut outcome.paths, r, created_secs))
+                    }
+                    _ => None,
+                };
+                let fetched = outcome.paths.len();
+                let mut line = outcome.status_line_opts(fetched.min(MAX_ROWS), count_only);
+                if let Some(r) = range.as_ref() {
+                    line.push_str(&created_note(
+                        r,
+                        &stats.unwrap_or_default(),
+                        fetched,
+                        outcome.total,
+                        count_only,
+                    ));
+                }
                 status.set_text(&line);
                 if count_only {
                     // No paths come back: show the number, not an empty list that
@@ -433,7 +495,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     *current.borrow_mut() = results.displayed_column(PATH_COLUMN);
                     // Sorted, but only the page on screen is in the list: ask
                     // for the rest so the sort really does cover every match.
-                    if results.sort_state().is_some() && outcome.total > shown.len() as u64 {
+                    // A created range is a client-side filter over this page;
+                    // the whole-set load would replace the rows with the
+                    // unfiltered set, so it stays off while one is active.
+                    if range.is_none()
+                        && results.sort_state().is_some()
+                        && outcome.total > shown.len() as u64
+                    {
                         want_full.set(true);
                     }
                 }
@@ -527,6 +595,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let last_total = last_total.clone();
             let want_full = want_full.clone();
             let loaded_column = loaded_column.clone();
+            let created_range = created_range.clone();
             // Partial renders paint rows directly (the `render` closure owns
             // its clones), so the pump holds its own.
             let partial_results = results.clone();
@@ -673,6 +742,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     _ => None,
                                 })
                                 .collect();
+                            // Filter the streaming rows by the same range the
+                            // final render uses, so rows outside it never
+                            // flash up and then vanish.
+                            let kept: Vec<String> = match created_range.borrow().as_ref() {
+                                Some(r) => hits
+                                    .iter()
+                                    .filter(|p| created_secs(p).map(|t| r.contains(t)).unwrap_or(false))
+                                    .cloned()
+                                    .collect(),
+                                None => hits.clone(),
+                            };
                             // Fold every Progress record into the watermark:
                             // monotone, never rewinds.
                             for r in p.records() {
@@ -722,7 +802,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             if hits.len() > *rendered {
                                 *rendered = hits.len();
                                 let elapsed = started_at.elapsed();
-                                let fresh_hits = hits.clone();
+                                let fresh_hits = kept.clone();
                                 drop(pending_ref);
                                 if gate.borrow().is_current(seq) {
                                     // Paint only the rows on screen (MAX_ROWS);
@@ -738,7 +818,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     // phase, if it has one, speaks for itself.
                                     let _ = (phase, crawl_entries, crawl_dirs_pending);
                                     startup_status.set_text(&streaming_status_line(
-                                        hits.len(),
+                                        fresh_hits.len(),
                                         elapsed,
                                         pct,
                                     ));
@@ -801,7 +881,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             // set is already complete, or when the list
                             // already holds every match.
                             let sorted_column = partial_results.sort_state().map(|(c, _)| c);
-                            let worth_it = sorted_column.is_some()
+                            let worth_it = created_range.borrow().is_none()
+                                && sorted_column.is_some()
                                 && loaded_column.get() != sorted_column
                                 && last_total.get() > partial_current.borrow().len() as u64;
                             if worth_it {
@@ -974,6 +1055,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         return;
                     }
                     arm();
+                })
+                .ok();
+        }
+
+        // The date fields re-run the search once the pair parses (or both are
+        // blank). A half-typed date is not an error yet: Search/Return reports
+        // it, so typing `2026-0` does not flash an error on every keystroke.
+        for entry in [&created_from, &created_to] {
+            let arm = arm.clone();
+            let from_box = created_from.clone();
+            let to_box = created_to.clone();
+            entry
+                .connect_changed(move || {
+                    let from = from_box.get_text().unwrap_or_default();
+                    let to = to_box.get_text().unwrap_or_default();
+                    if parse_created_range(&from, &to).is_ok() {
+                        arm();
+                    }
                 })
                 .ok();
         }

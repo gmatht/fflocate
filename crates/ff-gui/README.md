@@ -339,6 +339,15 @@ depend on a checkout outside this repository.
   and *Count only* (`count`) which returns just the total — shown as
   `N matches (count only)` rather than an empty list that would read as "no
   matches". Ticking them changes what is searched; they are not decoration.
+* **Created from / to** in the foldout narrow the list to files whose creation
+  time falls in the inclusive `YYYY-MM-DD` range; either end may be left blank.
+  The index carries no timestamps (a v1 entry is 12 bytes of name, parent and
+  flags), so the daemon cannot filter on them: the GUI applies the range to the
+  rows the daemon returned, and the status line states what it checked —
+  `[created 2026-01-02–2026-01-03: 12 of 50 matched]`, plus `N had no creation
+  time` and `N more matches not checked` when those apply. A date that does not
+  parse, or a `from` after the `to`, is refused in the status line instead of
+  being silently ignored.
 * **Right-clicking a result opens its row menu.** The row under the cursor is
   selected by the canvas hit-test, then a real menu (`GtkMenu` on GTK, `NSMenu`
   on AppKit) offers *Open*, *Open containing folder*, *Copy full path* and
