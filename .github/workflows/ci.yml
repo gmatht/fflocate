@@ -108,7 +108,14 @@ jobs:
             echo "::error title=row menu on a row (macOS)::the walk did not finish: $(grep -E '^row menu on a row:' row-menu-row.log | tr '\n' '|' | cut -c1-1200)"
             exit 1
           fi
-          echo "::notice title=row menu on a row (macOS)::$(grep -E '^(row menu on a row|clipboard):' row-menu-row.log | tr '\n' '|')"
+          # The as-you-type list is part of this walk: its right-click block
+          # prints this line, so a binary that stopped covering streaming rows
+          # fails here instead of passing quietly.
+          if ! grep -q '^row menu on a streaming row:' row-menu-row.log; then
+            echo "::error title=row menu on a row (macOS)::the streaming-row walk did not run: $(grep -E '^row menu on' row-menu-row.log | tr '\n' '|' | cut -c1-1200)"
+            exit 1
+          fi
+          echo "::notice title=row menu on a row (macOS)::$(grep -E '^(row menu on a row|row menu on a streaming row|clipboard):' row-menu-row.log | tr '\n' '|' | cut -c1-3900)"
 
       # The pasteboard on its own, so a read that echoed a write cannot hide
       # behind the menu walk: set through the app's call, read through it and
@@ -324,7 +331,14 @@ jobs:
             echo "::error title=row menu on a row (Linux)::the walk did not run: $(grep -E '^row menu on a row:' row-menu-row.log | tr '\n' '|' | cut -c1-1200)"
             exit 1
           fi
-          echo "::notice title=row menu on a row (Linux)::$(grep -E '^(row menu on a row|clipboard):' row-menu-row.log | tr '\n' '|' | cut -c1-3900)"
+          # The as-you-type list is part of this walk: its right-click block
+          # prints this line, so a binary that stopped covering streaming rows
+          # fails here instead of passing quietly.
+          if ! grep -q '^row menu on a streaming row:' row-menu-row.log; then
+            echo "::error title=row menu on a row (Linux)::the streaming-row walk did not run: $(grep -E '^row menu on' row-menu-row.log | tr '\n' '|' | cut -c1-1200)"
+            exit 1
+          fi
+          echo "::notice title=row menu on a row (Linux)::$(grep -E '^(row menu on a row|row menu on a streaming row|clipboard):' row-menu-row.log | tr '\n' '|' | cut -c1-3900)"
 
       # The CLIPBOARD selection on its own: set through the app's call, read
       # through it and through GDK's own waiting read, replaced by a second
