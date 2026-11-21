@@ -625,7 +625,15 @@ pub fn create_textview() -> Result<TextView, Error> { Ok(TextView::new()) }
 pub fn create_canvas() -> Result<Canvas, Error> { Ok(Canvas::new()) }
 pub fn create_scrolled_window() -> Result<ScrolledWindow, Error> { Ok(ScrolledWindow::new()) }
 pub fn create_overlay() -> Result<Overlay, Error> { Ok(Overlay::new()) }
-pub fn create_application() -> Result<Application, Error> { Ok(Application(gtk4::Application::new(Some("org.corro.Corro"), gio::ApplicationFlags::empty()))) }
+pub fn create_application() -> Result<Application, Error> {
+    // `NON_UNIQUE`, for the same reason the dlopen loader passes
+    // `G_APPLICATION_NON_UNIQUE`: a fixed app id must not make the second
+    // process a remote instance whose `app.*` menu actions never resolve.
+    Ok(Application(gtk4::Application::new(
+        Some("org.corro.Corro"),
+        gio::ApplicationFlags::NON_UNIQUE,
+    )))
+}
 pub fn quit_main_loop() -> Result<(), Error> { Ok(()) }
 pub fn pump_main_context(count: usize) { for _ in 0..count { glib::MainContext::default().iteration(false); } }
 pub fn open_file(_t: &str) -> Result<Option<String>, Error> { Ok(None) }

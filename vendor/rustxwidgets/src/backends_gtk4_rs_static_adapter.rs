@@ -596,7 +596,14 @@ pub fn create_textview() -> Result<TextView, Error> { Ok(TextView::new()) }
 pub fn create_canvas() -> Result<Canvas, Error> { Ok(Canvas::new()) }
 pub fn create_scrolled_window() -> Result<ScrolledWindow, Error> { Ok(ScrolledWindow::new()) }
 pub fn create_overlay() -> Result<Overlay, Error> { Ok(Overlay::new()) }
-pub fn create_application() -> Result<Application, Error> { Ok(Application(gtk4_static::Application::new(Some("org.corro.Corro"), gio::ApplicationFlags::empty()))) }
+pub fn create_application() -> Result<Application, Error> {
+    // Non-unique: two processes must not fight over one app id, or the second
+    // one's `app.*` menu actions would never resolve (see the dlopen loader).
+    Ok(Application(gtk4_static::Application::new(
+        Some("org.corro.Corro"),
+        gio::ApplicationFlags::NON_UNIQUE,
+    )))
+}
 pub fn quit_main_loop() -> Result<(), Error> { Ok(()) }
 pub fn pump_main_context(count: usize) { for _ in 0..count { glib::MainContext::default().iteration(false); } }
 pub fn open_file(_t: &str) -> Result<Option<String>, Error> { Ok(None) }

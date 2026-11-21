@@ -10,9 +10,12 @@
 //! action could resolve. GTK renders an unresolvable item insensitive.
 //!
 //! (b) The group itself was a `GtkApplication`, which resolves `app.<name>`
-//! items only on some displays (greyed out on WSLg's `:0`, fine under Xvfb).
-//! `ensure_action_group` now hands out a plain `GSimpleActionGroup`, which
-//! resolves identically everywhere.
+//! items only on some displays (greyed out on WSLg's `:0`, fine under Xvfb),
+//! and which claimed one fixed app id on the session bus — so a second process
+//! registered as a *remote* instance and its items resolved to nothing at all.
+//! The loader now creates that application with `G_APPLICATION_NON_UNIQUE`
+//! (`gtk_dynamic_loader::Application::new`), so every process is its own
+//! primary and every process's `app.<name>` items resolve and dispatch.
 //!
 //! Needs a display with GTK3 (real `GtkMenuItem` widgets only exist there),
 //! so on headless CI — or anywhere the toolkit is missing — it passes

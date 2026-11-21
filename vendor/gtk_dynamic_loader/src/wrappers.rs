@@ -695,8 +695,19 @@ impl Application {
     pub fn new(loader: Arc<Loader>, _id: Option<&str>) -> Result<Self, Error> {
         // If possible try to create a GApplication via symbol (glib/gio)
         if let Some(app_new) = loader.symbols.gtk_application_new {
+            // `G_APPLICATION_NON_UNIQUE` (1 << 5): every process is its own
+            // primary instance instead of claiming a name on the session bus.
+            // Without it, a second process with the same fixed app id registers
+            // as a *remote* instance, and its `app.<name>` menu actions never
+            // resolve locally — activating a menu item then dispatches nothing.
+            // That is not hypothetical: two `ff-gui` processes (or two GTK test
+            // binaries in the same `cargo test` run) left every process but the
+            // first with a menubar whose items fired nothing, and made
+            // `menubar_items_are_enabled_and_fire` fail 7 times out of 8 for no
+            // reason the test could see.
+            const NON_UNIQUE: u32 = 1 << 5;
             let id_c = CString::new("org.example.GtkCompatApp").unwrap();
-            let app = unsafe { app_new(id_c.as_ptr() as *const u8, 0) };
+            let app = unsafe { app_new(id_c.as_ptr() as *const u8, NON_UNIQUE) };
             if !app.is_null() {
                 return Ok(Application { inner: app, loader });
             }
