@@ -129,14 +129,14 @@ jobs:
           # GTK main loop, and two of them in one session have been seen to wait
           # on each other. Each is bounded so a hang fails the job instead of
           # stalling it.
-          for t in row_menu_gtk interaction_gtk typing_gtk reflow_gtk menubar_gtk daemon_pixels_gtk created_range_gtk; do
+          for t in row_menu_gtk row_menu_row_gtk interaction_gtk typing_gtk reflow_gtk menubar_gtk daemon_pixels_gtk created_range_gtk; do
             printf '=== %s ===\n' "$t" >> interaction.log
             xvfb-run -a -s "-screen 0 1280x1024x24" \
               timeout 180 cargo test -p ff-gui --test "$t" -- --nocapture >> interaction.log 2>&1 \
               || status=1
           done
           echo "interaction tests: exit ${status}; $(grep -E 'test result' interaction.log | tr '\n' '|')"
-          lines=$(grep -E 'row menu:|clipboard holds|pixels:|created range:|interaction:|typing:|reflow:|menu bar:|test result' interaction.log | tr '\n' '|' | cut -c1-3500)
+          lines=$(grep -E 'row menu:|row menu on a row:|clipboard holds|pixels:|created range:|interaction:|typing:|reflow:|menu bar:|test result' interaction.log | tr '\n' '|' | cut -c1-3500)
           if [ "$status" -eq 0 ]; then
             # The pixel check must have run, not skipped for want of a display
             # or a daemon: Xvfb is up and this step builds nothing else, so a
@@ -151,7 +151,14 @@ jobs:
               echo "::error title=created range (Linux)::the created from/to walk did not run: $(grep -E '^created range:' interaction.log | tr '\n' '|' | cut -c1-1200)"
               exit 1
             fi
+            # ... and for the right-click-on-a-row walk: a display-less skip
+            # must not pass for a menu that was never shown.
+            if ! grep -q '^row menu on a row: right-clicked' interaction.log; then
+              echo "::error title=row menu on a row (Linux)::the right-click walk did not run: $(grep -E '^row menu on a row:' interaction.log | tr '\n' '|' | cut -c1-1200)"
+              exit 1
+            fi
             echo "::notice title=interaction (Linux)::${lines}"
+            echo "::notice title=row menu on a row (Linux)::$(grep '^row menu on a row:' interaction.log | tr '\n' '|')"
             echo "::notice title=daemon pixels (Linux)::$(grep '^pixels:' interaction.log | tr '\n' '|')"
             echo "::notice title=created range (Linux)::$(grep '^created range:' interaction.log | tr '\n' '|')"
             exit 0

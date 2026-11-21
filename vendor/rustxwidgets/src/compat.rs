@@ -1721,6 +1721,11 @@ impl AsRef<*mut c_void> for Expander {
 pub struct ContextMenu {
     labels: Vec<String>,
     actions: Rc<RefCell<Vec<Box<dyn FnMut()>>>>,
+    /// The native menu the last [`ContextMenu::build`] made (0 before that, or
+    /// where the backend cannot build one). Kept so a caller — the tests — can
+    /// inspect the very menu `popup_at_pointer` puts on screen instead of
+    /// building a look-alike.
+    handle: usize,
 }
 
 impl ContextMenu {
@@ -1728,6 +1733,7 @@ impl ContextMenu {
         ContextMenu {
             labels: Vec::new(),
             actions: Rc::new(RefCell::new(Vec::new())),
+            handle: 0,
         }
     }
 
@@ -1765,7 +1771,15 @@ impl ContextMenu {
     /// same plumbing a click uses. A handle of `0` means the backend cannot
     /// build one.
     pub fn build(&mut self) -> Result<usize, Error> {
-        context_menu_build(&self.labels, self.dispatcher())
+        let handle = context_menu_build(&self.labels, self.dispatcher())?;
+        self.handle = handle;
+        Ok(handle)
+    }
+
+    /// The native handle of the menu last built (and, for a popup, shown).
+    /// `0` when nothing has been built.
+    pub fn handle(&self) -> usize {
+        self.handle
     }
 
     /// The items of a built menu and whether each is enabled.

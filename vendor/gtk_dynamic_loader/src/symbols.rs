@@ -352,6 +352,9 @@ pub type GtkWidgetActivate = unsafe extern "C" fn(widget: *mut c_void);
 // GtkWidget get_visible — checks the widget's visible flag
 pub type GtkWidgetGetVisible = unsafe extern "C" fn(widget: *mut c_void) -> i32;
 
+// GtkWidget get_sensitive — checks the widget's sensitive (enabled) flag
+pub type GtkWidgetGetSensitive = unsafe extern "C" fn(widget: *mut c_void) -> i32;
+
 // GtkExpander — GTK3's own disclosure widget. GTK4 removed it, so every one
 // of these is optional and a caller has to have a fallback.
 pub type GtkExpanderNew = unsafe extern "C" fn(label: *const u8) -> *mut c_void;
@@ -519,6 +522,7 @@ pub struct Symbols {
     pub gtk_widget_add_events: Option<GtkWidgetAddEvents>,
     pub gtk_widget_activate: Option<GtkWidgetActivate>,
     pub gtk_widget_get_visible: Option<GtkWidgetGetVisible>,
+    pub gtk_widget_get_sensitive: Option<GtkWidgetGetSensitive>,
     /// `GtkWidget* gtk_expander_new(const gchar*)` and its state accessors:
     /// the toolkit's own foldout, with its arrow and its clickable header.
     pub gtk_expander_new: Option<GtkExpanderNew>,
@@ -920,6 +924,8 @@ impl Symbols {
         let gtk_widget_add_events = unsafe { sym::<GtkWidgetAddEvents>(gtk, "gtk_widget_add_events") };
         let gtk_widget_activate = unsafe { sym::<GtkWidgetActivate>(gtk, "gtk_widget_activate") };
         let gtk_widget_get_visible = unsafe { sym::<GtkWidgetGetVisible>(gtk, "gtk_widget_get_visible") };
+        let gtk_widget_get_sensitive =
+            unsafe { sym::<GtkWidgetGetSensitive>(gtk, "gtk_widget_get_sensitive") };
         let gtk_expander_new = unsafe { sym::<GtkExpanderNew>(gtk, "gtk_expander_new") };
         let gtk_expander_set_expanded =
             unsafe { sym::<GtkExpanderSetExpanded>(gtk, "gtk_expander_set_expanded") };
@@ -1186,7 +1192,7 @@ impl Symbols {
             gtk_overlay_new, gtk_overlay_add_overlay, gtk_overlay_set_overlay_pass_through, gtk_overlay_set_child,
             gtk_widget_set_margin_start, gtk_widget_set_margin_top, gtk_widget_add_events,
             gtk_fixed_new, gtk_fixed_put, gtk_fixed_move,
-            gtk_widget_activate, gtk_widget_get_visible, gtk_widget_activate_action,
+            gtk_widget_activate, gtk_widget_get_visible, gtk_widget_get_sensitive, gtk_widget_activate_action,
             gtk_expander_new, gtk_expander_set_expanded, gtk_expander_get_expanded,
             gtk_init,
             g_signal_emit_by_name,

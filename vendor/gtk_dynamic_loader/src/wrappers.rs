@@ -2730,6 +2730,38 @@ pub fn context_menu_labels(id: u64) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether item `index` of a built menu is sensitive (GTK's own flag).
+///
+/// `None` when the item does not exist or this GTK lacks the symbol. The popup
+/// path only ever builds sensitive items, so this is the readable half of "the
+/// menu the user gets is usable" rather than a value invented by the adapter.
+pub fn context_menu_item_sensitive(loader: &Arc<Loader>, id: u64, index: usize) -> Option<bool> {
+    let item = context_menus()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&id).and_then(|s| s.items.get(index).copied()))?;
+    let get = loader.symbols.gtk_widget_get_sensitive?;
+    // SAFETY: the item belongs to a menu we built and is still alive.
+    unsafe { Some(get(item) != 0) }
+}
+
+/// Whether the built menu is currently shown, per GTK's visible flag.
+///
+pub fn context_menu_visible(loader: &Arc<Loader>, id: u64) -> bool {
+    let menu = context_menus()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&id).map(|s| s.menu));
+    let Some(menu) = menu else {
+        return false;
+    };
+    let Some(get) = loader.symbols.gtk_widget_get_visible else {
+        return false;
+    };
+    // SAFETY: the menu belongs to a built context menu and is still alive.
+    unsafe { get(menu) != 0 }
+}
+
 /// Fire item `index` exactly as a click does: GTK emits "activate" on it.
 ///
 /// This is the headless half of a menu choice — the same signal the popup

@@ -726,11 +726,27 @@ mod gtk_adapter {
         Ok(id as usize)
     }
 
-    /// The items a built menu offers, with their sensitive state.
+    /// The items a built menu offers, with GTK's own sensitive state.
+    ///
+    /// The state is the toolkit's flag for each real `GtkMenuItem`, not a
+    /// constant: a greyed-out item would be reported as disabled. A build
+    /// whose GTK lacks the accessor falls back to `true`, which is what the
+    /// popup builds (it appends every item enabled).
     pub fn context_menu_items(handle: usize) -> Vec<(String, bool)> {
-        gtk_dynamic_loader::context_menu_labels(handle as u64)
+        let labels = gtk_dynamic_loader::context_menu_labels(handle as u64);
+        let loader = crate::backends::gtk::loader();
+        labels
             .into_iter()
-            .map(|label| (label, true))
+            .enumerate()
+            .map(|(index, label)| {
+                let sensitive = loader
+                    .as_ref()
+                    .and_then(|l| {
+                        gtk_dynamic_loader::context_menu_item_sensitive(l, handle as u64, index)
+                    })
+                    .unwrap_or(true);
+                (label, sensitive)
+            })
             .collect()
     }
 
