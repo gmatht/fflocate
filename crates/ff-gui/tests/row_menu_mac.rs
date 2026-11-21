@@ -40,11 +40,22 @@ mod appkit {
 
     use ff_gui::{row_menu_plan, run_row_action, RowAction};
     use rswidgets::compat::ContextMenu;
+    use rswidgets::prelude::App;
 
     fn send0(obj: *mut c_void, sel: &str) -> *mut c_void {
         let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
             unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
         unsafe { f(obj, rswidgets::backends::apple::selector(sel)) }
+    }
+    fn send0i(obj: *mut c_void, sel: &str) -> isize {
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize =
+            unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+        unsafe { f(obj, rswidgets::backends::apple::selector(sel)) }
+    }
+    fn send1i(obj: *mut c_void, sel: &str, arg: isize) -> *mut c_void {
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void, isize) -> *mut c_void =
+            unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+        unsafe { f(obj, rswidgets::backends::apple::selector(sel), arg) }
     }
     fn send1p(obj: *mut c_void, sel: &str, arg: *mut c_void) -> *mut c_void {
         let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
@@ -69,14 +80,17 @@ mod appkit {
         rswidgets::backends::apple::nsstring_to_rust(send1p(pasteboard, "stringForType:", kind))
     }
 
-    /// Build the native menu from a plan: one item per model entry, at that
-    /// entry's sensitivity, each running the action through the app's runner.
-    fn build_from_plan(
+    /// Add a plan's items to a menu: one per model entry, at that entry's
+    /// sensitivity, each running the action through the app's runner.
+    ///
+    /// The menu is filled in place rather than built in here and returned: a
+    /// menu is inspected and fired while the value the app holds stays put.
+    fn fill_menu(
+        menu: &mut ContextMenu,
         target: &str,
         items: &[ff_gui::RowMenuItem],
-    ) -> (ContextMenu, usize, Rc<RefCell<Vec<String>>>) {
+    ) -> Rc<RefCell<Vec<String>>> {
         let ran: Rc<RefCell<Vec<String>>> = Default::default();
-        let mut menu = ContextMenu::new();
         for item in items {
             let ran = ran.clone();
             let path = target.to_string();
@@ -92,15 +106,16 @@ mod appkit {
                 }),
             );
         }
-        let handle = menu.build().expect("the row menu could not be built");
-        (menu, handle, ran)
+        ran
     }
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-        // AppKit's own classes before any of them is touched, then the
-        // application object the adapter hangs its menu target off.
-        rswidgets::backends_macos_adapter::ensure_runtime_classes();
-        let _app = rswidgets::App::init()?;
+        // The application object comes first: it loads AppKit and creates the
+        // process's main-thread application, which the menu's target hangs off.
+        let app = rswidgets::App::init()?;
+        let win = app.create_window()?;
+        win.set_title("ff-gui row menu test");
+        win.present();
 
         // A real file on disk, so the copy round trip is a real path rather than
         // a string nothing would find.
@@ -118,7 +133,9 @@ mod appkit {
             "the plan targets {:?}, not the row's path {:?}",
             plan.0, path
         );
-        let (menu, handle, ran) = build_from_plan(&plan.0, &plan.1);
+        let mut menu = ContextMenu::new();
+        let ran = fill_menu(&mut menu, &plan.0, &plan.1);
+        let handle = menu.build().expect("the row menu could not be built");
         let shown = ContextMenu::items_of(handle);
         println!("row menu: NSMenu items {shown:?}");
         assert_eq!(
@@ -147,6 +164,38 @@ mod appkit {
                 *enabled,
                 "the NSMenuItem {label:?} is insensitive although the row's file exists"
             );
+        }
+
+        // Every item's target and action: the wiring a click goes through, so a
+        // nil target or a different selector means a menu that shows and does
+        // nothing.
+        let menu_obj = handle as *mut c_void;
+        assert!(!menu_obj.is_null(), "the row menu handle is null");
+        let array = send0(menu_obj, "itemArray");
+        let count = send0i(array, "count") as usize;
+        assert_eq!(count, plan.1.len(), "AppKit's NSMenu holds {count} items");
+        for index in 0..count {
+            let item = send1i(array, "objectAtIndex:", index as isize);
+            assert!(!item.is_null(), "item {index} is null");
+            let title = rswidgets::backends::apple::nsstring_to_rust(send0(item, "title"))
+                .unwrap_or_default();
+            let target = send0(item, "target");
+            assert!(
+                !target.is_null(),
+                "item {index} ({title:?}) has no target, so choosing it would do nothing"
+            );
+            let class = rswidgets::backends::apple::nsstring_to_rust(send0(target, "className"))
+                .unwrap_or_default();
+            assert_eq!(
+                class, "CorroMacMenuTarget",
+                "item {index} ({title:?}) targets {class:?}, not the adapter's menu target"
+            );
+            assert_eq!(
+                send0(item, "action"),
+                rswidgets::backends::apple::selector("corroFired:"),
+                "item {index} ({title:?}) does not send corroFired: to its target"
+            );
+            println!("row menu: item {index} {title:?} -> CorroMacMenuTarget/corroFired:");
         }
 
         // Copy path is the sensitive item this test fires: it dispatches through
@@ -194,7 +243,11 @@ mod appkit {
         // present directory.
         let gone = row_menu_plan(3, Some(0), &rows, |p| Path::new(p).is_dir())
             .ok_or("a right-click on a row produced no menu")?;
-        let (menu_gone, handle_gone, ran_gone) = build_from_plan(&gone.0, &gone.1);
+        let mut menu_gone = ContextMenu::new();
+        let ran_gone = fill_menu(&mut menu_gone, &gone.0, &gone.1);
+        let handle_gone = menu_gone
+            .build()
+            .expect("the row menu for a missing file could not be built");
         let shown_gone = ContextMenu::items_of(handle_gone);
         println!("row menu: a missing file shows {shown_gone:?}");
         assert_eq!(
