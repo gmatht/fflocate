@@ -60,7 +60,9 @@ jobs:
       # this binary needs its own step to be seen running. It is harness-free:
       # AppKit wants the main thread.
       - name: Row menu on a row (macOS)
-        if: runner.os == 'macOS'
+        # `!cancelled()`, not `success()`: this binary's result is its own, and an
+        # earlier failure must not skip it.
+        if: ${{ runner.os == 'macOS' && !cancelled() }}
         shell: bash
         run: |
           ulimit -c 0 || true
@@ -76,7 +78,33 @@ jobs:
             echo "::error title=row menu on a row (macOS)::the right-click walk did not run: $(tail -c 900 row-menu-row.log | tr -cd '[:print:]\n' | tr '\n' '|')"
             exit 1
           fi
+          # The binary's own ok line, so a menu that was never shown cannot pass
+          # as one that was.
+          if ! grep -q '^row menu on a row: ok' row-menu-row.log; then
+            echo "::error title=row menu on a row (macOS)::the walk did not finish: $(grep -E '^row menu on a row:' row-menu-row.log | tr '\n' '|' | cut -c1-1200)"
+            exit 1
+          fi
           echo "::notice title=row menu on a row (macOS)::$(grep -E '^(row menu on a row|clipboard):' row-menu-row.log | tr '\n' '|')"
+
+      # The pasteboard on its own, so a read that echoed a write cannot hide
+      # behind the menu walk: set through the app's call, read through it and
+      # through NSPasteboard asked directly, then Copy path.
+      - name: Clipboard (macOS)
+        if: ${{ runner.os == 'macOS' && !cancelled() }}
+        shell: bash
+        run: |
+          ulimit -c 0 || true
+          status=0
+          cargo test -p ff-gui --test clipboard_mac > clipboard.log 2>&1 || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=clipboard (macOS)::exit ${status}: $(tail -c 1800 clipboard.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            exit 1
+          fi
+          if ! grep -q '^clipboard: ok' clipboard.log; then
+            echo "::error title=clipboard (macOS)::the round trip did not run: $(grep -E '^clipboard:|clipboard_mac:' clipboard.log | tr '\n' '|' | cut -c1-1200)"
+            exit 1
+          fi
+          echo "::notice title=clipboard (macOS)::$(grep '^clipboard:' clipboard.log | tr '\n' '|' | cut -c1-3900)"
 
       # The GUI binary compiles on both platforms (its widgets come from
       # rswidgets::compat), so the whole crate is built and tested here — lib,
@@ -199,7 +227,7 @@ jobs:
           # GTK main loop, and two of them in one session have been seen to wait
           # on each other. Each is bounded so a hang fails the job instead of
           # stalling it.
-          for t in row_menu_gtk row_menu_row_gtk interaction_gtk typing_gtk reflow_gtk menubar_gtk daemon_pixels_gtk created_range_gtk; do
+          for t in row_menu_gtk interaction_gtk typing_gtk reflow_gtk menubar_gtk daemon_pixels_gtk created_range_gtk; do
             printf '=== %s ===\n' "$t" >> interaction.log
             xvfb-run -a -s "-screen 0 1280x1024x24" \
               timeout 180 cargo test -p ff-gui --test "$t" -- --nocapture >> interaction.log 2>&1 \
@@ -221,20 +249,61 @@ jobs:
               echo "::error title=created range (Linux)::the created from/to walk did not run: $(grep -E '^created range:' interaction.log | tr '\n' '|' | cut -c1-1200)"
               exit 1
             fi
-            # ... and for the right-click-on-a-row walk: a display-less skip
-            # must not pass for a menu that was never shown.
-            if ! grep -q '^row menu on a row: right-clicked' interaction.log; then
-              echo "::error title=row menu on a row (Linux)::the right-click walk did not run: $(grep -E '^row menu on a row:' interaction.log | tr '\n' '|' | cut -c1-1200)"
-              exit 1
-            fi
+            # (The right-click-on-a-row walk and the clipboard have their own
+            # steps below, so they are reported and fail on their own.)
             echo "::notice title=interaction (Linux)::${lines}"
-            echo "::notice title=row menu on a row (Linux)::$(grep '^row menu on a row:' interaction.log | tr '\n' '|')"
             echo "::notice title=daemon pixels (Linux)::$(grep '^pixels:' interaction.log | tr '\n' '|')"
             echo "::notice title=created range (Linux)::$(grep '^created range:' interaction.log | tr '\n' '|')"
             exit 0
           fi
           echo "::error title=interaction test (Linux)::$(grep -E 'panicked|assertion|^error|error\[|not found|No such|timed out' interaction.log | head -12 | tr '\n' '|' | cut -c1-3000)"
           exit 1
+
+      # A real right-click on a row of the results list, on its own: the menu
+      # GTK actually shows, its enabled items, each choice running its own
+      # action, and Copy path reaching CLIPBOARD. A display-less skip exits 0,
+      # so the binary's ok line is required rather than merely a zero exit.
+      - name: Row menu on a row (Linux, Xvfb)
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        shell: bash
+        run: |
+          command -v xvfb-run || { echo "::error title=row menu on a row (Linux)::xvfb-run is not installed"; exit 1; }
+          status=0
+          xvfb-run -a -s "-screen 0 1280x1024x24" \
+            timeout 180 cargo test -p ff-gui --test row_menu_row_gtk -- --nocapture \
+            > row-menu-row.log 2>&1 || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=row menu on a row (Linux)::exit ${status}: $(tail -c 1800 row-menu-row.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            exit 1
+          fi
+          if ! grep -q '^row menu on a row: ok' row-menu-row.log; then
+            echo "::error title=row menu on a row (Linux)::the walk did not run: $(grep -E '^row menu on a row:' row-menu-row.log | tr '\n' '|' | cut -c1-1200)"
+            exit 1
+          fi
+          echo "::notice title=row menu on a row (Linux)::$(grep -E '^(row menu on a row|clipboard):' row-menu-row.log | tr '\n' '|' | cut -c1-3900)"
+
+      # The CLIPBOARD selection on its own: set through the app's call, read
+      # through it and through GDK's own waiting read, replaced by a second
+      # text, then Copy path. Its own step so a pasteboard that swallows text
+      # fails here rather than inside the menu walk.
+      - name: Clipboard (Linux, Xvfb)
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        shell: bash
+        run: |
+          command -v xvfb-run || { echo "::error title=clipboard (Linux)::xvfb-run is not installed"; exit 1; }
+          status=0
+          xvfb-run -a -s "-screen 0 1280x1024x24" \
+            timeout 180 cargo test -p ff-gui --test clipboard_gtk -- --nocapture \
+            > clipboard.log 2>&1 || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=clipboard (Linux)::exit ${status}: $(tail -c 1800 clipboard.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            exit 1
+          fi
+          if ! grep -q '^clipboard: ok' clipboard.log; then
+            echo "::error title=clipboard (Linux)::the round trip did not run: $(grep -E '^clipboard:' clipboard.log | tr '\n' '|' | cut -c1-1200)"
+            exit 1
+          fi
+          echo "::notice title=clipboard (Linux)::$(grep '^clipboard:' clipboard.log | tr '\n' '|' | cut -c1-3900)"
 
       - name: GUI launches (macOS)
         if: runner.os == 'macOS'

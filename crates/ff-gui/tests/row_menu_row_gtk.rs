@@ -454,4 +454,8 @@ fn right_clicking_a_row_opens_its_menu_and_copy_path_reaches_the_clipboard() {
         NAMED.iter().map(|a| a.label()).collect::<Vec<_>>(),
         paths[clicked]
     );
+    println!(
+        "row menu on a row: ok — four enabled items on a real right-click, each choice ran its own \
+         action for the clicked row, and Copy path is on the CLIPBOARD selection"
+    );
 }

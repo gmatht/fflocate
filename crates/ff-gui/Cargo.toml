@@ -47,6 +47,12 @@ name = "row_menu_row_mac"
 path = "tests/row_menu_row_mac.rs"
 harness = false
 
+# NSPasteboard is AppKit's, and reading it wants the process's main thread.
+[[test]]
+name = "clipboard_mac"
+path = "tests/clipboard_mac.rs"
+harness = false
+
 # Keystrokes go through AppKit's field editor (`currentEditor`) and the text
 # field's editing delegate, and both want the process's main thread.
 [[test]]

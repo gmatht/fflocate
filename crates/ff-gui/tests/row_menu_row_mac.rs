@@ -536,6 +536,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          Open / Open containing folder / Open in terminal each launched for that row",
         paths[clicked], paths[clicked]
     );
+    println!(
+        "row menu on a row: ok — a real NSRightMouseDown on a row built the menu with every item \
+         enabled, each choice ran its own action for that row, and Copy path is on NSPasteboard"
+    );
     Ok(())
 }
 
