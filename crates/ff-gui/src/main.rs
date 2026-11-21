@@ -1758,10 +1758,11 @@ mod widget_traits {
 }
 
 // The results list is the compat `TreeView` on *every* backend, so the
-// clipboard hook is one implementation rather than one per adapter. Copy
-// reports whatever the compat layer says: the merged toolkit carries no
-// clipboard helper, so this answers with the reason instead of pretending the
-// copy happened.
+// clipboard hook is one implementation rather than one per adapter. The compat
+// layer routes it to the running toolkit's own clipboard (GTK's CLIPBOARD
+// selection, AppKit's NSPasteboard); only a build with no desktop toolkit has
+// no clipboard to write to, and it reports that instead of pretending the copy
+// happened.
 impl TextViewLike for rswidgets::compat::TreeView {
     fn clipboard_set_text(&self, text: &str) -> Result<(), rswidgets::Error> {
         rswidgets::compat::TreeView::clipboard_set_text(self, text)

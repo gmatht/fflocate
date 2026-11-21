@@ -18,10 +18,15 @@
 //!   GTK3's `GtkExpander`, arrow and clickable header included — and elsewhere
 //!   a header line plus a child box, with the state in the header text and the
 //!   caller doing the toggling (see [`Expander::set_expanded`]).
-//! * [`ContextMenu`] collects items, but popping one up is *not* implemented in
-//!   this build: [`ContextMenu::popup_at_pointer`] returns an error, which
-//!   clients surface to the user. That is deliberate — a menu that silently
-//!   never appears is worse than one that says why.
+//! * [`ContextMenu`] is a native popup, not a model: GTK3's `GtkMenu`
+//!   (shown with `gtk_menu_popup_at_pointer`) or AppKit's `NSMenu` (shown with
+//!   `+popUpContextMenu:withEvent:forView:`), anchored at the click and
+//!   dispatching each chosen item into the caller's action, with per-item
+//!   sensitivity. Copy's text lands on the toolkit's own clipboard (the GTK
+//!   CLIPBOARD selection / `NSPasteboard`). A build with neither desktop
+//!   toolkit has no menu or clipboard to reach: that arm is selected at compile
+//!   time and names the missing backend, so a desktop build can never show a
+//!   "not implemented" message at runtime.
 
 use crate::common::{Canvas, Label, ScrolledWindow, WidgetBox};
 use crate::core::{App, DrawContext};

@@ -15,6 +15,7 @@
 #![cfg(unix)]
 
 use std::cell::RefCell;
+use std::os::unix::fs::PermissionsExt;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -194,24 +195,71 @@ fn typing_debounces_into_a_request_and_the_rows_repaint_then_clicks_land() {
         "reversing did not reorder the rows"
     );
 
-    // ...and a double click activates the row under the pointer.
-    let activated: Rc<RefCell<Vec<usize>>> = Rc::new(RefCell::new(Vec::new()));
+    // ...and a double click opens the row under the pointer, through the
+    // app's own handler (`connect_open_on_double_click`), which reads the
+    // clicked row's path out of the list and hands it to the Open action. The
+    // opener is a stub on a private PATH, so the test records the path it was
+    // asked to open instead of starting a file manager on this machine.
+    let opener_dir = tempfile::tempdir().expect("no temp dir");
+    let open_log = opener_dir.path().join("open.log");
+    let opener = opener_dir.path().join("xdg-open");
+    std::fs::write(
+        &opener,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FF_GUI_OPEN_LOG\"\n",
+    )
+    .expect("stub opener");
+    std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o755))
+        .expect("stub executable");
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    std::env::set_var("PATH", format!("{}:{old_path}", opener_dir.path().display()));
+    std::env::set_var("FF_GUI_OPEN_LOG", &open_log);
+    std::env::remove_var("XDG_CURRENT_DESKTOP");
+    std::env::remove_var("TERMINAL");
+
+    let reported: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
     {
-        let activated = activated.clone();
-        list.connect_row_activated(Box::new(move |row| activated.borrow_mut().push(row)));
+        let reported = reported.clone();
+        ff_gui::connect_open_on_double_click(&list, 2, move |line| {
+            reported.borrow_mut().push(line)
+        });
     }
     assert_eq!(list.double_click_at(row_y), Some(1), "the double click missed row 1");
     assert_eq!(
-        *activated.borrow(),
-        vec![1],
-        "the double click did not activate the row it landed on"
+        reported.borrow().len(),
+        1,
+        "the double click did not dispatch Open: {:?}",
+        reported.borrow()
+    );
+    assert!(
+        reported.borrow()[0].starts_with("Open \u{2192} beta.md"),
+        "Open reported {:?} for the clicked row, not that row's path",
+        reported.borrow()
+    );
+    // The launcher is what actually opens something: it must have been handed
+    // the clicked row's path, and no other row's. The child runs detached, so
+    // poll the log rather than assuming it has already written.
+    let start = std::time::Instant::now();
+    let mut launched = String::new();
+    while start.elapsed() < Duration::from_secs(5) {
+        launched = std::fs::read_to_string(&open_log).unwrap_or_default();
+        if !launched.trim().is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        launched.trim(),
+        "/rec/beta.md",
+        "Open was handed {:?}, not the double-clicked row's path",
+        launched.trim()
     );
     println!(
-        "interaction: click selected {:?}; header sorted {:?} then {:?}; double click opened {:?}",
+        "interaction: click selected {:?}; header sorted {:?} then {:?}; double click reported {:?} and opened {:?}",
         list.selected_path(2),
         Some((1, true)),
         list.sort_state(),
-        activated.borrow()
+        reported.borrow(),
+        launched.trim()
     );
 
     // The leftmost (icon) header sorts too, by the kind its glyph shows: a
