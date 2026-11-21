@@ -3387,6 +3387,94 @@ mod macos_adapter {
         }
     }
 
+    /// `+[CorroMacField fieldDelegate]`: the `NSControlTextEditingDelegate` a
+    /// text field is given, so AppKit reports keystrokes, focus and Return.
+    ///
+    /// `NSTextField`'s `delegate` is an unretained reference, so the object is
+    /// `own`ed here (a singleton per field, kept for the process's life) — the
+    /// alternative, a delegate that is freed after `create_entry` returns, is a
+    /// crash on the first keystroke.
+    extern "C" fn field_delegate_imp(cls_ptr: *mut c_void, _cmd: *mut c_void) -> *mut c_void {
+        // SAFETY: `alloc`/`init` on our own NSObject subclass.
+        unsafe {
+            let obj = msg0(msg0(cls_ptr, "alloc"), "init");
+            if obj.is_null() {
+                return obj;
+            }
+            own(obj)
+        }
+    }
+
+    /// `-[CorroMacField controlTextDidChange:]`: a keystroke changed the field.
+    ///
+    /// The notification's object is the `NSTextField`; its handle is the key
+    /// `Entry::connect_changed` registered, so this is the one place a real
+    /// keystroke becomes a Rust `changed` callback on AppKit.
+    extern "C" fn field_changed_imp(_this: *mut c_void, _cmd: *mut c_void, note: *mut c_void) {
+        if note.is_null() {
+            return;
+        }
+        // SAFETY: `object` on a notification AppKit handed us.
+        unsafe {
+            let field = msg0(note, "object");
+            if !field.is_null() {
+                dispatch_text_changed(field);
+            }
+        }
+    }
+
+    /// `-[CorroMacField controlTextDidBeginEditing:]` / `...EndEditing:`.
+    extern "C" fn field_begin_imp(_this: *mut c_void, _cmd: *mut c_void, note: *mut c_void) {
+        if note.is_null() {
+            return;
+        }
+        // SAFETY: as above.
+        unsafe {
+            let field = msg0(note, "object");
+            if !field.is_null() {
+                dispatch_focus(field, true);
+            }
+        }
+    }
+
+    extern "C" fn field_end_imp(_this: *mut c_void, _cmd: *mut c_void, note: *mut c_void) {
+        if note.is_null() {
+            return;
+        }
+        // SAFETY: as above.
+        unsafe {
+            let field = msg0(note, "object");
+            if !field.is_null() {
+                dispatch_focus(field, false);
+            }
+        }
+    }
+
+    /// `-[CorroMacField control:textView:doCommandBySelector:]`: Return in the
+    /// field, which is the app's Search-on-Return key. Claiming it keeps AppKit
+    /// from beeping and ends the edit instead of inserting a newline.
+    extern "C" fn field_command_imp(
+        _this: *mut c_void,
+        _cmd: *mut c_void,
+        control: *mut c_void,
+        _text_view: *mut c_void,
+        command: *mut c_void,
+    ) -> bool {
+        if control.is_null() || command.is_null() {
+            return false;
+        }
+        // SAFETY: comparing SELs, which are interned pointers.
+        unsafe {
+            if command == core_apple::selector("insertNewline:")
+                || command == core_apple::selector("insertNewlineIgnoringFieldEditor:")
+            {
+                dispatch_entry_activate(control);
+                return true;
+            }
+        }
+        false
+    }
+
     /// `+[CorroMacMenuTarget targetWithActionName:]`: a menu item's target,
     /// carrying the name `SimpleAction::connect_activate` registered.
     extern "C" fn menu_target_imp(
@@ -3936,6 +4024,46 @@ mod macos_adapter {
                             "alertTargetWithDialog:index:",
                             alert_target_imp as *const (),
                             "@@:qq",
+                        );
+                        objc_registerClassPair(c);
+                    }
+                }
+                // A text field's delegate: AppKit reports keystrokes, focus and
+                // Return through it, and without it `connect_changed` never
+                // fires on a real keypress — the as-you-type search could not
+                // be reached by typing at all.
+                if cls("CorroMacField").is_null() {
+                    let name = b"CorroMacField\0";
+                    let c = objc_allocateClassPair(
+                        nsobject,
+                        name.as_ptr() as *const std::os::raw::c_char,
+                        0,
+                    );
+                    if !c.is_null() {
+                        add_method(c, "controlTextDidChange:", field_changed_imp as *const (), "v@:@");
+                        add_method(
+                            c,
+                            "controlTextDidBeginEditing:",
+                            field_begin_imp as *const (),
+                            "v@:@",
+                        );
+                        add_method(
+                            c,
+                            "controlTextDidEndEditing:",
+                            field_end_imp as *const (),
+                            "v@:@",
+                        );
+                        add_method(
+                            c,
+                            "control:textView:doCommandBySelector:",
+                            field_command_imp as *const (),
+                            "c@:@@:",
+                        );
+                        add_class_method(
+                            c,
+                            "fieldDelegate",
+                            field_delegate_imp as *const (),
+                            "@@:",
                         );
                         objc_registerClassPair(c);
                     }
@@ -5461,7 +5589,16 @@ mod macos_adapter {
         if e.is_null() {
             return Ok(Entry(e));
         }
+        ensure_runtime_classes();
         unsafe {
+            // Without a delegate a keystroke is invisible to Rust: AppKit
+            // reports the edit through `controlTextDidChange:`, which
+            // `CorroMacField` turns into `dispatch_text_changed` and then into
+            // the `connect_changed` handler (the as-you-type search).
+            let delegate = msg0(cls("CorroMacField"), "fieldDelegate");
+            if !delegate.is_null() {
+                msg1v(e, "setDelegate:", delegate);
+            }
             // Editable text field with the standard bezel; a compact height.
             msg1bv(e, "setEditable:", true);
             msg1bv(e, "setBezeled:", true);

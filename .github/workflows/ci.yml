@@ -139,6 +139,33 @@ jobs:
           fi
           exit 0
 
+      # The core loop from the keyboard: AppKit keystrokes into the query
+      # entry's field editor -> the text-field delegate -> `connect_changed` ->
+      # debounce -> the app's request to a real daemon -> rows -> a changed
+      # bitmap. Its own step, so its result is reported on its own, and
+      # `!cancelled()` so an earlier failure cannot skip it.
+      - name: Typing and search (macOS)
+        if: ${{ runner.os == 'macOS' && !cancelled() }}
+        shell: bash
+        run: |
+          ulimit -c 0 || true
+          status=0
+          # The loop's request goes to a real `fflocated`, as the probe's does.
+          cargo build -p fflocated 2>&1 | tail -1
+          cargo test -p ff-gui --test typing_search_mac > typing.log 2>&1 || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=typing and search (macOS)::exit ${status}: $(tail -c 1800 typing.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            exit 1
+          fi
+          echo "::notice title=typing and search (macOS)::$(grep '^typing:' typing.log | tr '\n' '|' | cut -c1-3900)"
+          # A run that skipped for want of a field editor or a daemon would
+          # still exit 0; this is macOS with the backend and a daemon built
+          # above, so the loop has to have run end to end.
+          if ! grep -q '^typing: ok' typing.log; then
+            echo "::error title=typing and search (macOS)::the loop did not run: $(grep -E '^typing:|typing_search_mac:' typing.log | tr '\n' '|' | cut -c1-1200)"
+            exit 1
+          fi
+
       # The build step's own annotations can be dropped when it fails, so a
       # failed build is also reported from its log file by this step.
       - name: GUI build log (macOS)

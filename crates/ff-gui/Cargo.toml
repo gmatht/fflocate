@@ -47,6 +47,13 @@ name = "row_menu_row_mac"
 path = "tests/row_menu_row_mac.rs"
 harness = false
 
+# Keystrokes go through AppKit's field editor (`currentEditor`) and the text
+# field's editing delegate, and both want the process's main thread.
+[[test]]
+name = "typing_search_mac"
+path = "tests/typing_search_mac.rs"
+harness = false
+
 # The capture is AppKit's own bitmap of the window, and it has to be taken on
 # the main thread after the rows are laid out.
 [[test]]
