@@ -69,8 +69,10 @@ jobs:
             exit 1
           fi
           # A zero exit with no tests would be a silent skip; the binary's own
-          # count is the post-condition.
-          if ! grep -q 'test result: ok. 5 passed' row-menu-model.log; then
+          # count is the post-condition. The floor is the number of tests in the
+          # file today (six); it only grows, so a higher count still passes and a
+          # filtered-out test cannot slip by as "ok. 0 passed".
+          if ! grep -qE 'test result: ok\. ([6-9]|[1-9][0-9]+) passed; 0 failed' row-menu-model.log; then
             echo "::error title=row menu model (${RUNNER_OS})::the model tests did not run: $(grep -E 'test result|running' row-menu-model.log | tr '\n' '|' | cut -c1-1200)"
             exit 1
           fi
