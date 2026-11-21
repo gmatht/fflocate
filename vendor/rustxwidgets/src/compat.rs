@@ -1474,11 +1474,8 @@ pub fn backend_label() -> &'static str {
 /// Each desktop backend answers with its own pasteboard; a platform with
 /// neither says so instead of pretending the copy happened.
 #[cfg(all(feature = "macos", target_os = "macos", not(feature = "zork")))]
-pub fn clipboard_set_text(_text: &str) -> Result<(), Error> {
-    // NEGATIVE CONTROL (temporary): the old stub.
-    Err(Error::Backend(
-        "clipboard is not wired up in this build".to_string(),
-    ))
+pub fn clipboard_set_text(text: &str) -> Result<(), Error> {
+    crate::backends_macos_adapter::clipboard_set_text(text)
 }
 
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
@@ -1806,11 +1803,11 @@ impl ContextMenu {
         widget: *mut c_void,
         event: *mut c_void,
     ) -> Result<(), Error> {
-        let _ = (widget, event);
-        // NEGATIVE CONTROL (temporary): the old stub.
-        Err(Error::Backend(
-            "context menus are not available in this build".to_string(),
-        ))
+        if self.labels.is_empty() {
+            return Ok(());
+        }
+        let handle = self.build()?;
+        context_menu_show(handle, widget, event)
     }
 
     /// Run an item's action by label (used by tests and by the popup).
