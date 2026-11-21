@@ -40,6 +40,13 @@ name = "row_menu_interaction_mac"
 path = "tests/row_menu_interaction_mac.rs"
 harness = false
 
+# A right-click on a row is an `NSRightMouseDown` to the canvas and a modal
+# NSMenu popup, so it too needs the main thread.
+[[test]]
+name = "row_menu_row_mac"
+path = "tests/row_menu_row_mac.rs"
+harness = false
+
 # The capture is AppKit's own bitmap of the window, and it has to be taken on
 # the main thread after the rows are laid out.
 [[test]]

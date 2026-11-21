@@ -64,11 +64,14 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          # `--no-fail-fast`: one failing test binary (macOS: drag_reflow_mac's
+          # pre-existing knob geometry) must not stop the others from running,
+          # so every binary's result is in this log.
           if (
             cargo build -p ff-gui \
-            && cargo test -p ff-gui \
+            && cargo test -p ff-gui --no-fail-fast \
             && cargo build -p ff-gui --no-default-features --features zork \
-            && cargo test -p ff-gui --no-default-features --features zork
+            && cargo test -p ff-gui --no-fail-fast --no-default-features --features zork
           ) 2>&1 | tee gui-test.log; then
             exit 0
           fi
@@ -242,6 +245,23 @@ jobs:
             # The row menu and the pasteboard, from the probe's popup path too,
             # in a notice of their own so the generic one's cap cannot hide them.
             echo "::notice title=row menu and clipboard (macOS, probe)::$(grep -E '^probe: (row menu|choosing|pasteboard|clipboard|row menu popped)' probe.log | tr '\n' '|')"
+            # The right-click-on-a-row walk: an `NSRightMouseDown` at a specific
+            # row, the NSMenu it opens, Copy path on the pasteboard, and the
+            # three launchers. Its own binary, so it runs and is reported
+            # before anything else in this step.
+            row_menu_row_status=0
+            cargo test -p ff-gui --test row_menu_row_mac > row-menu-row.log 2>&1 || row_menu_row_status=$?
+            if [ "$row_menu_row_status" -ne 0 ]; then
+              echo "::error title=row menu on a row (macOS)::exit ${row_menu_row_status}: $(tail -c 1800 row-menu-row.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+              exit 1
+            fi
+            # A run that skipped for want of AppKit would still exit 0; this is
+            # macOS with the backend, so the walk has to have run.
+            if ! grep -q '^row menu on a row: right-clicked' row-menu-row.log; then
+              echo "::error title=row menu on a row (macOS)::the right-click walk did not run: $(grep -E '^row_menu_row_mac:|^row menu' row-menu-row.log | tr '\n' '|' | cut -c1-1200)"
+              exit 1
+            fi
+            echo "::notice title=row menu on a row (macOS)::$(grep -E '^(row menu on a row|clipboard):' row-menu-row.log | tr '\n' '|')"
             # The AppKit menu-bar test is its own binary (harness = false), so it
             # runs on the process's main thread — the only one AppKit lets call
             # setMainMenu:. Its observed menu titles, enabled states, the item
@@ -264,16 +284,6 @@ jobs:
               exit 1
             fi
             echo "::notice title=list interaction (macOS)::$(grep '^list:' list.log | tr '\n' '|')"
-            # The knob drag and the resize reflow: a real NSScroller's tracking
-            # loop and AppKit's layout pass, so a drag that never reaches the
-            # scroller or a list that keeps its old geometry fails the job.
-            drag_status=0
-            cargo test -p ff-gui --test drag_reflow_mac > drag.log 2>&1 || drag_status=$?
-            if [ "$drag_status" -ne 0 ]; then
-              echo "::error title=drag and reflow (macOS)::exit ${drag_status}: $(tail -c 1800 drag.log | tr -cd '[:print:]\n' | tr '\n' '|')"
-              exit 1
-            fi
-            echo "::notice title=drag and reflow (macOS)::$(grep -E '^(drag|reflow):' drag.log | tr '\n' '|')"
             # The row menu as AppKit holds it: four enabled NSMenuItems, each
             # targeting CorroMacMenuTarget/corroFired:, and Copy path read back
             # from NSPasteboard. A menu that only looks right fails here.
@@ -301,6 +311,21 @@ jobs:
               exit 1
             fi
             echo "::notice title=daemon pixels (macOS)::$(grep '^pixels:' pixels.log | tr '\n' '|')"
+            # Last, deliberately: this is where the pre-existing knob-geometry
+            # failure lives (`AppKit's knob covers 39.4% of the track but the
+            # layout derived 24.1%`), and it must be reported without stopping
+            # any of the binaries above from running. The assertion is not
+            # weakened or skipped; the job still fails here.
+            # The knob drag and the resize reflow: a real NSScroller's tracking
+            # loop and AppKit's layout pass, so a drag that never reaches the
+            # scroller or a list that keeps its old geometry fails the job.
+            drag_status=0
+            cargo test -p ff-gui --test drag_reflow_mac > drag.log 2>&1 || drag_status=$?
+            if [ "$drag_status" -ne 0 ]; then
+              echo "::error title=drag and reflow (macOS)::exit ${drag_status} (pre-existing knob geometry): $(tail -c 1800 drag.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+              exit 1
+            fi
+            echo "::notice title=drag and reflow (macOS)::$(grep -E '^(drag|reflow):' drag.log | tr '\n' '|')"
             exit 0
           fi
           msg=$(tail -c 1800 probe.log | tr -cd '[:print:]\n' | tr '\n' '|')

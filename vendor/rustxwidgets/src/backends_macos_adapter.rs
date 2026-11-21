@@ -3486,7 +3486,7 @@ mod macos_adapter {
     ///
     /// `locationInWindow` then `convertPoint:fromView:` is the AppKit way to get
     /// a point in the view's (flipped) space; both return `CGPoint` by value.
-    unsafe fn sheet_fire_click(obj: *mut c_void, event: *mut c_void, press: bool) {
+    unsafe fn sheet_fire_click(obj: *mut c_void, event: *mut c_void, press: bool, button: u32) {
         if event.is_null() {
             return;
         }
@@ -3507,8 +3507,7 @@ mod macos_adapter {
             (in_window.x, in_window.y, std::ptr::null_mut())
         );
         let mods = unsafe { msg0i(event, "modifierFlags") } as u32;
-        // Left button, as the portable canvas reports it.
-        const BUTTON_LEFT: u32 = 1;
+        // 1 = primary, 3 = secondary, as the portable canvas reports them.
         let plain = {
             let mut map = CLICK_CALLBACKS.lock().unwrap();
             map.get_mut(&canvas_id).map(|SendClickCallback(p)| *p)
@@ -3537,21 +3536,26 @@ mod macos_adapter {
         if press {
             if let Some(ptr) = rich {
                 // SAFETY: registry-owned closure, dispatched on the main thread.
-                unsafe { (*ptr)(local.x, local.y, BUTTON_LEFT, mods) };
+                unsafe { (*ptr)(local.x, local.y, button, mods) };
             }
-            if let Some(ptr) = plain {
-                // SAFETY: as above.
-                unsafe { (*ptr)(local.x, local.y) };
-            }
-            if activates_on_click_count(clicks) {
-                if let Some(ptr) = double {
+            // Selecting a row, sorting on a header click and opening on a
+            // double click are the primary button's business: a secondary
+            // press must not select, sort or open before its menu appears.
+            if button == 1 {
+                if let Some(ptr) = plain {
                     // SAFETY: as above.
-                    unsafe { (*ptr)(local.x, local.y) }
+                    unsafe { (*ptr)(local.x, local.y) };
+                }
+                if activates_on_click_count(clicks) {
+                    if let Some(ptr) = double {
+                        // SAFETY: as above.
+                        unsafe { (*ptr)(local.x, local.y) }
+                    }
                 }
             }
         } else if let Some(ptr) = release {
             // SAFETY: as above.
-            unsafe { (*ptr)(local.x, local.y, BUTTON_LEFT, mods) };
+            unsafe { (*ptr)(local.x, local.y, button, mods) };
         }
     }
 
@@ -3562,13 +3566,31 @@ mod macos_adapter {
             if !window.is_null() {
                 msg1v(window, "makeFirstResponder:", obj);
             }
-            sheet_fire_click(obj, event, true);
+            sheet_fire_click(obj, event, true, 1);
+        }
+    }
+
+    /// `-[CorroSheetView rightMouseDown:]`: the canvas' secondary press.
+    ///
+    /// Without this override AppKit's default is a no-op on a plain `NSView`,
+    /// so the app's right-click handler (`connect_button_press_event`) never
+    /// ran and the row menu could not appear from an actual right-click. The
+    /// press is dispatched with button 3, which is what that handler reads;
+    /// selection, sorting and double-click opening stay with button 1.
+    extern "C" fn right_mouse_down_imp(obj: *mut c_void, _cmd: *mut c_void, event: *mut c_void) {
+        // SAFETY: AppKit calls this on the main thread.
+        unsafe {
+            let window = msg0(obj, "window");
+            if !window.is_null() {
+                msg1v(window, "makeFirstResponder:", obj);
+            }
+            sheet_fire_click(obj, event, true, 3);
         }
     }
 
     extern "C" fn mouse_up_imp(obj: *mut c_void, _cmd: *mut c_void, event: *mut c_void) {
         // SAFETY: as above.
-        unsafe { sheet_fire_click(obj, event, false) }
+        unsafe { sheet_fire_click(obj, event, false, 1) }
     }
 
     /// Whether a press carrying this AppKit `clickCount` activates what is
@@ -3789,6 +3811,12 @@ mod macos_adapter {
                         );
                         add_method(c, "corroSetCanvasId:", set_canvas_id_imp as *const (), "v@:q");
                         add_method(c, "mouseDown:", mouse_down_imp as *const (), "v@:@");
+                        add_method(
+                            c,
+                            "rightMouseDown:",
+                            right_mouse_down_imp as *const (),
+                            "v@:@",
+                        );
                         add_method(c, "mouseUp:", mouse_up_imp as *const (), "v@:@");
                         objc_registerClassPair(c);
                     }
