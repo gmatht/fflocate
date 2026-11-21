@@ -54,6 +54,30 @@ jobs:
           echo "::error title=widget test failure (Linux)::$(grep -E 'panicked|assertion|^error' widget-test.log | head -10 | tr '\n' '|' | cut -c1-2500)"
           exit 1
 
+      # The AppKit right-click-on-a-row walk, reported on its own before the
+      # all-tests step. That step still fails at drag_reflow_mac's pre-existing
+      # knob-geometry assertion, and a failed step skips every step after it, so
+      # this binary needs its own step to be seen running. It is harness-free:
+      # AppKit wants the main thread.
+      - name: Row menu on a row (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          ulimit -c 0 || true
+          status=0
+          cargo test -p ff-gui --test row_menu_row_mac > row-menu-row.log 2>&1 || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=row menu on a row (macOS)::exit ${status}: $(tail -c 1800 row-menu-row.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            exit 1
+          fi
+          # A run that skipped for want of AppKit would still exit 0; this is
+          # macOS with the backend, so a missing line means it did nothing.
+          if ! grep -q '^row menu on a row: right-clicked' row-menu-row.log; then
+            echo "::error title=row menu on a row (macOS)::the right-click walk did not run: $(tail -c 900 row-menu-row.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            exit 1
+          fi
+          echo "::notice title=row menu on a row (macOS)::$(grep -E '^(row menu on a row|clipboard):' row-menu-row.log | tr '\n' '|')"
+
       # The GUI binary compiles on both platforms (its widgets come from
       # rswidgets::compat), so the whole crate is built and tested here — lib,
       # binary and integration tests — plus the documented `zork` fallback
