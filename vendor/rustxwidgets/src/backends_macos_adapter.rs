@@ -3463,14 +3463,12 @@ mod macos_adapter {
         if control.is_null() || command.is_null() {
             return false;
         }
-        // SAFETY: comparing SELs, which are interned pointers.
-        unsafe {
-            if command == core_apple::selector("insertNewline:")
-                || command == core_apple::selector("insertNewlineIgnoringFieldEditor:")
-            {
-                dispatch_entry_activate(control);
-                return true;
-            }
+        // SELs are interned pointers, so the comparison is identity.
+        if command == core_apple::selector("insertNewline:")
+            || command == core_apple::selector("insertNewlineIgnoringFieldEditor:")
+        {
+            dispatch_entry_activate(control);
+            return true;
         }
         false
     }

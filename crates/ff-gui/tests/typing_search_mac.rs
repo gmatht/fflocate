@@ -70,19 +70,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     /// `-[NSTextView insertText:replacementRange:]`: what typing into a field
     /// editor is. `NSNotFound` (for the range) means "insert at the caret".
-    fn insert_text(editor: *mut c_void, text: &str) {
-        type F = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, NSRange);
-        let f: F = unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+    /// Falls back to the older `insertText:` when the editor has no ranged
+    /// form — sending an object an unrecognised selector aborts the process,
+    /// so the choice is made by asking, not by assuming.
+    fn insert_text(editor: *mut c_void, text: &str, modern: bool) {
+        if modern {
+            type F = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, NSRange);
+            let f: F = unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+            unsafe {
+                f(
+                    editor,
+                    rswidgets::backends::apple::selector("insertText:replacementRange:"),
+                    rswidgets::backends::apple::nsstring(text),
+                    NSRange {
+                        location: usize::MAX,
+                        length: 0,
+                    },
+                )
+            }
+        } else {
+            send1v(editor, "insertText:", rswidgets::backends::apple::nsstring(text));
+        }
+    }
+    fn responds(obj: *mut c_void, sel: &str) -> bool {
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i8 =
+            unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
         unsafe {
             f(
-                editor,
-                rswidgets::backends::apple::selector("insertText:replacementRange:"),
-                rswidgets::backends::apple::nsstring(text),
-                NSRange {
-                    location: usize::MAX,
-                    length: 0,
-                },
-            )
+                obj,
+                rswidgets::backends::apple::selector("respondsToSelector:"),
+                rswidgets::backends::apple::selector(sel),
+            ) != 0
         }
     }
 
@@ -345,11 +363,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let requests: RefCell<Vec<String>> = RefCell::new(Vec::new());
 
     // --- Start the edit the way a click or Tab would: the field editor ---
-    send1v(view, "makeFirstResponder:", entry.raw_handle());
+    //
+    // `makeFirstResponder:` is the window's: sending it to the content view is
+    // an unrecognised selector in AppKit, which aborts the process rather than
+    // returning an error.
+    let window = send0(entry.raw_handle(), "window");
+    assert!(!window.is_null(), "the entry is not in a window");
+    send1v(window, "makeFirstResponder:", entry.raw_handle());
     let editor = send0(entry.raw_handle(), "currentEditor");
     assert!(
         !editor.is_null(),
         "the entry has no field editor, so AppKit never started an edit and nothing typed could reach it"
+    );
+    let modern_insert = responds(editor, "insertText:replacementRange:");
+    assert!(
+        modern_insert || responds(editor, "insertText:"),
+        "the field editor accepts no text insertion, so typing cannot be delivered"
+    );
+    println!(
+        "typing: the entry is first responder and its field editor is open ({})",
+        if modern_insert {
+            "insertText:replacementRange:"
+        } else {
+            "insertText:"
+        }
     );
 
     // One pump tick, exactly as `main.rs` decides: nothing due while typing,
@@ -379,7 +416,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut typed_changes = 0usize;
     for ch in ["t", "y", "p", "i", "n", "g"] {
         let before = changes.get();
-        insert_text(editor, ch);
+        insert_text(editor, ch, modern_insert);
         assert_eq!(
             changes.get(),
             before + 1,
@@ -474,7 +511,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Type a query that narrows the list: "-a" ---
     for ch in ["-", "a"] {
         let before = changes.get();
-        insert_text(editor, ch);
+        insert_text(editor, ch, modern_insert);
         assert_eq!(
             changes.get(),
             before + 1,
@@ -491,14 +528,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "typing {ch:?} reached the backend early: {:?}",
             requests.borrow()
         );
+        // The list keeps the daemon's order, so compare as sorted sets: the
+        // point is that these are still the previous query's rows.
+        let mut shown = column(&list, 1);
+        shown.sort();
         assert_eq!(
-            column(&list, 1),
-            {
-                let mut n = expected_broad.clone();
-                // The list's own order can be either; compare as sets below.
-                n.sort();
-                n
-            },
+            shown, expected_broad,
             "the rows were replaced before the debounce elapsed"
         );
     }
