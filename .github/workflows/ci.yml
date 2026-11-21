@@ -232,7 +232,10 @@ jobs:
       # canvas renders blank. The probe is a binary, not a test, so it runs on
       # the main thread the way AppKit requires.
       - name: GUI interactivity (macOS)
-        if: runner.os == 'macOS'
+        # `!cancelled()`, not `success()`: the all-tests step now fails at
+        # drag_reflow_mac's pre-existing knob geometry, and that must not
+        # skip the AppKit binaries whose results this step reports.
+        if: ${{ runner.os == 'macOS' && !cancelled() }}
         shell: bash
         run: |
           set -o pipefail
@@ -258,6 +261,12 @@ jobs:
           status=0
           wait "$probe_pid" || status=$?
           kill "$watchdog" 2>/dev/null || true
+          # The probe's own outcome is reported first, but the harness-free
+          # AppKit binaries below run whatever it did: their results must not
+          # depend on another test. They also can no longer be skipped by the
+          # all-tests step's failure at drag_reflow_mac's pre-existing knob
+          # geometry, because this step carries `!cancelled()`.
+          failures=""
           if [ "$status" -eq 0 ]; then
             echo "::notice title=GUI interactivity (macOS)::$(grep '^probe:' probe.log | tr '\n' '|')"
             # The list-interaction lines get their own notice: the one above is
@@ -269,92 +278,79 @@ jobs:
             # The row menu and the pasteboard, from the probe's popup path too,
             # in a notice of their own so the generic one's cap cannot hide them.
             echo "::notice title=row menu and clipboard (macOS, probe)::$(grep -E '^probe: (row menu|choosing|pasteboard|clipboard|row menu popped)' probe.log | tr '\n' '|')"
-            # The right-click-on-a-row walk: an `NSRightMouseDown` at a specific
-            # row, the NSMenu it opens, Copy path on the pasteboard, and the
-            # three launchers. Its own binary, so it runs and is reported
-            # before anything else in this step.
-            row_menu_row_status=0
-            cargo test -p ff-gui --test row_menu_row_mac > row-menu-row.log 2>&1 || row_menu_row_status=$?
-            if [ "$row_menu_row_status" -ne 0 ]; then
-              echo "::error title=row menu on a row (macOS)::exit ${row_menu_row_status}: $(tail -c 1800 row-menu-row.log | tr -cd '[:print:]\n' | tr '\n' '|')"
-              exit 1
-            fi
-            # A run that skipped for want of AppKit would still exit 0; this is
-            # macOS with the backend, so the walk has to have run.
-            if ! grep -q '^row menu on a row: right-clicked' row-menu-row.log; then
-              echo "::error title=row menu on a row (macOS)::the right-click walk did not run: $(grep -E '^row_menu_row_mac:|^row menu' row-menu-row.log | tr '\n' '|' | cut -c1-1200)"
-              exit 1
-            fi
-            echo "::notice title=row menu on a row (macOS)::$(grep -E '^(row menu on a row|clipboard):' row-menu-row.log | tr '\n' '|')"
-            # The AppKit menu-bar test is its own binary (harness = false), so it
-            # runs on the process's main thread — the only one AppKit lets call
-            # setMainMenu:. Its observed menu titles, enabled states, the item
-            # chosen and the state change that followed are re-emitted here.
-            menu_status=0
-            cargo test -p ff-gui --test menubar_mac > menubar.log 2>&1 || menu_status=$?
-            if [ "$menu_status" -ne 0 ]; then
-              echo "::error title=menu bar (macOS)::exit ${menu_status}: $(tail -c 1800 menubar.log | tr -cd '[:print:]\n' | tr '\n' '|')"
-              exit 1
-            fi
-            echo "::notice title=menu bar (macOS)::$(grep '^menubar:' menubar.log | tr '\n' '|')"
-            # The list-interaction test is the same shape: a harness-free binary
-            # that dispatches canvas presses at coordinates its own hit test
-            # found, so a wrong id, a header click that cannot sort or an open
-            # that never runs fails the job here rather than going unnoticed.
-            list_status=0
-            cargo test -p ff-gui --test list_interaction_mac > list.log 2>&1 || list_status=$?
-            if [ "$list_status" -ne 0 ]; then
-              echo "::error title=list interaction (macOS)::exit ${list_status}: $(tail -c 1800 list.log | tr -cd '[:print:]\n' | tr '\n' '|')"
-              exit 1
-            fi
-            echo "::notice title=list interaction (macOS)::$(grep '^list:' list.log | tr '\n' '|')"
-            # The row menu as AppKit holds it: four enabled NSMenuItems, each
-            # targeting CorroMacMenuTarget/corroFired:, and Copy path read back
-            # from NSPasteboard. A menu that only looks right fails here.
-            row_status=0
-            cargo test -p ff-gui --test row_menu_interaction_mac > rowmenu.log 2>&1 || row_status=$?
-            if [ "$row_status" -ne 0 ]; then
-              echo "::error title=row menu and clipboard (macOS)::exit ${row_status}: $(tail -c 1800 rowmenu.log | tr -cd '[:print:]\n' | tr '\n' '|')"
-              exit 1
-            fi
-            echo "::notice title=row menu and clipboard (macOS)::$(grep -E '^(row menu|clipboard):' rowmenu.log | tr '\n' '|')"
-            # Daemon results -> rows -> pixels: a daemon child answers a query,
-            # its hits are rendered in a real window and captured through
-            # AppKit's own bitmap path, and two result sets and an empty list
-            # are compared pixel by pixel.
-            pixels_status=0
-            cargo test -p ff-gui --test daemon_pixels_mac > pixels.log 2>&1 || pixels_status=$?
-            if [ "$pixels_status" -ne 0 ]; then
-              echo "::error title=daemon pixels (macOS)::exit ${pixels_status}: $(tail -c 1800 pixels.log | tr -cd '[:print:]\n' | tr '\n' '|')"
-              exit 1
-            fi
-            # A run that skipped for want of a daemon binary would still exit 0;
-            # this step built fflocated above, so the check has to have run.
-            if ! grep -q '^pixels: ok' pixels.log; then
-              echo "::error title=daemon pixels (macOS)::the pixel check did not run: $(grep -E '^pixels:|daemon_pixels_mac:' pixels.log | tr '\n' '|' | cut -c1-1200)"
-              exit 1
-            fi
-            echo "::notice title=daemon pixels (macOS)::$(grep '^pixels:' pixels.log | tr '\n' '|')"
-            # Last, deliberately: this is where the pre-existing knob-geometry
-            # failure lives (`AppKit's knob covers 39.4% of the track but the
-            # layout derived 24.1%`), and it must be reported without stopping
-            # any of the binaries above from running. The assertion is not
-            # weakened or skipped; the job still fails here.
-            # The knob drag and the resize reflow: a real NSScroller's tracking
-            # loop and AppKit's layout pass, so a drag that never reaches the
-            # scroller or a list that keeps its old geometry fails the job.
-            drag_status=0
-            cargo test -p ff-gui --test drag_reflow_mac > drag.log 2>&1 || drag_status=$?
-            if [ "$drag_status" -ne 0 ]; then
-              echo "::error title=drag and reflow (macOS)::exit ${drag_status} (pre-existing knob geometry): $(tail -c 1800 drag.log | tr -cd '[:print:]\n' | tr '\n' '|')"
-              exit 1
-            fi
-            echo "::notice title=drag and reflow (macOS)::$(grep -E '^(drag|reflow):' drag.log | tr '\n' '|')"
-            exit 0
+          else
+            echo "::error title=GUI is not interactive (macOS)::exit ${status}: $(tail -c 1800 probe.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            failures=" probe"
           fi
-          msg=$(tail -c 1800 probe.log | tr -cd '[:print:]\n' | tr '\n' '|')
-          echo "::error title=GUI is not interactive (${RUNNER_OS})::exit ${status}: ${msg}"
-          exit 1
+
+          # One harness-free binary: run it, report it, and remember a failure
+          # instead of exiting, so every later binary's result is still seen.
+          run_appkit() {
+            name=$1
+            logfile=$2
+            title=$3
+            pattern=$4
+            st=0
+            cargo test -p ff-gui --test "$name" > "$logfile" 2>&1 || st=$?
+            if [ "$st" -ne 0 ]; then
+              echo "::error title=${title} (macOS)::exit ${st}: $(tail -c 1800 "$logfile" | tr -cd '[:print:]\n' | tr '\n' '|')"
+              failures="${failures} ${name}"
+              return 0
+            fi
+            echo "::notice title=${title} (macOS)::$(grep -E "$pattern" "$logfile" | tr '\n' '|')"
+          }
+
+          # The right-click-on-a-row walk: an `NSRightMouseDown` at a specific
+          # row, the NSMenu it opens, Copy path on the pasteboard, and the three
+          # launchers.
+          run_appkit row_menu_row_mac row-menu-row.log "row menu on a row" "^(row menu on a row|clipboard):"
+          # A run that skipped for want of AppKit would still exit 0; this is
+          # macOS with the backend, so the walk has to have run.
+          if ! grep -q '^row menu on a row: right-clicked' row-menu-row.log; then
+            echo "::error title=row menu on a row (macOS)::the right-click walk did not run: $(grep -E '^row_menu_row_mac:|^row menu' row-menu-row.log | tr '\n' '|' | cut -c1-1200)"
+            failures="${failures} row_menu_row_mac(no-walk)"
+          fi
+
+          # The AppKit menu bar, driven through `install_main_menu` →
+          # `setMainMenu:`: the bar's titles, each item's enabled state, and the
+          # item chosen with `performActionForItemAtIndex:`.
+          run_appkit menubar_mac menubar.log "menu bar" "^menubar:"
+
+          # Row click, header click and double click through the canvas'
+          # dispatch: a wrong canvas id or a header click that cannot sort fails
+          # here.
+          run_appkit list_interaction_mac list.log "list interaction" "^list:"
+
+          # The row menu as AppKit holds it: four enabled NSMenuItems, each
+          # targeting CorroMacMenuTarget/corroFired:, and Copy path read back
+          # from NSPasteboard.
+          run_appkit row_menu_interaction_mac rowmenu.log "row menu and clipboard" "^(row menu|clipboard):"
+
+          # Daemon results -> rows -> pixels, captured through AppKit's own
+          # bitmap path.
+          run_appkit daemon_pixels_mac pixels.log "daemon pixels" "^pixels:"
+          # A run that skipped for want of a daemon binary would still exit 0;
+          # this step built fflocated above, so the check has to have run.
+          if ! grep -q '^pixels: ok' pixels.log; then
+            echo "::error title=daemon pixels (macOS)::the pixel check did not run: $(grep -E '^pixels:|daemon_pixels_mac:' pixels.log | tr '\n' '|' | cut -c1-1200)"
+            failures="${failures} daemon_pixels_mac(no-pixels)"
+          fi
+
+          # Last, deliberately: this is where the pre-existing knob-geometry
+          # failure lives (`AppKit's knob covers 39.4% of the track but the
+          # layout derived 24.1%`), and it must be reported without stopping any
+          # of the binaries above. The assertion is not weakened or skipped; the
+          # job still fails here.
+          # The knob drag and the resize reflow: a real NSScroller's tracking
+          # loop and AppKit's layout pass, so a drag that never reaches the
+          # scroller or a list that keeps its old geometry fails the job.
+          run_appkit drag_reflow_mac drag.log "drag and reflow" "^(drag|reflow):"
+
+          if [ -n "$failures" ]; then
+            echo "::error title=macOS GUI tests::failed:${failures} (drag_reflow_mac's knob geometry is the pre-existing one)"
+            exit 1
+          fi
+          exit 0
 
       # A picture of the AppKit window, so parity with the GTK build can be
       # checked by looking at it rather than only by reading assertions. The PNG
