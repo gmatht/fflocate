@@ -437,6 +437,116 @@ fn right_clicking_a_row_opens_its_menu_and_copy_path_reaches_the_clipboard() {
         eprintln!("row menu on a row: {:?} launched {launch}", action.label());
     }
 
+    // --- A right-click on a *streaming* row: partial hits, same menu ---
+    //
+    // As-you-type hits are painted into this very list (`main.rs` calls
+    // `set_rows` on the same tree view, with the rows `ff_gui::streaming_rows`
+    // chooses), so a press mid-stream must resolve the row painted at that
+    // position. Paint a tick whose painted rows do not start at the settled
+    // list's first row: an implementation that indexed the settled paths would
+    // copy a different file, which the clipboard assertions below catch.
+    let (kept, shown) = ff_gui::streaming_rows(&paths[1..], None, paths.len());
+    assert_eq!(kept, paths[1..].to_vec(), "the streaming filter dropped a hit");
+    assert_eq!(shown, paths[1..].to_vec(), "the streaming paint was bounded too small");
+    list.set_rows(&cells(&shown));
+    pump(&loader, 20);
+    assert_eq!(
+        list.displayed_column(2),
+        shown,
+        "the streaming paint did not land in the row list a press reads"
+    );
+    let streaming_path = paths[1].clone();
+    live.borrow_mut().take();
+    let hit = list.click_at(40.0, y_of(0), 3);
+    assert_eq!(hit, Some(0), "the press did not hit the streaming row");
+    pump(&loader, 20);
+    let handle = live
+        .borrow_mut()
+        .as_ref()
+        .map(|m| m.handle())
+        .expect("the right-click on a streaming row produced no menu");
+    assert!(
+        gtk_dynamic_loader::context_menu_visible(&loader, handle as u64),
+        "the streaming row's menu was built but not shown"
+    );
+    let items = ContextMenu::items_of(handle);
+    let labels: Vec<String> = items.iter().map(|(l, _)| l.clone()).collect();
+    assert_eq!(
+        labels, expected,
+        "the menu on a streaming row is not the app's action list; got {items:?}"
+    );
+    for label in NAMED.iter().map(|a| a.label()) {
+        assert!(
+            labels.iter().any(|l| l == label),
+            "the streaming row's menu does not offer {label:?}: {labels:?}"
+        );
+    }
+    assert!(
+        items.iter().all(|(_, enabled)| *enabled),
+        "a streaming row's menu item is greyed out: {items:?}"
+    );
+    let index = items
+        .iter()
+        .position(|(l, _)| l == RowAction::CopyPath.label())
+        .expect("the streaming row's menu has no Copy full path item");
+    assert!(
+        ContextMenu::fire(handle, index),
+        "choosing Copy path on a streaming row did not reach GTK's activate signal"
+    );
+    pump(&loader, 20);
+    assert_eq!(
+        dispatched.borrow().last().expect("a dispatch").1,
+        streaming_path,
+        "Copy path on a streaming row dispatched for the wrong row"
+    );
+    assert_eq!(
+        status.get_text().unwrap_or_default(),
+        format!("copied {streaming_path}"),
+        "Copy path on a streaming row copied the wrong path"
+    );
+    let through_app = rswidgets::compat::clipboard_get_text()
+        .expect("the app's clipboard read failed after a streaming copy");
+    assert_eq!(
+        through_app,
+        streaming_path.as_str(),
+        "the clipboard does not hold the streaming row's path"
+    );
+    assert_eq!(
+        read_clipboard_gdk(&loader).as_deref(),
+        Some(streaming_path.as_str()),
+        "GDK's own read does not hold the streaming row's path"
+    );
+    eprintln!(
+        "row menu on a streaming row: items {items:?}, Copy path put {streaming_path} on CLIPBOARD"
+    );
+
+    // The next tick paints the settled rows again; the press re-reads the list,
+    // so row 0 is now the settled row 0 rather than the streaming tick's row 0.
+    list.set_rows(&cells(&paths));
+    pump(&loader, 20);
+    live.borrow_mut().take();
+    assert_eq!(list.click_at(40.0, y_of(0), 3), Some(0));
+    pump(&loader, 20);
+    let handle = live
+        .borrow_mut()
+        .as_ref()
+        .map(|m| m.handle())
+        .expect("the right-click after the paint grew produced no menu");
+    let items = ContextMenu::items_of(handle);
+    let index = items
+        .iter()
+        .position(|(l, _)| l == RowAction::CopyPath.label())
+        .expect("no Copy full path item");
+    assert!(ContextMenu::fire(handle, index));
+    pump(&loader, 20);
+    let through_app = rswidgets::compat::clipboard_get_text()
+        .expect("the app's clipboard read failed after the second streaming copy");
+    assert_eq!(
+        through_app,
+        paths[0].as_str(),
+        "after the streaming paint was replaced, the press still copied the old tick's row"
+    );
+
     // A right-click on blank space below the rows offers nothing: the menu is
     // for a row, not for whatever was last selected.
     live.borrow_mut().take();

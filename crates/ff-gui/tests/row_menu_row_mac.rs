@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::rc::Rc;
     use std::time::{Duration, Instant};
 
-    use ff_gui::{context_menu_target, run_row_action, RowAction};
+    use ff_gui::{context_menu_target, run_row_action, streaming_rows, RowAction};
     use rswidgets::compat::{CellValue, ContextMenu};
     use rswidgets::prelude::*;
 
@@ -510,6 +510,130 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("row menu on a row: {:?} launched {launch}", action.label());
     }
+
+    // --- A right-click on a *streaming* row: partial hits, same menu ---
+    //
+    // As-you-type hits paint into this very list (`main.rs` sets rows on the same
+    // tree view, with the rows `ff_gui::streaming_rows` chooses), so a press
+    // mid-stream must resolve the row painted at that position. Paint a tick
+    // whose rows do not start at the settled list's first row: an implementation
+    // that indexed the settled paths would copy a different file, which the
+    // pasteboard assertions below catch.
+    let paint = |shown: &[String]| {
+        let cells: Vec<Vec<CellValue>> = shown
+            .iter()
+            .map(|p| {
+                let name = p.rsplit('/').next().unwrap_or(p).to_string();
+                vec![
+                    CellValue::Icon {
+                        name: "text-x-generic".to_string(),
+                        fallback: "-".to_string(),
+                    },
+                    CellValue::Text(name),
+                    CellValue::Text(p.clone()),
+                ]
+            })
+            .collect();
+        list.set_rows(&cells);
+    };
+    let (kept, shown) = streaming_rows(&paths[1..], None, paths.len());
+    assert_eq!(
+        kept,
+        paths[1..].to_vec(),
+        "the streaming filter dropped a hit"
+    );
+    assert_eq!(
+        shown,
+        paths[1..].to_vec(),
+        "the streaming paint was bounded too small"
+    );
+    paint(&shown);
+    send0v(view, "layoutSubtreeIfNeeded");
+    assert_eq!(
+        list.displayed_column(2),
+        shown,
+        "the streaming paint did not land in the row list a press reads"
+    );
+    let streaming_path = paths[1].clone();
+    let handle = right_click(0);
+    let items = ContextMenu::items_of(handle);
+    let labels: Vec<String> = items.iter().map(|(l, _)| l.clone()).collect();
+    assert_eq!(
+        labels, expected,
+        "the NSMenu on a streaming row is not the app's action list; got {items:?}"
+    );
+    for label in [
+        RowAction::Open,
+        RowAction::OpenContainingFolder,
+        RowAction::CopyPath,
+        RowAction::OpenInTerminal,
+    ]
+    .iter()
+    .map(|a| a.label())
+    {
+        assert!(
+            labels.iter().any(|l| l == label),
+            "the streaming row's menu does not offer {label:?}: {labels:?}"
+        );
+    }
+    assert!(
+        items.iter().all(|(_, enabled)| *enabled),
+        "a streaming row's NSMenuItem is disabled: {items:?}"
+    );
+    let index = items
+        .iter()
+        .position(|(l, _)| l == RowAction::CopyPath.label())
+        .expect("the streaming row's menu has no Copy full path item");
+    let before = dispatched.borrow().len();
+    assert!(
+        ContextMenu::fire(handle, index),
+        "choosing Copy path on a streaming row did not reach AppKit's performActionForItemAtIndex:"
+    );
+    assert_eq!(
+        dispatched.borrow().len(),
+        before + 1,
+        "choosing Copy path on a streaming row did not dispatch exactly once"
+    );
+    assert_eq!(
+        dispatched.borrow().last().expect("a dispatch").1,
+        streaming_path,
+        "Copy path on a streaming row dispatched for the wrong row"
+    );
+    assert_eq!(
+        status.get_text().unwrap_or_default(),
+        format!("copied {streaming_path}"),
+        "Copy path on a streaming row copied the wrong path"
+    );
+    let through_app = rswidgets::compat::clipboard_get_text()
+        .expect("the app's clipboard read failed after a streaming copy");
+    assert_eq!(
+        through_app,
+        streaming_path.as_str(),
+        "the pasteboard does not hold the streaming row's path"
+    );
+    assert_eq!(
+        pasteboard_text().as_deref(),
+        Some(streaming_path.as_str()),
+        "NSPasteboard's own read does not hold the streaming row's path"
+    );
+    println!("row menu on a streaming row: NSMenu items {items:?}, Copy path put {streaming_path} on the pasteboard");
+
+    // The next tick paints the settled rows again; the press re-reads the list,
+    // so row 0 is now the settled row 0 rather than the streaming tick's row 0.
+    paint(&paths);
+    send0v(view, "layoutSubtreeIfNeeded");
+    let handle = right_click(0);
+    let items = ContextMenu::items_of(handle);
+    let index = items
+        .iter()
+        .position(|(l, _)| l == RowAction::CopyPath.label())
+        .expect("no Copy full path item");
+    assert!(ContextMenu::fire(handle, index));
+    assert_eq!(
+        pasteboard_text().as_deref(),
+        Some(paths[0].as_str()),
+        "after the streaming paint was replaced, the press still copied the old tick's row"
+    );
 
     // A right-click on blank space below the rows offers nothing: the menu is
     // for a row, not for whatever was last selected.

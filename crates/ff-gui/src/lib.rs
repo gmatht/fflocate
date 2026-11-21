@@ -18,7 +18,7 @@
 //!   the status line — the tool must never silently show an empty list for a
 //!   broken connection.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -191,6 +191,7 @@ impl DaemonClient {
     /// two cannot interpret a reply differently.
     pub fn outcome_from_records(&self, resp: &[Response]) -> Result<SearchOutcome, GuiError> {
         let mut paths = Vec::new();
+        let mut created: HashMap<String, u32> = HashMap::new();
         let mut total = 0u64;
         let mut fresh = true;
         let mut stale: Vec<String> = Vec::new();
@@ -226,7 +227,15 @@ impl DaemonClient {
                     crawl_entries = *ce;
                     crawl_dirs_pending = *cdp;
                 }
-                Response::Hit { path, .. } => paths.push(path.clone()),
+                Response::Hit { path, created: c, .. } => {
+                    // The daemon's own creation time for this entry (minutes
+                    // since the epoch). Kept beside the path so the created-date
+                    // filter never has to `stat` a row the daemon already dated.
+                    if let Some(min) = c {
+                        created.insert(path.clone(), *min);
+                    }
+                    paths.push(path.clone())
+                }
                 Response::Done { count, .. } => total = *count,
                 Response::Error { message } => {
                     // A version rejection means a *stale daemon* is running:
@@ -247,6 +256,7 @@ impl DaemonClient {
         }
         Ok(SearchOutcome {
             paths,
+            created,
             total,
             fresh,
             stale_roots: stale,
@@ -702,9 +712,12 @@ pub struct SearchOptions {
 /// The advanced foldout's **created from / to** range.
 ///
 /// Both bounds are inclusive unix seconds; `None` means that end is unbounded.
-/// The index stores no timestamps (a v1 entry is 12 bytes of name/parent/flags),
-/// so the daemon cannot answer this: the GUI applies the range to the rows the
-/// daemon returned (see [`filter_by_created`]) and says so in the status line.
+/// The index stores each entry's creation time in whole minutes since the epoch
+/// and the daemon sends it with the hit (protocol v5), so the usual range is
+/// filtered from data that already arrived — no per-row `stat`. A daemon that
+/// predates the field, or an entry whose filesystem has no birth time, falls
+/// back to [`created_secs`]; [`filter_by_created`] takes whichever clock it is
+/// given and the caller decides.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CreatedRange {
     pub from: Option<i64>,
@@ -852,11 +865,15 @@ pub fn parse_created_range(from_text: &str, to_text: &str) -> Result<Option<Crea
     }
 }
 
-/// A file's creation (birth) time in unix seconds.
+/// A file's creation (birth) time in unix seconds, read with `stat`.
 ///
-/// `None` when the path is gone or the filesystem does not record a birth
-/// time — an unknown time never matches a range, and the status line counts
-/// those rows separately rather than silently dropping them.
+/// This is the fallback now that hits carry the daemon's stored creation time:
+/// it answers for a daemon that predates protocol v5, and for entries the
+/// filesystem would not date at index time (the file may have been created
+/// since, or an older index may simply not know). `None` when the path is gone
+/// or the filesystem does not record a birth time — an unknown time never
+/// matches a range, and the status line counts those rows separately rather
+/// than silently dropping them.
 pub fn created_secs(path: &str) -> Option<i64> {
     let md = std::fs::metadata(path).ok()?;
     let created = md.created().ok()?;
@@ -969,7 +986,17 @@ pub fn apply_created_range(
     // it: "more matches not checked" is about rows the reply never held, so it
     // must not count the ones the range itself hid.
     let fetched = outcome.paths.len();
-    let stats = filter_by_created(&mut outcome.paths, &range, created_secs);
+    // The daemon dated these rows at index time; only a row it could not date
+    // costs a `stat`. Taking the map out first keeps the closure from borrowing
+    // `outcome` twice, and it is put back so the field stays meaningful.
+    let times = std::mem::take(&mut outcome.created);
+    let stats = filter_by_created(&mut outcome.paths, &range, |path| {
+        times
+            .get(path)
+            .map(|min| *min as i64 * 60)
+            .or_else(|| created_secs(path))
+    });
+    outcome.created = times;
     created_note(&range, &stats, fetched, outcome.total, false)
 }
 
@@ -1105,6 +1132,11 @@ pub mod created_ui {
 #[derive(Clone, Debug, Default)]
 pub struct SearchOutcome {
     pub paths: Vec<String>,
+    /// Creation time per returned path, in whole minutes since the unix epoch,
+    /// as the daemon reported it. Absent for a path the daemon could not date
+    /// (or a daemon too old to send it); [`apply_created_range`] falls back to a
+    /// `stat` for those only.
+    pub created: HashMap<String, u32>,
     pub total: u64,
     /// False when the daemon's generation moved on: results are a fresh view.
     pub fresh: bool,
@@ -1800,7 +1832,19 @@ impl RowAction {
         }
     }
 
-    /// All actions, in menu order.
+    /// All actions, in menu order. This is the row menu, on every backend.
+    ///
+    /// The mission's requirement names four actions (Open, Open containing
+    /// folder, Copy path, Open in terminal) and this list is a superset of them:
+    /// `Copy folder path` and `Open with…` are real commands the app has shipped
+    /// and whose launch/pasteboard behaviour is tested here, so they are kept
+    /// rather than deleted to match a shorter list. The decision is recorded
+    /// here, next to the definition, and pinned by `tests/row_menu_model.rs`:
+    /// that test asserts this exact six-item list *and* the four required `label`s
+    /// by name, all enabled and all dispatching, so removing a required item or
+    /// renaming one fails the suite. A backend that draws a row menu draws this
+    /// list — a surface missing one of the four cannot reach a user without that
+    /// test failing.
     pub fn all() -> [RowAction; 6] {
         [
             RowAction::CopyPath,
@@ -2336,6 +2380,26 @@ where
 /// file manager would open a window. This takes it as a closure, so a test can
 /// record which command each menu item runs; the app uses the spawn above, and
 /// the status line is the same either way.
+/// The rows an as-you-type (streaming) tick paints, plus every hit it kept.
+///
+/// `main.rs` paints partial hits into the same `TreeView` the settled answer
+/// uses — one row list, one hit test, one index mapping — so the partial paint
+/// follows the settled rules: rows outside the created range are dropped (a hit
+/// must not flash up and then vanish when the final render filters it) and the
+/// paint is bounded to `max_rows`. Returning both lets the status line count
+/// every kept hit while the list shows the first page. The row-menu tests paint
+/// through this function, so "the row the pointer is on" mid-stream is resolved
+/// by the app's rule rather than a re-implementation of it.
+pub fn streaming_rows(
+    hits: &[String],
+    range: Option<CreatedRange>,
+    max_rows: usize,
+) -> (Vec<String>, Vec<String>) {
+    let kept = filter_partial_paths(hits, range);
+    let shown = kept.iter().take(max_rows).cloned().collect();
+    (kept, shown)
+}
+
 pub fn run_row_action_with<F, L>(action: RowAction, path: &str, copy: F, launch: L) -> String
 where
     F: Fn(&str) -> Result<(), String>,
@@ -2384,9 +2448,14 @@ pub struct RowMenuItem {
 /// The row context menu as a list, independent of any toolkit.
 ///
 /// The items are the same on every backend, in the same order (the app's
-/// [`RowAction::all`]); only their drawing differs per platform. `target` is the
+/// [`RowAction::all`], whose doc records why the list is the six-item superset of
+/// the mission's four); only their drawing differs per platform. `target` is the
 /// path the menu would act on — [`context_menu_target`]'s answer — so the
 /// enabled rule is testable, and asserted, without a display.
+///
+/// The settled list and the as-you-type (streaming/partial) list feed this same
+/// function from the same painted rows: `main.rs` paints both into one
+/// `TreeView`, so there is no second row list whose indices could drift.
 pub fn row_menu_model(target: Option<&str>) -> Vec<RowMenuItem> {
     let enabled = target.is_some();
     RowAction::all()
@@ -3972,6 +4041,7 @@ mod tests {
             Response::Hit {
                 path: "/a/b".into(),
                 id: 9,
+                created: None,
             },
             Response::Progress {
                 scanned: 1000,
@@ -4597,6 +4667,7 @@ mod nonblocking_tests {
         Response::Hit {
             path: path.into(),
             id,
+            created: None,
         }
     }
 
@@ -4858,6 +4929,7 @@ mod full_set_tests {
         Response::Hit {
             path: path.to_string(),
             id,
+            created: None,
         }
     }
 
@@ -5017,6 +5089,33 @@ mod created_range_tests {
             }
         );
         assert_eq!(stats.outside(), 2);
+    }
+
+    #[test]
+    fn created_range_prefers_the_daemons_minute_over_a_stat() {
+        // These paths do not exist, so a `stat` would report "undated". Keeping
+        // the dated one proves the answer came from the hit's `created`.
+        let mut o = SearchOutcome {
+            paths: vec![
+                "/nonexistent/ff-gui/dated".into(),
+                "/nonexistent/ff-gui/other".into(),
+            ],
+            total: 2,
+            fresh: true,
+            ..Default::default()
+        };
+        let day = 29_491_680u32; // 2026-01-02, in minutes since the epoch
+        o.created.insert("/nonexistent/ff-gui/dated".into(), day);
+        let range = CreatedRange {
+            from: Some(day as i64 * 60),
+            to: Some(day as i64 * 60 + 86_399),
+        };
+        let note = apply_created_range(&mut o, Some(range), false);
+        assert_eq!(o.paths, vec!["/nonexistent/ff-gui/dated"]);
+        assert!(note.contains("1 of 2 matched"), "{note}");
+        assert!(note.contains("1 had no creation time"), "{note}");
+        // The map survives the filter, so a later pass can reuse it.
+        assert_eq!(o.created.get("/nonexistent/ff-gui/dated"), Some(&day));
     }
 
     #[test]

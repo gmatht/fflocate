@@ -21,7 +21,8 @@
 use std::cell::RefCell;
 
 use ff_gui::{
-    containing_dir, context_menu_target, row_menu_model, run_row_action_with, RowAction,
+    containing_dir, context_menu_target, row_menu_model, run_row_action_with, streaming_rows,
+    RowAction,
 };
 
 const PATH: &str = "/tmp/ff-gui-cm/typing-alpha.txt";
@@ -88,6 +89,22 @@ fn menu_over_a_row_offers_every_action_enabled() {
     let items = row_menu_model(Some(&target));
 
     let labels: Vec<&str> = items.iter().map(|i| i.label).collect();
+    // The item set is pinned here, item by item: the four the requirement names
+    // plus `Copy folder path` and `Open with…`. `RowAction::all`'s doc records
+    // why the superset is kept; this assertion is what makes that decision
+    // durable, so dropping, adding or renaming an item fails the suite.
+    assert_eq!(
+        labels,
+        vec![
+            "Copy full path",
+            "Copy folder path",
+            "Open",
+            "Open with…",
+            "Open containing folder",
+            "Open in terminal",
+        ],
+        "the row menu's item set changed; the four required actions must all be present: {items:?}"
+    );
     let expected: Vec<&str> = RowAction::all().iter().map(|a| a.label()).collect();
     assert_eq!(
         labels, expected,
@@ -136,6 +153,93 @@ fn menu_without_a_row_disables_every_item() {
     assert!(
         items.iter().all(|i| !i.enabled),
         "an item is enabled although no row is under the pointer: {items:?}"
+    );
+}
+
+/// The as-you-type (streaming) list feeds the same row menu as the settled one:
+/// its rows come from [`streaming_rows`], and the row under the pointer resolves
+/// inside the rows painted so far — not against the settled paths, whose indices
+/// would name a different file.
+#[test]
+fn streaming_rows_share_the_settled_lists_row_menu() {
+    let hits: Vec<String> = vec![
+        "/tmp/ff-gui-stream/first.rs".to_string(),
+        "/tmp/ff-gui-stream/second.rs".to_string(),
+        "/tmp/ff-gui-stream/third.rs".to_string(),
+    ];
+
+    // A mid-stream tick where the daemon has delivered every hit but only the
+    // first page is painted: the filter keeps all three, the paint shows two.
+    let (kept, shown) = streaming_rows(&hits, None, 2);
+    assert_eq!(kept, hits, "the streaming filter dropped a hit the list keeps");
+    assert_eq!(
+        shown,
+        hits[..2].to_vec(),
+        "the streaming paint is not the first page of the kept hits"
+    );
+
+    // A tick whose painted rows do not start at the settled list's first row —
+    // the case a stale mapping gets wrong.
+    let (kept, shown) = streaming_rows(&hits[1..], None, 8);
+    assert_eq!(kept, hits[1..].to_vec());
+    assert_eq!(shown, hits[1..].to_vec());
+
+    // Row 0 of that paint is `hits[1]`; resolving against the settled list would
+    // hand back `hits[0]`.
+    let target = context_menu_target(3, Some(0), &shown)
+        .expect("a right-click on the painted row 0 resolved to nothing");
+    assert_eq!(
+        target, hits[1],
+        "a right-click on streaming row 0 did not resolve the row painted there"
+    );
+
+    let items = row_menu_model(Some(&target));
+    assert!(
+        items.iter().all(|i| i.enabled),
+        "a streaming row's menu has a disabled item: {items:?}"
+    );
+    for named in [
+        RowAction::Open,
+        RowAction::OpenContainingFolder,
+        RowAction::CopyPath,
+        RowAction::OpenInTerminal,
+    ] {
+        let item = items
+            .iter()
+            .find(|i| i.action == named)
+            .unwrap_or_else(|| panic!("a streaming row's menu lacks {:?}", named.label()));
+        assert!(
+            item.enabled,
+            "{:?} is disabled on a streaming row",
+            named.label()
+        );
+    }
+
+    let copied: RefCell<Option<String>> = RefCell::new(None);
+    let status = run_row_action_with(
+        RowAction::CopyPath,
+        &target,
+        |text| {
+            *copied.borrow_mut() = Some(text.to_string());
+            Ok(())
+        },
+        |program, args| panic!("Copy path launched {program} {args:?} instead of copying"),
+    );
+    assert_eq!(
+        *copied.borrow(),
+        Some(hits[1].clone()),
+        "Copy path on a streaming row put the wrong path on the clipboard"
+    );
+    assert_eq!(status, format!("copied {}", hits[1]));
+
+    // Clicking past the painted rows opens nothing mid-stream either, and a
+    // later tick that paints more rows re-resolves the same row index.
+    assert_eq!(context_menu_target(3, Some(2), &shown), None);
+    let (_, grown) = streaming_rows(&hits, None, 8);
+    assert_eq!(
+        context_menu_target(3, Some(0), &grown).as_deref(),
+        Some(hits[0].as_str()),
+        "after the paint grew, row 0 still resolved to the earlier tick's row"
     );
 }
 

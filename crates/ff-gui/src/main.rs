@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use ff_gui::{
     apply_created_range, box_change_clears, containing_dir, context_menu_target, created_request_range,
-    created_ui, drag_payload, effective_query, encode_request, filter_partial_paths, render_count,
+    created_ui, drag_payload, effective_query, encode_request, render_count, streaming_rows,
     rows_from_paths, scan_percent, search_label, searching_status_line, step_max_distance,
     streaming_status_line, CreatedRange, DaemonClient, GuiError, MenuAction, PendingRequest,
     Progress, RowAction, SearchGate, SearchOptions, SearchOutcome, StartupPoll, StartupProbe,
@@ -445,8 +445,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(mut outcome) => {
                 let count_only = opt_count.is_active();
                 last_total.set(outcome.total);
-                // The created range is applied to the page the daemon returned:
-                // the index has no timestamps to filter on server-side. The
+                // The created range is applied to the page the daemon returned,
+                // using the creation minute each hit carries (protocol v5) — no
+                // per-row `stat` unless the daemon could not date the entry. The
                 // suffix then states how much of that page it hid, so the
                 // filtered count never passes for the daemon's total.
                 let range = *created_range.borrow();
@@ -720,10 +721,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     _ => None,
                                 })
                                 .collect();
-                            // Filter the streaming rows by the same range the
-                            // final render uses, so rows outside it never
-                            // flash up and then vanish.
-                            let kept = filter_partial_paths(&hits, *created_range.borrow());
+                            // Filter and bound the streaming rows by the same
+                            // rule the final render uses, so rows outside the
+                            // range never flash up and then vanish — and so a
+                            // mid-stream right-click resolves the rows this
+                            // list actually paints (`streaming_rows` is the
+                            // function the row-menu tests paint through).
+                            let (kept, partial_shown) =
+                                streaming_rows(&hits, *created_range.borrow(), MAX_ROWS);
                             // Fold every Progress record into the watermark:
                             // monotone, never rewinds.
                             for r in p.records() {
@@ -776,11 +781,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 let fresh_hits = kept.clone();
                                 drop(pending_ref);
                                 if gate.borrow().is_current(seq) {
-                                    // Paint only the rows on screen (MAX_ROWS);
-                                    // the status counts every Hit so far.
-                                    let shown: Vec<String> =
-                                        fresh_hits.iter().take(MAX_ROWS).cloned().collect();
-                                    partial_results.set_rows(&rows_to_cells(&shown));
+                                    // Paint only the rows on screen (MAX_ROWS),
+                                    // bounded above; the status counts every Hit
+                                    // so far.
+                                    partial_results.set_rows(&rows_to_cells(&partial_shown));
                                     *partial_current.borrow_mut() =
                                         partial_results.displayed_column(PATH_COLUMN);
                                     // The streaming line: hits are on screen,
