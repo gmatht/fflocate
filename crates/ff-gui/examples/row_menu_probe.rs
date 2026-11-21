@@ -1,6 +1,6 @@
 //! Pop the app's row menu at the pointer and leave it on screen.
 //!
-//! `main.rs` builds this menu from `RowAction::all()` and shows it with
+//! `main.rs` builds this menu from `row_menu_plan` and shows it with
 //! `ContextMenu::popup_at_pointer`; this does the same from a one-shot process,
 //! so the popup can be photographed from outside. It holds for a few seconds
 //! and then exits, taking the menu with it.
@@ -12,7 +12,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use ff_gui::RowAction;
 // `raw_handle` comes from the widget trait, as it does in the app.
 use rswidgets::core::Widget as _;
 
@@ -52,15 +51,27 @@ fn main() {
         unsafe { present(window.raw_handle()) };
     }
 
-    // The app's menu: one item per row action, each running the action.
+    // The app's menu: the shared plan, one item per model entry at its own
+    // sensitivity. The probe offers every action, so its filesystem probe is
+    // `|_| true` — the same menu the app builds when nothing is greyed out.
+    let (target, plan) = ff_gui::row_menu_plan(
+        3,
+        Some(0),
+        &["/tmp/row-menu-probe.txt".to_string()],
+        |_| true,
+    )
+    .expect("a right-click on a row produced no menu");
     let fired: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let mut menu = rswidgets::compat::ContextMenu::new();
-    for action in RowAction::all() {
+    for item in &plan {
         let fired = fired.clone();
-        menu.append_item(
-            action.label(),
+        let target = target.clone();
+        let action = item.action;
+        menu.append_item_enabled(
+            item.label,
+            item.enabled,
             Box::new(move || {
-                let line = ff_gui::run_row_action(action, "/tmp/row-menu-probe.txt", |text| {
+                let line = ff_gui::run_row_action(action, &target, |text| {
                     rswidgets::compat::clipboard_set_text(text).map_err(|e| e.to_string())
                 });
                 *fired.borrow_mut() = Some(line);

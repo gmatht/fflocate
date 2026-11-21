@@ -194,10 +194,18 @@ jobs:
               failures="${failures} ${name}"
               return 0
             fi
-            echo "::notice title=mac gui model test ${name} (macOS)::$(grep -E '^test |test result' "$logfile" | tr '\n' '|' | cut -c1-1500)"
+            echo "::notice title=mac gui model test ${name} (macOS)::$(grep -E '^test |test result|^row menu|^clipboard' "$logfile" | tr '\n' '|' | cut -c1-1500)"
           }
           run_model_test macos_gui_parts
           run_model_test row_menu_mac
+          # row_menu_mac builds the menu from `row_menu_plan` and reads it back
+          # out of a real NSMenu. A binary that cannot load AppKit prints one
+          # line and exits 0, so require the plan-built walk's own line instead
+          # of trusting the exit status.
+          if ! grep -q 'row menu: missing file' macos-row_menu_mac.log; then
+            echo "::error title=row menu (macOS)::the plan-built NSMenu walk did not run: $(grep -E '^row menu' macos-row_menu_mac.log | tr '\n' '|' | cut -c1-1200)"
+            failures="${failures} row_menu_mac(plan)"
+          fi
           if [ -n "$failures" ]; then
             echo "::error title=mac gui model tests (macOS)::failed:${failures}"
             exit 1
@@ -304,6 +312,12 @@ jobs:
             # job, not pass it, so the GTK field cannot silently go unchecked.
             if ! grep -q '^created range: [0-9]' interaction.log; then
               echo "::error title=created range (Linux)::the created from/to walk did not run: $(grep -E '^created range:' interaction.log | tr '\n' '|' | cut -c1-1200)"
+              exit 1
+            fi
+            # The menu the app builds from its plan, built and walked on GTK:
+            # a display-less skip exits 0, so its own line has to be there.
+            if ! grep -q 'row menu: missing file' interaction.log; then
+              echo "::error title=row menu (Linux)::the plan-built GtkMenu walk did not run: $(grep -E '^row menu' interaction.log | tr '\n' '|' | cut -c1-1200)"
               exit 1
             fi
             # (The right-click-on-a-row walk and the clipboard have their own

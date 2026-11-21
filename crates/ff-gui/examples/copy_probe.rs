@@ -60,17 +60,22 @@ fn main() {
     };
     window.set_title("ff-gui copy probe");
 
-    // The row menu the app builds: one item per row action, each running its
-    // action against this path through the shared action runner.
+    // The row menu the app builds: the shared plan for this path, each item
+    // running its action through the shared action runner. The probe offers
+    // every action, so its filesystem probe is `|_| true`.
+    let (target, plan) = ff_gui::row_menu_plan(3, Some(0), std::slice::from_ref(&path), |_| true)
+        .expect("a right-click on a row produced no menu");
     let status: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let mut menu = rswidgets::compat::ContextMenu::new();
-    for action in RowAction::all() {
+    for item in &plan {
         let status = status.clone();
-        let path = path.clone();
-        menu.append_item(
-            action.label(),
+        let target = target.clone();
+        let action = item.action;
+        menu.append_item_enabled(
+            item.label,
+            item.enabled,
             Box::new(move || {
-                let line = ff_gui::run_row_action(action, &path, |text| {
+                let line = ff_gui::run_row_action(action, &target, |text| {
                     rswidgets::compat::clipboard_set_text(text).map_err(|e| e.to_string())
                 });
                 *status.borrow_mut() = Some(line);

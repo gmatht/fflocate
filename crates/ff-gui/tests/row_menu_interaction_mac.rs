@@ -8,8 +8,9 @@
 //!
 //! What is asserted is exactly what a right-click depends on:
 //!
-//! * `ContextMenu::build` — the popup's first step — produces an `NSMenu` with
-//!   the four row actions, all enabled;
+//! * `ContextMenu::build` — the popup's first step — produces the `NSMenu` the
+//!   app shows because it is built from `row_menu_plan`: the model's six items,
+//!   at the model's sensitivity (all sensitive here, the row's file exists);
 //! * every `NSMenuItem` has a non-nil target of the adapter's
 //!   `CorroMacMenuTarget` class and the `corroFired:` action, i.e. the item is
 //!   wired into the Rust registry rather than to nothing;
@@ -20,6 +21,11 @@
 //!
 //! The popup's own modal tracking loop is exercised by
 //! `examples/macos_probe.rs`, which queues an Escape and pops the real menu up.
+//!
+//! `Open with…` is the one item not fired: choosing it hands the file to
+//! whichever application the desktop registered for it, which cannot be stubbed
+//! in this process. It is the same `corroFired:` dispatch every other item uses,
+//! and the target/action loop below covers it.
 
 #[cfg(all(target_os = "macos", feature = "macos", not(feature = "zork")))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -79,23 +85,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = file.to_string_lossy().into_owned();
     let name = file.file_name().unwrap_or_default().to_string_lossy().into_owned();
 
-    let actions = [
-        RowAction::Open,
-        RowAction::OpenContainingFolder,
-        RowAction::CopyPath,
-        RowAction::OpenInTerminal,
-    ];
+    // The app's own plan: the shared model, with its per-item sensitivity.
+    let plan = ff_gui::row_menu_plan(3, Some(0), std::slice::from_ref(&path), |p| {
+        std::path::Path::new(p).exists()
+    })
+    .ok_or("a right-click on a row produced no menu")?;
+    let (target, plan_items) = plan;
+    assert_eq!(target, path, "the plan targets another path");
+
     let ran: Rc<RefCell<Vec<String>>> = Default::default();
     let copies = Rc::new(Cell::new(0usize));
     let mut menu = ContextMenu::new();
-    for action in actions {
+    for item in &plan_items {
         let ran = ran.clone();
         let copies = copies.clone();
-        let path = path.clone();
-        menu.append_item(
-            action.label(),
+        let target = target.clone();
+        let action = item.action;
+        menu.append_item_enabled(
+            item.label,
+            item.enabled,
             Box::new(move || {
-                let line = ff_gui::run_row_action(action, &path, |text| {
+                let line = ff_gui::run_row_action(action, &target, |text| {
                     copies.set(copies.get() + 1);
                     rswidgets::compat::clipboard_set_text(text).map_err(|e| e.to_string())
                 });
@@ -109,11 +119,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handle = menu.build().expect("the row menu could not be built");
     let items = ContextMenu::items_of(handle);
     println!("row menu: NSMenu items {items:?}");
-    assert_eq!(items.len(), 4, "the NSMenu does not offer four actions");
     assert_eq!(
-        items.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>(),
-        actions.iter().map(|a| a.label().to_string()).collect::<Vec<_>>(),
-        "the NSMenu labels are not the four row actions"
+        items.len(),
+        plan_items.len(),
+        "the NSMenu does not offer the plan's items: {items:?}"
+    );
+    assert_eq!(
+        items,
+        plan_items
+            .iter()
+            .map(|item| (item.label.to_string(), item.enabled))
+            .collect::<Vec<_>>(),
+        "the NSMenu is not the shared plan: titles and isEnabled"
     );
     for (label, enabled) in &items {
         assert!(*enabled, "the NSMenu item {label:?} is disabled");
@@ -126,7 +143,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(!menu_obj.is_null(), "the row menu handle is null");
     let array = send0(menu_obj, "itemArray");
     let count = send0i(array, "count");
-    assert_eq!(count, 4, "AppKit's NSMenu holds {count} items");
+    assert_eq!(
+        count as usize,
+        plan_items.len(),
+        "AppKit's NSMenu holds {count} items"
+    );
     for index in 0..count as usize {
         let item = send1i(array, "objectAtIndex:", index as isize);
         assert!(!item.is_null(), "item {index} is null");
@@ -150,9 +171,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("row menu: item {index} {title:?} -> CorroMacMenuTarget/corroFired:");
     }
 
-    // Fire each item the way a click does: AppKit's own dispatch, then the
-    // registry action the item names.
-    for (index, action) in actions.iter().enumerate() {
+    // Fire the items a click would: AppKit's own dispatch, then the registry
+    // action the item names. `Open with…` is left alone (see the note above).
+    let fired = [
+        RowAction::Open,
+        RowAction::OpenContainingFolder,
+        RowAction::CopyPath,
+        RowAction::OpenInTerminal,
+    ];
+    for action in fired {
+        let index = plan_items
+            .iter()
+            .position(|item| item.action == action)
+            .unwrap_or_else(|| panic!("the plan has no {} item", action.label()));
         assert!(
             ContextMenu::fire(handle, index),
             "{} could not be fired",
@@ -160,7 +191,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         let line = ran.borrow().last().cloned().unwrap_or_default();
         println!("row menu: chose {:?} -> {line:?}", action.label());
-        if *action == RowAction::CopyPath {
+        if action == RowAction::CopyPath {
             assert_eq!(line, format!("copied {path}"), "Copy path reported {line:?}");
         } else {
             assert!(
@@ -175,7 +206,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
-    assert_eq!(ran.borrow().len(), 4, "not every NSMenu item ran its action");
+    assert_eq!(
+        ran.borrow().len(),
+        fired.len(),
+        "not every chosen NSMenu item ran its action"
+    );
     assert_eq!(
         copies.get(),
         1,
@@ -195,7 +230,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     println!(
-        "row menu: ok — 4 enabled items, each wired to CorroMacMenuTarget/corroFired:, Copy on the pasteboard"
+        "row menu: ok — the plan's six items on the real NSMenu, each wired to CorroMacMenuTarget/corroFired:, Copy on the pasteboard"
     );
     println!("clipboard: ok — the pasteboard reads back the row's path");
     Ok(())

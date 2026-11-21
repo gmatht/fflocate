@@ -1,126 +1,272 @@
-//! The row context menu and Copy path on macOS, in the half `cargo test` can
-//! reach without a window server.
+//! The row context menu and Copy path on AppKit, built from the app's plan.
 //!
-//! A `cargo test` binary has no AppKit: nothing in it initialises the backend,
-//! so `objc_getClass("NSMenu")` and `objc_getClass("NSPasteboard")` both return
-//! nil and the NSMenu cannot even be built. The AppKit half — the menu's items
-//! and their enabled state read back out of the `NSMenu`, each item fired
-//! through `performActionForItemAtIndex:`, the menu popped up at the pointer, and
-//! the pasteboard read back by a second AppKit call — therefore runs in
-//! `examples/macos_probe.rs`, which CI executes as a binary on the main thread
-//! with a real window. This file covers what is testable here: the menu model
-//! the popup is built from, its dispatch, and the exact text Copy path produces
-//! for a real file.
+//! The macOS sibling of `tests/row_menu_gtk.rs`: the items come from
+//! `ff_gui::row_menu_plan`, the menu under test is the real `NSMenu` the adapter
+//! builds, its titles and `isEnabled` are read back out of AppKit, an item is
+//! fired through `performActionForItemAtIndex:` (the target/action dispatch a
+//! click inside the menu runs), and Copy path is read back from `NSPasteboard`
+//! with a call that is not the one that wrote it.
+//!
+//! The file's absence is simulated with the probe the app passes to
+//! `row_menu_plan` (`Path::is_dir` for the second menu, where the row's
+//! directory still exists and the file does not), so `Open`/`Open with…` come
+//! out insensitive and the refusal is exercised without launching a helper.
+//! Nothing here opens an application: the sensitive item that is fired is Copy
+//! path, and an insensitive one cannot fire at all.
+//!
+//! AppKit's classes are not loaded in a process that never touched the backend,
+//! and the framework wants the process's main thread, which the normal test
+//! harness cannot give a test — hence `harness = false` and its own `fn main`
+//! (see `[[test]]` in `Cargo.toml`), as with the other AppKit binaries here.
 
-#![cfg(target_os = "macos")]
-
-use ff_gui::RowAction;
-use rswidgets::compat::ContextMenu;
-
-/// Whether `path` is absolute — the row's path is what Copy puts on the
-/// clipboard, and a relative one would be useless in another application.
-fn copied_path_is_absolute(path: &str) -> bool {
-    path.starts_with('/')
+#[cfg(all(target_os = "macos", feature = "macos", not(feature = "zork")))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    appkit::run()
 }
 
-/// The four actions a right-click offers, in menu order.
-fn row_actions() -> [RowAction; 4] {
-    [
-        RowAction::Open,
-        RowAction::OpenContainingFolder,
-        RowAction::CopyPath,
-        RowAction::OpenInTerminal,
-    ]
+#[cfg(not(all(target_os = "macos", feature = "macos", not(feature = "zork"))))]
+fn main() {
+    // The NSMenu and the pasteboard are AppKit's; the GTK counterpart is
+    // `tests/row_menu_gtk.rs`.
+    println!("row_menu_mac: needs the AppKit backend (macOS, `macos` on, `zork` off)");
 }
 
-#[test]
-fn the_row_menu_model_dispatches_and_copy_path_copies_the_real_path() {
-    let dir = tempfile::tempdir().expect("no temp dir");
-    let file = dir.path().join("ff-gui-row-menu.txt");
-    std::fs::write(&file, "row menu\n").expect("could not write the row's file");
-    let path = file.to_string_lossy().into_owned();
+#[cfg(all(target_os = "macos", feature = "macos", not(feature = "zork")))]
+mod appkit {
+    use std::cell::RefCell;
+    use std::ffi::c_void;
+    use std::path::Path;
+    use std::rc::Rc;
 
-    let ran: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
-    let copied: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
-    let mut menu = ContextMenu::new();
-    for action in row_actions() {
-        let ran = ran.clone();
-        let copied = copied.clone();
-        let path = path.clone();
-        menu.append_item(
-            action.label(),
-            Box::new(move || {
-                // The copy is captured instead of reaching the pasteboard: this
-                // process has no AppKit, and the probe checks the pasteboard
-                // itself.
-                let line = ff_gui::run_row_action(action, &path, |text| {
-                    copied.borrow_mut().push(text.to_string());
-                    Ok(())
-                });
-                ran.borrow_mut().push(line);
-            }),
-        );
+    use ff_gui::{row_menu_plan, run_row_action, RowAction};
+    use rswidgets::compat::ContextMenu;
+
+    fn send0(obj: *mut c_void, sel: &str) -> *mut c_void {
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+        unsafe { f(obj, rswidgets::backends::apple::selector(sel)) }
+    }
+    fn send1p(obj: *mut c_void, sel: &str, arg: *mut c_void) -> *mut c_void {
+        let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
+            unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
+        unsafe { f(obj, rswidgets::backends::apple::selector(sel), arg) }
     }
 
-    let labels = menu.labels();
-    eprintln!("row menu (appkit model): {labels:?}");
-    assert_eq!(
-        labels,
-        row_actions()
-            .iter()
-            .map(|a| a.label().to_string())
-            .collect::<Vec<_>>(),
-        "the row menu labels are not the four row actions"
-    );
-
-    for action in row_actions() {
-        assert!(
-            menu.activate(action.label()),
-            "{} could not be dispatched",
-            action.label()
+    /// The pasteboard's text, read with `NSPasteboard`'s own call.
+    ///
+    /// Deliberately not `compat::clipboard_get_text`: Copy writes through the
+    /// adapter, so this asks the pasteboard itself, the way another application
+    /// would.
+    fn pasteboard_text() -> Option<String> {
+        let pasteboard = send0(
+            rswidgets::backends::apple::cls("NSPasteboard"),
+            "generalPasteboard",
         );
-    }
-    let lines = ran.borrow().clone();
-    eprintln!("row menu (appkit model): fired {lines:?}");
-    assert_eq!(lines.len(), 4, "not every menu item ran its action");
-    for (line, action) in lines.iter().zip(row_actions().iter()) {
-        // Copy reports the exact text it put on the clipboard, not its own
-        // label; the clipboard itself is checked below.
-        if *action == RowAction::CopyPath {
-            assert_eq!(*line, format!("copied {path}"), "Copy path reported {line:?}");
-            continue;
+        if pasteboard.is_null() {
+            return None;
         }
-        assert!(
-            line.starts_with(action.label()),
-            "choosing {:?} ran {line:?}",
-            action.label()
-        );
+        let kind = rswidgets::backends::apple::nsstring("public.utf8-plain-text");
+        rswidgets::backends::apple::nsstring_to_rust(send1p(pasteboard, "stringForType:", kind))
     }
-    assert!(
-        copied_path_is_absolute(&path),
-        "the row's path {path:?} is not absolute, so copying it would not travel"
-    );
 
-    let copied = copied.borrow().clone();
-    assert_eq!(
-        copied.len(),
-        1,
-        "only Copy path should put text on the clipboard: {copied:?}"
-    );
-    assert_eq!(
-        copied[0], path,
-        "Copy path did not copy the row's absolute path"
-    );
-    assert!(
-        std::fs::metadata(&copied[0])
-            .map(|m| m.is_file())
-            .unwrap_or(false),
-        "the copied path {:?} is not a file on disk",
-        copied[0]
-    );
-    assert!(
-        lines[2].starts_with("copied "),
-        "Copy path reported {:?}",
-        lines[2]
-    );
+    /// Build the native menu from a plan: one item per model entry, at that
+    /// entry's sensitivity, each running the action through the app's runner.
+    fn build_from_plan(
+        target: &str,
+        items: &[ff_gui::RowMenuItem],
+    ) -> (ContextMenu, usize, Rc<RefCell<Vec<String>>>) {
+        let ran: Rc<RefCell<Vec<String>>> = Default::default();
+        let mut menu = ContextMenu::new();
+        for item in items {
+            let ran = ran.clone();
+            let path = target.to_string();
+            let action = item.action;
+            menu.append_item_enabled(
+                item.label,
+                item.enabled,
+                Box::new(move || {
+                    let line = run_row_action(action, &path, |text| {
+                        rswidgets::compat::clipboard_set_text(text).map_err(|e| e.to_string())
+                    });
+                    ran.borrow_mut().push(line);
+                }),
+            );
+        }
+        let handle = menu.build().expect("the row menu could not be built");
+        (menu, handle, ran)
+    }
+
+    pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+        // AppKit's own classes before any of them is touched, then the
+        // application object the adapter hangs its menu target off.
+        rswidgets::backends_macos_adapter::ensure_runtime_classes();
+        let _app = rswidgets::App::init()?;
+
+        // A real file on disk, so the copy round trip is a real path rather than
+        // a string nothing would find.
+        let dir = tempfile::tempdir()?;
+        let file = dir.path().join("ff-gui-row-menu.txt");
+        std::fs::write(&file, "row menu\n")?;
+        let path = file.to_string_lossy().into_owned();
+        let rows = vec![path.clone()];
+
+        // --- The row's file exists: every item the plan offers is sensitive ---
+        let plan = row_menu_plan(3, Some(0), &rows, |p| Path::new(p).exists())
+            .ok_or("a right-click on a row produced no menu")?;
+        assert_eq!(
+            plan.0, path,
+            "the plan targets {:?}, not the row's path {:?}",
+            plan.0, path
+        );
+        let (menu, handle, ran) = build_from_plan(&plan.0, &plan.1);
+        let shown = ContextMenu::items_of(handle);
+        println!("row menu: NSMenu items {shown:?}");
+        assert_eq!(
+            shown.len(),
+            6,
+            "the NSMenu does not offer the model's six actions: {shown:?}"
+        );
+        assert_eq!(
+            shown
+                .iter()
+                .map(|(label, _)| label.clone())
+                .collect::<Vec<_>>(),
+            plan.1
+                .iter()
+                .map(|item| item.label.to_string())
+                .collect::<Vec<_>>(),
+            "the NSMenu titles are not the shared plan's"
+        );
+        assert_eq!(
+            shown.iter().map(|(_, enabled)| *enabled).collect::<Vec<_>>(),
+            plan.1.iter().map(|item| item.enabled).collect::<Vec<_>>(),
+            "the NSMenu's isEnabled is not the shared plan's"
+        );
+        for (label, enabled) in &shown {
+            assert!(
+                *enabled,
+                "the NSMenuItem {label:?} is insensitive although the row's file exists"
+            );
+        }
+
+        // Copy path is the sensitive item this test fires: it dispatches through
+        // AppKit's own item dispatch and must leave the row's path on the
+        // pasteboard.
+        let copy = plan
+            .1
+            .iter()
+            .position(|item| item.action == RowAction::CopyPath)
+            .ok_or("the plan has no Copy path item")?;
+        assert!(
+            ContextMenu::fire(handle, copy),
+            "Copy path ({}) could not be fired",
+            plan.1[copy].label
+        );
+        let lines = ran.borrow().clone();
+        println!("row menu: fired {lines:?}");
+        assert_eq!(
+            lines,
+            vec![format!("copied {path}")],
+            "choosing Copy path did not run its action"
+        );
+        assert_eq!(
+            rswidgets::compat::clipboard_get_text().unwrap_or_default(),
+            path.as_str(),
+            "the clipboard does not hold the row's path after Copy path"
+        );
+        let read_back = pasteboard_text().ok_or("NSPasteboard holds no text after Copy path")?;
+        println!("row menu: pasteboard holds {read_back:?}");
+        assert_eq!(
+            read_back, path,
+            "Copy path did not leave the row's path on NSPasteboard"
+        );
+        assert!(
+            std::fs::metadata(&read_back)
+                .map(|m| m.is_file())
+                .unwrap_or(false),
+            "the copied path {read_back:?} is not a file on disk"
+        );
+
+        // --- The row's file is gone: the plan greys two items out ---
+        //
+        // The app's probe is a real `Path::exists`; this passes `is_dir`, which is
+        // the same answer for a row whose file has been deleted under a still
+        // present directory.
+        let gone = row_menu_plan(3, Some(0), &rows, |p| Path::new(p).is_dir())
+            .ok_or("a right-click on a row produced no menu")?;
+        let (menu_gone, handle_gone, ran_gone) = build_from_plan(&gone.0, &gone.1);
+        let shown_gone = ContextMenu::items_of(handle_gone);
+        println!("row menu: a missing file shows {shown_gone:?}");
+        assert_eq!(
+            shown_gone,
+            gone.1
+                .iter()
+                .map(|item| (item.label.to_string(), item.enabled))
+                .collect::<Vec<_>>(),
+            "the NSMenu does not match the plan for a row whose file is gone"
+        );
+        let open = gone
+            .1
+            .iter()
+            .position(|item| item.action == RowAction::Open)
+            .ok_or("the plan has no Open item")?;
+        let open_with = gone
+            .1
+            .iter()
+            .position(|item| item.action == RowAction::OpenWith)
+            .ok_or("the plan has no Open with… item")?;
+        assert!(
+            !shown_gone[open].1 && !shown_gone[open_with].1,
+            "Open and Open with… stay sensitive for a missing file: {shown_gone:?}"
+        );
+        assert_eq!(
+            shown_gone.iter().filter(|(_, enabled)| !*enabled).count(),
+            2,
+            "more than the two file actions went insensitive: {shown_gone:?}"
+        );
+
+        // An insensitive item refuses: AppKit's dispatch does not reach the
+        // action, so nothing opens and nothing is recorded.
+        assert!(
+            !ContextMenu::fire(handle_gone, open),
+            "an insensitive {} dispatched",
+            gone.1[open].label
+        );
+        assert!(
+            ran_gone.borrow().is_empty(),
+            "choosing an insensitive item dispatched {:?}",
+            ran_gone.borrow()
+        );
+        let copy_gone = gone
+            .1
+            .iter()
+            .position(|item| item.action == RowAction::CopyPath)
+            .ok_or("the plan has no Copy path item")?;
+        assert!(
+            ContextMenu::fire(handle_gone, copy_gone),
+            "Copy path could not be fired for a row whose file is gone"
+        );
+        assert_eq!(
+            ran_gone.borrow().clone(),
+            vec![format!("copied {path}")],
+            "Copy path on a missing file did not run its action"
+        );
+        assert_eq!(
+            pasteboard_text().as_deref(),
+            Some(path.as_str()),
+            "Copy path on a missing file left the wrong text on the pasteboard"
+        );
+        println!(
+            "row menu: missing file → {shown_gone:?}; Open refused, Copy path put {path} on the pasteboard"
+        );
+
+        drop((menu_gone, ran_gone));
+        // The first menu stays alive until here: its items are the ones whose
+        // dispatch ran above.
+        drop((menu, ran));
+        println!(
+            "row menu: ok — six items from the shared plan on the real NSMenu, isEnabled from the model, an insensitive item refused, and Copy path is on NSPasteboard"
+        );
+        Ok(())
+    }
 }

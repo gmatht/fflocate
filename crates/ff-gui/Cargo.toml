@@ -47,6 +47,14 @@ name = "row_menu_row_mac"
 path = "tests/row_menu_row_mac.rs"
 harness = false
 
+# The row menu on its own — built from the app's `row_menu_plan`, read back out
+# of the real NSMenu, and fired through AppKit's item dispatch. AppKit's classes
+# are loaded by the binary itself and it wants the main thread, so: no harness.
+[[test]]
+name = "row_menu_mac"
+path = "tests/row_menu_mac.rs"
+harness = false
+
 # NSPasteboard is AppKit's, and reading it wants the process's main thread.
 [[test]]
 name = "clipboard_mac"
