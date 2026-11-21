@@ -349,6 +349,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "scrolling to the end left the clip view at {end}pt instead of {last}pt"
     );
 
+    // Back to the top: the checks below render the list on its own and read
+    // the header band and the row under it, which only exist at the top of a
+    // 822pt canvas in a 630pt viewport.
+    scrolled.scroll_to(0.0, 0.0, 0.0, 0.0, doc_h, clip_h);
+    let top = send_rect(clip, "bounds").y;
+    println!("probe: scrolled back to the top at {top}pt");
+    assert!(
+        top.abs() < 0.5,
+        "scrolling back to the top left the clip view at {top}pt"
+    );
+
     // --- A dialog presents its buttons, and a click reaches Rust ---
     {
         let dlg = app.new_dialog()?;

@@ -74,6 +74,22 @@ fn new_canvas() -> Result<Canvas, Error> {
     })
 }
 
+/// The offset a backend applied by scrolling the canvas itself, if it does.
+///
+/// Only AppKit's `NSScrollView` moves the canvas under compat's feet; on every
+/// other backend the canvas is the viewport and the list scrolls itself.
+fn canvas_scroll_offset(canvas: &Canvas) -> Option<f64> {
+    #[cfg(all(feature = "macos", target_os = "macos", not(feature = "zork")))]
+    {
+        canvas.inner.scroll_offset()
+    }
+    #[cfg(not(all(feature = "macos", target_os = "macos", not(feature = "zork"))))]
+    {
+        let _ = canvas;
+        None
+    }
+}
+
 #[cfg(all(feature = "macos", target_os = "macos", not(feature = "zork")))]
 fn new_canvas() -> Result<Canvas, Error> {
     Ok(Canvas {
@@ -383,6 +399,7 @@ impl TreeView {
             let width = width.clone();
             let offset = offset.clone();
             let viewport = viewport.clone();
+            let canvas_for_offset = canvas.clone();
             canvas.set_draw_callback(Box::new(move |ctx, w, h| {
                 let w = if w > 0 { f64::from(w) } else { width.get() };
                 width.set(w);
@@ -393,7 +410,14 @@ impl TreeView {
                 }
                 let vp = viewport.get();
                 let content = content_height(rows.borrow().len());
-                let off = clamp_offset(offset.get(), content, vp);
+                // A backend whose scroll view scrolls the canvas itself (AppKit's
+                // clip view) holds the real offset; compat's own is what the
+                // list drags where it scrolls itself. Taking the backend's here
+                // keeps the painter, the hit test and the drawn scrollbar on the
+                // same number after a scroller drag.
+                let requested =
+                    canvas_scroll_offset(&canvas_for_offset).unwrap_or_else(|| offset.get());
+                let off = clamp_offset(requested, content, vp);
                 offset.set(off);
                 paint_list(
                     ctx,

@@ -1008,8 +1008,9 @@ mod macos_adapter {
             // A negative request means "unconstrained" on the GTK contract;
             // AppKit's frame takes floats, so pass them straight through rather
             // than clamping and silently showing a different size.
-            unsafe { msg2cv(self.0, "setFrameSize:", w as f64, h as f64) };
+            unsafe { msg2cv(self.0, "setFrameSize:", w as f64, h as f64) }
         }
+
     }
 
     // ------------------------------------------------------------------
@@ -1430,6 +1431,35 @@ mod macos_adapter {
     }
 
     impl Canvas {
+        /// How far the scroll view holding this canvas has scrolled it.
+        ///
+        /// A canvas that is an `NSScrollView`'s document view is scrolled by
+        /// its clip view behind compat's back: the clip's bounds origin is the
+        /// offset the painter must draw for, and hit-testing must add. `None`
+        /// when the canvas is not inside a scroll view.
+        pub fn scroll_offset(&self) -> Option<f64> {
+            if self.0.is_null() {
+                return None;
+            }
+            // SAFETY: live AppKit views; both sends are documented selectors.
+            unsafe {
+                let parent = msg0(self.0, "superview");
+                if parent.is_null()
+                    || core_apple::nsstring_to_rust(msg0(parent, "className")).as_deref()
+                        != Some("NSClipView")
+                {
+                    return None;
+                }
+                let clip: CGRect = raw_send!(
+                    parent,
+                    "bounds",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
+                    ()
+                );
+                Some(clip.y)
+            }
+        }
+
         /// Canvas id for this view (0 = unknown; registry lookups miss).
         ///
         /// `pub` because the shared GUI code publishes it to the platform
