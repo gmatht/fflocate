@@ -40,8 +40,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ff_gui::{
-    box_change_clears, containing_dir, context_menu_target, created_note, created_secs, drag_payload,
-    effective_query, encode_request, filter_by_created, parse_created_range, render_count,
+    apply_created_range, box_change_clears, containing_dir, context_menu_target, created_request_range,
+    created_ui, drag_payload, effective_query, encode_request, filter_partial_paths, render_count,
     rows_from_paths, scan_percent, search_label, searching_status_line, step_max_distance,
     streaming_status_line, CreatedRange, DaemonClient, GuiError, MenuAction, PendingRequest,
     Progress, RowAction, SearchGate, SearchOptions, SearchOutcome, StartupPoll, StartupProbe,
@@ -225,22 +225,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // answer this — the GUI filters the rows it gets (see
     // `ff_gui::filter_by_created`) and the status line says exactly what it
     // checked. A file whose filesystem reports no birth time never matches.
-    trace_step!("created from entry");
-    let created_from = app.create_entry()?;
-    created_from.set_text("");
-    created_from.set_placeholder_text("YYYY-MM-DD");
-    trace_step!("created to entry");
-    let created_to = app.create_entry()?;
-    created_to.set_text("");
-    created_to.set_placeholder_text("YYYY-MM-DD");
+    //
+    // The row is built by `ff_gui::created_ui` rather than here: `main.rs` is a
+    // binary, so the GTK regression test can only drive the same widgets if
+    // the construction lives in the library.
     trace_step!("created row");
-    let created_from_label = app.create_label("created from:")?;
-    let created_to_label = app.create_label("to:")?;
-    let created_row = app.create_box(Orientation::Horizontal, 2)?;
-    created_row.append(&created_from_label);
-    created_row.append(&created_from);
-    created_row.append(&created_to_label);
-    created_row.append(&created_to);
+    let created = created_ui::build(&app)?;
+    let created_from = created.from.clone();
+    let created_to = created.to.clone();
 
     trace_step!("case checkbutton");
     let opt_case = app.create_checkbutton("Case sensitive")?;
@@ -265,7 +257,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     trace_step!("advanced box");
     let advanced_box = app.create_box(Orientation::Vertical, 2)?;
     advanced_box.append(&advanced_query);
-    advanced_box.append(&created_row);
+    advanced_box.append(&created.row);
     advanced_box.append(&opt_case);
     advanced_box.append(&opt_fuzzy);
     advanced_box.append(&distance_row);
@@ -427,11 +419,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // A bad or inverted date refuses the search here, so the status
             // says which field is wrong instead of the list quietly ignoring
             // the range.
-            let created = parse_created_range(
+            let created = created_request_range(
                 &created_from.get_text().unwrap_or_default(),
                 &created_to.get_text().unwrap_or_default(),
-            )
-            .map_err(GuiError::Protocol)?;
+            )?;
             let req = DaemonClient::query_request(&q, FETCH_LIMIT, &opts);
             *created_range.borrow_mut() = created;
             // Remember exactly what was asked, so a whole-set load asks the
@@ -459,23 +450,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // suffix then states how much of that page it hid, so the
                 // filtered count never passes for the daemon's total.
                 let range = *created_range.borrow();
-                let stats = match (&range, count_only) {
-                    (Some(r), false) => {
-                        Some(filter_by_created(&mut outcome.paths, r, created_secs))
-                    }
-                    _ => None,
-                };
-                let fetched = outcome.paths.len();
-                let mut line = outcome.status_line_opts(fetched.min(MAX_ROWS), count_only);
-                if let Some(r) = range.as_ref() {
-                    line.push_str(&created_note(
-                        r,
-                        &stats.unwrap_or_default(),
-                        fetched,
-                        outcome.total,
-                        count_only,
-                    ));
-                }
+                let note = apply_created_range(&mut outcome, range, count_only);
+                let mut line =
+                    outcome.status_line_opts(outcome.paths.len().min(MAX_ROWS), count_only);
+                line.push_str(&note);
                 status.set_text(&line);
                 if count_only {
                     // No paths come back: show the number, not an empty list that
@@ -745,14 +723,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             // Filter the streaming rows by the same range the
                             // final render uses, so rows outside it never
                             // flash up and then vanish.
-                            let kept: Vec<String> = match created_range.borrow().as_ref() {
-                                Some(r) => hits
-                                    .iter()
-                                    .filter(|p| created_secs(p).map(|t| r.contains(t)).unwrap_or(false))
-                                    .cloned()
-                                    .collect(),
-                                None => hits.clone(),
-                            };
+                            let kept = filter_partial_paths(&hits, *created_range.borrow());
                             // Fold every Progress record into the watermark:
                             // monotone, never rewinds.
                             for r in p.records() {
@@ -1062,20 +1033,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // The date fields re-run the search once the pair parses (or both are
         // blank). A half-typed date is not an error yet: Search/Return reports
         // it, so typing `2026-0` does not flash an error on every keystroke.
-        for entry in [&created_from, &created_to] {
-            let arm = arm.clone();
-            let from_box = created_from.clone();
-            let to_box = created_to.clone();
-            entry
-                .connect_changed(move || {
-                    let from = from_box.get_text().unwrap_or_default();
-                    let to = to_box.get_text().unwrap_or_default();
-                    if parse_created_range(&from, &to).is_ok() {
-                        arm();
-                    }
-                })
-                .ok();
-        }
+        // The handler lives in `created_ui` so the GTK test exercises it too.
+        created_ui::wire(&created, arm.clone());
     }
 
     // Return in either query field runs the same search.

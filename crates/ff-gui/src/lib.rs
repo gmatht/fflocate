@@ -785,7 +785,7 @@ fn days_in_month(y: i64, m: i64) -> i64 {
 }
 
 /// `YYYY-MM-DD` for a unix timestamp, in UTC like the bounds themselves.
-fn format_day(secs: i64) -> String {
+pub fn format_day(secs: i64) -> String {
     let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
     format!("{y:04}-{m:02}-{d:02}")
 }
@@ -926,6 +926,179 @@ pub fn created_note(
     }
     s.push(']');
     s
+}
+
+/// The range a search should apply, or the status-line refusal that names the
+/// field which is wrong.
+///
+/// This is what `main.rs`'s request builder calls, and what
+/// `tests/created_range_gtk.rs` calls, so the refusal the user sees in the
+/// status line and the refusal the test reads are the same string.
+pub fn created_request_range(from: &str, to: &str) -> Result<Option<CreatedRange>, GuiError> {
+    parse_created_range(from, to).map_err(GuiError::Protocol)
+}
+
+/// Whether an edit to a created-date field should re-run the search.
+///
+/// True once the pair parses (or both fields are blank). A half-typed date
+/// does not search — `Search`/`Return` reports the error instead, so typing
+/// `2026-0` does not flash an error on every keystroke.
+pub fn created_edit_searches(from: &str, to: &str) -> bool {
+    parse_created_range(from, to).is_ok()
+}
+
+/// Apply `range` to a reply and return the status-line suffix that states what
+/// was checked (`""` when no range is active).
+///
+/// The daemon's total describes the *name* query, so the range can only be
+/// applied to the page that came back; [`created_note`] says so. A count-only
+/// reply carries no paths, so the note says the range was not applied rather
+/// than implying it was.
+pub fn apply_created_range(
+    outcome: &mut SearchOutcome,
+    range: Option<CreatedRange>,
+    count_only: bool,
+) -> String {
+    let Some(range) = range else {
+        return String::new();
+    };
+    if count_only {
+        return created_note(&range, &CreatedStats::default(), 0, outcome.total, true);
+    }
+    // `fetched` is the page the daemon sent, before the range removes rows from
+    // it: "more matches not checked" is about rows the reply never held, so it
+    // must not count the ones the range itself hid.
+    let fetched = outcome.paths.len();
+    let stats = filter_by_created(&mut outcome.paths, &range, created_secs);
+    created_note(&range, &stats, fetched, outcome.total, false)
+}
+
+/// The rows a streaming reply should paint under `range`.
+///
+/// Filtering the as-you-type paint with the same rule as the final render is
+/// what stops rows outside the range from flashing up and then vanishing.
+pub fn filter_partial_paths(hits: &[String], range: Option<CreatedRange>) -> Vec<String> {
+    match range {
+        Some(r) => hits
+            .iter()
+            .filter(|p| created_secs(p).map_or(false, |t| r.contains(t)))
+            .cloned()
+            .collect(),
+        None => hits.to_vec(),
+    }
+}
+
+/// The Advanced foldout's created-date controls, built by one function so the
+/// app and the GTK regression test create the very same widgets.
+///
+/// The row lives here rather than in `main.rs` because `main.rs` is a binary:
+/// nothing can link against it, so a test that builds its own look-alike row
+/// would prove nothing about the foldout the user actually opens.
+pub mod created_ui {
+    use rswidgets::prelude::App;
+
+    /// The foldout's concrete widget types on this backend.
+    ///
+    /// The portable prelude re-exports the `common` wrappers of these names,
+    /// but `App::create_entry`/`create_label`/`create_box` hand back the
+    /// adapter's own types — the ones `main.rs` names in its trait impls — so
+    /// the row must name those too. One arm per backend, mirroring
+    /// `main.rs`'s `widget_traits`.
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    mod widgets {
+        pub type Entry = rswidgets::backends_gtk_adapter::Entry;
+        pub type Label = rswidgets::backends_gtk_adapter::Label;
+        pub type Row = rswidgets::backends_gtk_adapter::BoxWidget;
+    }
+    #[cfg(feature = "zork")]
+    mod widgets {
+        pub type Entry = rswidgets::backends_zork_adapter::Entry;
+        pub type Label = rswidgets::backends_zork_adapter::Label;
+        pub type Row = rswidgets::backends_zork_adapter::BoxWidget;
+    }
+    #[cfg(all(windows, not(feature = "zork")))]
+    mod widgets {
+        pub type Entry = rswidgets::backends_nwg_adapter::Entry;
+        pub type Label = rswidgets::backends_nwg_adapter::Label;
+        pub type Row = rswidgets::backends_nwg_adapter::BoxWidget;
+    }
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
+    mod widgets {
+        pub type Entry = rswidgets::backends_wasm_adapter::Entry;
+        pub type Label = rswidgets::backends_wasm_adapter::Label;
+        pub type Row = rswidgets::backends_wasm_adapter::BoxWidget;
+    }
+    #[cfg(all(target_os = "macos", not(feature = "zork")))]
+    mod widgets {
+        pub type Entry = rswidgets::backends_macos_adapter::Entry;
+        pub type Label = rswidgets::backends_macos_adapter::Label;
+        pub type Row = rswidgets::backends_macos_adapter::BoxWidget;
+    }
+
+    use widgets::{Entry, Label, Row};
+
+    /// The `created from: [date] to: [date]` row of the foldout.
+    pub struct CreatedRow {
+        pub from: Entry,
+        pub to: Entry,
+        pub from_label: Label,
+        pub to_label: Label,
+        /// The horizontal box holding the two labels and both fields.
+        pub row: Row,
+    }
+
+    /// The labels the row shows. Named so the GTK test can assert that the
+    /// text on screen is the text it is looking for.
+    pub const FROM_LABEL: &str = "created from:";
+    pub const TO_LABEL: &str = "to:";
+    /// The grey hint shown inside either field while it is empty.
+    pub const PLACEHOLDER: &str = "YYYY-MM-DD";
+
+    /// Build the row, ready to append to the foldout's vertical box.
+    pub fn build(app: &App) -> Result<CreatedRow, rswidgets::Error> {
+        let from_label = app.create_label(FROM_LABEL)?;
+        let to_label = app.create_label(TO_LABEL)?;
+        let from = app.create_entry()?;
+        from.set_text("");
+        from.set_placeholder_text(PLACEHOLDER);
+        let to = app.create_entry()?;
+        to.set_text("");
+        to.set_placeholder_text(PLACEHOLDER);
+        let row = app.create_box(rswidgets::prelude::Orientation::Horizontal, 2)?;
+        row.append(&from_label);
+        row.append(&from);
+        row.append(&to_label);
+        row.append(&to);
+        Ok(CreatedRow {
+            from,
+            to,
+            from_label,
+            to_label,
+            row,
+        })
+    }
+
+    /// Re-run the search when a date edit leaves a readable range (or both
+    /// fields blank). The decision is [`super::created_edit_searches`], the
+    /// function `main.rs` uses, so a half-typed date cannot silently search.
+    pub fn wire(row: &CreatedRow, arm: impl Fn() + Clone + 'static) {
+        let from = row.from.clone();
+        let to = row.to.clone();
+        for entry in [row.from.clone(), row.to.clone()] {
+            let arm = arm.clone();
+            let from = from.clone();
+            let to = to.clone();
+            entry
+                .connect_changed(move || {
+                    let f = from.get_text().unwrap_or_default();
+                    let t = to.get_text().unwrap_or_default();
+                    if super::created_edit_searches(&f, &t) {
+                        arm();
+                    }
+                })
+                .ok();
+        }
+    }
 }
 
 /// What a search returned, including the consistency metadata (§11).
