@@ -49,7 +49,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rswidgets::backends::apple::nsstring_to_rust(value)
     }
 
-    // AppKit has to be initialised before the pasteboard can be reached.
+    // AppKit has to be up before `NSPasteboard` can be looked up: `App::init`
+    // alone does not load the framework, and a canvas/window would. The
+    // adapter's own runtime-class setup is the documented entry point.
+    rswidgets::backends_macos_adapter::ensure_runtime_classes();
     let _app = App::init()?;
 
     // A real file on disk, so what travels is a path another application could
