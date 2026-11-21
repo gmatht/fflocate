@@ -21,8 +21,8 @@
 use std::cell::RefCell;
 
 use ff_gui::{
-    containing_dir, context_menu_target, row_menu_model, run_row_action_with, streaming_rows,
-    RowAction,
+    containing_dir, context_menu_target, row_menu_model, row_menu_plan, run_row_action_with,
+    streaming_rows, RowAction,
 };
 
 const PATH: &str = "/tmp/ff-gui-cm/typing-alpha.txt";
@@ -154,6 +154,70 @@ fn menu_without_a_row_disables_every_item() {
         items.iter().all(|i| !i.enabled),
         "an item is enabled although no row is under the pointer: {items:?}"
     );
+}
+
+/// The app's right-click path is one call: hit test → plan → the model the
+/// native menu is built from. A press with no row under it produces no plan at
+/// all, so nothing can be acted on from a stale selection.
+#[test]
+fn the_apps_menu_plan_is_the_shared_model() {
+    let rows = rows();
+    let (path, items) = row_menu_plan(3, Some(1), &rows, |_| true).expect("row 1 had no plan");
+    assert_eq!(path, rows[1], "the plan resolved the wrong row");
+    assert_eq!(
+        items,
+        row_menu_model(Some(&path)),
+        "the plan's items are not the shared model's"
+    );
+    assert!(
+        items.iter().all(|i| i.enabled),
+        "an item is disabled over a row: {items:?}"
+    );
+
+    for (button, row, why) in [
+        (3, None, "a right-click with no row under it"),
+        (1, Some(0), "a left click"),
+        (2, Some(0), "a middle click"),
+        (3, Some(2), "a row index past the rows"),
+        (3, Some(-1), "a negative row"),
+    ] {
+        assert!(
+            row_menu_plan(button, row, &rows, |_| true).is_none(),
+            "{why} produced a menu plan, so a stale selection could be acted on"
+        );
+    }
+}
+
+/// Every action states its own precondition: with the file gone but its
+/// directory present, only the file actions are disabled.
+#[test]
+fn an_action_that_cannot_run_is_disabled_and_the_rest_are_not() {
+    let rows = rows();
+    let probe = |path: &str| path == DIR;
+    let (path, items) = row_menu_plan(3, Some(1), &rows, probe).expect("row 1 had no plan");
+    assert_eq!(path, rows[1]);
+    for action in RowAction::all() {
+        let item = items
+            .iter()
+            .find(|i| i.action == action)
+            .unwrap_or_else(|| panic!("the plan lacks {:?}", action.label()));
+        let needs_the_file = matches!(action, RowAction::Open | RowAction::OpenWith);
+        assert_eq!(
+            item.enabled,
+            !needs_the_file,
+            "{:?} is enabled={} although the file is gone and only its directory remains",
+            item.label,
+            item.enabled
+        );
+    }
+    // With the directory gone too, the directory actions go with it; the
+    // clipboard actions still only need a path.
+    let (_, items) = row_menu_plan(3, Some(1), &rows, |_| false).expect("row 1 had no plan");
+    for action in RowAction::all() {
+        let item = items.iter().find(|i| i.action == action).expect("item");
+        let path_only = matches!(action, RowAction::CopyPath | RowAction::CopyFolderPath);
+        assert_eq!(item.enabled, path_only, "{:?} with nothing on disk", item.label);
+    }
 }
 
 /// The as-you-type (streaming) list feeds the same row menu as the settled one:

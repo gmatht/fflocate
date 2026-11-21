@@ -2425,15 +2425,62 @@ pub struct RowMenuItem {
 /// function from the same painted rows: `main.rs` paints both into one
 /// `TreeView`, so there is no second row list whose indices could drift.
 pub fn row_menu_model(target: Option<&str>) -> Vec<RowMenuItem> {
-    let enabled = target.is_some();
+    row_menu_model_with(target, |_| true)
+}
+
+/// [`row_menu_model`] with the filesystem consulted per item.
+///
+/// Every action needs its own precondition. The clipboard actions only need a
+/// path, so they stay available while the row's path is known. `Open` and
+/// `Open with…` need the file itself: a hit whose file has been deleted since
+/// the index was built cannot be opened. The two directory actions need only
+/// the containing directory, so they survive a deleted file. `exists` is how
+/// that is decided — the app passes a real `Path::exists`, tests pass a probe
+/// — which keeps the rule testable without a display and without touching the
+/// filesystem.
+pub fn row_menu_model_with(
+    target: Option<&str>,
+    exists: impl Fn(&str) -> bool,
+) -> Vec<RowMenuItem> {
+    let path = target.unwrap_or_default();
+    let dir = containing_dir(path);
+    let has_target = target.is_some();
     RowAction::all()
         .iter()
-        .map(|&action| RowMenuItem {
-            action,
-            label: action.label(),
-            enabled,
+        .map(|&action| {
+            let enabled = has_target
+                && match action {
+                    RowAction::CopyPath | RowAction::CopyFolderPath => true,
+                    RowAction::Open | RowAction::OpenWith => exists(path),
+                    RowAction::OpenContainingFolder | RowAction::OpenInTerminal => exists(&dir),
+                };
+            RowMenuItem {
+                action,
+                label: action.label(),
+                enabled,
+            }
         })
         .collect()
+}
+
+/// One right-click, resolved end to end: the path the menu acts on and the
+/// items — with their sensitivity — the native menu must show.
+///
+/// This is the single rule the app's right-click path follows: hit test → this
+/// plan → native menu. `None` means no menu at all (the press was not a
+/// secondary click, the pointer was not over a row, or the row is gone), so no
+/// item can dispatch against a stale selection. `exists` decides the
+/// per-action enablement (see [`row_menu_model_with`]); a call site that wants
+/// every action offered passes `|_| true`.
+pub fn row_menu_plan(
+    button: u32,
+    row: Option<i32>,
+    rows: &[String],
+    exists: impl Fn(&str) -> bool,
+) -> Option<(String, Vec<RowMenuItem>)> {
+    let target = context_menu_target(button, row, rows)?;
+    let items = row_menu_model_with(Some(&target), exists);
+    Some((target, items))
 }
 
 /// The last component of `path`, for a status line.

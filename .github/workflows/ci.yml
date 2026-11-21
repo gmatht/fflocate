@@ -115,6 +115,12 @@ jobs:
             echo "::error title=row menu on a row (macOS)::the streaming-row walk did not run: $(grep -E '^row menu on' row-menu-row.log | tr '\n' '|' | cut -c1-1200)"
             exit 1
           fi
+          # An action the row cannot support must be disabled in the NSMenu and
+          # refuse a choice; the line is printed after both were asserted.
+          if ! grep -q '^row menu on a row: missing file' row-menu-row.log; then
+            echo "::error title=row menu on a row (macOS)::the disabled-item walk did not run: $(grep -E '^row menu on' row-menu-row.log | tr '\n' '|' | cut -c1-1200)"
+            exit 1
+          fi
           echo "::notice title=row menu on a row (macOS)::$(grep -E '^(row menu on a row|row menu on a streaming row|clipboard):' row-menu-row.log | tr '\n' '|' | cut -c1-3900)"
 
       # The pasteboard on its own, so a read that echoed a write cannot hide
@@ -336,6 +342,12 @@ jobs:
           # fails here instead of passing quietly.
           if ! grep -q '^row menu on a streaming row:' row-menu-row.log; then
             echo "::error title=row menu on a row (Linux)::the streaming-row walk did not run: $(grep -E '^row menu on' row-menu-row.log | tr '\n' '|' | cut -c1-1200)"
+            exit 1
+          fi
+          # An action the row cannot support must be insensitive in the GtkMenu
+          # and refuse a choice; the line is printed after both were asserted.
+          if ! grep -q '^row menu on a row: missing file' row-menu-row.log; then
+            echo "::error title=row menu on a row (Linux)::the insensitive-item walk did not run: $(grep -E '^row menu on' row-menu-row.log | tr '\n' '|' | cut -c1-1200)"
             exit 1
           fi
           echo "::notice title=row menu on a row (Linux)::$(grep -E '^(row menu on a row|row menu on a streaming row|clipboard):' row-menu-row.log | tr '\n' '|' | cut -c1-3900)"

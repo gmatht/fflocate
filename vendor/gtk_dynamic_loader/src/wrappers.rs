@@ -2662,15 +2662,24 @@ extern "C" fn context_item_activated(item: *mut c_void, data: *mut c_void) {
 pub fn build_context_menu(
     loader: &Arc<Loader>,
     labels: &[&str],
+    enabled: &[bool],
     on_choose: Box<dyn FnMut(usize)>,
 ) -> Result<u64, Error> {
     let syms = &loader.symbols;
-    let (Some(new_menu), Some(new_item), Some(append), Some(show_all), Some(connect)) = (
+    let (
+        Some(new_menu),
+        Some(new_item),
+        Some(append),
+        Some(show_all),
+        Some(connect),
+        Some(set_sensitive),
+    ) = (
         syms.gtk_menu_new,
         syms.gtk_menu_item_new_with_label,
         syms.gtk_menu_shell_append,
         syms.gtk_widget_show_all,
         syms.g_signal_connect_data,
+        syms.gtk_widget_set_sensitive,
     ) else {
         return Err(Error::MissingSymbol("gtk context menu".into()));
     };
@@ -2681,12 +2690,17 @@ pub fn build_context_menu(
         return Err(Error::Other("gtk_menu_new returned null".into()));
     }
     let mut items = Vec::new();
-    for label in labels {
+    for (index, label) in labels.iter().enumerate() {
         let c = CString::new(*label).map_err(|_| Error::Other("label holds a NUL".into()))?;
         let item = unsafe { new_item(c.as_ptr() as *const u8) };
         if item.is_null() {
             continue;
         }
+        // An item whose action cannot run for the row is insensitive: GTK then
+        // greys it out and does not deliver a click's "activate", so it cannot
+        // dispatch. `enabled` is indexed like `labels`.
+        let sensitive = enabled.get(index).copied().unwrap_or(true);
+        unsafe { set_sensitive(item, sensitive as i32) };
         unsafe { append(menu, item) };
         items.push(item);
     }
@@ -2777,6 +2791,15 @@ pub fn fire_context_menu(loader: &Arc<Loader>, id: u64, index: usize) -> bool {
     let Some(activate) = loader.symbols.gtk_menu_item_activate else {
         return false;
     };
+    // An insensitive item is not choosable. A real click never reaches it, but
+    // `gtk_menu_item_activate` would run its handler anyway, so the check is
+    // here as well as in the toolkit: an insensitive item dispatches nothing.
+    if let Some(get) = loader.symbols.gtk_widget_get_sensitive {
+        // SAFETY: the item belongs to a menu we built and is still alive.
+        if unsafe { get(item) } == 0 {
+            return false;
+        }
+    }
     // SAFETY: the item belongs to a menu we built and is still alive.
     unsafe { activate(item) };
     true

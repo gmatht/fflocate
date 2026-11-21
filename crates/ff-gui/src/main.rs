@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ff_gui::{
-    apply_created_range, box_change_clears, containing_dir, context_menu_target, created_request_range,
+    apply_created_range, box_change_clears, containing_dir, created_request_range, row_menu_plan,
     created_ui, drag_payload, effective_query, encode_request, render_count, streaming_rows,
     rows_from_paths, scan_percent, search_label, searching_status_line, step_max_distance,
     streaming_status_line, CreatedRange, DaemonClient, GuiError, MenuAction, PendingRequest,
@@ -1090,16 +1090,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if button != 3 {
                 return;
             }
-            // Right-click acts on the row under the pointer; a click on blank
-            // space below the rows does nothing rather than acting on a
-            // neighbour (see `ff_gui::context_menu_target`).
+            // Right-click acts on the row under the pointer, and the menu is
+            // the shared model's output rather than a second list that has to
+            // agree with it: hit test → `row_menu_plan` → native items. A press
+            // with no row under it opens nothing, and an action the resolved row
+            // cannot support (its file is gone since the index dated it) comes
+            // out insensitive and dispatches nothing.
             let row = cb_results.row_at(x, y);
-            let path = match context_menu_target(button, row.map(|r| r as i32), &current.borrow()) {
-                Some(p) => p,
+            let (path, items) = match row_menu_plan(
+                button,
+                row.map(|r| r as i32),
+                &current.borrow(),
+                |p| std::path::Path::new(p).exists(),
+            ) {
+                Some(plan) => plan,
                 None => return,
             };
             // Show the selection too, so it is obvious which row the menu is for.
-            // `path` is `Some`, so `row` held a valid in-bounds row.
+            // A plan exists, so `row` held a valid in-bounds row.
             cb_results.select_row(row.unwrap_or(0));
             let mut menu = match app_handle.new_context_menu() {
                 Ok(m) => m,
@@ -1114,15 +1122,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             // per menu. Per-menu (not global): every new right-click arms a
             // fresh menu whose items must all fire once.
             let menu_fired: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
-            for action in RowAction::all() {
+            for item in items {
+                let action = item.action;
+                let enabled = item.enabled;
                 let path = path.clone();
                 let status = status.clone();
                 let results = cb_results.clone();
                 let menu_fired = menu_fired.clone();
-                menu.append_item(
-                    action.label(),
+                // The item keeps the model's sensitivity: a greyed-out item is
+                // not a silent item, and the guard below means a host that
+                // delivered the choice anyway would still not act on it.
+                menu.append_item_enabled(
+                    item.label,
+                    enabled,
                     Box::new(move || {
-                        if *menu_fired.borrow() {
+                        if !enabled || *menu_fired.borrow() {
                             return;
                         }
                         *menu_fired.borrow_mut() = true;

@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     use std::rc::Rc;
     use std::time::{Duration, Instant};
 
-    use ff_gui::{context_menu_target, run_row_action, streaming_rows, RowAction};
+    use ff_gui::{row_menu_plan, run_row_action, streaming_rows, RowAction};
     use rswidgets::compat::{CellValue, ContextMenu};
     use rswidgets::prelude::*;
 
@@ -267,9 +267,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if button != 3 {
                 return;
             }
+            // The app's own construction path: hit test → `row_menu_plan` →
+            // native items, sensitivity included.
             let row = press_list.row_at(x, y);
-            let path = match context_menu_target(button, row.map(|r| r as i32), &current.borrow()) {
-                Some(p) => p,
+            let (path, items) = match row_menu_plan(
+                button,
+                row.map(|r| r as i32),
+                &current.borrow(),
+                |p| std::path::Path::new(p).exists(),
+            ) {
+                Some(plan) => plan,
                 None => return,
             };
             // Show the selection too, so it is obvious which row the menu is for.
@@ -283,15 +290,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             // One-shot guard per menu, exactly as the app arms it.
             let menu_fired: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
-            for action in RowAction::all() {
+            for item in items {
+                let action = item.action;
+                let enabled = item.enabled;
                 let path = path.clone();
                 let status = status.clone();
                 let menu_fired = menu_fired.clone();
                 let dispatched = dispatched.clone();
-                menu.append_item(
-                    action.label(),
+                menu.append_item_enabled(
+                    item.label,
+                    enabled,
                     Box::new(move || {
-                        if *menu_fired.borrow() {
+                        if !enabled || *menu_fired.borrow() {
                             return;
                         }
                         *menu_fired.borrow_mut() = true;
@@ -633,6 +643,101 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pasteboard_text().as_deref(),
         Some(paths[0].as_str()),
         "after the streaming paint was replaced, the press still copied the old tick's row"
+    );
+
+    // --- An action the row cannot support: disabled, and not choosable ---
+    //
+    // A hit can outlive the file it names (the index was built earlier, the file
+    // was deleted since). `Open` and `Open with…` need the file itself, so they
+    // must be greyed out and inert; `Copy full path`, `Copy folder path`, the
+    // containing folder and the terminal only need the path or its directory, so
+    // they stay available.
+    let missing = 2usize;
+    std::fs::remove_file(&paths[missing]).expect("could not delete the row's file");
+    let handle = right_click(missing);
+    let items = ContextMenu::items_of(handle);
+    println!("row menu on a row: a missing file shows {items:?}");
+    let sensitivity = |label: &str| {
+        items
+            .iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, enabled)| *enabled)
+            .unwrap_or_else(|| panic!("the NSMenu has no {label:?} item"))
+    };
+    for label in [RowAction::Open.label(), RowAction::OpenWith.label()] {
+        assert!(
+            !sensitivity(label),
+            "{label:?} is still enabled although the row's file is gone"
+        );
+    }
+    for label in [
+        RowAction::CopyPath.label(),
+        RowAction::CopyFolderPath.label(),
+        RowAction::OpenContainingFolder.label(),
+        RowAction::OpenInTerminal.label(),
+    ] {
+        assert!(
+            sensitivity(label),
+            "{label:?} is disabled although the row's path (or its directory) still exists"
+        );
+    }
+    // A disabled item cannot be chosen: AppKit refuses it, so nothing
+    // dispatches and no launcher runs.
+    let launches_before = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    let dispatches_before = dispatched.borrow().len();
+    let open_index = items
+        .iter()
+        .position(|(l, _)| l == RowAction::Open.label())
+        .expect("the NSMenu has no Open item");
+    assert!(
+        !ContextMenu::fire(handle, open_index),
+        "a disabled item could be chosen"
+    );
+    assert_eq!(
+        dispatched.borrow().len(),
+        dispatches_before,
+        "choosing a disabled item dispatched the action"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count(),
+        launches_before,
+        "choosing a disabled item launched a helper"
+    );
+    // Its enabled neighbour still works, and copies the row's own path.
+    let copy_index = items
+        .iter()
+        .position(|(l, _)| l == RowAction::CopyPath.label())
+        .expect("the NSMenu has no Copy full path item");
+    assert!(
+        ContextMenu::fire(handle, copy_index),
+        "the enabled Copy path could not be chosen"
+    );
+    assert_eq!(
+        dispatched.borrow().last().expect("a dispatch").1,
+        paths[missing],
+        "Copy path on the row with a missing file dispatched for another row"
+    );
+    let through_app = rswidgets::compat::clipboard_get_text()
+        .expect("the app's clipboard read failed after copying the row's path");
+    assert_eq!(
+        through_app,
+        paths[missing].as_str(),
+        "the pasteboard does not hold the row's path"
+    );
+    assert_eq!(
+        pasteboard_text().as_deref(),
+        Some(paths[missing].as_str()),
+        "NSPasteboard's own read does not hold the row's path"
+    );
+    println!(
+        "row menu on a row: missing file → {items:?}; Open refused, Copy path put {} on the pasteboard",
+        paths[missing]
     );
 
     // A right-click on blank space below the rows offers nothing: the menu is

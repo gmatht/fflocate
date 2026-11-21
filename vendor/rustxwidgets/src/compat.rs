@@ -1754,18 +1754,22 @@ impl AsRef<*mut c_void> for Expander {
     }
 }
 
-/// A menu built from labelled closures.
-///
-/// Collecting items works everywhere; showing one requires a native popup
-/// (`gtk_menu_popup_at_pointer` / `NSMenu popUpMenu:atLocation:inView:`), which
-/// this build does not provide.
 /// A menu of labelled actions for a right-click.
+///
+/// Showing one uses the native popup (`gtk_menu_popup_at_pointer` / NSMenu's
+/// `popUpMenu:`); each item can carry its own sensitivity, so an action that
+/// cannot run for the clicked row is greyed out and cannot be chosen.
 ///
 /// The actions live behind a shared cell because a shown menu runs them later:
 /// GTK delivers the choice through a signal on the main loop, so the popup
 /// returns before the action runs.
 pub struct ContextMenu {
     labels: Vec<String>,
+    /// One entry per label: whether the native item is sensitive. `false`
+    /// items are greyed out by the toolkit, refuse a real click, and are
+    /// refused by [`ContextMenu::fire`] and the dispatcher, so an impossible
+    /// action cannot dispatch.
+    enabled: Vec<bool>,
     actions: Rc<RefCell<Vec<Box<dyn FnMut()>>>>,
     /// The native menu the last [`ContextMenu::build`] made (0 before that, or
     /// where the backend cannot build one). Kept so a caller — the tests — can
@@ -1778,13 +1782,27 @@ impl ContextMenu {
     pub fn new() -> ContextMenu {
         ContextMenu {
             labels: Vec::new(),
+            enabled: Vec::new(),
             actions: Rc::new(RefCell::new(Vec::new())),
             handle: 0,
         }
     }
 
+    /// Append a sensitive item.
     pub fn append_item(&mut self, label: &str, action: Box<dyn FnMut()>) {
+        self.append_item_enabled(label, true, action);
+    }
+
+    /// Append an item with its own sensitivity.
+    ///
+    /// `enabled == false` makes the native item insensitive (GTK's
+    /// `gtk_widget_set_sensitive` / AppKit's `setEnabled:`), and choosing it
+    /// does nothing: the backend refuses to fire it and the dispatcher checks
+    /// the flag again. This is how the row menu says "this action cannot run
+    /// for the row under the pointer" without pretending it is available.
+    pub fn append_item_enabled(&mut self, label: &str, enabled: bool, action: Box<dyn FnMut()>) {
         self.labels.push(label.to_string());
+        self.enabled.push(enabled);
         self.actions.borrow_mut().push(action);
     }
 
@@ -1803,7 +1821,13 @@ impl ContextMenu {
 
     fn dispatcher(&self) -> Box<dyn FnMut(usize)> {
         let actions = self.actions.clone();
+        let enabled = self.enabled.clone();
         Box::new(move |index: usize| {
+            // A second gate behind the toolkit's own: a host that delivers the
+            // choice anyway must not run an action the item said cannot run.
+            if !enabled.get(index).copied().unwrap_or(false) {
+                return;
+            }
             if let Some(action) = actions.borrow_mut().get_mut(index) {
                 action();
             }
@@ -1817,7 +1841,7 @@ impl ContextMenu {
     /// same plumbing a click uses. A handle of `0` means the backend cannot
     /// build one.
     pub fn build(&mut self) -> Result<usize, Error> {
-        let handle = context_menu_build(&self.labels, self.dispatcher())?;
+        let handle = context_menu_build(&self.labels, &self.enabled, self.dispatcher())?;
         self.handle = handle;
         Ok(handle)
     }
@@ -1860,6 +1884,9 @@ impl ContextMenu {
     pub fn activate(&mut self, label: &str) -> bool {
         match self.labels.iter().position(|l| l == label) {
             Some(index) => {
+                if !self.enabled.get(index).copied().unwrap_or(false) {
+                    return false;
+                }
                 if let Some(action) = self.actions.borrow_mut().get_mut(index) {
                     action();
                 }
@@ -1874,17 +1901,19 @@ impl ContextMenu {
 #[cfg(all(feature = "macos", target_os = "macos", not(feature = "zork")))]
 fn context_menu_build(
     labels: &[String],
+    enabled: &[bool],
     on_choose: Box<dyn FnMut(usize)>,
 ) -> Result<usize, Error> {
-    crate::backends_macos_adapter::context_menu_build(labels, on_choose)
+    crate::backends_macos_adapter::context_menu_build(labels, enabled, on_choose)
 }
 
 #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
 fn context_menu_build(
     labels: &[String],
+    enabled: &[bool],
     on_choose: Box<dyn FnMut(usize)>,
 ) -> Result<usize, Error> {
-    crate::backends_gtk_adapter::context_menu_build(labels, on_choose)
+    crate::backends_gtk_adapter::context_menu_build(labels, enabled, on_choose)
 }
 
 #[cfg(not(any(
@@ -1893,6 +1922,7 @@ fn context_menu_build(
 )))]
 fn context_menu_build(
     _labels: &[String],
+    _enabled: &[bool],
     _on_choose: Box<dyn FnMut(usize)>,
 ) -> Result<usize, Error> {
     // As with the clipboard: only a build with neither GTK nor AppKit gets

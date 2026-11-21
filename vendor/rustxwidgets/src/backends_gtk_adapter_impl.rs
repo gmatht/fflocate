@@ -716,12 +716,13 @@ mod gtk_adapter {
     /// `activate` signal a click emits.
     pub fn context_menu_build(
         labels: &[String],
+        enabled: &[bool],
         on_choose: Box<dyn FnMut(usize)>,
     ) -> Result<usize, Error> {
         let loader = crate::backends::gtk::loader()
             .ok_or_else(|| Error::Backend("GTK is not initialised".to_string()))?;
         let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
-        let id = gtk_dynamic_loader::build_context_menu(&loader, &refs, on_choose)
+        let id = gtk_dynamic_loader::build_context_menu(&loader, &refs, enabled, on_choose)
             .map_err(|e| Error::Backend(format!("{e}")))?;
         Ok(id as usize)
     }

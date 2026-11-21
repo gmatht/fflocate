@@ -5673,7 +5673,10 @@ mod macos_adapter {
                 msg1bv(sub, "setAutoenablesItems:", false);
                 for it in items {
                     if let MenuItem::Item { label, action } = it {
-                        append_menu_item(sub, item_cls, target_cls, label, action);
+                        // The window menu bar has no per-item enablement: its
+                        // items are enabled unless the app disables the widget
+                        // they drive.
+                        append_menu_item(sub, item_cls, target_cls, label, action, true);
                     }
                 }
                 let holder = new_menu_item(item_cls, label, std::ptr::null_mut());
@@ -5726,6 +5729,7 @@ mod macos_adapter {
         target_cls: *mut c_void,
         label: &str,
         action: &str,
+        enabled: bool,
     ) {
         let name = action.strip_prefix("app.").unwrap_or(action);
         let name_obj = nsstring(name);
@@ -5745,6 +5749,9 @@ mod macos_adapter {
             }
             own(target);
             msg1v(item, "setTarget:", target);
+            // The menu has `setAutoenablesItems:` off, so this flag is the only
+            // thing that decides whether the item is greyed out.
+            msg1bv(item, "setEnabled:", enabled);
             msg1v(menu, "addItem:", item);
         }
     }
@@ -5803,6 +5810,7 @@ mod macos_adapter {
     /// `corroFired:` -> `invoke_action`, the same path a menu-bar item uses.
     pub fn context_menu_build(
         labels: &[String],
+        enabled: &[bool],
         on_choose: Box<dyn FnMut(usize)>,
     ) -> Result<usize, Error> {
         let menu_cls = cls("NSMenu");
@@ -5835,7 +5843,10 @@ mod macos_adapter {
                         }
                     }),
                 );
-                append_menu_item(menu, item_cls, target_cls, label, &name);
+                // An item whose action cannot run for the row is disabled:
+                // AppKit greys it out and a click does not fire it.
+                let item_enabled = enabled.get(index).copied().unwrap_or(true);
+                append_menu_item(menu, item_cls, target_cls, label, &name, item_enabled);
             }
             Ok(menu as usize)
         }
@@ -5893,6 +5904,28 @@ mod macos_adapter {
         }
         // SAFETY: NSMenu's own dispatch for a selection.
         unsafe {
+            // A disabled item is not choosable: AppKit's tracking loop skips
+            // it, but `performActionForItemAtIndex:` would run the action
+            // anyway, so refuse it here too — a disabled item dispatches
+            // nothing.
+            let item = raw_send!(
+                menu,
+                "itemAtIndex:",
+                unsafe extern "C" fn(*mut c_void, *mut c_void, isize) -> *mut c_void,
+                (index as isize)
+            );
+            if item.is_null() {
+                return false;
+            }
+            let enabled: i8 = raw_send!(
+                item,
+                "isEnabled",
+                unsafe extern "C" fn(*mut c_void, *mut c_void) -> i8,
+                ()
+            );
+            if enabled == 0 {
+                return false;
+            }
             raw_send!(
                 menu,
                 "performActionForItemAtIndex:",
