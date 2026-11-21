@@ -76,6 +76,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rswidgets::backends::apple::nsstring_to_rust(send0(item, "title")).unwrap_or_default()
     }
 
+    // AppKit's own classes before any of them is touched (`App::init` alone does
+    // not load the framework; `new_menubar` would, but the window comes first).
+    rswidgets::backends_macos_adapter::ensure_runtime_classes();
     let app = App::init()?;
     let win = app.create_window()?;
     win.set_title("ff-gui menubar test");
@@ -171,9 +174,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 send_bool(item, "isEnabled"),
                 "{menu_label}/{label} is disabled, so a user could not choose it"
             );
+            // The item must be wired to the adapter's target and action, not
+            // merely enabled: an item with a nil target, a target of the wrong
+            // class, or a different action would look live and do nothing.
+            let target = send0(item, "target");
             assert!(
-                !send0(item, "target").is_null(),
+                !target.is_null(),
                 "{menu_label}/{label} has no target, so its action would go nowhere"
+            );
+            let target_class = rswidgets::backends::apple::nsstring_to_rust(send0(
+                target,
+                "className",
+            ))
+            .unwrap_or_default();
+            assert_eq!(
+                target_class, "CorroMacMenuTarget",
+                "{menu_label}/{label} targets {target_class:?}, not the adapter's menu target, \
+                 so the click would not reach Rust"
+            );
+            assert_eq!(
+                send0(item, "action"),
+                rswidgets::backends::apple::selector("corroFired:"),
+                "{menu_label}/{label} sends a different action than -corroFired:, so its \
+                 registered closure would never run"
             );
             titles.push(title);
         }
@@ -191,16 +214,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let view = submenu_named("View");
         assert!(!advanced.is_expanded(), "the foldout started expanded");
+        // The query is what the *other* chosen item changes, so leaving it
+        // alone is how a dispatch that runs the wrong command is caught.
+        entry.set_text("stale query");
         choose(view, 0);
         let opened = advanced.is_expanded();
+        let query_after_view = entry.get_text().unwrap_or_default();
         println!(
-            "menubar: chose View → {:?} -> foldout expanded {opened}, actions ran {:?}",
+            "menubar: chose View → {:?} -> foldout expanded {opened}, entry {query_after_view:?}, actions ran {:?}",
             title_of(item_at(view, 0)),
             ran.borrow()
         );
         assert!(
             opened,
             "choosing View → Advanced Search did not expand the foldout"
+        );
+        assert_eq!(
+            query_after_view, "stale query",
+            "choosing View → Advanced Search also changed the query, so the wrong action ran"
         );
         choose(view, 0);
         assert!(
@@ -216,16 +247,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|(_, items)| items.iter().position(|(l, _)| *l == "Clear Query"))
             .expect("Search has no Clear Query item");
         entry.set_text("stale query");
+        // ... and Clear Query must not touch the foldout it does not own.
+        advanced.set_expanded(true);
         choose(search, clear_index);
         let text = entry.get_text().unwrap_or_default();
+        let foldout_after = advanced.is_expanded();
         println!(
-            "menubar: chose Search → {:?} -> entry text {text:?}, actions ran {:?}",
+            "menubar: chose Search → {:?} -> entry text {text:?}, foldout still {foldout_after}, actions ran {:?}",
             title_of(item_at(search, clear_index)),
             ran.borrow()
         );
         assert!(
             text.is_empty(),
             "choosing Search → Clear Query left the entry holding {text:?}"
+        );
+        assert!(
+            foldout_after,
+            "choosing Search → Clear Query also collapsed the foldout, so the wrong action ran"
         );
     }
     assert_eq!(

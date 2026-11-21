@@ -194,6 +194,26 @@ jobs:
             exit 1
           fi
 
+      # The menu bar, read back out of AppKit and chosen through its target:
+      # its own step so its result is reported alone, with the binary's ok line
+      # required (a run that skipped for want of AppKit would still exit 0).
+      - name: Menu bar (macOS)
+        if: ${{ runner.os == 'macOS' && !cancelled() }}
+        shell: bash
+        run: |
+          ulimit -c 0 || true
+          status=0
+          cargo test -p ff-gui --test menubar_mac > menubar.log 2>&1 || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=menu bar (macOS)::exit ${status}: $(tail -c 1800 menubar.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            exit 1
+          fi
+          if ! grep -q '^menubar: ok' menubar.log; then
+            echo "::error title=menu bar (macOS)::the menu bar walk did not run: $(grep -E '^menubar:' menubar.log | tr '\n' '|' | cut -c1-1200)"
+            exit 1
+          fi
+          echo "::notice title=menu bar (macOS)::$(grep '^menubar:' menubar.log | tr '\n' '|' | cut -c1-3900)"
+
       # The build step's own annotations can be dropped when it fails, so a
       # failed build is also reported from its log file by this step.
       - name: GUI build log (macOS)
@@ -423,10 +443,8 @@ jobs:
             failures="${failures} row_menu_row_mac(no-walk)"
           fi
 
-          # The AppKit menu bar, driven through `install_main_menu` →
-          # `setMainMenu:`: the bar's titles, each item's enabled state, and the
-          # item chosen with `performActionForItemAtIndex:`.
-          run_appkit menubar_mac menubar.log "menu bar" "^menubar:"
+          # (The AppKit menu bar has its own step above, so it is reported and
+          # fails on its own.)
 
           # Row click, header click and double click through the canvas'
           # dispatch: a wrong canvas id or a header click that cannot sort fails
