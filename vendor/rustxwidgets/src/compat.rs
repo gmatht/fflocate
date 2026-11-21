@@ -366,9 +366,11 @@ impl TreeView {
         let offset: Rc<Cell<f64>> = Rc::new(Cell::new(0.0));
         let viewport: Rc<Cell<f64>> = Rc::new(Cell::new(f64::from(CANVAS_REQUEST_H)));
         let dragging: Rc<Cell<bool>> = Rc::new(Cell::new(false));
-        // A screenful, never the content: the list scrolls itself (see
-        // `paint_list`), so the canvas only has to be as tall as its viewport.
-        canvas.set_content_size(720, CANVAS_REQUEST_H);
+        // On a backend whose scrolled window really scrolls the canvas (macOS's
+        // `NSScrollView`) the canvas is the document and has to be as tall as
+        // the rows; elsewhere it only has to be as tall as its viewport, since
+        // the list scrolls itself (see `paint_list`).
+        canvas.set_content_size(720, canvas_document_height(0));
 
         {
             let rows = rows.clone();
@@ -619,7 +621,7 @@ impl TreeView {
             .set(clamp_offset(self.offset.get(), content, self.viewport.get()));
         self.canvas.set_content_size(
             self.width.get().max(320.0) as i32,
-            CANVAS_REQUEST_H,
+            canvas_document_height(self.rows.borrow().len()),
         );
         self.canvas.queue_redraw();
     }
@@ -1090,6 +1092,26 @@ fn paint_list(
 /// The height of `rows` rows, header included: the list's content height.
 fn content_height(rows: usize) -> f64 {
     HEADER_HEIGHT + rows as f64 * ROW_HEIGHT
+}
+
+/// How tall the canvas is sized for `rows` rows.
+///
+/// On AppKit the canvas is a scroll view's document view, and the clip view
+/// scrolls it: it must be the full content height or the scroller has nothing
+/// to measure and the list cannot scroll at all (the canvas was a fixed
+/// screenful, which left the rows 480pt tall inside a 630pt clip). Everywhere
+/// else the canvas is the viewport and the list scrolls itself, so a screenful
+/// is right and keeps the drawing area bounded.
+fn canvas_document_height(rows: usize) -> i32 {
+    #[cfg(all(feature = "macos", target_os = "macos", not(feature = "zork")))]
+    {
+        content_height(rows).round() as i32
+    }
+    #[cfg(not(all(feature = "macos", target_os = "macos", not(feature = "zork"))))]
+    {
+        let _ = rows;
+        CANVAS_REQUEST_H
+    }
 }
 
 /// `offset` clamped so the viewport stays inside the content.

@@ -1902,6 +1902,7 @@ mod macos_adapter {
         fn CGContextGetClipBoundingBox(ctx: *mut c_void) -> CGRect;
         fn CGContextSaveGState(ctx: *mut c_void);
         fn CGContextRestoreGState(ctx: *mut c_void);
+        fn CGContextTranslateCTM(ctx: *mut c_void, tx: f64, ty: f64);
     }
 
     /// `CGRect`. Field order is ABI-critical: `CGFloat` (f64 on 64-bit, f32
@@ -3466,6 +3467,29 @@ mod macos_adapter {
             if cgctx.is_null() {
                 return;
             }
+            // A canvas that is an `NSScrollView`'s document view is scrolled
+            // by its clip view: the clip's bounds origin is the offset compat
+            // tracks, and the viewport is the *clip's* height, not the
+            // document's. Translating the context by that origin puts the
+            // closure's viewport-relative drawing where the clip shows it,
+            // instead of a second time off the top.
+            let mut viewport_h = bounds.height;
+            let parent = msg0(obj, "superview");
+            if !parent.is_null()
+                && core_apple::nsstring_to_rust(msg0(parent, "className")).as_deref()
+                    == Some("NSClipView")
+            {
+                let clip: CGRect = raw_send!(
+                    parent,
+                    "bounds",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
+                    ()
+                );
+                if clip.height > 0.0 {
+                    viewport_h = clip.height;
+                    CGContextTranslateCTM(cgctx, 0.0, clip.y);
+                }
+            }
             let ptr = {
                 let mut map = DRAW_CALLBACKS.lock().unwrap();
                 match map.get_mut(&canvas_id) {
@@ -3476,7 +3500,7 @@ mod macos_adapter {
             if let Some(ptr) = ptr {
                 if let Some(mut dc) = CgDrawContext::new(cgctx) {
                     let cb: &mut dyn FnMut(&mut dyn DrawContext, i32, i32) = &mut *ptr;
-                    cb(&mut dc, bounds.width as i32, bounds.height as i32);
+                    cb(&mut dc, bounds.width as i32, viewport_h as i32);
                 }
             }
         }
@@ -3506,6 +3530,24 @@ mod macos_adapter {
             unsafe extern "C" fn(*mut c_void, *mut c_void, f64, f64, *mut c_void) -> CGPoint,
             (in_window.x, in_window.y, std::ptr::null_mut())
         );
+        // The portable click callbacks take *viewport* coordinates (compat adds
+        // the offset itself). A document view is scrolled by its clip, so the
+        // view-local point is in document coordinates: subtract the clip's
+        // origin so a click after scrolling hits the row under the pointer.
+        let mut viewport_y = local.y;
+        let parent = msg0(obj, "superview");
+        if !parent.is_null()
+            && core_apple::nsstring_to_rust(msg0(parent, "className")).as_deref()
+                == Some("NSClipView")
+        {
+            let clip: CGRect = raw_send!(
+                parent,
+                "bounds",
+                unsafe extern "C" fn(*mut c_void, *mut c_void) -> CGRect,
+                ()
+            );
+            viewport_y = local.y - clip.y;
+        }
         let mods = unsafe { msg0i(event, "modifierFlags") } as u32;
         // 1 = primary, 3 = secondary, as the portable canvas reports them.
         let plain = {
@@ -3536,7 +3578,7 @@ mod macos_adapter {
         if press {
             if let Some(ptr) = rich {
                 // SAFETY: registry-owned closure, dispatched on the main thread.
-                unsafe { (*ptr)(local.x, local.y, button, mods) };
+                unsafe { (*ptr)(local.x, viewport_y, button, mods) };
             }
             // Selecting a row, sorting on a header click and opening on a
             // double click are the primary button's business: a secondary
@@ -3544,18 +3586,18 @@ mod macos_adapter {
             if button == 1 {
                 if let Some(ptr) = plain {
                     // SAFETY: as above.
-                    unsafe { (*ptr)(local.x, local.y) };
+                    unsafe { (*ptr)(local.x, viewport_y) };
                 }
                 if activates_on_click_count(clicks) {
                     if let Some(ptr) = double {
                         // SAFETY: as above.
-                        unsafe { (*ptr)(local.x, local.y) }
+                        unsafe { (*ptr)(local.x, viewport_y) }
                     }
                 }
             }
         } else if let Some(ptr) = release {
             // SAFETY: as above.
-            unsafe { (*ptr)(local.x, local.y, button, mods) };
+            unsafe { (*ptr)(local.x, viewport_y, button, mods) };
         }
     }
 

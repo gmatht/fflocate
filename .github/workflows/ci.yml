@@ -110,18 +110,34 @@ jobs:
       # green step does not say which of them ran. This names them, so the job
       # log shows the AppKit side's model tests instead of leaving them implied.
       - name: Mac GUI model tests (macOS)
-        if: runner.os == 'macOS'
+        # `!cancelled()`, not `success()`: the all-tests step fails at
+        # drag_reflow_mac's pre-existing knob geometry, and that must not skip
+        # these model tests.
+        if: ${{ runner.os == 'macOS' && !cancelled() }}
         shell: bash
         run: |
-          status=0
-          cargo test -p ff-gui --test macos_gui_parts --test row_menu_mac >macos-parts.log 2>&1 || status=$?
-          lines=$(grep -E '^test |test result' macos-parts.log | tr '\n' '|' | cut -c1-1500)
-          if [ "$status" -eq 0 ]; then
-            echo "::notice title=mac gui model tests (macOS)::${lines}"
-            exit 0
+          failures=""
+          # One binary at a time, so a failure in one still reports the other's
+          # result instead of gating on it.
+          run_model_test() {
+            name=$1
+            logfile=macos-$name.log
+            st=0
+            cargo test -p ff-gui --test "$name" > "$logfile" 2>&1 || st=$?
+            if [ "$st" -ne 0 ]; then
+              echo "::error title=mac gui model test ${name} (macOS)::exit ${st}: $(tail -c 1200 "$logfile" | tr -cd '[:print:]\n' | tr '\n' '|')"
+              failures="${failures} ${name}"
+              return 0
+            fi
+            echo "::notice title=mac gui model test ${name} (macOS)::$(grep -E '^test |test result' "$logfile" | tr '\n' '|' | cut -c1-1500)"
+          }
+          run_model_test macos_gui_parts
+          run_model_test row_menu_mac
+          if [ -n "$failures" ]; then
+            echo "::error title=mac gui model tests (macOS)::failed:${failures}"
+            exit 1
           fi
-          echo "::error title=mac gui model tests (macOS)::$(tail -c 1200 macos-parts.log | tr -cd '[:print:]\n' | tr '\n' '|')"
-          exit 1
+          exit 0
 
       # The build step's own annotations can be dropped when it fails, so a
       # failed build is also reported from its log file by this step.
