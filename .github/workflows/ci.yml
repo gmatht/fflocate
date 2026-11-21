@@ -54,6 +54,28 @@ jobs:
           echo "::error title=widget test failure (Linux)::$(grep -E 'panicked|assertion|^error' widget-test.log | head -10 | tr '\n' '|' | cut -c1-2500)"
           exit 1
 
+      # The row menu's platform-free half — hit test, item list and enabled
+      # state, and the dispatch each item runs — on both platforms, so a run
+      # names it instead of leaving it implied inside `cargo test`. It needs no
+      # display, so it is the one row-menu check Ubuntu can run too.
+      - name: Row menu model (all platforms)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          status=0
+          cargo test -p ff-gui --test row_menu_model > row-menu-model.log 2>&1 || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=row menu model (${RUNNER_OS})::exit ${status}: $(tail -c 1800 row-menu-model.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            exit 1
+          fi
+          # A zero exit with no tests would be a silent skip; the binary's own
+          # count is the post-condition.
+          if ! grep -q 'test result: ok. 5 passed' row-menu-model.log; then
+            echo "::error title=row menu model (${RUNNER_OS})::the model tests did not run: $(grep -E 'test result|running' row-menu-model.log | tr '\n' '|' | cut -c1-1200)"
+            exit 1
+          fi
+          echo "::notice title=row menu model (${RUNNER_OS})::$(grep -E '^test |test result' row-menu-model.log | tr '\n' '|' | cut -c1-3900)"
+
       # The AppKit right-click-on-a-row walk, reported on its own before the
       # all-tests step. That step still fails at drag_reflow_mac's pre-existing
       # knob-geometry assertion, and a failed step skips every step after it, so

@@ -2312,6 +2312,35 @@ pub fn run_row_action<F>(action: RowAction, path: &str, copy: F) -> String
 where
     F: Fn(&str) -> Result<(), String>,
 {
+    run_row_action_with(action, path, copy, |program, args| {
+        // The children own their own windows and are never read from: detaching
+        // stdio keeps them from holding this process's pipes open (a `dolphin`
+        // or `kde-open` that outlives the app would otherwise keep a shell
+        // waiting on the pipe for as long as the window is up) and keeps their
+        // diagnostics out of the app's output.
+        std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// [`run_row_action`] with the launcher supplied by the caller.
+///
+/// The one thing a caller cannot inject into [`run_row_action`] is the spawn
+/// itself, which makes the dispatch untestable on a machine where launching a
+/// file manager would open a window. This takes it as a closure, so a test can
+/// record which command each menu item runs; the app uses the spawn above, and
+/// the status line is the same either way.
+pub fn run_row_action_with<F, L>(action: RowAction, path: &str, copy: F, launch: L) -> String
+where
+    F: Fn(&str) -> Result<(), String>,
+    L: Fn(&str, &[String]) -> Result<(), String>,
+{
     let (program, args) = launch_command(action, path);
     if program.is_empty() {
         let text = match action {
@@ -2326,28 +2355,48 @@ where
             Err(e) => format!("copy failed: {e}"),
         };
     }
-    // The children own their own windows and are never read from: detaching
-    // stdio keeps them from holding this process's pipes open (a `dolphin` or
-    // `kde-open` that outlives the app would otherwise keep a shell waiting on
-    // the pipe for as long as the window is up) and keeps their diagnostics out
-    // of the app's output.
-    match std::process::Command::new(&program)
-        .args(&args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
+    match launch(&program, &args) {
         // Name the program: "Open containing folder → photo.png (dolphin)"
         // says which helper actually ran, which is the difference between
         // "the app did nothing" and "the app started a file manager".
-        Ok(_) => format!(
+        Ok(()) => format!(
             "{} → {} ({program})",
             action.label(),
             short_path(path)
         ),
         Err(e) => format!("{} failed to start {program}: {e}", action.label()),
     }
+}
+
+/// One item of the row context menu, described without a toolkit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowMenuItem {
+    /// The action choosing this item runs.
+    pub action: RowAction,
+    /// The label every desktop backend draws for it.
+    pub label: &'static str,
+    /// Whether it can be chosen. False when the pointer was not over a row:
+    /// the app then opens no menu at all, and a backend that shows one anyway
+    /// must show these greyed out.
+    pub enabled: bool,
+}
+
+/// The row context menu as a list, independent of any toolkit.
+///
+/// The items are the same on every backend, in the same order (the app's
+/// [`RowAction::all`]); only their drawing differs per platform. `target` is the
+/// path the menu would act on — [`context_menu_target`]'s answer — so the
+/// enabled rule is testable, and asserted, without a display.
+pub fn row_menu_model(target: Option<&str>) -> Vec<RowMenuItem> {
+    let enabled = target.is_some();
+    RowAction::all()
+        .iter()
+        .map(|&action| RowMenuItem {
+            action,
+            label: action.label(),
+            enabled,
+        })
+        .collect()
 }
 
 /// The last component of `path`, for a status line.
