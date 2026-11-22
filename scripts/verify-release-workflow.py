@@ -162,6 +162,16 @@ def mode_guards(wf, triggers):
     check("only publish may write", pub.get("permissions") == {"contents": "write"})
     mentions = [job for job, body in wf["jobs"].items() if "gh release" in str(body)]
     check("`gh release` appears only in publish", mentions == ["publish"], str(mentions))
+    # `gh` resolves owner/name from the git remote, and publish has no checkout
+    # (it only downloads artifacts), so the repo has to arrive in the
+    # environment — the first tag run failed exactly there.
+    publish_env = next((s.get("env") or {} for s in pub["steps"]
+                        if s.get("name") == "Publish"), {})
+    check("publish tells gh which repo to use",
+          publish_env.get("GH_REPO") == "${{ github.repository }}", str(publish_env))
+    check("no publish step checks out the repository",
+          not any("actions/checkout" in str(s.get("uses", "")) for s in pub["steps"]))
+
     guards = [s["run"] for s in pub["steps"] if s.get("name", "").startswith("Refuse")]
     if not check("the publish job has one ref guard step", len(guards) == 1, str(len(guards))):
         return False

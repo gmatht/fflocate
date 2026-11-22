@@ -258,6 +258,10 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job never checks out the repository, so `gh` has no git remote
+          # to read the owner and name from; without this it fails with "could
+          # not determine base repo".
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           # A "-beta"/"-rc" version is a prerelease on GitHub too, so it is not
