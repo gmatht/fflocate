@@ -259,6 +259,27 @@ jobs:
           fi
           echo "::notice title=menu bar (macOS)::$(grep '^menubar:' menubar.log | tr '\n' '|' | cut -c1-3900)"
 
+      # Live mode under AppKit: the foldout's toggle, the subscribe connection
+      # `LiveRunner` opens, and the rows a create and a delete repaint. Its own
+      # step with the binary's ok line required, because a run that skipped for
+      # want of AppKit would still exit 0.
+      - name: Live mode (macOS)
+        if: ${{ runner.os == 'macOS' && !cancelled() }}
+        shell: bash
+        run: |
+          ulimit -c 0 || true
+          status=0
+          cargo test -p ff-gui --test live_mac > live.log 2>&1 || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=live mode (macOS)::exit ${status}: $(tail -c 1800 live.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            exit 1
+          fi
+          if ! grep -q '^live_mac: ok' live.log; then
+            echo "::error title=live mode (macOS)::the live walk did not run: $(grep -E '^live_mac:' live.log | tr '\n' '|' | cut -c1-1200)"
+            exit 1
+          fi
+          echo "::notice title=live mode (macOS)::$(grep '^live_mac:' live.log | tr '\n' '|' | cut -c1-3900)"
+
       # The build step's own annotations can be dropped when it fails, so a
       # failed build is also reported from its log file by this step.
       - name: GUI build log (macOS)
@@ -292,7 +313,7 @@ jobs:
           # GTK main loop, and two of them in one session have been seen to wait
           # on each other. Each is bounded so a hang fails the job instead of
           # stalling it.
-          for t in row_menu_gtk interaction_gtk typing_gtk reflow_gtk menubar_gtk daemon_pixels_gtk created_range_gtk; do
+          for t in row_menu_gtk interaction_gtk typing_gtk reflow_gtk menubar_gtk daemon_pixels_gtk created_range_gtk live_gtk; do
             printf '=== %s ===\n' "$t" >> interaction.log
             xvfb-run -a -s "-screen 0 1280x1024x24" \
               timeout 180 cargo test -p ff-gui --test "$t" -- --nocapture >> interaction.log 2>&1 \
@@ -320,9 +341,17 @@ jobs:
               echo "::error title=row menu (Linux)::the plan-built GtkMenu walk did not run: $(grep -E '^row menu' interaction.log | tr '\n' '|' | cut -c1-1200)"
               exit 1
             fi
+            # Live mode is a socket feed plus repainted rows, so a display-less
+            # skip would exit 0 without proving anything: its own ok line has to
+            # be there.
+            if ! grep -q '^live: ok' interaction.log; then
+              echo "::error title=live mode (Linux)::the live walk did not run: $(grep -E '^live:' interaction.log | tr '\n' '|' | cut -c1-1200)"
+              exit 1
+            fi
             # (The right-click-on-a-row walk and the clipboard have their own
             # steps below, so they are reported and fail on their own.)
             echo "::notice title=interaction (Linux)::${lines}"
+            echo "::notice title=live mode (Linux)::$(grep '^live:' interaction.log | tr '\n' '|' | cut -c1-1500)"
             echo "::notice title=daemon pixels (Linux)::$(grep '^pixels:' interaction.log | tr '\n' '|')"
             echo "::notice title=created range (Linux)::$(grep '^created range:' interaction.log | tr '\n' '|')"
             exit 0
