@@ -66,6 +66,26 @@ Notes and limits:
   reports that the popup menu is unavailable, and drag-and-drop is off. The
   daemon and CLI are unaffected; see `crates/ff-gui/README.md`.
 
+## Releases
+
+A `v<version>` tag whose version matches `[workspace.package] version` builds
+installers for Linux and macOS (`.github/workflows/release.yml`) and attaches
+them, with `SHA256SUMS`, to the GitHub Release. Running the workflow manually
+(`workflow_dispatch`) is the dry run: it builds and packages both platforms and
+leaves the installers as workflow artifacts. Only a `v*` tag push reaches the
+publishing job, so a dry run cannot create a release.
+
+* `fflocate_<version>_amd64.deb` — `ff`, `fflocated` and `ff-gui` in `/usr/bin`,
+  plus a systemd user unit; `systemctl --user enable --now fflocated` is the
+  setup step.
+* `fflocate-<version>-linux-<arch>.tar.gz` — the same three binaries under
+  `bin/` and the unit under `systemd/`, for installs without a package manager.
+* `fflocate-<version>-macos-universal.pkg` — arm64 + x86_64 `ff`, `fflocated`
+  and `ff-gui` in `/usr/local/bin`; the postinstall writes and loads the
+  `com.fflocate.fflocated` LaunchAgent for the user at the console. It is
+  unsigned, so another Mac needs right-click → Open (or a quarantine-attribute
+  removal) first.
+
 ## Quick start
 
 `ff` auto-spawns `fflocated` if it is not already running.

@@ -1,0 +1,269 @@
+name: release
+
+# One release per tag:
+#   git tag -a v0.1.0 -m "fflocate 0.1.0" && git push origin v0.1.0
+#
+# Manual dispatch is the dry run: it builds and packages both platforms and
+# keeps the installers as workflow artifacts for inspection, and it cannot
+# publish. Only a `v*` tag push reaches the `publish` job (job condition), and
+# that job re-checks the ref before its first `gh` call, so neither a dispatch
+# nor an edited condition can create a release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Read-only by default; the write scope is granted to the one job that publishes,
+# so a dry run never even holds it.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      # The tag is the version users see in the .deb and the .pkg; the binaries
+      # report `CARGO_PKG_VERSION`. Publishing an installer named v0.2.0 whose
+      # `ff -V` says 0.1.0 would be worse than publishing nothing.
+      - name: Version, and the tag must name it
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 |
+                  jq -r '.packages[] | select(.name == "fflocate") | .version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            tagged="${GITHUB_REF_NAME#v}"
+            if [ "$tagged" != "$version" ]; then
+              echo "::error title=release version::tag ${GITHUB_REF_NAME} does not match [workspace.package] version ${version}; bump it or retag"
+              exit 1
+            fi
+            echo "::notice title=release::building ${GITHUB_REF_NAME} (${version})"
+          else
+            echo "::notice title=release (dry run)::building ${version}; nothing will be published"
+          fi
+
+  linux:
+    name: linux (x86_64)
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        shell: bash
+        run: cargo build --release -p ff -p fflocated -p ff-gui
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          scripts/package-linux.sh "$VERSION" target/release dist
+          ls -l dist
+
+      # The packaged tree, not the build tree: what a user gets has to run, and
+      # the unit's ExecStart has to name a file the package actually installs.
+      - name: The artifact works installed
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          root=$(mktemp -d)
+          dpkg-deb -x "dist/fflocate_${VERSION}_amd64.deb" "$root"
+          for b in ff fflocated ff-gui; do
+            if [ ! -x "$root/usr/bin/$b" ]; then
+              echo "::error title=package::the .deb does not install an executable usr/bin/$b"
+              exit 1
+            fi
+          done
+          unit="$root/usr/lib/systemd/user/fflocated.service"
+          exec_start=$(sed -n 's/^ExecStart=//p' "$unit")
+          case "$exec_start" in
+            /*) ;;
+            *)
+              echo "::error title=package::$unit has no absolute ExecStart (got '$exec_start')"
+              exit 1
+              ;;
+          esac
+          if [ ! -x "$root$exec_start" ]; then
+            echo "::error title=package::$unit starts '$exec_start', which the package does not install"
+            exit 1
+          fi
+          test "$("$root/usr/bin/ff" -V)" = "ff ${VERSION}"
+          echo "::notice title=linux package::$(ls "$root/usr/bin" | tr '\n' ' ')installed; unit ExecStart=$exec_start"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: macos (universal)
+    needs: prepare
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The GUI is AppKit through a dlopen'd framework, and the CLI/daemon are
+      # pure Rust, so one runner can build both slices: the runner's SDK carries
+      # the x86_64 slice, only the std for that target is missing.
+      - name: Build both architectures
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --target "$target" -p ff -p fflocated -p ff-gui
+          done
+
+      - name: Universal binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Merged binaries live outside `dist`: only the finished installer is
+          # uploaded, so the release cannot attach a stray `bin/` directory.
+          mkdir -p universal
+          # `lipo -create` of one real slice still exits 0, so the arch list is
+          # the check: scripts/package-macos-pkg.sh runs `lipo -archs` on these
+          # and refuses anything that is not arm64 + x86_64.
+          for b in ff fflocated ff-gui; do
+            lipo -create \
+              "target/aarch64-apple-darwin/release/$b" \
+              "target/x86_64-apple-darwin/release/$b" \
+              -output "universal/$b"
+          done
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          scripts/package-macos-pkg.sh "$VERSION" universal dist
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/*
+          if-no-files-found: error
+
+  # Tag pushes only. The dry run never gets here, and the first step re-checks
+  # the ref so even a damaged condition cannot publish.
+  publish:
+    name: publish
+    needs: [prepare, linux, macos]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Refuse anything that is not a v* tag push
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" != "push" ] || [ "${GITHUB_REF_TYPE:-}" != "tag" ]; then
+            echo "::error title=refusing to publish::this run is ${GITHUB_EVENT_NAME} on ${GITHUB_REF:-<none>}; releases are published only from a v* tag push"
+            exit 1
+          fi
+          case "$GITHUB_REF_NAME" in
+            v*) ;;
+            *)
+              echo "::error title=refusing to publish::${GITHUB_REF_NAME} is not a v* tag"
+              exit 1
+              ;;
+          esac
+          echo "::notice title=publish::${GITHUB_REF_NAME}"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          # The assets are collected before the redirect creates SHA256SUMS, so
+          # the file does not list itself.
+          set -- *
+          sha256sum "$@" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          cat > notes.md <<EOF
+          fflocate ${version} — daemon, CLI and GUI installers for this tag.
+
+          ## Linux
+
+              sudo apt install ./fflocate_${version}_amd64.deb
+              systemctl --user enable --now fflocated
+
+          The .deb installs ff, ff-gui and fflocated into /usr/bin with a systemd
+          user unit, and enables nothing by itself: the daemon indexes one user's
+          home, so switching it on is per account.
+
+          fflocate-${version}-linux-x86_64.tar.gz is the same three binaries under
+          bin/ with the unit under systemd/, for installs without a package
+          manager. Run ff service install (not the unit's /usr/bin path) after
+          copying them.
+
+          ## macOS
+
+              sudo installer -pkg fflocate-${version}-macos-universal.pkg -target /
+
+          Installs arm64 + x86_64 ff, ff-gui and fflocated into /usr/local/bin and
+          registers the com.fflocate.fflocated LaunchAgent for the user logged in
+          at the console, then starts it. Accounts created later run
+          ff service install themselves.
+
+          The package is unsigned, so a Mac that downloaded it needs one of:
+          right-click the .pkg and choose Open, or
+
+              xattr -d com.apple.quarantine fflocate-${version}-macos-universal.pkg
+
+          and then run the installer again.
+
+          SHA256SUMS lists every asset.
+          EOF
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Re-running a failed release must replace assets, not fail on them.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag \
+              --title "fflocate $GITHUB_REF_NAME" \
+              --notes-file notes.md dist/*
+          fi
+          gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name'
