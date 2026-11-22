@@ -68,6 +68,13 @@ name = "typing_search_mac"
 path = "tests/typing_search_mac.rs"
 harness = false
 
+# Live mode's subscribe feed lives on a socket, but the toggle is a real
+# NSButton and the rows a real NSTableView, so this wants AppKit's main thread.
+[[test]]
+name = "live_mac"
+path = "tests/live_mac.rs"
+harness = false
+
 # The capture is AppKit's own bitmap of the window, and it has to be taken on
 # the main thread after the rows are laid out.
 [[test]]
