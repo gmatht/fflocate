@@ -277,6 +277,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ran.borrow()
     );
 
+    // --- The band itself opens and shuts, without the menu ---
+    //
+    // AppKit has no `GtkExpander`, so the foldout's header is a drawn canvas
+    // band; the host reports a click on it as a canvas id. This is the click a
+    // person makes when they open Advanced Search by clicking it, and it has to
+    // reach the same state the menu item drives.
+    {
+        let header = advanced
+            .header_handle()
+            .expect("the foldout has no header band on AppKit");
+        let header_id = rswidgets::backends_macos_adapter::Canvas(header).canvas_id();
+        assert_ne!(
+            header_id, 0,
+            "the header band has no canvas id, so a click on it goes nowhere"
+        );
+        advanced.set_expanded(false);
+        rswidgets::backends_macos_adapter::dispatch_canvas_click(header_id, 12.0, 8.0);
+        let opened = advanced.is_expanded();
+        println!("menubar: clicked the Advanced search band -> foldout expanded {opened}");
+        assert!(
+            opened,
+            "a click on the foldout's header band did not expand it, so the foldout \
+             cannot be opened on this desktop without the menu"
+        );
+        rswidgets::backends_macos_adapter::dispatch_canvas_click(header_id, 12.0, 8.0);
+        assert!(
+            !advanced.is_expanded(),
+            "a second click on the foldout's header band did not collapse it"
+        );
+    }
+
     println!("menubar: ok — installed, enabled, and dispatched through the target");
     Ok(())
 }

@@ -21,7 +21,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fflocate::config_paths::socket_path_from_env;
 use fflocate::proto::{Request, Response};
@@ -846,10 +846,15 @@ pub struct SearchOptions {
 /// predates the field, or an entry whose filesystem has no birth time, falls
 /// back to [`created_secs`]; [`filter_by_created`] takes whichever clock it is
 /// given and the caller decides.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CreatedRange {
     pub from: Option<i64>,
     pub to: Option<i64>,
+    /// How the user expressed the lower bound, when they expressed it as an age
+    /// ("3 days ago") rather than a date. The status line repeats it, because
+    /// "since 2026-08-19" answers a question nobody typed when they asked for
+    /// the last three days. `None` for a typed date, which needs no translation.
+    pub age: Option<String>,
 }
 
 impl CreatedRange {
@@ -858,14 +863,30 @@ impl CreatedRange {
         self.from.map_or(true, |f| secs >= f) && self.to.map_or(true, |t| secs <= t)
     }
 
-    /// The range as the status line spells it: `2026-01-02–2026-02-01`,
-    /// `since 2026-01-02`, or `until 2026-02-01`.
+    /// The range as the status line spells it: `since 3 days ago`,
+    /// `2026-01-02–2026-02-01`, `since 2026-01-02`, or `until 2026-02-01`.
     pub fn label(&self) -> String {
+        if let Some(age) = &self.age {
+            return format!("since {age}");
+        }
         match (self.from, self.to) {
             (Some(f), Some(t)) => format!("{}–{}", format_day(f), format_day(t)),
             (Some(f), None) => format!("since {}", format_day(f)),
             (None, Some(t)) => format!("until {}", format_day(t)),
             (None, None) => String::new(),
+        }
+    }
+
+    /// Everything created in the last `age`.
+    ///
+    /// The upper end is left open: an age names one instant, and "3 days ago"
+    /// means "since then", which does not need the clock frozen — a row dated a
+    /// second after `now` (a racing index) still matches.
+    pub fn since_age(age: AgoAge, now: i64) -> CreatedRange {
+        CreatedRange {
+            from: Some(age.since(now)),
+            to: None,
+            age: Some(age.option_text()),
         }
     }
 }
@@ -937,10 +958,25 @@ fn parse_day_bound(text: &str, field: &str, end_of_day: bool) -> Result<Option<i
     if text.is_empty() {
         return Ok(None);
     }
-    let bad = || format!("{field}: \"{text}\" is not a date — use YYYY-MM-DD");
+    if let Some((y, m, d)) = date_parts(text) {
+        let start = days_from_civil(y, m, d) * 86_400;
+        return Ok(Some(if end_of_day { start + 86_399 } else { start }));
+    }
+    Err(shape_error(field, text))
+}
+
+/// The one refusal, naming both accepted shapes. Kept in one place so the field
+/// name and the wording cannot drift between the date, time and age parsers.
+fn shape_error(field: &str, text: &str) -> String {
+    format!("{field}: \"{text}\" is not a date or a time — use YYYY-MM-DD, HH:MM or \"3 days ago\"")
+}
+
+/// `YYYY-MM-DD` as `(year, month, day)` when it is a real calendar date.
+///
+/// The shape is validated on bytes first, so every slice below is ASCII (a
+/// multi-byte character can never split a date string then).
+fn date_parts(text: &str) -> Option<(i64, i64, i64)> {
     let bytes = text.as_bytes();
-    // Validate the shape on bytes first, so every slice below is ASCII (a
-    // multi-byte character can never split a date string then).
     let shaped = bytes.len() == 10
         && bytes.iter().enumerate().all(|(i, b)| {
             if i == 4 || i == 7 {
@@ -950,7 +986,7 @@ fn parse_day_bound(text: &str, field: &str, end_of_day: bool) -> Result<Option<i
             }
         });
     if !shaped {
-        return Err(bad());
+        return None;
     }
     let (y, m, d) = match (
         text[0..4].parse::<i64>(),
@@ -958,25 +994,281 @@ fn parse_day_bound(text: &str, field: &str, end_of_day: bool) -> Result<Option<i
         text[8..10].parse::<i64>(),
     ) {
         (Ok(y), Ok(m), Ok(d)) => (y, m, d),
-        _ => return Err(bad()),
+        _ => return None,
     };
     if m < 1 || m > 12 || d < 1 || d > days_in_month(y, m) {
+        return None;
+    }
+    Some((y, m, d))
+}
+
+/// `HH:MM` as `(hour, minute)` when the shape is exactly five ASCII bytes with
+/// a colon in the middle and a real time of day on either side; `None`
+/// otherwise, so the caller can fall through to the date parser.
+fn clock_parts(text: &str) -> Option<(i64, i64)> {
+    let b = text.as_bytes();
+    if b.len() != 5 || b[2] != b':' {
+        return None;
+    }
+    if !b[0].is_ascii_digit() || !b[1].is_ascii_digit() || !b[3].is_ascii_digit() || !b[4].is_ascii_digit() {
+        return None;
+    }
+    let hh = i64::from(b[0] - b'0') * 10 + i64::from(b[1] - b'0');
+    let mm = i64::from(b[3] - b'0') * 10 + i64::from(b[4] - b'0');
+    (hh < 24 && mm < 60).then_some((hh, mm))
+}
+
+/// How a bare clock time is read: the most recent occurrence of that time of
+/// day, at or before the moment being parsed.
+///
+/// "12:30" typed at 09:00 is *yesterday's* 12:30, not a future instant: a
+/// creation time can never be in the future, and the search is asking "when was
+/// this made?", not "when will it be?". Exactly `now`'s own time maps to `now`.
+fn most_recent_occurrence(hh: i64, mm: i64, now: i64) -> i64 {
+    let sod = hh * 3600 + mm * 60;
+    let today = now.div_euclid(86_400) * 86_400 + sod;
+    if today > now {
+        today - 86_400
+    } else {
+        today
+    }
+}
+
+/// The current wall clock in unix seconds. The one place the created-time code
+/// reads the clock, so everything else takes `now` as a parameter.
+pub fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// The "created from" shortcut a search can start from with no typing at all.
+///
+/// It is also what a bare clock time widens to when no date accompanies it (see
+/// [`parse_created_range_at`]): "10:30" alone is a moment, and a moment with no
+/// date is rarely the question — "what have I made recently?" is.
+pub const CREATED_LAST_24_HOURS: &str = "24 hours ago";
+
+/// The dropdown's options, in increasing reach.
+///
+/// Offered as whole units rather than an arbitrary count, because the field
+/// beside the dropdown is what types a count ("3 days ago"); the list is the
+/// fast path for the common answers. [`CREATED_LAST_24_HOURS`] is deliberately
+/// the first entry: it is both the default and the narrowest useful window.
+pub const CREATED_AGE_OPTIONS: &[&str] = &[
+    CREATED_LAST_24_HOURS,
+    "1 hour ago",
+    "6 hours ago",
+    "1 day ago",
+    "3 days ago",
+    "1 week ago",
+    "2 weeks ago",
+    "1 month ago",
+    "3 months ago",
+    "6 months ago",
+    "1 year ago",
+    "any time",
+];
+
+/// One parsed "n units ago" age.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AgoAge {
+    /// How many whole `unit`s back; `0` means "now" is included.
+    pub count: i64,
+    pub unit: AgoUnit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgoUnit {
+    Minute,
+    Hour,
+    Day,
+    Week,
+    /// Calendar months, not 30-day blocks: `1 month` before 2026-03-31 is
+    /// 2026-02-28, because a "month ago" means the same day last month.
+    Month,
+    Year,
+}
+
+impl AgoAge {
+    /// The instant this age names, `now` minus the age.
+    ///
+    /// Minutes/hours/days/weeks subtract fixed durations. Months and years are
+    /// calendar arithmetic on the UTC date, then the original time of day is
+    /// restored: a month ago is the same day last month, not 30 days ago (the
+    /// two differ by 1–3 days and users mean the former). A day that does not
+    /// exist in the target month clamps to that month's last day — "1 month ago"
+    /// from 31 March is 28 or 29 February, never an invalid date and never a
+    /// silent jump into the following month (which is what subtracting a fixed
+    /// number of days gives).
+    pub fn since(&self, now: i64) -> i64 {
+        let fixed = match self.unit {
+            AgoUnit::Minute => Some(60),
+            AgoUnit::Hour => Some(3_600),
+            AgoUnit::Day => Some(86_400),
+            AgoUnit::Week => Some(604_800),
+            AgoUnit::Month | AgoUnit::Year => None,
+        };
+        if let Some(secs) = fixed {
+            return now - secs * self.count;
+        }
+        let days = now.div_euclid(86_400);
+        let sod = now.rem_euclid(86_400);
+        let (y0, m0, d0) = civil_from_days(days);
+        let months = if self.unit == AgoUnit::Year {
+            self.count * 12
+        } else {
+            self.count
+        };
+        // Work in months-since-year-0 so the borrow arithmetic is one expression
+        // and cannot produce a month outside 1..=12.
+        let total = y0 * 12 + (m0 - 1) - months;
+        let y = total.div_euclid(12);
+        let m = total.rem_euclid(12) + 1;
+        let d = d0.min(days_in_month(y, m));
+        days_from_civil(y, m, d) * 86_400 + sod
+    }
+
+    /// The option text for [`CREATED_AGE_OPTIONS`], singular for a count of one.
+    /// Public so the status line can echo the age the user picked rather than
+    /// only the date it resolved to.
+    pub fn option_text(&self) -> String {
+        let unit = match self.unit {
+            AgoUnit::Minute => "minute",
+            AgoUnit::Hour => "hour",
+            AgoUnit::Day => "day",
+            AgoUnit::Week => "week",
+            AgoUnit::Month => "month",
+            AgoUnit::Year => "year",
+        };
+        let plural = if self.count == 1 { "" } else { "s" };
+        format!("{} {unit}{plural} ago", self.count)
+    }
+}
+
+/// Parse an age expression: `n minute|hour|day|week|month|year ago`.
+///
+/// Accepts the plural and singular forms, any amount of whitespace, and is
+/// case-insensitive, so `1 day ago` (the dropdown's spelling) and `2 DAYS AGO`
+/// both parse. `any time` is the empty window and comes back as `Ok(None)` so a
+/// cleared dropdown means "no lower bound" rather than an error.
+///
+/// **`Err` means "this is a malformed age", not "this is not an age".** A string
+/// that simply is not shaped like an age — a date, a clock time, a word — comes
+/// back as `Ok(None)` after [`looks_like_age`], so the caller can try the next
+/// shape. Returning `Err` for those is the bug that made every plain date
+/// unparseable. A string that *is* attempting an age (`3 dayz ago`) still errors,
+/// because falling through to "not a date or a time" would hide the real typo.
+pub fn parse_age(text: &str) -> Result<Option<AgoAge>, String> {
+    let norm = text.trim().to_ascii_lowercase();
+    if norm.is_empty() || norm == "any time" {
+        return Ok(None);
+    }
+    if !looks_like_age(&norm) {
+        return Ok(None);
+    }
+    let bad = || shape_error("created from", text);
+    let mut words = norm.split_whitespace();
+    let count: i64 = words.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
+    let unit = words.next().ok_or_else(bad)?;
+    let ago = words.next().ok_or_else(bad)?;
+    if words.next().is_some() || ago != "ago" || count < 0 {
         return Err(bad());
     }
-    let start = days_from_civil(y, m, d) * 86_400;
-    Ok(Some(if end_of_day { start + 86_399 } else { start }))
+    let unit = match unit.trim_end_matches('s') {
+        "minute" => AgoUnit::Minute,
+        "hour" => AgoUnit::Hour,
+        "day" => AgoUnit::Day,
+        "week" => AgoUnit::Week,
+        "month" => AgoUnit::Month,
+        "year" => AgoUnit::Year,
+        _ => return Err(bad()),
+    };
+    Ok(Some(AgoAge { count, unit }))
+}
+
+/// Whether `text` (lowercased, trimmed) is *attempting* to be an age: a leading
+/// number and a unit word. This is what separates "not an age, try the next
+/// shape" from "a bad age, say so" in [`parse_age`].
+fn looks_like_age(norm: &str) -> bool {
+    let mut words = norm.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    if first.parse::<i64>().is_err() {
+        return false;
+    }
+    match words.next().map(|u| u.trim_end_matches('s')) {
+        Some("minute" | "hour" | "day" | "week" | "month" | "year") => true,
+        // A count followed by something else is a typo in the unit, e.g.
+        // "3 dayz ago": still an attempt, so it must be reported.
+        Some(_) => norm.ends_with("ago") || words.next() == Some("ago"),
+        None => false,
+    }
+}
+
+/// Re-point an [`parse_age`] refusal at the field the user typed it in, so the
+/// status line names the box that must be fixed (the parser is shared by both).
+fn rename_field(message: String, field: &str) -> String {
+    message.replacen("created from:", &format!("{field}:"), 1)
 }
 
 /// Parse the foldout's two created-date fields.
 ///
-/// Both are `YYYY-MM-DD` in UTC, blank for unbounded, and the range is
-/// inclusive at the day level (the `to` day's last second is included). A
-/// blank pair means no range at all (`Ok(None)`). Errors name the field and
-/// the offending text so the status line can repeat them verbatim.
+/// Each is `YYYY-MM-DD` (a whole day, UTC), `HH:MM` (a clock time), an age
+/// (`3 days ago`) or blank for unbounded. The range is inclusive at the day
+/// level (the `to` day's last second is included). A blank pair means no range
+/// at all (`Ok(None)`). Errors name the field and the offending text so the
+/// status line can repeat them verbatim.
 pub fn parse_created_range(from_text: &str, to_text: &str) -> Result<Option<CreatedRange>, String> {
-    let from = parse_day_bound(from_text, "created from", false)?;
-    let to = parse_day_bound(to_text, "created to", true)?;
-    match (from, to) {
+    parse_created_range_at(from_text, to_text, now_secs())
+}
+
+/// [`parse_created_range`] against an explicit clock, so the relative forms
+/// (`HH:MM`, ages) are testable without waiting for a particular time of day.
+///
+/// **No date given.** A bare `HH:MM` in `created from`, with `created to`
+/// empty, becomes a **24-hour window ending at that time**: the typed clock
+/// anchors the window, so nothing the user wrote is discarded. On its own that
+/// time is a single instant on one particular day, which would match almost
+/// nothing; the window is what someone typing a time into a filter on creation
+/// times meant. It is recorded in [`CreatedRange::age`], so the status line says
+/// `24 hours (no date given)` rather than pretending a date was typed.
+///
+/// Only the `from` field widens, and only when `to` is empty: widening an upper
+/// bound would quietly include everything up to a day later than the time the
+/// user named.
+pub fn parse_created_range_at(
+    from_text: &str,
+    to_text: &str,
+    now: i64,
+) -> Result<Option<CreatedRange>, String> {
+    let from = parse_bound_full(from_text, "created from", false, now)?;
+    let to = parse_bound_full(to_text, "created to", true, now)?;
+    let (from_secs, mut age) = match &from {
+        None => (None, None),
+        Some(b) => (Some(b.secs), b.age.clone()),
+    };
+    let to_secs = to.as_ref().map(|b| b.secs);
+    let bare_clock = from.as_ref().map(|b| b.bare_clock).unwrap_or(false);
+    // A bare clock time anchors the *end* of the window: "10:30" typed with no
+    // date means the 24 hours up to the most recent 10:30, not the 24 hours up
+    // to now. The digits the user typed decide where the window ends, so nothing
+    // they wrote is discarded — `10:30` asked at 09:00 gives yesterday 10:30 →
+    // today 09:00's instant, a ~23-hour window ending at the typed time.
+    //
+    // Only the `from` field widens, and only when `to` is empty: widening an
+    // upper bound would quietly include everything up to a day later than the
+    // time the user named.
+    let (mut from_secs, mut to_secs) = (from_secs, to_secs);
+    if bare_clock && to_secs.is_none() {
+        let end = from_secs.unwrap_or(now);
+        from_secs = Some(end - 24 * 3_600);
+        to_secs = Some(end);
+        age = Some("24 hours (no date given)".to_string());
+    }
+    match (from_secs, to_secs) {
         (None, None) => Ok(None),
         (f, t) => {
             if let (Some(f), Some(t)) = (f, t) {
@@ -988,9 +1280,67 @@ pub fn parse_created_range(from_text: &str, to_text: &str) -> Result<Option<Crea
                     ));
                 }
             }
-            Ok(Some(CreatedRange { from: f, to: t }))
+            Ok(Some(CreatedRange { from: f, to: t, age }))
         }
     }
+}
+
+/// Parse one bound, reporting whether it was a bare clock time (no date).
+///
+/// The flag is the "no date given" signal: a `HH:MM` names a moment on *some*
+/// day, and the caller decides which — see [`parse_created_range_at`].
+fn parse_bound_full(
+    text: &str,
+    field: &str,
+    end_of_day: bool,
+    now: i64,
+) -> Result<Option<Bound>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    // An age is self-contained ("3 days ago"), so it means the same thing in
+    // either field and needs no `end_of_day` adjustment. Its refusal is
+    // re-pointed at this field, since the shared parser always says "from".
+    let age = parse_age(text).map_err(|e| rename_field(e, field))?;
+    // `any time` is the dropdown's "no bound"; `parse_age` reports it as the
+    // empty window, which the caller must read as "unbounded", not as "not a
+    // date or a time".
+    if age.is_none() && text.trim().eq_ignore_ascii_case("any time") {
+        return Ok(None);
+    }
+    if let Some(age) = age {
+        return Ok(Some(Bound {
+            secs: age.since(now),
+            // Remember how it was written, so the status line can repeat "3 days
+            // ago" instead of translating it into a date the user never typed.
+            age: Some(age.option_text()),
+            bare_clock: false,
+        }));
+    }
+    if let Some((hh, mm)) = clock_parts(text) {
+        return Ok(Some(Bound {
+            secs: most_recent_occurrence(hh, mm, now),
+            age: None,
+            bare_clock: true,
+        }));
+    }
+    parse_day_bound(text, field, end_of_day).map(|o| {
+        o.map(|secs| Bound {
+            secs,
+            age: None,
+            bare_clock: false,
+        })
+    })
+}
+
+/// One parsed bound, and how the user wrote it.
+struct Bound {
+    secs: i64,
+    /// The age text, when the bound was an age (`3 days ago`).
+    age: Option<String>,
+    /// `HH:MM` with no date: the day is the caller's to choose.
+    bare_clock: bool,
 }
 
 /// A file's creation (birth) time in unix seconds, read with `stat`.
@@ -1163,34 +1513,39 @@ pub mod created_ui {
     mod widgets {
         pub type Entry = rswidgets::backends_gtk_adapter::Entry;
         pub type Label = rswidgets::backends_gtk_adapter::Label;
+        pub type DropDown = rswidgets::backends_gtk_adapter::DropDown;
         pub type Row = rswidgets::backends_gtk_adapter::BoxWidget;
     }
     #[cfg(feature = "zork")]
     mod widgets {
         pub type Entry = rswidgets::backends_zork_adapter::Entry;
         pub type Label = rswidgets::backends_zork_adapter::Label;
+        pub type DropDown = rswidgets::backends_zork_adapter::DropDown;
         pub type Row = rswidgets::backends_zork_adapter::BoxWidget;
     }
     #[cfg(all(windows, not(feature = "zork")))]
     mod widgets {
         pub type Entry = rswidgets::backends_nwg_adapter::Entry;
         pub type Label = rswidgets::backends_nwg_adapter::Label;
+        pub type DropDown = rswidgets::backends_nwg_adapter::DropDown;
         pub type Row = rswidgets::backends_nwg_adapter::BoxWidget;
     }
     #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
     mod widgets {
         pub type Entry = rswidgets::backends_wasm_adapter::Entry;
         pub type Label = rswidgets::backends_wasm_adapter::Label;
+        pub type DropDown = rswidgets::backends_wasm_adapter::DropDown;
         pub type Row = rswidgets::backends_wasm_adapter::BoxWidget;
     }
     #[cfg(all(target_os = "macos", not(feature = "zork")))]
     mod widgets {
         pub type Entry = rswidgets::backends_macos_adapter::Entry;
         pub type Label = rswidgets::backends_macos_adapter::Label;
+        pub type DropDown = rswidgets::backends_macos_adapter::DropDown;
         pub type Row = rswidgets::backends_macos_adapter::BoxWidget;
     }
 
-    use widgets::{Entry, Label, Row};
+    use widgets::{DropDown, Entry, Label, Row};
 
     /// The `created from: [date] to: [date]` row of the foldout.
     pub struct CreatedRow {
@@ -1198,7 +1553,13 @@ pub mod created_ui {
         pub to: Entry,
         pub from_label: Label,
         pub to_label: Label,
-        /// The horizontal box holding the two labels and both fields.
+        /// The age shortcuts beside each field. Picking one writes that age into
+        /// the field it sits next to — the field stays the single source of
+        /// truth, so [`super::created_edit_searches`] and the request builder
+        /// need no knowledge of the dropdown at all.
+        pub from_ages: DropDown,
+        pub to_ages: DropDown,
+        /// The horizontal box holding the labels, fields and dropdowns.
         pub row: Row,
     }
 
@@ -1206,10 +1567,27 @@ pub mod created_ui {
     /// text on screen is the text it is looking for.
     pub const FROM_LABEL: &str = "created from:";
     pub const TO_LABEL: &str = "to:";
-    /// The grey hint shown inside either field while it is empty.
-    pub const PLACEHOLDER: &str = "YYYY-MM-DD";
+    /// The grey hint shown inside either field while it is empty. It names both
+    /// absolute and relative shapes, since both are accepted.
+    pub const PLACEHOLDER: &str = "YYYY-MM-DD or HH:MM";
+
+    /// The dropdown's leading row: no selection yet. Selecting it clears the
+    /// field, exactly as emptying the field by hand does.
+    pub const AGES_EMPTY: &str = "(ages)";
+
+    /// Every dropdown row: the placeholder first, then
+    /// [`super::CREATED_AGE_OPTIONS`].
+    fn age_items() -> Vec<&'static str> {
+        let mut v = Vec::with_capacity(super::CREATED_AGE_OPTIONS.len() + 1);
+        v.push(AGES_EMPTY);
+        v.extend_from_slice(super::CREATED_AGE_OPTIONS);
+        v
+    }
 
     /// Build the row, ready to append to the foldout's vertical box.
+    ///
+    /// The dropdowns start on [`AGES_EMPTY`] and the fields blank, which is the
+    /// "no range" state the foldout has always opened in.
     pub fn build(app: &App) -> Result<CreatedRow, rswidgets::Error> {
         let from_label = app.create_label(FROM_LABEL)?;
         let to_label = app.create_label(TO_LABEL)?;
@@ -1219,23 +1597,60 @@ pub mod created_ui {
         let to = app.create_entry()?;
         to.set_text("");
         to.set_placeholder_text(PLACEHOLDER);
+        let items = age_items();
+        let from_ages = app.create_dropdown(&items)?;
+        from_ages.set_active(Some(0));
+        let to_ages = app.create_dropdown(&items)?;
+        to_ages.set_active(Some(0));
         let row = app.create_box(rswidgets::prelude::Orientation::Horizontal, 2)?;
         row.append(&from_label);
         row.append(&from);
+        row.append(&from_ages);
         row.append(&to_label);
         row.append(&to);
+        row.append(&to_ages);
         Ok(CreatedRow {
             from,
             to,
             from_label,
             to_label,
+            from_ages,
+            to_ages,
             row,
         })
+    }
+
+    /// The text a dropdown row writes into its field, by row index: `""` for the
+    /// placeholder, otherwise the option's own spelling. `None` when the index
+    /// is out of range (a backend reporting "nothing selected" as a large
+    /// number rather than -1).
+    pub fn age_text_at(index: usize) -> Option<String> {
+        if index == 0 {
+            return Some(String::new());
+        }
+        super::CREATED_AGE_OPTIONS
+            .get(index - 1)
+            .map(|s| (*s).to_string())
+    }
+
+    /// The row index a given age text occupies, so a field seeded from somewhere
+    /// else can put its dropdown on the matching entry. `0` when no option
+    /// matches — the same place the row starts.
+    pub fn index_of_age(text: &str) -> u32 {
+        let t = text.trim();
+        match super::CREATED_AGE_OPTIONS.iter().position(|o| *o == t) {
+            Some(i) => (i + 1) as u32,
+            None => 0,
+        }
     }
 
     /// Re-run the search when a date edit leaves a readable range (or both
     /// fields blank). The decision is [`super::created_edit_searches`], the
     /// function `main.rs` uses, so a half-typed date cannot silently search.
+    ///
+    /// The dropdowns act as typing does: a selection writes the age text into
+    /// the field and then takes the same path, so a picked age and a typed one
+    /// cannot diverge.
     pub fn wire(row: &CreatedRow, arm: impl Fn() + Clone + 'static) {
         let from = row.from.clone();
         let to = row.to.clone();
@@ -1252,6 +1667,205 @@ pub mod created_ui {
                     }
                 })
                 .ok();
+        }
+        for (dropdown, field) in [
+            (row.from_ages.clone(), row.from.clone()),
+            (row.to_ages.clone(), row.to.clone()),
+        ] {
+            let arm = arm.clone();
+            let from = from.clone();
+            let to = to.clone();
+            let field = field.clone();
+            // The handle clones cheaply (each backend's widget is a wrapper), and
+            // the closure must own one to read the selection without borrowing
+            // the dropdown it is being attached to.
+            let picker = dropdown.clone();
+            dropdown
+                .connect_changed(move || {
+                    // The selected index, resolved through the same list the
+                    // dropdown was built from: index 0 is the placeholder (clear
+                    // the field), the rest are `CREATED_AGE_OPTIONS`.
+                    let idx = picker.get_active();
+                    let text = usize::try_from(idx)
+                        .ok()
+                        .and_then(age_text_at)
+                        .unwrap_or_default();
+                    if field.get_text().unwrap_or_default() == text {
+                        return; // already showing it: no edit, no re-search
+                    }
+                    field.set_text(&text);
+                    let f = from.get_text().unwrap_or_default();
+                    let t = to.get_text().unwrap_or_default();
+                    if super::created_edit_searches(&f, &t) {
+                        arm();
+                    }
+                })
+                .ok();
+        }
+    }
+}
+
+/// The foldout's **max distance** row: the fuzzy edit budget, with `−`/`+`
+/// buttons beside the field.
+///
+/// Built here rather than in `main.rs` for the same reason [`created_ui`] is:
+/// `main.rs` is a binary, so a test can only drive widgets the library builds.
+///
+/// The buttons are not decoration. Typing in the field is the obvious way to
+/// set it on GTK, but an `NSTextField` inside a `NSStackView` only forwards
+/// keystrokes to its cell's field editor (and only on some AppKit releases), and
+/// the AppKit backend wires no wheel events to the field — so on macOS a user
+/// with a mouse and no working field editor had *no* way to change the value.
+/// The buttons are real `NSButton`s: a plain button's click is always
+/// delivered, so the number is reachable on every backend.
+pub mod distance_ui {
+    use rswidgets::prelude::App;
+
+    /// The foldout's concrete widget types on this backend; one arm per
+    /// backend, mirroring `main.rs`'s `widget_traits`.
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    mod widgets {
+        pub type Entry = rswidgets::backends_gtk_adapter::Entry;
+        pub type Label = rswidgets::backends_gtk_adapter::Label;
+        pub type Button = rswidgets::backends_gtk_adapter::Button;
+        pub type Row = rswidgets::backends_gtk_adapter::BoxWidget;
+    }
+    #[cfg(feature = "zork")]
+    mod widgets {
+        pub type Entry = rswidgets::backends_zork_adapter::Entry;
+        pub type Label = rswidgets::backends_zork_adapter::Label;
+        pub type Button = rswidgets::backends_zork_adapter::Button;
+        pub type Row = rswidgets::backends_zork_adapter::BoxWidget;
+    }
+    #[cfg(all(windows, not(feature = "zork")))]
+    mod widgets {
+        pub type Entry = rswidgets::backends_nwg_adapter::Entry;
+        pub type Label = rswidgets::backends_nwg_adapter::Label;
+        pub type Button = rswidgets::backends_nwg_adapter::Button;
+        pub type Row = rswidgets::backends_nwg_adapter::BoxWidget;
+    }
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
+    mod widgets {
+        pub type Entry = rswidgets::backends_wasm_adapter::Entry;
+        pub type Label = rswidgets::backends_wasm_adapter::Label;
+        pub type Button = rswidgets::backends_wasm_adapter::Button;
+        pub type Row = rswidgets::backends_wasm_adapter::BoxWidget;
+    }
+    #[cfg(all(target_os = "macos", not(feature = "zork")))]
+    mod widgets {
+        pub type Entry = rswidgets::backends_macos_adapter::Entry;
+        pub type Label = rswidgets::backends_macos_adapter::Label;
+        pub type Button = rswidgets::backends_macos_adapter::Button;
+        pub type Row = rswidgets::backends_macos_adapter::BoxWidget;
+    }
+
+    use widgets::{Button, Entry, Label, Row};
+
+    /// The label in front of the field.
+    pub const LABEL: &str = "max distance:";
+    /// The two step buttons. ASCII, so they render on a canvas font with no
+    /// glyph fallback (the same rule the icon glyphs follow).
+    pub const DECREASE: &str = "-";
+    pub const INCREASE: &str = "+";
+
+    /// The row, ready to append to the foldout's vertical box.
+    ///
+    /// `Clone` shares the handles (each backend's widgets are handle
+    /// wrappers), so the app can keep one for the request and hand another to
+    /// the Fuzzy toggle's callback.
+    #[derive(Clone)]
+    pub struct DistanceRow {
+        pub label: Label,
+        /// The number itself; the same field `main.rs` reads into the request.
+        pub field: Entry,
+        pub decrease: Button,
+        pub increase: Button,
+        /// Label, field and both buttons.
+        pub row: Row,
+        /// Just the label and its two buttons, so Fuzzy-off can grey the
+        /// chrome while the field stays typeable.
+        pub body: Row,
+    }
+
+    impl DistanceRow {
+        /// Grey the chrome. The field is deliberately left sensitive: a
+        /// disabled `NSTextField` drops input, and greyed chrome is enough to
+        /// say the number means nothing until Fuzzy is ticked — which is what
+        /// leaves typing (or pasting) open to a user who prefers it.
+        pub fn set_controls_sensitive(&self, sensitive: bool) {
+            // Only the label: the backend adapters have no uniform
+            // "insensitive" for a `Button` (GTK greys it, zork and NWG ignore
+            // it, AppKit has no such selector), and a control that only
+            // *looks* enabled on one desktop and dead on another is worse than
+            // one the label explains. The buttons stay clickable, and a click
+            // with Fuzzy off just sets a value the search ignores.
+            self.label.set_sensitive(sensitive);
+            self.set_active(sensitive);
+        }
+
+        /// The state, carried by the label text as well as by the buttons'
+        /// sensitivity.
+        ///
+        /// AppKit dims a label with alpha and zork records `set_sensitive` as
+        /// a no-op, so neither says "inactive" in words; the parenthesised
+        /// note does, on every backend. It is the wording the disclosure
+        /// stand-in uses, so the two read the same.
+        pub fn set_active(&self, active: bool) {
+            let text = format!("{LABEL}{}", if active { "" } else { " (fuzzy off)" });
+            self.label.set_text(&text);
+        }
+    }
+
+    /// Build the row, seeded with `value`.
+    pub fn build(app: &App, value: &str) -> Result<DistanceRow, rswidgets::Error> {
+        let label = app.create_label(LABEL)?;
+        let field = app.create_entry()?;
+        field.set_text(value);
+        // Wide enough for the longest value [`super::step_max_distance`]
+        // produces, so the stack view does not reflow the row on every step.
+        field.set_width_chars(3);
+        let decrease = app.create_button(DECREASE)?;
+        let increase = app.create_button(INCREASE)?;
+        let body = app.create_box(rswidgets::prelude::Orientation::Horizontal, 2)?;
+        body.append(&label);
+        body.append(&decrease);
+        body.append(&field);
+        body.append(&increase);
+        let row = app.create_box(rswidgets::prelude::Orientation::Horizontal, 2)?;
+        row.append(&body);
+        let built = DistanceRow {
+            label,
+            field,
+            decrease,
+            increase,
+            row,
+            body,
+        };
+        // Starts inactive, as the foldout shows it.
+        built.set_active(false);
+        Ok(built)
+    }
+
+    /// Wire the buttons: each click reads the field, applies [`WheelStep`] and
+    /// writes the result back. `on_step` runs after every click that changed
+    /// the text, so the GUI can re-run the search the way it does for a typed
+    /// value.
+    pub fn wire(row: &DistanceRow, on_step: impl Fn() + Clone + 'static) {
+        for (button, step) in [
+            (row.decrease.clone(), super::WheelStep::Down),
+            (row.increase.clone(), super::WheelStep::Up),
+        ] {
+            let field = row.field.clone();
+            let on_step = on_step.clone();
+            let _ = button.on_click(move || {
+                let current = field.get_text().unwrap_or_default();
+                let next = super::step_max_distance(&current, step);
+                if next == current.trim() {
+                    return; // already at the bound: no change, no re-search
+                }
+                field.set_text(&next);
+                on_step();
+            });
         }
     }
 }
@@ -2031,6 +2645,31 @@ pub fn effective_query(quick: &str, advanced: &str) -> Option<String> {
     }
 }
 
+/// The [`SearchOptions`] the foldout's controls describe.
+///
+/// Lives here rather than in `main.rs` so a test can read the **widgets the
+/// app shows** back into a request: a widget that reports the wrong value here
+/// still passes a test that asserts only the widget's own state, while the user
+/// sees an empty list. Fuzzy off ignores the distance, exactly as the label
+/// says — a disabled `NSTextField` still holds whatever was typed.
+pub fn gather_options(
+    case_on: bool,
+    fuzzy_on: bool,
+    count_on: bool,
+    distance: &str,
+) -> SearchOptions {
+    SearchOptions {
+        case_sensitive: case_on,
+        fuzzy: fuzzy_on,
+        max_distance: if fuzzy_on {
+            distance.trim().parse().ok()
+        } else {
+            None
+        },
+        count_only: count_on,
+    }
+}
+
 /// Whether an edit to either box should clear the list at once instead of
 /// searching.
 ///
@@ -2083,6 +2722,19 @@ pub fn step_max_distance(text: &str, step: WheelStep) -> String {
         WheelStep::Down => current.saturating_sub(1),
     };
     next.to_string()
+}
+
+/// The number [`step_max_distance`] would produce, as a number.
+///
+/// The text form is what the field holds (it is an entry, so the user may type
+/// anything); this is the same step for a caller that wants the value rather
+/// than the text, and it exists so the two can never disagree — it parses what
+/// [`step_max_distance`] returns.
+pub fn wheel_step_value(text: &str, step: WheelStep) -> String {
+    step_max_distance(text, step)
+        .parse::<u32>()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| DEFAULT_MAX_DISTANCE_VALUE.to_string())
 }
 
 /// A one-line reminder of the advanced syntax, shown inside the foldout.
@@ -5690,6 +6342,7 @@ mod created_range_tests {
         let range = CreatedRange {
             from: Some(day as i64 * 60),
             to: Some(day as i64 * 60 + 86_399),
+            age: None,
         };
         let note = apply_created_range(&mut o, Some(range), false);
         assert_eq!(o.paths, vec!["/nonexistent/ff-gui/dated"]);
@@ -5822,3 +6475,157 @@ mod live_tests {
         assert!(line.contains("\"q\":\"x\""), "{line}");
     }
 }
+
+#[cfg(test)]
+mod created_time_tests {
+    use super::*;
+
+    /// 2026-03-15 09:30:00 UTC. Fixed, so every relative case is deterministic.
+    const NOW: i64 = 1_773_567_000;
+
+    #[test]
+    fn a_clock_time_is_the_most_recent_occurrence() {
+        // NOW is 2026-03-15 09:30Z, so 08:00 has already passed today.
+        let today8 = days_from_civil(2026, 3, 15) * 86_400 + 8 * 3600;
+        let r = parse_created_range_at("08:00", "", NOW).unwrap().unwrap();
+        // A bare `from` is the START of a 24h window ending at that time.
+        assert_eq!(r.from, Some(today8 - 24 * 3600));
+        assert_eq!(r.to, Some(today8));
+        // With a `to` given, the clock is NOT widened: the pair is exact.
+        let r = parse_created_range_at("08:00", "2026-03-15", NOW).unwrap().unwrap();
+        assert_eq!(r.from, Some(today8));
+        assert_eq!(r.age, None, "a dated pair keeps its plain spelling");
+    }
+
+    #[test]
+    fn a_clock_time_later_than_now_means_yesterday() {
+        // 23:00 has not happened yet today (it is 09:30), so it is yesterday's:
+        // a creation time can never be in the future.
+        let r = parse_created_range_at("23:00", "2026-03-15", NOW).unwrap().unwrap();
+        let yday = NOW.div_euclid(86_400) * 86_400 - 86_400 + 23 * 3600;
+        assert_eq!(r.from, Some(yday));
+        assert!(r.from.unwrap() < NOW);
+    }
+
+    #[test]
+    fn a_bare_clock_time_is_a_24h_window_ending_at_that_time() {
+        // NOW is 09:30Z; the most recent 10:30 is yesterday's, so the window is
+        // yesterday 10:30 -> yesterday 10:30 + 24h (which is 09:30 today).
+        let r = parse_created_range_at("10:30", "", NOW).unwrap().unwrap();
+        let end = days_from_civil(2026, 3, 14) * 86_400 + 10 * 3600 + 30 * 60;
+        assert_eq!(r.to, Some(end), "the typed time ends the window");
+        assert_eq!(r.from, Some(end - 24 * 3600), "and it is 24 hours long");
+        assert_eq!(
+            r.age.as_deref(),
+            Some("24 hours (no date given)"),
+            "the status line must say the date was inferred, not typed"
+        );
+        // The typed digits still matter: 08:00 today ends a different window.
+        let r = parse_created_range_at("08:00", "", NOW).unwrap().unwrap();
+        let end = days_from_civil(2026, 3, 15) * 86_400 + 8 * 3600;
+        assert_eq!(r.to, Some(end));
+        assert_eq!(r.from, Some(end - 24 * 3600));
+    }
+
+    #[test]
+    fn an_upper_clock_time_is_never_widened() {
+        // Widening an upper bound would silently include a day more than asked.
+        let r = parse_created_range_at("", "10:30", NOW).unwrap().unwrap();
+        let expect = most_recent_occurrence(10, 30, NOW);
+        assert_eq!(r.to, Some(expect));
+        assert_eq!(r.age, None);
+    }
+
+    #[test]
+    fn ages_parse_in_both_fields_and_all_units() {
+        for (text, secs) in [
+            ("1 minute ago", 60),
+            ("5 minutes ago", 300),
+            ("2 hours ago", 7_200),
+            ("1 day ago", 86_400),
+            ("3 days ago", 259_200),
+            ("2 weeks ago", 1_209_600),
+        ] {
+            let r = parse_created_range_at(text, "", NOW).unwrap().unwrap();
+            assert_eq!(r.from, Some(NOW - secs), "{text}");
+            assert_eq!(r.label(), format!("since {text}"), "{text}");
+        }
+        // The `to` field takes an age too.
+        let r = parse_created_range_at("", "7 days ago", NOW).unwrap().unwrap();
+        assert_eq!(r.to, Some(NOW - 7 * 86_400));
+    }
+
+    #[test]
+    fn a_month_is_the_same_day_last_month_not_thirty_days() {
+        let mut age = AgoAge { count: 1, unit: AgoUnit::Month };
+        // 2026-03-15 -> 2026-02-15, keeping the time of day.
+        assert_eq!(format_day(age.since(NOW)), "2026-02-15");
+        assert_eq!(age.since(NOW) % 86_400, NOW % 86_400, "time of day kept");
+        // 31 March -> 28 February (2026 is not a leap year), not 3 March.
+        let mar31 = days_from_civil(2026, 3, 31) * 86_400 + 12 * 3600;
+        assert_eq!(format_day(age.since(mar31)), "2026-02-28");
+        // ... and a leap year goes to the 29th.
+        let mar31_2024 = days_from_civil(2024, 3, 31) * 86_400;
+        assert_eq!(format_day(age.since(mar31_2024)), "2024-02-29");
+        age.unit = AgoUnit::Year;
+        assert_eq!(format_day(age.since(NOW)), "2025-03-15");
+    }
+
+    #[test]
+    fn every_dropdown_option_parses_and_round_trips() {
+        for opt in CREATED_AGE_OPTIONS {
+            let parsed = parse_created_range_at(opt, "", NOW)
+                .unwrap_or_else(|e| panic!("{opt}: {e}"));
+            let Some(r) = parsed else {
+                assert_eq!(*opt, "any time", "{opt} parsed to no range");
+                continue;
+            };
+            // The option text is what the status line echoes back.
+            assert_eq!(r.age.as_deref(), Some(*opt), "{opt}");
+        }
+        // "any time" is the empty window, not an error.
+        assert_eq!(parse_created_range_at("any time", "", NOW).unwrap(), None);
+        // The dropdown row index maps back to the same text.
+        for (i, opt) in CREATED_AGE_OPTIONS.iter().enumerate() {
+            assert_eq!(created_ui::age_text_at(i + 1).as_deref(), Some(*opt));
+            assert_eq!(created_ui::index_of_age(opt), (i + 1) as u32);
+        }
+        assert_eq!(created_ui::age_text_at(0).as_deref(), Some(""));
+        assert_eq!(created_ui::index_of_age("not an option"), 0);
+    }
+
+    #[test]
+    fn a_bad_age_is_named_but_a_date_is_not_mistaken_for_one() {
+        // An attempted age with a bad unit is reported...
+        let e = parse_created_range_at("3 dayz ago", "", NOW).unwrap_err();
+        assert!(e.starts_with("created from:"), "{e}");
+        assert!(e.contains("3 dayz ago"), "{e}");
+        // ... and the refusal names the `to` field when that is where it was typed.
+        let e = parse_created_range_at("", "2 fortnights ago", NOW).unwrap_err();
+        assert!(e.starts_with("created to:"), "{e}");
+        // A plain date must NOT be read as a broken age (the regression this pins:
+        // every date used to fail once `parse_age` started rejecting non-ages).
+        assert!(parse_created_range_at("2026-01-02", "", NOW).is_ok());
+        assert!(parse_created_range_at("2024-02-29", "", NOW).is_ok());
+        // Out-of-range clock times are refused, not wrapped.
+        assert!(parse_created_range_at("24:00", "", NOW).is_err());
+        assert!(parse_created_range_at("12:60", "", NOW).is_err());
+    }
+
+    #[test]
+    fn bad_shapes_mention_every_accepted_form() {
+        let e = parse_created_range_at("yesterday", "", NOW).unwrap_err();
+        assert!(e.contains("YYYY-MM-DD"), "{e}");
+        assert!(e.contains("HH:MM"), "{e}");
+        assert!(e.contains("3 days ago"), "{e}");
+    }
+
+    #[test]
+    fn an_age_window_filters_from_that_instant() {
+        let range = parse_created_range_at(CREATED_LAST_24_HOURS, "", NOW).unwrap().unwrap();
+        assert!(range.contains(NOW));
+        assert!(range.contains(NOW - 86_399));
+        assert!(!range.contains(NOW - 86_401));
+    }
+}
+

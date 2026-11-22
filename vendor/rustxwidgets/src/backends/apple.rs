@@ -806,6 +806,23 @@ pub fn is_view_expanding(handle: *mut std::os::raw::c_void) -> bool {
     with_meta(handle, |m| m.hexpand).unwrap_or(false)
 }
 
+/// Record a `set_vexpand` request on a *container* (the box or scrolled
+/// window), so the box it is appended to can give it the leftover height.
+///
+/// A stack view distributes along its axis and has no per-child weight, so the
+/// flag has to be read by the parent's `append`: every child got
+/// `corroSetFlex:` regardless, and a vertical box with `Fill` distribution
+/// stretched whichever children it liked — the results list ended up as short
+/// as its canvas request, and every widget below it was pushed up.
+pub fn set_view_vexpanding(handle: *mut std::os::raw::c_void, expand: bool) {
+    with_meta_mut(handle, |m| m.vexpand = expand);
+}
+
+/// Whether a container asked for the leftover space along its parent's axis.
+pub fn is_view_vexpanding(handle: *mut std::os::raw::c_void) -> bool {
+    with_meta(handle, |m| m.vexpand).unwrap_or(false)
+}
+
 pub fn set_view_min_chars(handle: *mut std::os::raw::c_void, n: i32) {
     with_meta_mut(handle, |m| m.min_chars = n);
 }

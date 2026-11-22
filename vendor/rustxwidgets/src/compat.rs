@@ -16,8 +16,9 @@
 //!   pictogram per file kind (see `paint_icon`), not a themed pixbuf.
 //! * [`Expander`] is the backend's own disclosure widget where it has one —
 //!   GTK3's `GtkExpander`, arrow and clickable header included — and elsewhere
-//!   a header line plus a child box, with the state in the header text and the
-//!   caller doing the toggling (see [`Expander::set_expanded`]).
+//!   a header band drawn on the canvas (a triangle and the title) over a child
+//!   box: the band reports its own click, and [`Expander::set_expanded`] drives
+//!   the same state from a menu item.
 //! * [`ContextMenu`] is a native popup, not a model: GTK3's `GtkMenu`
 //!   (shown with `gtk_menu_popup_at_pointer`) or AppKit's `NSMenu` (shown with
 //!   `+popUpContextMenu:withEvent:forView:`), anchored at the click and
@@ -28,7 +29,7 @@
 //!   time and names the missing backend, so a desktop build can never show a
 //!   "not implemented" message at runtime.
 
-use crate::common::{Canvas, Label, ScrolledWindow, WidgetBox};
+use crate::common::{Canvas, ScrolledWindow, WidgetBox};
 use crate::core::{App, DrawContext};
 use crate::Error;
 use std::cell::{Cell, RefCell};
@@ -1676,41 +1677,55 @@ pub fn clipboard_get_text() -> Result<String, Error> {
     )))
 }
 
-/// A disclosure: a header line with a child under it.
+/// A disclosure: a header band with a child under it.
 ///
 /// GTK3 has a real one — `GtkExpander`, with the toolkit's arrow and a header
 /// that folds the section out when it is clicked — and this **uses it** rather
 /// than imitating it. The other backends have no foldout widget on this layer
 /// (AppKit's is an `NSButton` in a disclosing bezel, which this layer does not
-/// build), so they get the same shape made of a label and a box, with the
-/// state in the header text and [`Expander::set_expanded`] as the only way to
-/// change it.
+/// build, and a button's click callback has to be `Send`, which no widget
+/// handle is), so they get a header band drawn on the portable canvas: a
+/// disclosure triangle and the title, and a click anywhere on the band folds
+/// the section out. [`Expander::set_expanded`] drives the same state, so the
+/// menu item and the band never disagree.
 #[derive(Clone)]
 pub struct Expander {
     /// What goes into the layout: the native expander, or the stand-in's box.
     handle: *mut c_void,
     /// Whether `handle` is a `GtkExpander` (see [`native_foldout`]).
     native: bool,
-    /// The header text without its state marker (only a stand-in shows it).
-    title: Rc<str>,
     /// Mirrors the state where there is no native widget to ask.
     expanded: Rc<Cell<bool>>,
     /// The stand-in's parts; `None` when the native widget is in use.
     stand_in: Option<Rc<StandIn>>,
 }
 
-/// The label-and-box disclosure used where the backend has no foldout widget.
+/// Height of a stand-in disclosure's header band, in logical pixels.
+const DISCLOSURE_HEIGHT: i32 = 20;
+/// Text size in that band.
+const DISCLOSURE_SIZE: f64 = 12.0;
+/// Inset of the triangle from the band's left edge, in logical pixels.
+const DISCLOSURE_PAD_X: f64 = 4.0;
+/// Gap between the triangle and the title, in logical pixels.
+const DISCLOSURE_GAP: f64 = 4.0;
+/// Side of the disclosure triangle, in logical pixels.
+const DISCLOSURE_TRIANGLE: f64 = 7.0;
+
+/// The drawn-band disclosure used where the backend has no foldout widget.
 ///
-/// The header is a label rather than a button: AppKit's click callbacks go
-/// through a process-global registry that requires `Send`, and a widget handle
-/// cannot cross a thread, so this layer has no click callback that works on
-/// both desktops. The header therefore carries the state in its text, and the
-/// caller toggles with [`Expander::set_expanded`].
+/// The band is a canvas, not a label: a label does not report clicks, and a
+/// button's click callback would have to be `Send` while the body it has to
+/// hide is a widget handle. A canvas click callback has no such bound, so the
+/// click that folds the section out can live here.
 struct StandIn {
     /// Kept for the layout: the handle in [`Expander::handle`] points into it.
     _root: WidgetBox,
-    header: Label,
-    body: WidgetBox,
+    /// The child box, shared with the closure that shows and hides it.
+    body: Rc<WidgetBox>,
+    /// Applies one state: hides or shows the body and repaints the band.
+    apply: Rc<dyn Fn(bool)>,
+    /// The header band, on the backends that have a canvas to draw one on.
+    canvas: Option<Canvas>,
 }
 
 impl Expander {
@@ -1727,27 +1742,69 @@ impl Expander {
             return Ok(Expander {
                 handle,
                 native: true,
-                title: Rc::from(label),
                 expanded: Rc::new(Cell::new(false)),
                 stand_in: None,
             });
         }
         let root = new_vbox(2)?;
-        let body = new_vbox(2)?;
-        let header = new_label(&header_text(label, false))?;
-        root.append(&header);
-        root.append(&body);
+        let body = Rc::new(new_vbox(2)?);
         set_box_visible(&body, false);
+        let title: Rc<str> = Rc::from(label);
+        let expanded = Rc::new(Cell::new(false));
+
+        // The band, and the one closure that puts it in a state: a canvas that
+        // draws the triangle and the title and reports the click, or — on a
+        // backend with no canvas — a label naming the state, where the menu is
+        // the only toggle.
+        let (apply, canvas): (Rc<dyn Fn(bool)>, Option<Canvas>) = match new_canvas() {
+            Ok(canvas) => {
+                let draw_title = title.clone();
+                let draw_state = expanded.clone();
+                canvas.set_size_request(1, DISCLOSURE_HEIGHT);
+                canvas.set_draw_callback(Box::new(move |ctx, w, h| {
+                    paint_header(ctx, w, h, &draw_title, draw_state.get())
+                }));
+                let apply_state = expanded.clone();
+                let apply_body = body.clone();
+                let apply_canvas = canvas.clone();
+                let apply: Rc<dyn Fn(bool)> = Rc::new(move |open: bool| {
+                    apply_state.set(open);
+                    set_box_visible(&apply_body, open);
+                    // The band shows the state, so it has to repaint with it.
+                    apply_canvas.queue_redraw();
+                });
+                let click_state = expanded.clone();
+                let click_apply = apply.clone();
+                canvas.on_click(Box::new(move |_x: f64, _y: f64| {
+                    click_apply(!click_state.get());
+                }));
+                root.append(&canvas);
+                (apply, Some(canvas))
+            }
+            Err(_) => {
+                let header = new_label(&header_text(label, false))?;
+                root.append(&header);
+                let apply_state = expanded.clone();
+                let apply_body = body.clone();
+                let name = title.clone();
+                let apply: Rc<dyn Fn(bool)> = Rc::new(move |open: bool| {
+                    apply_state.set(open);
+                    set_box_visible(&apply_body, open);
+                    header.set_text(&header_text(&name, open));
+                });
+                (apply, None)
+            }
+        };
         let handle = *root.as_ref();
         Ok(Expander {
             handle,
             native: false,
-            title: Rc::from(label),
-            expanded: Rc::new(Cell::new(false)),
+            expanded,
             stand_in: Some(Rc::new(StandIn {
                 _root: root,
-                header,
                 body,
+                apply,
+                canvas,
             })),
         })
     }
@@ -1774,8 +1831,7 @@ impl Expander {
             native_foldout::set_expanded(self.handle, expanded);
         }
         if let Some(parts) = &self.stand_in {
-            set_box_visible(&parts.body, expanded);
-            parts.header.set_text(&header_text(&self.title, expanded));
+            (parts.apply)(expanded);
         }
     }
 
@@ -1844,13 +1900,66 @@ mod native_foldout {
 
 /// The header line for a *stand-in* disclosure in the given state.
 ///
-/// Stated in words, not a `[+]`/`[-]` marker: the stand-in's header is not
-/// clickable, and a triangle or plus sign would promise a toggle that is not
-/// there. The native `GtkExpander` needs none of this — its arrow is the
-/// state, and it is clickable.
+/// Stated in words, not a `[+]`/`[-]` marker, for the backends with no canvas to
+/// draw the band on: there the header is a label and the menu is the only
+/// toggle, so a triangle would promise a control that is not there. Where the
+/// band is drawn ([`paint_header`]) the text carries no state — the triangle in
+/// the band and the title are all it needs.
 fn header_text(title: &str, expanded: bool) -> String {
     let state = if expanded { "expanded" } else { "collapsed" };
     format!("{title} ({state})")
+}
+
+/// Paint a disclosure band: the state triangle, then the title, centred in it.
+fn paint_header(ctx: &mut dyn DrawContext, _w: i32, h: i32, title: &str, expanded: bool) {
+    let band = if h > 0 {
+        h as f64
+    } else {
+        DISCLOSURE_HEIGHT as f64
+    };
+    let ink = ink_height(ctx, DISCLOSURE_SIZE, 0);
+    let top = centred_text_top(ink, band);
+    let triangle_top = ((band - DISCLOSURE_TRIANGLE) / 2.0).max(0.0);
+    paint_triangle(
+        ctx,
+        DISCLOSURE_PAD_X,
+        triangle_top,
+        DISCLOSURE_TRIANGLE,
+        expanded,
+    );
+    ctx.draw_text(
+        DISCLOSURE_PAD_X + DISCLOSURE_TRIANGLE + DISCLOSURE_GAP,
+        top,
+        title,
+        FONT,
+        DISCLOSURE_SIZE,
+        0.1,
+        0.1,
+        0.12,
+        1.0,
+    );
+}
+
+/// A filled triangle: pointing down when the section is open, right when shut.
+///
+/// One-pixel rows rather than a glyph (`▸`/`▾`): the band has to look the same
+/// whichever glyphs the canvas's font happens to cover, and a missing glyph is
+/// drawn as a box, which reads as a broken control.
+fn paint_triangle(ctx: &mut dyn DrawContext, x: f64, y: f64, size: f64, expanded: bool) {
+    let rows = size.ceil() as i32;
+    for r in 0..rows {
+        let row = r as f64;
+        let (rx, ry, rw, rh) = if expanded {
+            // Apex at the top: row `r` is `r + 1` pixels wide, centred.
+            let w = (row + 1.0).min(size);
+            (x + (size - w) / 2.0, y + row, w, 1.0)
+        } else {
+            // Apex on the left: row `r` is `size - r` pixels wide.
+            let w = (size - row).max(1.0);
+            (x, y + row, w, 1.0)
+        };
+        ctx.fill_rect(rx, ry, rw, rh, 0.1, 0.1, 0.12, 1.0);
+    }
 }
 
 /// The expander is itself a widget: it can be packed into a box like any

@@ -75,6 +75,21 @@ name = "live_mac"
 path = "tests/live_mac.rs"
 harness = false
 
+# The daemon binary itself answering the GUI's fuzzy question: the in-process
+# tests cannot see a stale `fflocated`, which is one way macOS "found nothing".
+[[test]]
+name = "daemon_fuzzy_mac"
+path = "tests/daemon_fuzzy_mac.rs"
+harness = false
+
+# The macOS half of the foldout's fuzzy search: it presses real `NSButton`s and
+# builds the foldout's AppKit widgets, which need the main thread (as the walks
+# above do).
+[[test]]
+name = "foldout_fuzzy_mac"
+path = "tests/foldout_fuzzy_mac.rs"
+harness = false
+
 # The capture is AppKit's own bitmap of the window, and it has to be taken on
 # the main thread after the rows are laid out.
 [[test]]

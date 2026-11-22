@@ -902,7 +902,32 @@ mod macos_adapter {
             }
             let is_canvas = core_apple::is_canvas_view(child_ptr);
             let expands = core_apple::is_view_expanding(child_ptr);
+            let vexpands = core_apple::is_view_vexpanding(child_ptr);
             let stack_appkit = responds(self.0, "setDistribution:");
+            let vertical = responds(self.0, "orientation")
+                && raw_send!(
+                    self.0,
+                    "orientation",
+                    unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize,
+                    ()
+                ) == 1;
+            // Along the box's *own* axis the child grows only when it asked to
+            // (`set_vexpand` in a vertical box, `set_hexpand` in a horizontal
+            // one). Across it, every child fills — that is `pin_across`.
+            //
+            // This distinction is the whole layout on AppKit. Every child used
+            // to be sent `corroSetFlex:` (a hugging priority of 1) no matter
+            // what it asked for, and a vertical `NSStackView` with `Fill`
+            // distribution then split the window's spare height between *all*
+            // of them: the results list got a share instead of the leftover,
+            // and the status line, the column headers and the rows were pushed
+            // up out of place — the status text ended up over the Name/Path
+            // headers and the headers over the first rows. A child that did not
+            // ask to grow now keeps AppKit's default hugging priority, so it is
+            // its natural size and the expanding child is the only one that
+            // moves. A bare canvas is content rather than chrome and does not
+            // ask, so it keeps growing along the axis, as it always did.
+            let grows_along_axis = if vertical { vexpands } else { expands };
             // GTK's box stretches a child across the *other* axis: a vertical
             // box gives every child the box's width, a horizontal box its
             // height. `NSStackView` only aligns children, so they kept their
@@ -918,24 +943,12 @@ mod macos_adapter {
                 if stack_appkit {
                     pin_across(self.0, child_ptr);
                 }
-                if expands || is_canvas {
+                if grows_along_axis || is_canvas {
                     // GTK gives the leftover space to the expanding child. On a
                     // stack view that is a low content-hugging priority along
                     // the axis: without it `Fill` stretched whichever child
-                    // happened to resist least, and the Search button took half
-                    // the query row while the entry stayed narrow.
-                    let axis = if responds(self.0, "orientation")
-                        && raw_send!(
-                            self.0,
-                            "orientation",
-                            unsafe extern "C" fn(*mut c_void, *mut c_void) -> isize,
-                            ()
-                        ) == 1
-                    {
-                        1isize
-                    } else {
-                        0isize
-                    };
+                    // happened to resist least.
+                    let axis = if vertical { 1isize } else { 0isize };
                     if responds(child_ptr, "setContentHuggingPriority:forOrientation:") {
                         raw_send!(
                             child_ptr,
@@ -950,6 +963,21 @@ mod macos_adapter {
                     // `corroFlexChild:`. Android does exactly this with
                     // LinearLayout weight (ANDROID_GUIDELINES.md §6).
                     shim_bv(child_ptr, "corroSetFlex:", true);
+                } else if stack_appkit {
+                    // Say it explicitly rather than leaning on AppKit's default:
+                    // a child whose hugging was lowered earlier must not keep
+                    // growing after it stopped asking to. Along the axis only:
+                    // across the axis `pin_across` already made the child fill,
+                    // and a label wants its low cross-axis hugging so its text
+                    // defines the natural size it is pinned to.
+                    let axis = if vertical { 1isize } else { 0isize };
+                    raw_send!(
+                        child_ptr,
+                        "setContentHuggingPriority:forOrientation:",
+                        unsafe extern "C" fn(*mut c_void, *mut c_void, f32, isize),
+                        (250.0f32, axis)
+                    );
+                    shim_bv(child_ptr, "corroSetFlex:", false);
                 }
             }
             // Minimum width for an empty entry: `set_width_chars` recorded a
@@ -979,9 +1007,12 @@ mod macos_adapter {
         }
 
         /// A stack view distributes along its own axis, so a box's vertical
-        /// expansion is the axis' business (`set_child_vexpand` handles a
-        /// child); recorded as a no-op, as on `Entry`.
-        pub fn set_vexpand(&self, _expand: bool) {}
+        /// expansion is the axis' business: recorded, and read by the parent
+        /// box's `append`, which turns it into `corroSetFlex:` exactly as
+        /// `set_child_vexpand` does for a child.
+        pub fn set_vexpand(&self, expand: bool) {
+            core_apple::set_view_vexpanding(self.0, expand);
+        }
 
         /// Show or hide the box (and everything in it).
         ///
@@ -2873,6 +2904,21 @@ mod macos_adapter {
     }
 
     impl ScrolledWindow {
+        /// `set_vexpand` on a scroll view: the box it is appended to gives it
+        /// the leftover height (see [`BoxWidget::append`]).
+        ///
+        /// This used to be recorded as a no-op because the per-child flag
+        /// collapsed into the same `corroSetFlex:` call `append` makes for every
+        /// child. That is not enough on a vertical `NSStackView`: `Fill`
+        /// distributes the spare height among all of them, so the results list
+        /// took its canvas request instead of the window's leftover and the
+        /// status line, the column headers and the rows were shoved up out of
+        /// place. The flag is what `append` reads to make this the *only* child
+        /// along the stack's axis that grows.
+        pub fn set_vexpand(&self, expand: bool) {
+            core_apple::set_view_vexpanding(self.0, expand);
+        }
+
         /// Put the sheet canvas in the scroll view as its document view.
         ///
         /// `setDocumentView:` is what puts it inside the clip view (so it is

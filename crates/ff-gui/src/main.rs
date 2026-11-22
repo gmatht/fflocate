@@ -255,15 +255,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let live_run: Rc<RefCell<ff_gui::LiveRunner>> =
         Rc::new(RefCell::new(ff_gui::LiveRunner::new()));
 
-    // The max edit distance only means anything with Fuzzy on, so it is
-    // disabled until then rather than silently ignored.
+    // The max edit distance only means anything with Fuzzy on, so its label
+    // says so until then rather than leaving a value that reads as active. The
+    // row (label, `-`, field, `+`) is built by the library so a test can drive
+    // the very widgets the app shows; the buttons are what makes the value
+    // changeable on macOS, where AppKit's entry wires no wheel to the field
+    // and keystrokes may not reach it inside a stack view (see
+    // `ff_gui::distance_ui`).
     trace_step!("distance row");
-    let opt_distance = app.create_entry()?;
-    opt_distance.set_text(DEFAULT_MAX_DISTANCE);
-    let distance_row = app.create_box(Orientation::Horizontal, 2)?;
-    let distance_label = app.create_label("max distance:")?;
-    distance_row.append(&distance_label);
-    distance_row.append(&opt_distance);
+    let distance = ff_gui::distance_ui::build(&app, DEFAULT_MAX_DISTANCE)?;
+    let opt_distance = distance.field.clone();
+    let distance_row = distance.row.clone();
 
     trace_step!("advanced box");
     let advanced_box = app.create_box(Orientation::Vertical, 2)?;
@@ -280,19 +282,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // `present()` below, because GTK's show_all would otherwise re-show the
     // body (the expander hides it by hiding the box it lives in).
 
-    // Fuzzy off => the distance field is inert; grey it out so it is clear the
-    // value has no effect rather than being silently ignored.
+    // Fuzzy off => the distance means nothing, and the label says `(fuzzy
+    // off)` so that is clear rather than silently ignored. The field itself
+    // stays typeable and the buttons stay clickable: a disabled `NSTextField`
+    // drops input, and someone who prefers preparing the value before ticking
+    // Fuzzy must still be able to set it (`gather_options` ignores it until
+    // then).
     {
-        opt_distance.set_sensitive(false);
-        distance_label.set_sensitive(false);
-        let d = opt_distance.clone();
-        let l = distance_label.clone();
+        let controls = distance.clone();
+        controls.set_controls_sensitive(false);
         let f = opt_fuzzy.clone();
         opt_fuzzy
             .connect_toggled(move || {
-                let on = f.is_active();
-                d.set_sensitive(on);
-                l.set_sensitive(on);
+                controls.set_controls_sensitive(f.is_active());
             })
             .ok();
     }
@@ -473,8 +475,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // per-row `stat` unless the daemon could not date the entry. The
                 // suffix then states how much of that page it hid, so the
                 // filtered count never passes for the daemon's total.
-                let range = *created_range.borrow();
-                let note = apply_created_range(&mut outcome, range, count_only);
+                let range = created_range.borrow().clone();
+                let note = apply_created_range(&mut outcome, range.clone(), count_only);
                 let mut line =
                     outcome.status_line_opts(outcome.paths.len().min(MAX_ROWS), count_only);
                 line.push_str(&note);
@@ -769,7 +771,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             // list actually paints (`streaming_rows` is the
                             // function the row-menu tests paint through).
                             let (kept, partial_shown) =
-                                streaming_rows(&hits, *created_range.borrow(), MAX_ROWS);
+                                streaming_rows(&hits, created_range.borrow().clone(), MAX_ROWS);
                             // Fold every Progress record into the watermark:
                             // monotone, never rewinds.
                             for r in p.records() {
@@ -1156,6 +1158,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // it, so typing `2026-0` does not flash an error on every keystroke.
         // The handler lives in `created_ui` so the GTK test exercises it too.
         created_ui::wire(&created, arm.clone());
+
+        // The max-distance `-`/`+` buttons are the one way to change the edit
+        // budget that does not depend on the field taking keystrokes or the
+        // wheel (AppKit wires neither here — see `ff_gui::distance_ui`). A
+        // click is a deliberate edit like a keystroke, so it arms the same
+        // debounce; with Fuzzy unticked the value changes but the search it
+        // would affect is off anyway, and `gather_options` ignores it.
+        ff_gui::distance_ui::wire(&distance, arm.clone());
     }
 
     // The Live toggle records intent only; the pump above owns the socket, so
@@ -1755,17 +1765,11 @@ fn gather_options(
     count: &impl Active,
     distance: &impl TextValue,
 ) -> SearchOptions {
-    let fuzzy_on = fuzzy.is_active();
-    SearchOptions {
-        case_sensitive: case.is_active(),
-        fuzzy: fuzzy_on,
-        max_distance: if fuzzy_on {
-            distance.get_text().and_then(|t| t.trim().parse().ok())
-        } else {
-            None
-        },
-        count_only: count.is_active(),
-    }
+    // The mapping itself lives in the library (`ff_gui::gather_options`) so a
+    // test can drive the foldout's real widgets through it; this is only the
+    // widget-side half: read each control, then hand over plain values.
+    let distance_text = distance.get_text().unwrap_or_default();
+    ff_gui::gather_options(case.is_active(), fuzzy.is_active(), count.is_active(), &distance_text)
 }
 
 /// The bits of a checkbox the option reader needs (lets the logic be tested
