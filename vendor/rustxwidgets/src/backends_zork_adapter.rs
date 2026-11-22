@@ -1088,6 +1088,17 @@ impl DropDown {
         crate::backends::zork::add_callback(self.id, Box::new(f));
         Ok(0)
     }
+    /// Fire the change handlers from the model, so a test can drive a selection
+    /// without reaching for the harness — the dropdown counterpart of
+    /// `Button::emit_clicked`.
+    ///
+    /// A real popup both records the index and emits `changed`; zork's
+    /// `set_active` only records, so a test that wants the app's handler to run
+    /// calls `set_active(Some(i))` and then this.
+    pub fn emit_changed(&self) -> Result<u64, Error> {
+        crate::backends::zork::fire(self.id);
+        Ok(0)
+    }
     pub fn grab_focus(&self) {
         crate::backends::zork::set_focus(self.id);
     }

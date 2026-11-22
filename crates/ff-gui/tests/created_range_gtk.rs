@@ -242,6 +242,24 @@ fn the_created_fields_filter_the_rows_and_report_what_they_checked() {
     assert_eq!(created.from.get_text().unwrap_or_default(), "");
     assert_eq!(created.to.get_text().unwrap_or_default(), "");
 
+    // The age dropdowns are real controls on the row, not labels: a real GTK
+    // combo box reports a selected index, and both start on the placeholder.
+    assert_eq!(
+        created.from_ages.get_active(),
+        0,
+        "the from dropdown must exist and start on the placeholder row"
+    );
+    assert_eq!(
+        created.to_ages.get_active(),
+        0,
+        "the to dropdown must exist and start on the placeholder row"
+    );
+    assert!(
+        created_ui::PLACEHOLDER.contains("HH:MM"),
+        "the hint must advertise the clock-time form, got {:?}",
+        created_ui::PLACEHOLDER
+    );
+
     let foldout_box = app
         .create_box(Orientation::Vertical, 2)
         .expect("foldout box");
