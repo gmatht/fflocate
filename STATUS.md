@@ -423,9 +423,14 @@ These are deliberate and small; each is noted so the design stays honest.
    probed, but the hot loop is the stdlib one. Replacing it is a contained
    change in `crates/fflocate/src/crawl.rs`.
 
-2. **`subscribe` is a preview.** Per §11 it is "v1.5". The op is accepted and
-   answers with meta + the current cursor, but there is no live per-subscriber
-   feed yet. `ff watch` therefore tails one snapshot, not a stream.
+2. **The change feed is bounded, and a `resync` is how it says so.** The daemon
+   keeps the connection open after `Meta` and sends one
+   `{action: "create"|"delete", path}` per change, filtered by the request's
+   optional `q` (protocol v6). `ff watch` prints them until interrupted and the
+   GUI's Live toggle consumes them; a pre-v6 client is refused rather than
+   streamed at, since its `subscribe` expected a terminating `Done`. The feed
+   is a 4096-change ring: a client whose cursor falls behind it gets
+   `action: "resync"` rather than a silent gap.
 
 3. **`since` emits coarse deltas.** The change log stores cursors at which the
    index changed, not per-path records, so `--since <cursor>` reports matching

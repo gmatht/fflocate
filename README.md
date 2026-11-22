@@ -124,7 +124,7 @@ ff --since c:7:481221            # what changed since
 ff stats --roots                 # entries, backend, queue depth, caps, state
 ff rescan /data
 ff update [--timeout 120] [ROOT...]  # reconcile missed changes, then settle
-ff watch                         # tail live events (subscribe preview)
+ff watch                         # tail live create/delete events
 ff service install               # systemd user unit / launchd plist
 ln -s "$(command -v ff)" ~/bin/locate  # drop-in locate replacement (argv[0])
 ```
@@ -274,6 +274,8 @@ crates/fx/       CLI client + service install
 **Not implemented:** `since` is still a coarse delta (flush cursors plus a
 filtered scan of the current index, not per-path diffs between two cursors).
 
-`subscribe` now streams real per-path `create`/`delete` events, filtered
-server-side by an optional query (protocol v6), and the GUI's Live toggle uses
-it; `ff watch` still reads one snapshot because it uses the batched client.
+`subscribe` streams real per-path `create`/`delete` events, filtered
+server-side by an optional query (protocol v6). `ff watch` prints them until
+interrupted, and the GUI's Live toggle applies them to the rows already on
+screen. A pre-v6 client is refused rather than streamed at, because its
+`subscribe` expected a terminating `Done`.

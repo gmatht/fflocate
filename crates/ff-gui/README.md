@@ -369,7 +369,20 @@ depend on a checkout outside this repository.
   (`fresh`, `stale_roots`, `catching_up`, and the daemon's own `phase` with crawl
   progress) is shown in the status line, so a stale view is never presented as an
   empty one and a slow search names what the daemon is actually doing.
-* `subscribe` (a live push feed) is still a v1.5 preview in the daemon, so the
-  GUI re-queries rather than streaming. As-you-type makes that feel live for the
-  index's *contents* changing, but it is still a fresh request each time, not a
-  subscription.
+* **Live mode** (the *Live: follow changes* toggle in Advanced Search) opens a
+  `subscribe` connection and leaves it open. The daemon filters the feed with the
+  same query the boxes hold, so only relevant creates/deletes are sent, each as
+  `{action: "create"|"delete", path}`. A burst is coalesced (`LiveMode`, 250 ms
+  quiet window) and then **applied to the rows already on screen**: a create is
+  merged in (the list's own sort decides where), a delete is removed, and every
+  other row keeps its order, the scroll offset and the selected file. A change
+  never rebuilds the list — `TreeView::append_rows` and
+  `TreeView::remove_rows_matching` touch only the rows that changed. The query
+  is re-run only when the events cannot be applied locally: a `resync` (the
+  daemon's feed has a gap) or a query whose matching the feed does not carry
+  (fuzzy, a created-date range, count-only). The socket is stepped by the same
+  30 ms pump as the search socket, so a quiet or wedged daemon never blocks the
+  window. Turning the toggle off drops the connection; a daemon that predates
+  protocol 6 is told so in the status line rather than silently doing nothing.
+  Proven by `tests/live_gtk.rs` (toggle → subscribe request → a pushed create
+  repaints the row → a delete removes it) and `tests/live_mac.rs` for AppKit.

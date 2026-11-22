@@ -314,12 +314,13 @@ NDJSON over unix socket. The op set is now cursor-native:
 ← {"type":"meta","gen":7,"fresh":true}          # gen mismatch → full listing
 ← {"type":"hit", ...}                            # else: delta events since LSN
 
-→ {"v":2,"op":"subscribe","name":"gui","cursor":null}     # v1.5: change feed
+→ {"v":6,"op":"subscribe","name":"gui","cursor":null,"q":"src ext:rs"}
+← meta, then per-change {"type":"event","action":"create","path":"…"}
 → {"v":2,"op":"stats"}   → {"recrawl_count":2,"last_rescan_cause":"overflow", ...}
 → {"v":2,"op":"rescan","root":"/data"}
 ```
 
-Design rules carried from Watchman: coalesce per subscriber, slow clients catch up or resync, never let a client block the applier.
+Design rules carried from Watchman: coalesce per subscriber, slow clients catch up or resync, never let a client block the applier. Implemented as a pull loop over the applier's bounded change ring: a subscriber polls `since(cursor)` every 50 ms, so the applier never blocks on a socket. A change evicted before the subscriber read it (ring overflow) is reported as `action: "resync"`, and a generation bump likewise — silence would look like "nothing changed". The optional `q` is compiled once and matched against each change's recorded name/kind/path, which is why the ring stores those rather than bare cursors.
 
 ---
 
@@ -338,7 +339,7 @@ ff stats --roots                 # entries, backend, queue depth, drops,
                                  # recrawl_count, last_rescan_cause, per-root caps/state
 ff rescan /data
 ff update [--timeout 120] [ROOT...]  # reconcile all roots, then settle
-ff watch                         # tail live events (debugging; preview of subscribe)
+ff watch                         # tail live create/delete events until interrupted
 ff service install               # systemd user unit / launchd plist
 ```
 
