@@ -437,6 +437,15 @@ pub struct Applier {
     dir_paths: HashMap<u32, DirPathNode>,
     /// Root dir id per root index.
     root_dir_ids: Vec<u32>,
+    /// Each root's configured path, byte-normalized the same way
+    /// [`crate::roots::root_entry_name`] normalizes it, parallel to
+    /// `root_dir_ids`. A root nested inside another root is a **boundary** for
+    /// the parent's walk (§4): the nested root's own crawl indexes that
+    /// subtree, so letting the parent crawl into it indexes every file there
+    /// twice, under two different parents. Mount boundaries cannot cover this
+    /// — a nested root need not be a mount point, and on a model/plain
+    /// directory tree there is no mountinfo at all.
+    root_abs: Vec<Vec<u8>>,
     /// When true, journal writes are suppressed (used during initial crawl
     /// replay where the snapshot will capture everything).
     pub journaling: bool,
@@ -554,6 +563,7 @@ impl Applier {
             let p = e.parent;
             (p != ROOT_ID && p != id).then_some(p)
         }));
+        let root_abs = root_abs_of(&shared);
         Applier {
             shared,
             store,
@@ -562,6 +572,7 @@ impl Applier {
             sync,
             dir_paths: HashMap::new(),
             root_dir_ids,
+            root_abs,
             journaling: true,
             records_since_compaction: 0,
             compaction_threshold: 100_000,
@@ -631,17 +642,65 @@ impl Applier {
         self.mountpoints.contains(&os_str_bytes(abs.as_os_str()))
     }
 
-    /// May `dir` (at `abs`) be enumerated? A mount point that is not itself a
-    /// root is another filesystem's business: the directory itself is
-    /// recorded, but it is never descended into, watched, or queued — its own
-    /// root (if indexed at all) covers it.
+    /// May `dir` (at `abs`) be enumerated? Two kinds of boundary stop a walk,
+    /// and both leave the directory entry itself recorded (only the descend —
+    /// enumerate, watch, queue — is skipped), because each subtree is indexed
+    /// by whatever owns it:
+    ///
+    /// * a **mount point** that is not itself a root: another filesystem, and
+    ///   the parent root must not read across it (§4);
+    /// * a **root nested inside another root**: that subtree is its own
+    ///   root's to index. Without this the outer root's crawl walks straight
+    ///   into it and every file beneath it is inserted twice, under two
+    ///   different parents — one copy per enclosing root. A nested root need
+    ///   not be a mount point (`ff roots add ~/src` under a `/home` root), and
+    ///   on a model or plain-directory tree there is no mountinfo at all, so
+    ///   the mount check alone cannot cover this.
+    ///
+    /// A directory that *is itself* a root is always descended into: it is
+    /// where that root's walk starts.
     fn may_descend(&self, dir: u32, abs: &std::path::Path) -> bool {
         // A folder the OS refused is never opened again, not even to confirm
         // the refusal: on macOS the open is exactly what raises the dialog.
         if self.is_denied(abs) {
             return false;
         }
-        self.root_dir_ids.contains(&dir) || !self.is_mountpoint(abs)
+        if self.root_dir_ids.contains(&dir) {
+            return true;
+        }
+        !self.is_mountpoint(abs) && !self.is_foreign_root(dir, abs)
+    }
+
+    /// Is `abs` the configured path of a root other than the one `dir` belongs
+    /// to? Such a directory is a boundary for this walk (see [`Self::may_descend`]).
+    ///
+    /// Matched by absolute path rather than by id, because the entry reached
+    /// through this walk is a *different* index entry from the root's own
+    /// root-dir entry: `/model/a` crawled from `/model` is a child of the
+    /// `/model` root-dir, while the root added for `/model/a` is a top-level
+    /// entry named `/model/a`. Path is the identity the roots table is keyed
+    /// by (see [`crate::roots::root_entry_name`]), so that is what is compared
+    /// — byte-normalized through the same function, so a trailing slash or a
+    /// `\\` separator in the configuration cannot miss.
+    ///
+    /// The root `dir` itself belongs to is not a boundary: a walk into its own
+    /// root's configured path is what a crawl of that root *is*.
+    fn is_foreign_root(&self, dir: u32, abs: &std::path::Path) -> bool {
+        if self.root_abs.is_empty() {
+            return false;
+        }
+        let here = root_abs_bytes(abs);
+        // A walk never reaches *itself* — `dir` being a root returned above —
+        // but a path reached twice (a store with two roots at one path) must
+        // not be treated as foreign to itself either.
+        let own_root = self
+            .root_index_of_dir(dir)
+            .and_then(|i| self.root_abs.get(i))
+            .is_some_and(|p| *p == here);
+        if own_root {
+            return false;
+        }
+        self.root_abs.iter().any(|p| *p == here)
     }
 
     /// Turn on per-entry ownership capture (system mode). Once on, every entry
@@ -742,6 +801,7 @@ impl Applier {
         let ix = self.shared.index.read().unwrap();
         let roots = self.shared.roots.read().unwrap();
         self.root_dir_ids = roots.iter().map(|r| root_dir_id(&ix, r)).collect();
+        self.root_abs = roots.iter().map(|r| root_abs_bytes(&r.path)).collect();
         for (i, r) in roots.iter().enumerate() {
             let rid = self.root_dir_ids[i];
             if rid != ROOT_ID {
@@ -2183,6 +2243,24 @@ pub fn root_dir_id(ix: &Index, root: &Root) -> u32 {
         Some(old) => ix.lookup(ROOT_ID, &old).unwrap_or(ROOT_ID),
         None => ROOT_ID,
     }
+}
+
+/// A root path in the byte form the roots table compares by: separators
+/// normalized and one trailing slash stripped (except for `/` itself), the
+/// same normalization [`crate::roots::root_entry_name`] applies so that a
+/// root's configured path and its index identity agree.
+///
+/// Non-UTF-8 paths lose fidelity through the lossy conversion, exactly as
+/// `root_entry_name` already does for root identities.
+fn root_abs_bytes(path: &Path) -> Vec<u8> {
+    crate::roots::root_entry_name(path)
+}
+
+/// Every configured root path in [`root_abs_bytes`] form, in roots-table
+/// order (parallel to `Applier::root_dir_ids`).
+fn root_abs_of(shared: &Shared) -> Vec<Vec<u8>> {
+    let roots = shared.roots.read().unwrap();
+    roots.iter().map(|r| root_abs_bytes(&r.path)).collect()
 }
 
 /// All descendants of `dir` (not including `dir`).

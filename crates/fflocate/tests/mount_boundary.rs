@@ -213,3 +213,122 @@ fn same_basename_roots_resolve_independently() {
     assert_eq!(root_dir_id(&ix, &roots[1]), qualified);
     assert_ne!(legacy, qualified);
 }
+
+fn three_deep_model() -> ModelFs {
+    // /model/a/b holds one file; three nested roots over it: /model, /model/a,
+    // /model/a/b.
+    let mut b = std::collections::BTreeMap::new();
+    b.insert(b"f.rs".to_vec(), Node::File);
+    let mut aa = std::collections::BTreeMap::new();
+    aa.insert(b"b".to_vec(), Node::Dir(b));
+    ModelFs::with([("a", Node::Dir(aa))])
+}
+
+#[test]
+fn nested_roots_index_the_same_file_exactly_once() {
+    let (mut a, shared, _d, rids) = harness(
+        three_deep_model(),
+        &["/model", "/model/a", "/model/a/b"],
+        mps(&[]),
+    );
+    for rid in rids.clone() {
+        assert_ne!(rid, ROOT_ID);
+        a.pending_mut().enqueue_crawl(rid);
+    }
+    a.drain();
+
+    let ix = shared.index.read().unwrap();
+    let files: Vec<u32> = ix
+        .iter_live()
+        .filter(|(id, e)| !e.flags().is_root_dir() && ix.name(*id) == b"f.rs")
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(files.len(), 1, "one file on disk, one index entry: {files:?}");
+}
+
+#[test]
+fn a_rescan_of_the_parent_heals_entries_crawled_before_the_nested_root_existed() {
+    // The outer root crawled while it was the only root: it walked straight
+    // into `/model/a/b` and indexed the file under itself.
+    let (mut a, shared, _d, _rids) = harness(three_deep_model(), &["/model"], mps(&[]));
+    let r0 = {
+        let ix = shared.index.read().unwrap();
+        root_dir_id(&ix, &shared.roots.read().unwrap()[0])
+    };
+    a.pending_mut().enqueue_crawl(r0);
+    a.drain();
+    let count_f_rs = || {
+        let ix = shared.index.read().unwrap();
+        ix.iter_live()
+            .filter(|(id, e)| !e.flags().is_root_dir() && ix.name(*id) == b"f.rs")
+            .count()
+    };
+    assert_eq!(count_f_rs(), 1);
+
+    // A nested root is added (an `ff roots add` that does not itself crawl)
+    // and the parent is rescanned: the leaked copy beneath the nested root is
+    // a boundary now, so the rescan drops it rather than re-walking into it.
+    let r1 = shared.index.write().unwrap().insert(
+        ROOT_ID,
+        &root_entry_name(std::path::Path::new("/model/a/b")),
+        EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+    );
+    shared
+        .roots
+        .write()
+        .unwrap()
+        .push(Root::new(1, std::path::PathBuf::from("/model/a/b")));
+    a.rebuild_dir_cache();
+    a.pending_mut().enqueue_rescan(r0, RescanCause::Manual);
+    // The daemon's normal sequence: every root gets its initial crawl, so the
+    // new root indexes its own subtree while the parent stops at it.
+    a.pending_mut().enqueue_crawl(r1);
+    a.drain();
+
+    // The outer root keeps `/model/a/b` as a leaf and nothing beneath it; the
+    // nested root indexes the file itself, once.
+    let outer = index_paths_under(&shared, b"/model");
+    assert_eq!(outer.get("/model/a/b"), Some(&true), "{outer:?}");
+    assert!(
+        !outer.contains_key("/model/a/b/f.rs"),
+        "the outer root must stop at the nested root: {outer:?}"
+    );
+    // Nothing was duplicated: the parent's rescan neither kept its own copy
+    // nor invented a second one under the nested root's id.
+    assert_eq!(count_f_rs(), 1, "one file on disk, one index entry");
+}
+
+#[test]
+fn a_restart_re_crawl_does_not_descend_into_a_nested_root() {
+    // After a restart everything is already "known", so the crawl takes the
+    // known-dir branch — which must honour the boundary too, or the nested
+    // root's watch is installed twice over and its files re-walked.
+    let (mut a, shared, _d, rids) = harness(
+        three_deep_model(),
+        &["/model", "/model/a/b"],
+        mps(&[]),
+    );
+    for rid in rids.clone() {
+        a.pending_mut().enqueue_crawl(rid);
+    }
+    a.drain();
+    a.take_watch_requests();
+
+    // Second pass over the same (now entirely known) tree.
+    a.pending_mut().enqueue_crawl(rids[0]);
+    a.drain();
+    let watches = a.take_watch_requests();
+    assert!(
+        !watches
+            .iter()
+            .any(|(_, p)| p.to_string_lossy() == "/model/a/b"),
+        "the outer root must not watch the nested root: {watches:?}"
+    );
+    let ix = shared.index.read().unwrap();
+    let files: Vec<u32> = ix
+        .iter_live()
+        .filter(|(id, e)| !e.flags().is_root_dir() && ix.name(*id) == b"f.rs")
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+}
