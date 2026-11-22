@@ -74,6 +74,29 @@ pub fn invoked_as_find() -> bool {
         .is_some_and(|n| is_find_name(&n))
 }
 
+/// Pull `--socket PATH` / `--socket=PATH` out of a `find`/`locate` argument
+/// list, returning the override (if any) and the remaining arguments.
+///
+/// GNU find has no `--socket`, so there is no collision with a search option;
+/// a *path* literally named `--socket` can still be selected with `./--socket`.
+pub fn split_socket_override(argv: &[String]) -> (Option<String>, Vec<String>) {
+    let mut socket = None;
+    let mut rest = Vec::with_capacity(argv.len());
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        if a == "--socket" {
+            if let Some(p) = it.next() {
+                socket = Some(p.clone());
+            }
+        } else if let Some(p) = a.strip_prefix("--socket=") {
+            socket = Some(p.to_string());
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    (socket, rest)
+}
+
 /// One entry in the *metadata* (phase 2) position, filled by `lstat` on the
 /// survivors of the index-level predicates.
 #[derive(Debug, Clone, Default)]
@@ -205,7 +228,11 @@ pub fn run(argv: &[String]) -> Result<ExitCode, CliError> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let (paths, expr) = split_paths(argv);
+    // `--socket PATH` selects the daemon (the same override `ff` takes), so a
+    // `find` shim can be pointed at a particular instance without exporting
+    // `$FFLOCATE_SOCKET` for the whole session.
+    let (socket, argv) = split_socket_override(argv);
+    let (paths, expr) = split_paths(&argv);
 
     // Resolve the starting points *before* building the plan. The index stores
     // absolute paths, so a relative base (`.` or `src`, which agents and humans
@@ -226,7 +253,7 @@ pub fn run(argv: &[String]) -> Result<ExitCode, CliError> {
 
     // The index-level expression, plus the metadata tests to run on survivors.
     let query = plan.to_query_json();
-    let mut c = Client::connect(None)?;
+    let mut c = Client::connect(socket.as_deref())?;
     // `find` exits 0 even with no matches, so we do not reuse `query`'s exit 1.
     c.find(&query, &plan)
 }
@@ -839,6 +866,35 @@ mod tests {
             "size 0 file is empty"
         );
         assert!(!meta_matches(&[MetaTest::User(0)], &m, false, now));
+    }
+
+    #[test]
+    fn socket_override_is_split_out_of_the_arguments() {
+        let argv: Vec<String> = ["/usr", "-name", "*.rs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (socket, rest) = split_socket_override(&argv);
+        assert_eq!(socket, None);
+        assert_eq!(rest, argv);
+
+        let argv: Vec<String> = ["--socket", "/run/x.sock", "-name", "*.rs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (socket, rest) = split_socket_override(&argv);
+        assert_eq!(socket.as_deref(), Some("/run/x.sock"));
+        assert_eq!(rest, vec!["-name".to_string(), "*.rs".to_string()]);
+
+        // `=` form, and the override is not a starting path even though it
+        // precedes the expression.
+        let argv: Vec<String> = ["--socket=/run/y.sock", "/usr"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (socket, rest) = split_socket_override(&argv);
+        assert_eq!(socket.as_deref(), Some("/run/y.sock"));
+        assert_eq!(split_paths(&rest).0, vec!["/usr".to_string()]);
     }
 
     #[test]

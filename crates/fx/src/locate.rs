@@ -28,6 +28,8 @@ OPTIONS:
     -b, --basename      match only the basename (default: whole path)
     -c, --count         print only the number of matches
     -d, --database DB   accepted and ignored (the live index replaces it)
+        --socket PATH   talk to the daemon at PATH (default: this user's
+                        daemon; $FFLOCATE_SOCKET does the same)
     -e, --existing      only print paths that still exist
     -A, --all           all patterns must match (default: any matches)
     -i, --ignore-case   case-insensitive matching
@@ -74,10 +76,12 @@ pub struct LocateArgs {
 }
 
 pub fn run(argv: &[String]) -> Result<ExitCode, CliError> {
+    // `--socket PATH`, the same override `ff` takes (see `find.rs`).
+    let (socket, argv) = crate::find::split_socket_override(argv);
     let args = parse_args(argv.iter().cloned())?;
 
     if args.stats {
-        let mut c = Client::connect(None)?;
+        let mut c = Client::connect(socket.as_deref())?;
         return c.stats(false, false);
     }
 
@@ -86,7 +90,7 @@ pub fn run(argv: &[String]) -> Result<ExitCode, CliError> {
     }
 
     let expr = build_expression(&args);
-    let mut c = Client::connect(None)?;
+    let mut c = Client::connect(socket.as_deref())?;
     c.locate(&args, expr)
 }
 

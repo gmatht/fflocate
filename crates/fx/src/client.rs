@@ -10,6 +10,14 @@ use fflocate::proto::{Request, Response};
 use fflocate::spawn::spawn_daemon;
 use fflocate::transport::{self, Stream};
 
+/// How long a `send` waits for a reply before calling the daemon busy.
+///
+/// A daemon mid-crawl can take a while to get the index lock, and an unbounded
+/// `read_line` is why `ff stats` could sit there with no output and no error for
+/// as long as the crawl lasted. Long enough for an honest answer, short enough
+/// that a busy daemon is reported as busy rather than looking frozen.
+const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug)]
 pub enum CliError {
     Usage(String),
@@ -120,18 +128,65 @@ impl Client {
 
     fn send(&mut self, req: &Request) -> Result<Vec<Response>, CliError> {
         let line = serde_json::to_string(req).map_err(|e| CliError::Protocol(e.to_string()))?;
-        writeln!(self.stream, "{line}").map_err(|e| CliError::Io(e.to_string()))?;
-        self.stream
-            .flush()
-            .map_err(|e| CliError::Io(e.to_string()))?;
+        // A daemon that hung up before reading the request (it crashed, or it
+        // closed the connection) surfaces here as EPIPE. Same verdict as
+        // reading EOF below: no answer, not an empty result.
+        writeln!(self.stream, "{line}")
+            .and_then(|()| self.stream.flush())
+            .map_err(|e| {
+                CliError::Io(format!(
+                    "no reply from fflocated at {} (the connection closed without an answer); \
+                     check the daemon with `systemctl status fflocated`, or select another one \
+                     with --socket PATH / $FFLOCATE_SOCKET ({e})",
+                    self.socket.display()
+                ))
+            })?;
         let mut out = Vec::new();
+        self.stream
+            .set_read_timeout(Some(REPLY_TIMEOUT))
+            .map_err(|e| CliError::Io(e.to_string()))?;
         let reader = BufReader::new(
             self.stream
                 .try_clone()
                 .map_err(|e| CliError::Io(e.to_string()))?,
         );
         for line in reader.lines() {
-            let line = line.map_err(|e| CliError::Io(e.to_string()))?;
+            let line = match line {
+                Ok(l) => l,
+                // The daemon hung up or reset the connection instead of
+                // answering: same verdict as EOF-before-a-reply below.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    return Err(CliError::Io(format!(
+                        "no reply from fflocated at {} (the connection closed without an \
+                         answer); check the daemon with `systemctl status fflocated`, or \
+                         select another one with --socket PATH / $FFLOCATE_SOCKET ({e})",
+                        self.socket.display()
+                    )))
+                }
+                // WouldBlock on unix (SO_RCVTIMEO), TimedOut on Windows.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(CliError::Io(format!(
+                        "fflocated did not answer within {}s: it is busy (most likely crawling) \
+                         and a reply now could be incomplete. Try again once `ff stats` reports \
+                         a settled phase.",
+                        REPLY_TIMEOUT.as_secs()
+                    )))
+                }
+                Err(e) => return Err(CliError::Io(e.to_string())),
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -150,6 +205,22 @@ impl Client {
             if terminal {
                 break;
             }
+        }
+        if out.is_empty() {
+            // EOF before a single reply: the daemon closed the connection
+            // without answering. Reporting that as "no matches" (exit 1, empty
+            // stdout) is the one failure a search tool must never fake — the
+            // user cannot tell it from "not on disk". Name the socket, and how
+            // to point at a different daemon, because the usual cause is
+            // talking to the wrong instance (a per-user daemon that has no
+            // privileged roots indexed will answer "nothing" for the whole
+            // filesystem).
+            return Err(CliError::Io(format!(
+                "no reply from fflocated at {} (the connection closed without an answer); \
+                 check the daemon with `systemctl status fflocated`, or select another one \
+                 with --socket PATH / $FFLOCATE_SOCKET",
+                self.socket.display()
+            )));
         }
         Ok(out)
     }
@@ -228,6 +299,7 @@ impl Client {
                     stale_roots,
                     catching_up,
                     lag_ms,
+                    phase,
                     ..
                 } => {
                     if !stale_roots.is_empty() {
@@ -246,6 +318,13 @@ impl Client {
                                 "ff: warning: daemon is still catching up; results may be incomplete"
                             ),
                         }
+                    } else if phase.as_deref() == Some("crawling") {
+                        // Still enumerating directories: an answer now is an
+                        // answer about a partial tree, so say so before an empty
+                        // result is mistaken for "not on disk".
+                        eprintln!(
+                            "ff: warning: daemon is still crawling; results may be incomplete"
+                        );
                     }
                 }
                 Response::Hit { path, id, created } => {
@@ -661,6 +740,17 @@ impl Client {
         let resp = self.send(&Request::Stats { roots })?;
         for r in resp {
             if let Response::Stats { stats } = r {
+                // The daemon answers from its last mirrored tick when the
+                // crawler holds the index, rather than blocking (which used to
+                // hang this command outright). Say so on stderr too, so stdout
+                // never passes off stale counters as current ones.
+                if stats.get("partial").and_then(|v| v.as_bool()) == Some(true) {
+                    let why = stats
+                        .get("partial_reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("daemon busy");
+                    eprintln!("ff: warning: {why}; results may be incomplete");
+                }
                 if json {
                     println!("{}", serde_json::to_string_pretty(&stats).unwrap());
                 } else {
@@ -849,6 +939,19 @@ fn print_stats(stats: &serde_json::Value) {
     p!("lsn");
     p!("entries");
     p!("tombstones");
+    // Present only when the daemon could not read its own index in time: the
+    // counters above are the last tick's, and it says so rather than letting
+    // them pass for an instant reading.
+    if stats.get("partial").and_then(|v| v.as_bool()) == Some(true) {
+        let why = stats
+            .get("partial_reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("busy");
+        println!(
+            "{:<20} {} (results may be incomplete)",
+            "partial", why
+        );
+    }
     p!("backend");
     p!("recrawl_count");
     p!("last_rescan_cause");

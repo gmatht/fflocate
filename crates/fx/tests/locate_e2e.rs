@@ -318,4 +318,78 @@ fn locate_stats_and_help_do_not_search() {
     assert_eq!(code, 2);
 
     kill(&mut daemon);
+
+
+    kill(&mut daemon);
+}
+
+/// `--socket PATH` selects the daemon per invocation, like `ff`'s own flag: a
+/// `locate`/`find` shim does not have to rely on the environment variable.
+#[test]
+fn locate_socket_flag_selects_the_daemon() {
+    let Some(bindir) = bin_dir() else {
+        eprintln!("skipping: set FFLOCATE_BIN_DIR to target/release (see scripts/e2e.sh)");
+        return;
+    };
+    let (_tree, root) = fixture_tree();
+    let (mut daemon, socket, locate_bin) = setup(&root, "socketflag");
+    let fxbin = bindir.join(format!("ff{}", std::env::consts::EXE_SUFFIX));
+    let _ = Command::new(&fxbin)
+        .args(["--sync", "", "-l", "1", ""])
+        .env("FFLOCATE_SOCKET", &socket)
+        .output();
+    // An empty FFLOCATE_SOCKET would still win over the flag, so point it
+    // somewhere useless and prove the flag took over.
+    let out = Command::new(&locate_bin)
+        .arg("--socket")
+        .arg(&socket)
+        .arg("foo")
+        .env("FFLOCATE_SOCKET", "/nonexistent/fflocate.sock")
+        .output()
+        .expect("run locate");
+    kill(&mut daemon);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(lines(&String::from_utf8_lossy(&out.stdout)), vec![canon(&root.join("foo.c"))]);
+}
+
+/// A connection that closes without a reply must be an error, never an empty
+/// result: `ff -c` exiting 1 with no output is indistinguishable from "not on
+/// disk", and a daemon that cannot answer (the wrong instance, a refusal, a
+/// crash) is exactly when that lie is most costly.
+#[test]
+fn silent_daemon_is_an_error_not_no_matches() {
+    let Some(bindir) = bin_dir() else {
+        eprintln!("skipping: set FFLOCATE_BIN_DIR to target/release (see scripts/e2e.sh)");
+        return;
+    };
+    let fxbin = bindir.join(format!("ff{}", std::env::consts::EXE_SUFFIX));
+    let d = tempfile::tempdir().unwrap();
+    let socket = test_socket(d.path());
+    // Accept and close: the worst-behaved daemon there is.
+    #[cfg(not(windows))]
+    {
+        let l = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let t = std::thread::spawn(move || {
+            if let Ok((s, _)) = l.accept() {
+                drop(s);
+            }
+        });
+        let out = Command::new(&fxbin)
+            .args(["-c", "anything"])
+            .env("FFLOCATE_SOCKET", &socket)
+            .output()
+            .expect("run ff");
+        let _ = t.join();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "a silent daemon is an error, not `no matches`"
+        );
+        assert!(out.stdout.is_empty());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("no reply from fflocated") && err.contains("fflocate.sock"),
+            "the error must name the socket it talked to: {err}"
+        );
+    }
 }

@@ -55,6 +55,11 @@ OPTIONS:
         --gui           start the GUI instead of searching; finds the
                         `ff-gui` binary next to ff or on PATH
                         (override with FF_GUI_BIN)
+        --socket PATH   talk to the daemon at PATH (default: this user's
+                        daemon; $FFLOCATE_SOCKET does the same). Also
+                        accepted by `find`/`locate` mode, so `find --socket
+                        /run/fflocated.sock / -name '*.rs'` uses the system
+                        instance
     -h, --help          show this help
     -V, --version       print version
 
