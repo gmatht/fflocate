@@ -245,6 +245,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let opt_count = app.create_checkbutton("Count only (skip the list)")?;
     opt_count.set_active(false);
 
+    // Live mode: a `subscribe` feed on its own connection, stepped by the same
+    // pump as the query socket. The toggle only records intent here — the pump
+    // opens the feed, because only the main thread may read the boxes the
+    // subscription is built from.
+    trace_step!("live checkbutton");
+    let live = ff_gui::live_ui::build(&app)?;
+    let live_wanted: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let live_run: Rc<RefCell<ff_gui::LiveRunner>> =
+        Rc::new(RefCell::new(ff_gui::LiveRunner::new()));
+
     // The max edit distance only means anything with Fuzzy on, so it is
     // disabled until then rather than silently ignored.
     trace_step!("distance row");
@@ -263,6 +273,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     advanced_box.append(&opt_fuzzy);
     advanced_box.append(&distance_row);
     advanced_box.append(&opt_count);
+    advanced_box.append(&live.button);
     trace_step!("sensitive toggles");
     advanced.set_child(&advanced_box);
     // Collapsed, and it stays collapsed: `set_expanded(false)` is applied after
@@ -576,6 +587,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let want_full = want_full.clone();
             let loaded_column = loaded_column.clone();
             let created_range = created_range.clone();
+            // Live mode: the runner, the user's intent, and the controls the
+            // subscription key is built from. The socket is resolved once, so a
+            // changed FFLOCATE_SOCKET cannot leave the feed pointing elsewhere
+            // than the query socket.
+            let live_run = live_run.clone();
+            let live_wanted = live_wanted.clone();
+            let live_button = live.button.clone();
+            let live_socket = DaemonClient::new().socket().to_path_buf();
+            let live_case = opt_case.clone();
+            let live_fuzzy = opt_fuzzy.clone();
+            let live_count = opt_count.clone();
+            let live_distance = opt_distance.clone();
             // Partial renders paint rows directly (the `render` closure owns
             // its clones), so the pump holds its own.
             let partial_results = results.clone();
@@ -904,6 +927,82 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
+                    // 1c. Live mode: keep the feed subscribed to the boxes on
+                    //     screen, and fold a burst of daemon change events into
+                    //     one re-query. Off means the socket is dropped here, so
+                    //     the daemon sees the disconnect and stops resolving
+                    //     paths for us.
+                    if !live_wanted.get() && live_run.borrow().is_active() {
+                        live_run.borrow_mut().stop();
+                    }
+                    if live_wanted.get() {
+                        let quick = quick_box.get_text().unwrap_or_default();
+                        let adv = adv_box.get_text().unwrap_or_default();
+                        if let Some(q) = effective_query(&quick, &adv) {
+                            let opts = gather_options(
+                                &live_case,
+                                &live_fuzzy,
+                                &live_count,
+                                &live_distance,
+                            );
+                            let key = ff_gui::LiveKey::new(&q, &opts);
+                            // Stepped into a binding first: a `match` on the
+                            // borrow itself holds the `RefMut` for every arm,
+                            // and the Refresh arm needs to borrow the runner
+                            // again to take the changes (`RefCell` panics).
+                            let step = live_run.borrow_mut().step(
+                                &live_socket,
+                                &key,
+                                std::time::Instant::now(),
+                            );
+                            match step {
+                                ff_gui::LiveStep::Refresh => {
+                                    // Apply what the daemon sent instead of
+                                    // re-running the query. The feed's events
+                                    // are already filtered by this same query
+                                    // (§11), so a create is a row to add and a
+                                    // delete a row to remove: the list updates
+                                    // in place, keeping its scroll and the
+                                    // selected file. A `resync` (ring overflow,
+                                    // generation bump) — or a query whose
+                                    // matching the feed does not carry (fuzzy,
+                                    // a created-date range, count-only) — falls
+                                    // back to the whole-query path below.
+                                    let changes = live_run.borrow_mut().take_changes();
+                                    let local = !live_fuzzy.is_active()
+                                        && !live_count.is_active()
+                                        && created_range.borrow().is_none();
+                                    if !(local
+                                        && !changes.is_empty()
+                                        && apply_live_changes(
+                                            &changes,
+                                            &partial_results,
+                                            &partial_current,
+                                        ))
+                                    {
+                                        // Same path as Return/Search: the next
+                                        // tick issues the query, so the rows and
+                                        // the status line come from one place.
+                                        start_now.store(true, Ordering::SeqCst);
+                                    }
+                                }
+                                ff_gui::LiveStep::Unsupported => {
+                                    live_wanted.set(false);
+                                    live_button.set_active(false);
+                                    startup_status.set_text(
+                                        "live mode needs daemon protocol 6 — this daemon cannot stream changes",
+                                    );
+                                }
+                                ff_gui::LiveStep::Failed(e) => {
+                                    live_wanted.set(false);
+                                    live_button.set_active(false);
+                                    startup_status.set_text(&format!("live: {e}"));
+                                }
+                                ff_gui::LiveStep::Idle => {}
+                            }
+                        }
+                    }
+
                     // 2. Start a new request if the debounce has elapsed (or the Search
                     //    button asked for one now). A newer keystroke *supersedes*
                     //    the in-flight scan: drop its socket and retire its
@@ -1040,6 +1139,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // it, so typing `2026-0` does not flash an error on every keystroke.
         // The handler lives in `created_ui` so the GTK test exercises it too.
         created_ui::wire(&created, arm.clone());
+    }
+
+    // The Live toggle records intent only; the pump above owns the socket, so
+    // turning it on subscribes with whatever the boxes say on the next tick and
+    // turning it off drops the feed.
+    {
+        let wanted = live_wanted.clone();
+        let button = live.button.clone();
+        let status = status.clone();
+        live.button
+            .connect_toggled(move || {
+                let on = button.is_active();
+                wanted.set(on);
+                status.set_text(if on { ff_gui::LIVE_STATUS } else { "live: off" });
+            })
+            .ok();
     }
 
     // Return in either query field runs the same search.
@@ -1883,6 +1998,52 @@ fn step_sort_load(
         String::new()
     };
     (over, line)
+}
+
+/// Apply a live feed's `create`/`delete` events to the rows already on screen.
+///
+/// The daemon filtered these against the subscription's own query (§11), so no
+/// row is guessed: a create is the row to add and a delete the row to remove.
+/// Only those rows are touched — the rest keep their order, the scroll offset
+/// and the selected file, which is the difference between a live list and one
+/// rebuilt from scratch on every change.
+///
+/// Returns `false`, with nothing applied, when the batch carries a `resync`
+/// (the daemon's feed has a gap only a fresh query can close), so the caller
+/// falls back to re-running the query.
+fn apply_live_changes(
+    changes: &[ff_gui::LiveChange],
+    results: &rswidgets::compat::TreeView,
+    current: &Rc<RefCell<Vec<String>>>,
+) -> bool {
+    use ff_gui::LiveChange;
+    if changes.iter().any(|c| matches!(c, LiveChange::Resync)) {
+        return false;
+    }
+    // A working copy of what the list shows, so a batch with several creates
+    // counts and de-duplicates against the rows this same batch added.
+    let mut shown = current.borrow().clone();
+    for change in changes {
+        match change {
+            LiveChange::Created(path) => {
+                // A full page stays full: a new match sorted past the last row
+                // would sit outside the page the daemon answered, so the list
+                // never grows beyond what a search would have shown.
+                if shown.len() >= MAX_ROWS || shown.iter().any(|p| p == path) {
+                    continue;
+                }
+                results.append_rows(&rows_to_cells(std::slice::from_ref(path)));
+                shown.push(path.clone());
+            }
+            LiveChange::Deleted(path) => {
+                results.remove_rows_matching(PATH_COLUMN, path);
+                shown.retain(|p| p != path);
+            }
+            LiveChange::Resync => unreachable!("checked above"),
+        }
+    }
+    *current.borrow_mut() = results.displayed_column(PATH_COLUMN);
+    true
 }
 
 /// Build the three-column cells (icon, name, path) for a list of paths.

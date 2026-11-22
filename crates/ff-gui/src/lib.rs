@@ -21,6 +21,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use fflocate::config_paths::socket_path_from_env;
 use fflocate::proto::{Request, Response};
@@ -343,6 +344,7 @@ impl DaemonClient {
         }
         Ok(Vec::new())
     }
+
 }
 
 /// What one [`StartupProbe::poll`] step reports.
@@ -1125,6 +1127,305 @@ pub mod created_ui {
                 })
                 .ok();
         }
+    }
+}
+
+/// The foldout's **Live** toggle: a checkbox, built here for the same reason
+/// [`created_ui`] is — `main.rs` is a binary, so the GTK test can only drive
+/// widgets the library builds.
+pub mod live_ui {
+    use rswidgets::prelude::App;
+
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    mod widgets {
+        pub type Check = rswidgets::backends_gtk_adapter::CheckButton;
+    }
+    #[cfg(feature = "zork")]
+    mod widgets {
+        pub type Check = rswidgets::backends_zork_adapter::CheckButton;
+    }
+    #[cfg(all(windows, not(feature = "zork")))]
+    mod widgets {
+        pub type Check = rswidgets::backends_nwg_adapter::CheckButton;
+    }
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
+    mod widgets {
+        pub type Check = rswidgets::backends_wasm_adapter::CheckButton;
+    }
+    #[cfg(all(target_os = "macos", not(feature = "zork")))]
+    mod widgets {
+        pub type Check = rswidgets::backends_macos_adapter::CheckButton;
+    }
+
+    /// The toggle's label. Named so a test asserts the text a user sees.
+    pub const LABEL: &str = "Live: follow changes";
+
+    pub struct LiveRow {
+        pub button: widgets::Check,
+    }
+
+    /// Build the toggle, off by default.
+    pub fn build(app: &App) -> Result<LiveRow, rswidgets::Error> {
+        let button = app.create_checkbutton(LABEL)?;
+        button.set_active(false);
+        Ok(LiveRow { button })
+    }
+}
+
+/// What a live subscription is asking the daemon for. Part of the subscription
+/// identity: when it changes, the open feed is asking the wrong question and is
+/// replaced rather than trusted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveKey {
+    pub q: String,
+    pub case_sensitive: bool,
+}
+
+impl LiveKey {
+    pub fn new(q: &str, opts: &SearchOptions) -> LiveKey {
+        LiveKey {
+            q: q.to_string(),
+            case_sensitive: opts.case_sensitive,
+        }
+    }
+}
+
+/// The `subscribe` request a live key turns into.
+pub fn live_request(key: &LiveKey) -> Request {
+    Request::Subscribe {
+        name: Some("ff-gui".to_string()),
+        cursor: None,
+        q: key.q.clone(),
+        case_sensitive: key.case_sensitive.then_some(true),
+    }
+}
+
+/// The status line while the feed is live. One string, so the GUI and its
+/// tests cannot drift on what the user is told.
+pub const LIVE_STATUS: &str = "live: watching for changes";
+
+/// How long a burst of change events is coalesced before one re-query. A crawl
+/// or an `untar` delivers thousands of events; the list must update once they
+/// settle, not once per file.
+pub const LIVE_COALESCE: Duration = Duration::from_millis(250);
+
+/// The live-mode state that is pure logic (and therefore unit-tested without a
+/// display): which subscription is open, and whether a refresh is due.
+#[derive(Debug, Default)]
+pub struct LiveMode {
+    key: Option<LiveKey>,
+    pending: bool,
+    last_event: Option<Instant>,
+}
+
+impl LiveMode {
+    pub fn new() -> LiveMode {
+        LiveMode::default()
+    }
+
+    /// True when no feed is open for `key` (or one is open for another key).
+    pub fn needs_subscribe(&self, key: &LiveKey) -> bool {
+        self.key.as_ref() != Some(key)
+    }
+
+    pub fn subscribed(&mut self, key: LiveKey) {
+        self.key = Some(key);
+    }
+
+    /// A matching change arrived; start (or extend) the coalescing window.
+    pub fn event(&mut self, now: Instant) {
+        self.pending = true;
+        self.last_event = Some(now);
+    }
+
+    /// One refresh per quiet window: a burst collapses into a single query.
+    pub fn due(&self, now: Instant) -> bool {
+        self.pending
+            && self
+                .last_event
+                .map_or(true, |t| now.duration_since(t) >= LIVE_COALESCE)
+    }
+
+    /// The refresh was started; wait for the next event before asking again.
+    pub fn fired(&mut self) {
+        self.pending = false;
+    }
+
+    pub fn reset(&mut self) {
+        *self = LiveMode::new();
+    }
+}
+
+/// What one pump step of live mode did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LiveStep {
+    Idle,
+    /// The coalescing window closed. The caller takes the changes
+    /// ([`LiveRunner::take_changes`]) and applies them to the rows it already
+    /// has — or, when they cannot be applied locally (a `resync`), runs the
+    /// query again.
+    Refresh,
+    /// The daemon answered the feed with a terminal record: it predates
+    /// protocol 6 and cannot stream. Not an error — an honest "not this daemon".
+    Unsupported,
+    Failed(String),
+}
+
+/// One change from the live feed, in the form the list can apply.
+///
+/// The daemon filters the feed against the subscription's own query (§11), so
+/// a create is a row to add and a delete a row to remove: the list updates in
+/// place instead of being rebuilt by a fresh query. `Resync` is the daemon
+/// saying its feed has a gap (ring overflow, or ids remapped by a generation
+/// bump) — the one case only a fresh query can answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LiveChange {
+    Created(String),
+    Deleted(String),
+    Resync,
+}
+
+/// Classify one feed `event` record.
+///
+/// `create`/`delete` are the two actions a subscription sends for a change that
+/// already matched its query. Anything else — `resync`, or an action this
+/// client does not know — is reported as [`LiveChange::Resync`]: asking the
+/// daemon again is the honest answer to "I cannot apply this", never a guess.
+pub fn live_change(action: &str, path: String) -> LiveChange {
+    match action {
+        "create" => LiveChange::Created(path),
+        "delete" => LiveChange::Deleted(path),
+        _ => LiveChange::Resync,
+    }
+}
+
+/// One live subscription, stepped from the GUI's pump.
+///
+/// Nothing here blocks: the socket is non-blocking and `advance` only reads
+/// what the kernel already has. `subscribe` never sends a terminal record on a
+/// v6 daemon, so `Finished` is exactly the "this daemon is too old" signal.
+pub struct LiveRunner {
+    mode: LiveMode,
+    feed: Option<PendingRequest>,
+    /// Changes read from the feed and not yet handed to the caller. Kept here
+    /// rather than returned by `step`, so a caller that only wants the
+    /// coalesced "refresh now" signal can ignore them while one that applies
+    /// them itself takes exactly the batch that signal covers.
+    changes: Vec<LiveChange>,
+}
+
+impl Default for LiveRunner {
+    fn default() -> Self {
+        LiveRunner::new()
+    }
+}
+
+impl LiveRunner {
+    pub fn new() -> LiveRunner {
+        LiveRunner {
+            mode: LiveMode::new(),
+            feed: None,
+            changes: Vec::new(),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.feed.is_some()
+    }
+
+    /// Close the feed and forget the subscription key.
+    pub fn stop(&mut self) {
+        self.feed = None;
+        self.mode.reset();
+        self.changes.clear();
+    }
+
+    /// Take the changes read since the last call.
+    ///
+    /// Paired with [`LiveStep::Refresh`]: the caller that gets a refresh gets
+    /// exactly the events that caused it, so it can apply them to the rows it
+    /// already has instead of re-running the query.
+    pub fn take_changes(&mut self) -> Vec<LiveChange> {
+        std::mem::take(&mut self.changes)
+    }
+
+    /// (Re)subscribe if `key` changed, then take one non-blocking step.
+    pub fn step(&mut self, socket: &Path, key: &LiveKey, now: Instant) -> LiveStep {
+        if self.mode.needs_subscribe(key) {
+            let line = match encode_request(&live_request(key)) {
+                Ok(line) => line,
+                Err(e) => return LiveStep::Failed(e.to_string()),
+            };
+            let opened = fflocate::transport::connect(socket)
+                .map_err(|e| GuiError::Connect(format!("{}: {e}", socket.display())))
+                .and_then(|stream| PendingRequest::start(stream, &line));
+            match opened {
+                Ok(feed) => {
+                    self.feed = Some(feed);
+                    self.mode.subscribed(key.clone());
+                }
+                Err(e) => {
+                    self.stop();
+                    return LiveStep::Failed(e.to_string());
+                }
+            }
+        }
+
+        let mut events = 0usize;
+        let mut collected: Vec<LiveChange> = Vec::new();
+        let mut finished = false;
+        let mut terminal = false;
+        let mut error = None;
+        {
+            let Some(feed) = self.feed.as_mut() else {
+                return LiveStep::Idle;
+            };
+            match feed.advance() {
+                Ok(Progress::Finished) => finished = true,
+                Err(e) => error = Some(e.to_string()),
+                Ok(_) => {}
+            }
+            if !finished {
+                for record in feed.take_records() {
+                    match record {
+                        Response::Event { action, path, .. } => {
+                            events += 1;
+                            collected.push(live_change(&action, path));
+                        }
+                        Response::Done { .. } => terminal = true,
+                        Response::Error { message } => {
+                            terminal = true;
+                            error = Some(message);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // A `Done` is a daemon that answered the feed with a snapshot: it
+        // predates the stream. An EOF with no `Done` is a feed that died, which
+        // is an error to report rather than a version to blame.
+        if terminal {
+            self.stop();
+            return LiveStep::Unsupported;
+        }
+        if finished {
+            self.stop();
+            return LiveStep::Failed("the change feed closed".into());
+        }
+        if let Some(e) = error {
+            self.stop();
+            return LiveStep::Failed(e);
+        }
+        self.changes.extend(collected);
+        if events > 0 {
+            self.mode.event(now);
+        }
+        if self.mode.due(now) {
+            self.mode.fired();
+            return LiveStep::Refresh;
+        }
+        LiveStep::Idle
     }
 }
 
@@ -5208,5 +5509,83 @@ mod created_range_tests {
             None => eprintln!("no creation time on this filesystem; range cannot match files here"),
         }
         assert_eq!(created_secs("/nonexistent/ff-gui/created"), None);
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    fn key(q: &str) -> LiveKey {
+        LiveKey::new(q, &SearchOptions::default())
+    }
+
+    #[test]
+    fn a_burst_of_changes_coalesces_into_one_refresh() {
+        let mut mode = LiveMode::new();
+        let t0 = Instant::now();
+        for n in 0..100 {
+            mode.event(t0 + Duration::from_millis(n));
+        }
+        assert!(
+            !mode.due(t0 + Duration::from_millis(100)),
+            "a refresh inside the quiet window would re-query once per file"
+        );
+        assert!(
+            mode.due(t0 + Duration::from_millis(100 + LIVE_COALESCE.as_millis() as u64)),
+            "the burst must produce a refresh once it settles"
+        );
+        mode.fired();
+        assert!(!mode.due(t0 + Duration::from_secs(10)), "one burst, one refresh");
+    }
+
+    #[test]
+    fn a_new_event_after_the_refresh_asks_again() {
+        let mut mode = LiveMode::new();
+        let t0 = Instant::now();
+        mode.event(t0);
+        let later = t0 + LIVE_COALESCE + Duration::from_millis(1);
+        assert!(mode.due(later));
+        mode.fired();
+        assert!(!mode.due(later));
+        mode.event(later);
+        assert!(mode.due(later + LIVE_COALESCE));
+    }
+
+    #[test]
+    fn changing_the_query_or_case_forces_a_resubscribe() {
+        let mut mode = LiveMode::new();
+        assert!(mode.needs_subscribe(&key("alpha")));
+        mode.subscribed(key("alpha"));
+        assert!(!mode.needs_subscribe(&key("alpha")));
+        assert!(mode.needs_subscribe(&key("beta")));
+        let mut opts = SearchOptions::default();
+        opts.case_sensitive = true;
+        assert!(
+            mode.needs_subscribe(&LiveKey::new("alpha", &opts)),
+            "case sensitivity changes what the daemon should report"
+        );
+    }
+
+    #[test]
+    fn the_live_request_is_a_subscribe_with_the_query_and_case() {
+        let mut opts = SearchOptions::default();
+        opts.case_sensitive = true;
+        match live_request(&LiveKey::new("src ext:rs", &opts)) {
+            Request::Subscribe {
+                q,
+                case_sensitive,
+                cursor,
+                ..
+            } => {
+                assert_eq!(q, "src ext:rs");
+                assert_eq!(case_sensitive, Some(true));
+                assert_eq!(cursor, None);
+            }
+            other => panic!("expected subscribe, got {other:?}"),
+        }
+        let line = encode_request(&live_request(&key("x"))).expect("encode");
+        assert!(line.contains("\"op\":\"subscribe\""), "{line}");
+        assert!(line.contains("\"q\":\"x\""), "{line}");
     }
 }

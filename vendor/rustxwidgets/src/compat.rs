@@ -675,6 +675,38 @@ impl TreeView {
         self.after_rows_changed();
     }
 
+    /// Remove every row whose `column` text equals `text`, then repaint.
+    ///
+    /// This is what makes a live update an update: one row leaves the list and
+    /// the rest keep their order, the scroll offset and the selected file. A
+    /// whole-list replacement would instead renumber every row and move the
+    /// highlight onto whichever file happened to land at that index.
+    ///
+    /// Returns how many rows were removed (`0` when nothing matched, in which
+    /// case nothing is repainted).
+    pub fn remove_rows_matching(&self, column: usize, text: &str) -> usize {
+        let selected = self.selected.get();
+        let mut removed: Vec<usize> = Vec::new();
+        {
+            let mut rows = self.rows.borrow_mut();
+            let mut kept: Vec<Vec<CellValue>> = Vec::with_capacity(rows.len());
+            for (index, row) in std::mem::take(&mut *rows).into_iter().enumerate() {
+                if row.get(column).map(CellValue::render).as_deref() == Some(text) {
+                    removed.push(index);
+                } else {
+                    kept.push(row);
+                }
+            }
+            *rows = kept;
+        }
+        if removed.is_empty() {
+            return 0;
+        }
+        self.selected.set(selection_after_removal(selected, &removed));
+        self.after_rows_changed();
+        removed.len()
+    }
+
     /// Height of the header row, in canvas pixels.
     ///
     /// A press above this is a header click (which re-sorts) rather than a row
@@ -1417,6 +1449,18 @@ fn sort_rows(rows: &mut Vec<Vec<CellValue>>, sort: Option<(usize, bool)>) {
     *rows = keyed.into_iter().map(|(_, row)| row).collect();
 }
 
+/// Where the selection lands after the rows at `removed` are gone.
+///
+/// A removed row clears the selection; rows below it shift up, so the
+/// highlighted file stays the same file rather than the same index.
+fn selection_after_removal(selected: Option<usize>, removed: &[usize]) -> Option<usize> {
+    let selected = selected?;
+    if removed.contains(&selected) {
+        return None;
+    }
+    Some(selected - removed.iter().filter(|&&index| index < selected).count())
+}
+
 /// Merge an unsorted `batch` into `rows`, keeping `sort`'s order, and keep at
 /// most `limit` rows.
 ///
@@ -2113,6 +2157,16 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removal_keeps_the_selection_on_the_same_file() {
+        assert_eq!(selection_after_removal(Some(2), &[0]), Some(1));
+        assert_eq!(selection_after_removal(Some(2), &[3]), Some(2));
+        assert_eq!(selection_after_removal(Some(2), &[2]), None);
+        assert_eq!(selection_after_removal(Some(0), &[0, 1]), None);
+        assert_eq!(selection_after_removal(Some(4), &[0, 1, 2]), Some(1));
+        assert_eq!(selection_after_removal(None, &[1]), None);
+    }
 
     #[test]
     fn row_hit_testing_skips_header_and_blank_space() {
