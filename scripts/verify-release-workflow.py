@@ -206,7 +206,10 @@ STUBS = {
         root=
         while [ $# -gt 1 ]; do [ "$1" = --root ] && root=$2; shift; done
         [ -d "$root" ] || exit 1
-        ( cd "$root" && find . -type f | cut -c3- ) > "$1"
+        # `! -type d`, not `-type f`: /usr/local/bin/ff-gui is a symlink into the
+        # app bundle, and a payload listing that drops it is the check failing.
+        ( cd "$root" && find . ! -type d | cut -c3- ) > "$1"
+        cp "$1" "${STUB_LOG}.payload"
         """,
     "pkgutil": """
         #!/bin/sh
@@ -269,8 +272,28 @@ def mode_mac(wf, triggers):
                "--identifier com.fflocate.pkg" in recorded
                and "--install-location /" in recorded) and ok
 
+    # The payload is what the installer puts on the disk: the GUI has to arrive
+    # as a launchable bundle in /Applications, with the CLI names still on PATH.
+    payload_file = Path(str(log) + ".payload")
+    files = payload_file.read_text().splitlines() if payload_file.is_file() else []
+    ok = check("the .app bundle is in the payload",
+               "Applications/fflocate.app/Contents/Info.plist" in files
+               and "Applications/fflocate.app/Contents/MacOS/ff-gui" in files,
+               str(files)) and ok
+    ok = check("ff-gui is on PATH as a link into the bundle",
+               "usr/local/bin/ff-gui" in files) and ok
+    ok = check("the CLI and daemon are installed",
+               {"usr/local/bin/ff", "usr/local/bin/fflocated"} <= set(files)) and ok
+
     # Negatives, straight at the packaging script: there is no Mac here to run
     # the real tools, and both preconditions must stop it before productbuild.
+    # The bundle script is a precondition of its own: no ff-gui is refused
+    # there too, with nothing packaged.
+    rc = run_step("macos-app-bundle.sh: no ff-gui",
+                  f"scripts/macos-app-bundle.sh {version} '{work}/empty' '{work}/Bundles/fflocate.app'",
+                  dict(base), work)
+    ok = check("a bundle without ff-gui is refused", rc != 0, f"exit {rc}") and ok
+
     one_arch = work / "one-arch"
     short = work / "short"
     one_arch.mkdir()

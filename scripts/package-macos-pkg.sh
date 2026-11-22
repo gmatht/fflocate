@@ -5,13 +5,16 @@
 #
 # <bindir> holds universal (arm64 + x86_64) `ff`, `fflocated` and `ff-gui`; the
 # release job lipos them from the two per-target builds first. The payload
-# installs all three into /usr/local/bin, and the postinstall
+# installs the CLI and daemon into /usr/local/bin, `fflocate.app` into
+# /Applications (with `ff-gui` on PATH as a link into it), and the postinstall
 # (scripts/macos-pkg-postinstall.sh) writes and loads the daemon's LaunchAgent
 # for the user logged in at the console — so "install and configure" is one
 # command, unlike the hand install in the README.
 #
-# No .app bundle: ff-gui is a bare binary (its Dock icon is embedded, see
-# STATUS.md), so there is nothing to put an Info.plist in.
+# The .app is what makes the GUI a normal Mac application: double-clickable in
+# Finder, with a bundle identifier, a Finder icon and a version. Without it the
+# user has a bare binary in /usr/local/bin that Finder cannot open and whose
+# only icon is the one it paints on its Dock tile at runtime.
 #
 # The package is unsigned. Once a "Developer ID Installer" certificate exists,
 # sign between productbuild and the upload with
@@ -59,8 +62,25 @@ trap 'rm -rf "$work"' EXIT
 # ---- payload ---------------------------------------------------------------
 root="$work/root"
 mkdir -p "$root/usr/local/bin"
-for b in ff fflocated ff-gui; do
+for b in ff fflocated; do
     install -m 0755 "$bindir/$b" "$root/usr/local/bin/$b"
+done
+
+# The GUI ships as an .app bundle in /Applications; `ff-gui` stays on PATH as a
+# link into it, so `ff --gui` and a terminal launch work and there is one copy
+# of the binary on disk.
+"$here/macos-app-bundle.sh" "$version" "$bindir" "$root/Applications/fflocate.app"
+ln -s /Applications/fflocate.app/Contents/MacOS/ff-gui "$root/usr/local/bin/ff-gui"
+
+# The bundle's own claims, checked where it is built: a plist that names the
+# wrong executable is an app that will not launch, and macOS will not tell the
+# user why.
+plist="$root/Applications/fflocate.app/Contents/Info.plist"
+for want in '<string>ff-gui</string>' "<string>$version</string>" 'com.fflocate.ffgui'; do
+    if ! grep -qF "$want" "$plist"; then
+        echo "$0: $plist does not contain $want" >&2
+        exit 1
+    fi
 done
 
 # ---- scripts ---------------------------------------------------------------
@@ -78,10 +98,13 @@ pkgbuild --root "$root" \
     "$component"
 
 # pkgbuild can exit 0 with an empty payload; the installed files are the point.
-for b in ff fflocated ff-gui; do
-    if ! pkgutil --payload-files "$component" | sed 's|^/||' | grep -qx "usr/local/bin/$b"; then
-        echo "$0: payload is missing usr/local/bin/$b" >&2
-        pkgutil --payload-files "$component" >&2
+payload=$(pkgutil --payload-files "$component" | sed 's|^/||')
+for f in usr/local/bin/ff usr/local/bin/fflocated usr/local/bin/ff-gui \
+         Applications/fflocate.app/Contents/Info.plist \
+         Applications/fflocate.app/Contents/MacOS/ff-gui; do
+    if ! printf '%s\n' "$payload" | grep -qx "$f"; then
+        echo "$0: payload is missing $f" >&2
+        printf '%s\n' "$payload" >&2
         exit 1
     fi
 done

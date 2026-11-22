@@ -6,7 +6,7 @@ members = ["crates/fflocate", "crates/fflocated", "crates/fx", "crates/ff-gui"]
 exclude = ["vendor/rustxwidgets", "vendor/gtk_dynamic_loader"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1-beta"
 edition = "2021"
 license = "MIT"
 rust-version = "1.75"

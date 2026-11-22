@@ -29,6 +29,26 @@ cargo build --release
 Requires a recent stable Rust (edition 2021). The realtime backend is per
 platform: inotify/fanotify on Linux, FSEvents on macOS (see below).
 
+## Install (Linux, systemd)
+
+`scripts/install.sh` builds the release binaries, installs them, writes the
+systemd unit whose `ExecStart` matches where they actually landed, and restarts
+the daemon:
+
+```sh
+scripts/install.sh                 # per-user: ~/.local/bin + systemd --user unit
+sudo scripts/install.sh --system   # machine-wide: /usr/local/bin + system unit
+```
+
+The per-user daemon indexes `$HOME`; the system instance runs as root, indexes
+privileged paths and answers each query as the caller (clients must be in the
+`fflocate` group). `--prefix`, `--socket`, `--state-dir`, `--root` (repeatable:
+the directories to index, instead of the daemon's default of every native
+mount), `--group`, `--no-build`, `--no-start`, `--force` and `--dry-run` are in
+`--help`.
+`scripts/package-linux.sh` is the other path: artifacts for distribution rather
+than this machine.
+
 ## macOS
 
 `ff` and `fflocated` run on macOS with an FSEvents watcher, selected
@@ -80,8 +100,10 @@ publishing job, so a dry run cannot create a release.
   setup step.
 * `fflocate-<version>-linux-<arch>.tar.gz` — the same three binaries under
   `bin/` and the unit under `systemd/`, for installs without a package manager.
-* `fflocate-<version>-macos-universal.pkg` — arm64 + x86_64 `ff`, `fflocated`
-  and `ff-gui` in `/usr/local/bin`; the postinstall writes and loads the
+* `fflocate-<version>-macos-universal.pkg` — arm64 + x86_64: `fflocate.app` in
+  `/Applications` (the GUI, double-clickable in Finder, with its icon and bundle
+  version), `ff` and `fflocated` in `/usr/local/bin`, and `ff-gui` there as a
+  link into the app; the postinstall writes and loads the
   `com.fflocate.fflocated` LaunchAgent for the user at the console. It is
   unsigned, so another Mac needs right-click → Open (or a quarantine-attribute
   removal) first.
@@ -249,6 +271,9 @@ crates/fx/       CLI client + service install
   `crates/fflocate/src/ownership.rs`, `crates/fflocate/src/server.rs`,
   `crates/fflocated/src/net.rs`, `tests/system_access.rs`, `tests/system_live.rs`.
 
-**Not implemented:** macOS FSEvents, live `since`/`subscribe` change feeds, and a
-GUI client. `subscribe` currently emits the protocol shape (meta + current
-cursor) as a preview.
+**Not implemented:** `since` is still a coarse delta (flush cursors plus a
+filtered scan of the current index, not per-path diffs between two cursors).
+
+`subscribe` now streams real per-path `create`/`delete` events, filtered
+server-side by an optional query (protocol v6), and the GUI's Live toggle uses
+it; `ff watch` still reads one snapshot because it uses the batched client.

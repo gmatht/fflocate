@@ -236,9 +236,12 @@ jobs:
 
               sudo installer -pkg fflocate-${version}-macos-universal.pkg -target /
 
-          Installs arm64 + x86_64 ff, ff-gui and fflocated into /usr/local/bin and
-          registers the com.fflocate.fflocated LaunchAgent for the user logged in
-          at the console, then starts it. Accounts created later run
+          Installs arm64 + x86_64 fflocate.app into /Applications — the GUI, with
+          a Finder icon, a bundle identifier and a version, so it launches by
+          double-click and behaves like any other Mac app — and ff and fflocated
+          into /usr/local/bin, with ff-gui there as a link into the bundle. It
+          then registers the com.fflocate.fflocated LaunchAgent for the user
+          logged in at the console and starts it. Accounts created later run
           ff service install themselves.
 
           The package is unsigned, so a Mac that downloaded it needs one of:
@@ -257,13 +260,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # A "-beta"/"-rc" version is a prerelease on GitHub too, so it is not
+          # offered as the stable download while it is still being tried out.
+          pre=
+          case "${GITHUB_REF_NAME#v}" in *-*) pre=--prerelease ;; esac
           # Re-running a failed release must replace assets, not fail on them.
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber
-            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md $pre
           else
             gh release create "$GITHUB_REF_NAME" --verify-tag \
               --title "fflocate $GITHUB_REF_NAME" \
-              --notes-file notes.md dist/*
+              --notes-file notes.md $pre dist/*
           fi
           gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name'
