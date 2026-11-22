@@ -1025,7 +1025,7 @@ fn handle_since(ctx: &ServerCtx, cursor: &str, q: &str) -> Vec<Response> {
         // Emit one event per matching path at/after that LSN is not tracked per
         // path in v1, so we emit a coarse "flush" event carrying the cursor.
         out.push(Response::Event {
-            cursor: c.to_string_repr(),
+            cursor: c.cursor.to_string_repr(),
             action: "flush".to_string(),
             path: String::new(),
         });
@@ -1140,8 +1140,10 @@ fn handle_rescan(ctx: &ServerCtx, root: &str) -> Vec<Response> {
 }
 
 fn handle_subscribe(ctx: &ServerCtx) -> Vec<Response> {
-    // v1.5 preview: emit meta then the current tail of the change log. A real
-    // subscriber would be fed by the applier; the protocol shape is final.
+    // The batched shape: meta and a cursor, no stream. A socket never reaches
+    // this — `respond_streaming` intercepts `subscribe` before
+    // `handle_request` — but `handle_request` is public, and a direct caller
+    // that expected a terminating answer keeps getting one.
     let t0 = Instant::now();
     let mut out = vec![meta_preamble(ctx, false, t0.elapsed())];
     out.push(Response::Done {
@@ -1149,6 +1151,156 @@ fn handle_subscribe(ctx: &ServerCtx) -> Vec<Response> {
         cursor: ctx.shared.cursor().to_string_repr(),
     });
     out
+}
+
+/// How often an idle subscription looks for new changes. Fast enough to feel
+/// live, slow enough that twenty open GUIs cost twenty cheap wakes a second.
+const SUBSCRIBE_POLL: Duration = Duration::from_millis(50);
+
+/// The one record that tells a subscriber its feed has a gap.
+fn resync_event(cursor: String) -> Response {
+    Response::Event {
+        cursor,
+        action: "resync".to_string(),
+        path: String::new(),
+    }
+}
+
+/// Stream the live change feed for a `subscribe` request (§11).
+///
+/// `Meta` first (the client learns the cursor it is starting from), then one
+/// `Event` per created/deleted path that matches `q`, until the client goes
+/// away — there is deliberately no `Done`: a `Done` would tell the client the
+/// feed ended. Overshooting the change ring is not silence: it emits
+/// `action: "resync"` so the client re-queries instead of showing a stale
+/// list.
+///
+/// Returns `false` when the peer is gone (abort poll or a refused write),
+/// which is the serve loop's signal to drop the connection.
+pub fn handle_subscribe_streaming(
+    ctx: &ServerCtx,
+    cursor: Option<&str>,
+    q: &str,
+    case_sensitive: bool,
+    emit: &mut dyn FnMut(Response) -> bool,
+    abort: &dyn Fn() -> bool,
+) -> bool {
+    // Attach *before* Meta: the cursor below is "from now", so a change that
+    // lands between reading it and announcing it must still be recorded (the
+    // guard is what makes the applier resolve paths). Getting this backwards
+    // silently drops the first events after a subscribe.
+    let _subscriber = ctx.shared.subscribe();
+    let gen = ctx.shared.generation();
+    let mut cur = ctx.shared.cursor();
+    // The last change index this subscriber has accounted for. The log counts
+    // evictions, so `dropped > consumed` is exactly "a change it had not read is
+    // gone" — and a fresh subscriber, starting at the newest index, is never
+    // behind.
+    let mut consumed = ctx.shared.changes.read().unwrap().pushed();
+    // A resume point that cannot be honoured asks for a re-query instead. The
+    // resync waits until after `Meta`, since a feed always opens with it.
+    let mut resync_now = false;
+    if let Some(spec) = cursor {
+        match crate::cursor::Cursor::parse_with_gen(spec, gen) {
+            Some(c) if c.gen == gen => {
+                cur = c;
+                let log = ctx.shared.changes.read().unwrap();
+                // A cursor names no index, so assume the client kept up (a
+                // pessimistic value would resync every resume once anything
+                // had ever been evicted) and refuse only a cursor behind the
+                // retained front, where changes it never saw are already gone.
+                consumed = log.dropped();
+                if log
+                    .earliest()
+                    .is_some_and(|e| e.gen == c.gen && e.lsn > c.lsn)
+                {
+                    resync_now = true;
+                    cur = ctx.shared.cursor();
+                }
+            }
+            Some(_) => resync_now = true,
+            None => {
+                let _ = emit(Response::Error {
+                    message: format!("bad cursor: {spec}"),
+                });
+                return false;
+            }
+        }
+    }
+    let t0 = Instant::now();
+    if !emit(meta_preamble(ctx, false, t0.elapsed())) {
+        return false;
+    }
+    if resync_now && !emit(resync_event(cur.to_string_repr())) {
+        return false;
+    }
+    let matcher = if q.trim().is_empty() {
+        None
+    } else {
+        match Query::compile_with_case(q, case_sensitive) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                let _ = emit(Response::Error { message: e });
+                return false;
+            }
+        }
+    };
+    loop {
+        if abort() {
+            return false;
+        }
+        let (batch, gap, dropped) = {
+            let log = ctx.shared.changes.read().unwrap();
+            (
+                log.since(cur),
+                log.gap(cur, consumed, ctx.shared.generation()),
+                log.dropped(),
+            )
+        };
+        // A gap is the one thing a subscriber is never shown silently. Ask for
+        // a re-query and carry on from now, skipping the batch: the re-query
+        // covers it, and replaying a batch from before the gap would leave
+        // `consumed` behind the evictions again. Falling through to the sleep
+        // below keeps a churning index from spinning this loop.
+        if gap {
+            cur = ctx.shared.cursor();
+            consumed = dropped;
+            if !emit(resync_event(cur.to_string_repr())) {
+                return false;
+            }
+        } else {
+            for change in batch {
+                consumed = change.seq;
+                cur = change.cursor;
+                if change.path.is_empty() {
+                    continue;
+                }
+                if let Some(m) = &matcher {
+                    let name = change
+                        .path
+                        .rsplit(|b| *b == b'/')
+                        .next()
+                        .unwrap_or(&change.path);
+                    // The path is carried by the change precisely so this
+                    // filter needs neither the index nor a `stat`: the entry
+                    // may already be tombstoned.
+                    if !m.matches(name, change.is_dir, change.is_exec, || {
+                        Some(change.path.clone())
+                    }) {
+                        continue;
+                    }
+                }
+                if !emit(Response::Event {
+                    cursor: cur.to_string_repr(),
+                    action: change.kind.action().to_string(),
+                    path: bytes_to_string(&change.path),
+                }) {
+                    return false;
+                }
+            }
+        }
+        std::thread::sleep(SUBSCRIBE_POLL);
+    }
 }
 
 pub fn bytes_to_string(b: &[u8]) -> String {

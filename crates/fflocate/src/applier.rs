@@ -15,12 +15,12 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::event::{FsEvent, RescanCause};
-use crate::health::Health;
+use crate::health::{ChangeKind, Health};
 use crate::index::{EntryFlags, Index, ROOT_ID};
 use crate::journal::Record;
 use crate::pending::{Pending, PushOutcome, WorkItem};
@@ -250,6 +250,10 @@ pub struct Shared {
     pub health: RwLock<Health>,
     /// A broadcast of change events for `subscribe` (cursor-based consumers).
     pub changes: RwLock<crate::health::ChangeLog>,
+    /// How many `subscribe` handlers are attached right now. The applier only
+    /// pays for change paths (a small walk per mutation) while this is
+    /// non-zero; CLI-only daemons see no extra work at all.
+    subscribers: AtomicUsize,
     /// §17 v2 trigram accelerator, cached against the index it was built from.
     /// Present only with the default-on `trigram` cargo feature.
     ///
@@ -299,6 +303,7 @@ impl Shared {
             lsn: AtomicU64::new(lsn),
             health: RwLock::new(Health::default()),
             changes: RwLock::new(crate::health::ChangeLog::new(4096)),
+            subscribers: AtomicUsize::new(0),
             #[cfg(feature = "trigram")]
             trigram: RwLock::new(None),
             ownership: RwLock::new(crate::ownership::Ownership::new()),
@@ -361,6 +366,36 @@ impl Shared {
     /// The current cursor: `c:<gen>:<lsn>`.
     pub fn cursor(&self) -> crate::cursor::Cursor {
         crate::cursor::Cursor::new(self.generation(), self.snapshot_lsn())
+    }
+
+    /// Whether any `subscribe` handler is attached (see [`Applier::change_for`]).
+    pub fn subscriber_count(&self) -> usize {
+        self.subscribers.load(Ordering::Acquire)
+    }
+
+    /// Register a subscriber for the lifetime of `guard`.
+    ///
+    /// Release/acquire on the counter orders an attaching subscriber before
+    /// the changes the applier records for it. That narrows — it cannot fully
+    /// close — the window where a mutation racing the attach is neither
+    /// recorded nor replayed; the subscriber's next change or query settles it.
+    pub fn subscribe(self: &Arc<Self>) -> SubscriberGuard {
+        self.subscribers.fetch_add(1, Ordering::AcqRel);
+        SubscriberGuard {
+            shared: Arc::clone(self),
+        }
+    }
+}
+
+/// Keeps [`Shared::subscriber_count`] honest even when a subscribe handler
+/// returns early (bad cursor, client gone, emit refused).
+pub struct SubscriberGuard {
+    shared: Arc<Shared>,
+}
+
+impl Drop for SubscriberGuard {
+    fn drop(&mut self) {
+        self.shared.subscribers.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -795,6 +830,11 @@ impl Applier {
         {
             self.note_ownership_for(*id, *parent, name);
         }
+        // §11 live feed: describe the mutation *before* it lands, so a delete
+        // can still name the entry it removes (afterwards only the tombstone
+        // and its name bytes survive, with no parent to walk). Skipped unless a
+        // subscriber is attached, so a CLI-only daemon pays nothing.
+        let changes = self.change_for(&rec);
         // Apply to the live index regardless of journaling.
         // §17 v2 incremental maintenance: keep the cached trigram postings
         // current, so the cache stays keyed on generation alone and a churning
@@ -887,6 +927,125 @@ impl Applier {
             let mut ix = self.shared.index.write().unwrap();
             apply_record(&mut ix, &rec);
         }
+        if let Some(changes) = changes {
+            self.publish_changes(changes);
+        }
+    }
+
+    /// The live-feed view of one record: what a `subscribe` client should hear.
+    ///
+    /// `None` when nothing is subscribed, when the record carries no path
+    /// change (`Fence`/`Mark`), or when the path cannot be resolved (an event
+    /// for a parent the index does not know yet): silence is better than a
+    /// path that is not the file's.
+    fn change_for(&mut self, rec: &Record) -> Option<Vec<(ChangeKind, Vec<u8>, bool, bool)>> {
+        if self.shared.subscriber_count() == 0 {
+            return None;
+        }
+        match rec {
+            Record::Add {
+                parent,
+                name,
+                flags,
+                ..
+            } => {
+                let path = self.child_path(*parent, name)?;
+                let f = crate::index::EntryFlags(*flags);
+                Some(vec![(ChangeKind::Create, path, f.is_dir(), f.is_exec())])
+            }
+            Record::Del { id } => {
+                let (path, is_dir, is_exec) = self.change_path_of(*id)?;
+                Some(vec![(ChangeKind::Delete, path, is_dir, is_exec)])
+            }
+            Record::Move {
+                id,
+                new_parent,
+                new_name,
+            } => {
+                // A rename is a delete plus a create: that is exactly what a
+                // follower of one path needs, and the journal's `Move` is rare
+                // (persist/compaction), so the extra event costs nothing. The
+                // entry keeps its kind across the rename, so the create half
+                // carries the same flags — a `kind:dir` subscription would
+                // otherwise filter out a moved directory.
+                let mut out = Vec::new();
+                if let Some((path, is_dir, is_exec)) = self.change_path_of(*id) {
+                    out.push((ChangeKind::Delete, path, is_dir, is_exec));
+                    if let Some(path) = self.child_path(*new_parent, new_name) {
+                        out.push((ChangeKind::Create, path, is_dir, is_exec));
+                    }
+                }
+                (!out.is_empty()).then_some(out)
+            }
+            Record::Fence | Record::Mark { .. } => None,
+        }
+    }
+
+    /// `parent`'s absolute path plus `name`, as raw bytes.
+    fn child_path(&mut self, parent: u32, name: &[u8]) -> Option<Vec<u8>> {
+        let parent_path = self.abs_path_for(parent)?;
+        let mut path = parent_path.to_string_lossy().into_owned().into_bytes();
+        if path.last() != Some(&b'/') {
+            path.push(b'/');
+        }
+        path.extend_from_slice(name);
+        Some(path)
+    }
+
+    /// Materialize `id`'s absolute path (and its kind) from the index.
+    ///
+    /// Only used for deletions, where the record itself names no path: the
+    /// entry is still live at this point, so walking its parent chain (and
+    /// tying the chain's root-dir entry back to the root table for the prefix)
+    /// is exact. Two short read guards, taken before the write that removes it;
+    /// never nested under another index guard.
+    fn change_path_of(&mut self, id: u32) -> Option<(Vec<u8>, bool, bool)> {
+        let ix = self.shared.index.read().unwrap();
+        let flags = ix.entry(id)?.flags();
+        let mut names: Vec<Vec<u8>> = Vec::new();
+        let mut cur = id;
+        let root_dir = loop {
+            if cur == ROOT_ID {
+                return None;
+            }
+            let entry = ix.entry(cur)?;
+            if entry.flags().is_root_dir() {
+                break cur;
+            }
+            if entry.flags().is_tombstone() {
+                return None;
+            }
+            names.push(ix.name(cur).to_vec());
+            cur = entry.parent;
+        };
+        let roots = self.shared.roots.read().unwrap();
+        let root = roots
+            .iter()
+            .find(|r| root_dir_id(&ix, r) == root_dir)?;
+        let mut path = root.path.as_os_str().to_string_lossy().into_owned().into_bytes();
+        for name in names.iter().rev() {
+            if path.last() != Some(&b'/') {
+                path.push(b'/');
+            }
+            path.extend_from_slice(name);
+        }
+        Some((path, flags.is_dir(), flags.is_exec()))
+    }
+
+    /// Publish one mutation's changes at the current cursor.
+    fn publish_changes(&mut self, changes: Vec<(ChangeKind, Vec<u8>, bool, bool)>) {
+        let cursor = self.shared.cursor();
+        let mut log = self.shared.changes.write().unwrap();
+        for (kind, path, is_dir, is_exec) in changes {
+            log.push(crate::health::Change {
+                seq: 0,
+                cursor,
+                kind,
+                path,
+                is_dir,
+                is_exec,
+            });
+        }
     }
 
     /// Record ownership for a newly inserted entry, resolving its absolute path
@@ -944,7 +1103,6 @@ impl Applier {
                 }
             }
         }
-        self.record_change();
     }
 
     fn apply_upsert(&mut self, parent: u32, name: Vec<u8>, is_dir_hint: bool) {
@@ -1143,11 +1301,6 @@ impl Applier {
                 ix.entry_mut(id).flags = nf.0;
             }
         }
-    }
-
-    fn record_change(&mut self) {
-        let cursor = self.shared.cursor();
-        self.shared.changes.write().unwrap().push(cursor);
     }
 
     // ------------------------------------------------------------ work items

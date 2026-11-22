@@ -21,7 +21,12 @@ use serde::{Deserialize, Serialize};
 /// their "what is it doing" wording on. v5 adds `Hit.created`: each index entry
 /// now carries its creation time, so a created-date query is answered from the
 /// index instead of one `stat` per hit.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
+
+/// The version that made `subscribe` a stream (§11). An older client expects a
+/// terminal `Done` and would wait for one forever, so it is refused rather than
+/// streamed at.
+pub const SUBSCRIBE_STREAM_VERSION: u32 = 6;
 
 /// A client request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -86,12 +91,22 @@ pub enum Request {
         #[serde(default)]
         q: String,
     },
-    /// Live change feed (v1.5 preview).
+    /// Live change feed (§11): after `Meta`, the daemon streams one `Event`
+    /// per created/deleted path and never sends `Done` — the connection stays
+    /// open until the client closes it. An optional `q` filters server-side,
+    /// so a watching client is not woken for changes it cannot show.
     Subscribe {
         #[serde(default)]
         name: Option<String>,
+        /// Resume after this cursor; absent means "from now".
         #[serde(default)]
         cursor: Option<String>,
+        /// Only report paths matching this expression (empty = everything).
+        #[serde(default)]
+        q: String,
+        /// Force case-sensitive matching for `q`, as the query op does.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        case_sensitive: Option<bool>,
     },
     /// Health telemetry (§15).
     Stats {
@@ -231,12 +246,27 @@ impl Request {
     pub fn from_line(line: &str) -> Result<Request, serde_json::Error> {
         let v: serde_json::Value = serde_json::from_str(line)?;
         // Accept requests with or without the `v` field; validate version when
-        // present.
+        // present. *Older* versions stay accepted: every later field is
+        // optional with a default, so a v5 client (no subscribe query, no
+        // progress) is served correctly by this daemon. Only a version this
+        // build does not understand is refused — guessing at new semantics is
+        // how a client gets a wrong answer instead of an error.
         if let Some(ver) = v.get("v").and_then(|x| x.as_u64()) {
-            if ver != PROTOCOL_VERSION as u64 {
+            if ver > PROTOCOL_VERSION as u64 {
                 return Err(serde_json::Error::io(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!("unsupported protocol version {ver}"),
+                )));
+            }
+            // `subscribe` is the one op whose *meaning* changed: it used to end
+            // with `Done` and now stays open. Streaming at a client that old
+            // would hang it waiting for a terminal record, so say why instead.
+            if ver < SUBSCRIBE_STREAM_VERSION as u64
+                && v.get("op").and_then(|x| x.as_str()) == Some("subscribe")
+            {
+                return Err(serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("subscribe streams from protocol {SUBSCRIBE_STREAM_VERSION}; this client sent {ver}"),
                 )));
             }
         }
@@ -251,7 +281,7 @@ mod tests {
     #[test]
     fn parse_query() {
         let r =
-            Request::from_line(r#"{"v":5,"op":"query","q":"src ext:rs","limit":50,"json":true}"#)
+            Request::from_line(r#"{"v":6,"op":"query","q":"src ext:rs","limit":50,"json":true}"#)
                 .unwrap();
         match r {
             Request::Query {
@@ -299,8 +329,35 @@ mod tests {
     }
 
     #[test]
-    fn wrong_version_rejected() {
-        assert!(Request::from_line(r#"{"v":1,"op":"query","q":"x"}"#).is_err());
+    fn older_versions_are_served_and_newer_refused() {
+        // A v5 client predates `subscribe.q`; every later field is optional with
+        // a default, so this daemon serves it rather than pretending not to
+        // understand a request it can answer exactly.
+        assert!(matches!(
+            Request::from_line(r#"{"v":5,"op":"query","q":"x"}"#).unwrap(),
+            Request::Query { .. }
+        ));
+        // A version *newer* than this build is refused: guessing at semantics
+        // it does not know is how a client gets a wrong answer.
+        assert!(Request::from_line(r#"{"v":7,"op":"query","q":"x"}"#).is_err());
+    }
+
+    #[test]
+    fn an_old_client_is_not_handed_a_stream_it_cannot_finish() {
+        // v5's `subscribe` ended with `Done`; streaming at that client would
+        // leave it waiting for a record that never comes.
+        let err = Request::from_line(r#"{"v":5,"op":"subscribe","q":""}"#)
+            .expect_err("a pre-stream subscribe must be refused");
+        assert!(
+            err.to_string().contains("streams from protocol 6"),
+            "the refusal must say what changed: {err}"
+        );
+        // The current version streams, and every other op is unchanged by it.
+        assert!(matches!(
+            Request::from_line(r#"{"v":6,"op":"subscribe","q":""}"#).unwrap(),
+            Request::Subscribe { .. }
+        ));
+        assert!(Request::from_line(r#"{"v":5,"op":"query","q":"x"}"#).is_ok());
     }
 
     #[test]
@@ -395,12 +452,12 @@ mod tests {
         // Opt-in: the flag is always on the wire (like `fuzzy`), and an old
         // line without it parses with progress off — an old daemon's reply
         // shape and a new client's default both mean "no Progress records".
-        let r = Request::from_line(r#"{"v":5,"op":"query","q":"comp","progress":true}"#).unwrap();
+        let r = Request::from_line(r#"{"v":6,"op":"query","q":"comp","progress":true}"#).unwrap();
         match r {
             Request::Query { progress, .. } => assert!(progress),
             _ => panic!("wrong request"),
         }
-        let r = Request::from_line(r#"{"v":5,"op":"query","q":"comp"}"#).unwrap();
+        let r = Request::from_line(r#"{"v":6,"op":"query","q":"comp"}"#).unwrap();
         match r {
             Request::Query { progress, .. } => assert!(!progress),
             _ => panic!("wrong request"),

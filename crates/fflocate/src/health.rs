@@ -108,12 +108,51 @@ pub fn classify_phase(replay: usize, crawl_dirs: usize, rescans: usize) -> Phase
 }
 
 
-/// Change log: a bounded ring of `Cursor`s at which the index changed. Used by
-/// `since` and `subscribe` (§11).
+/// What a recorded change did to the index. Deliberately two outcomes: a live
+/// rename arrives as a delete plus a create, which is exactly what a watcher
+/// wants to hear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeKind {
+    Create,
+    Delete,
+}
+
+impl ChangeKind {
+    /// The `Response::Event.action` spelling.
+    pub fn action(self) -> &'static str {
+        match self {
+            ChangeKind::Create => "create",
+            ChangeKind::Delete => "delete",
+        }
+    }
+}
+
+/// One recorded index change: the cursor it landed at, what it did, and enough
+/// of the entry to decide relevance without re-reading the index (the entry may
+/// already be gone by the time a subscriber asks).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Change {
+    /// Monotonic push index, stamped by [`ChangeLog::push`]. A subscriber tracks
+    /// the last one it consumed, so whether a change it had not read has been
+    /// evicted is answered exactly, without guessing from cursors.
+    pub seq: u64,
+    pub cursor: crate::cursor::Cursor,
+    pub kind: ChangeKind,
+    /// Absolute path. Empty when the applier could not resolve one.
+    pub path: Vec<u8>,
+    pub is_dir: bool,
+    pub is_exec: bool,
+}
+
+/// Change log: a bounded ring of changes at which the index changed. Used by
+/// `since` (coarse cursors) and `subscribe` (§11).
 #[derive(Debug)]
 pub struct ChangeLog {
-    ring: std::collections::VecDeque<crate::cursor::Cursor>,
+    ring: std::collections::VecDeque<Change>,
     cap: usize,
+    /// Changes ever recorded. With the ring's length this gives both the index
+    /// of the oldest retained change and the count of evicted ones.
+    pushed: u64,
 }
 
 impl ChangeLog {
@@ -121,26 +160,55 @@ impl ChangeLog {
         ChangeLog {
             ring: std::collections::VecDeque::with_capacity(cap),
             cap: cap.max(1),
+            pushed: 0,
         }
     }
-    pub fn push(&mut self, c: crate::cursor::Cursor) {
+    pub fn push(&mut self, mut c: Change) {
+        self.pushed += 1;
+        c.seq = self.pushed;
         if self.ring.len() == self.cap {
             self.ring.pop_front();
         }
         self.ring.push_back(c);
     }
-    /// The earliest cursor still retained. If the caller's cursor predates this,
-    /// they must resync (`fresh = true`).
+    /// How many changes have ever been recorded.
+    pub fn pushed(&self) -> u64 {
+        self.pushed
+    }
+    /// How many recorded changes have been evicted.
+    pub fn dropped(&self) -> u64 {
+        self.pushed - self.ring.len() as u64
+    }
+    /// The earliest change still retained.
     pub fn earliest(&self) -> Option<crate::cursor::Cursor> {
-        self.ring.front().copied()
+        self.ring.front().map(|c| c.cursor)
+    }
+    /// Whether a subscriber at `cursor` that has accounted for `consumed`
+    /// changes can no longer be fed: a change it had not read was evicted, or a
+    /// generation bump remapped the ids under it.
+    ///
+    /// `consumed` starts at [`pushed`](Self::pushed), which is why a fresh
+    /// subscriber never gaps: its cursor may well precede the retained window
+    /// (nothing was recorded before it arrived), but nothing it needed is gone.
+    pub fn gap(&self, cursor: crate::cursor::Cursor, consumed: u64, generation: u64) -> bool {
+        generation != cursor.gen || self.dropped() > consumed
     }
     /// All changes newer than `c` (same generation).
-    pub fn since(&self, c: crate::cursor::Cursor) -> Vec<crate::cursor::Cursor> {
-        self.ring
+    ///
+    /// Scanned from the back: a caught-up subscriber — the common case, polled
+    /// twenty times a second — stops at its own last change and never touches
+    /// the rest of the ring.
+    pub fn since(&self, c: crate::cursor::Cursor) -> Vec<Change> {
+        let mut out: Vec<Change> = self
+            .ring
             .iter()
-            .filter(|x| x.gen == c.gen && x.lsn > c.lsn)
-            .copied()
-            .collect()
+            .rev()
+            .take_while(|x| x.cursor.gen != c.gen || x.cursor.lsn > c.lsn)
+            .filter(|x| x.cursor.gen == c.gen)
+            .cloned()
+            .collect();
+        out.reverse();
+        out
     }
     pub fn len(&self) -> usize {
         self.ring.len()
@@ -245,28 +313,91 @@ mod tests {
     use super::*;
     use crate::cursor::Cursor;
 
+    fn change(lsn: u64, kind: ChangeKind, path: &str) -> Change {
+        Change {
+            seq: 0,
+            cursor: Cursor::new(1, lsn),
+            kind,
+            path: path.as_bytes().to_vec(),
+            is_dir: false,
+            is_exec: false,
+        }
+    }
+
     #[test]
     fn change_log_since() {
         let mut cl = ChangeLog::new(4);
         for lsn in 1..=6 {
-            cl.push(Cursor::new(1, lsn));
+            cl.push(change(lsn, ChangeKind::Create, &format!("/t/{lsn}")));
         }
         assert_eq!(cl.len(), 4);
         // entries 3..=6 retained
         let got = cl.since(Cursor::new(1, 2));
         assert_eq!(
-            got.iter().map(|c| c.lsn).collect::<Vec<_>>(),
+            got.iter().map(|c| c.cursor.lsn).collect::<Vec<_>>(),
             vec![3, 4, 5, 6]
         );
         let got = cl.since(Cursor::new(1, 5));
-        assert_eq!(got.iter().map(|c| c.lsn).collect::<Vec<_>>(), vec![6]);
+        assert_eq!(got.iter().map(|c| c.cursor.lsn).collect::<Vec<_>>(), vec![6]);
+        assert_eq!(got[0].kind.action(), "create");
+        assert_eq!(got[0].path, b"/t/6");
     }
 
     #[test]
     fn change_log_generation_mismatch_yields_nothing() {
         let mut cl = ChangeLog::new(4);
-        cl.push(Cursor::new(2, 10));
+        cl.push(Change {
+            seq: 0,
+            cursor: Cursor::new(2, 10),
+            kind: ChangeKind::Delete,
+            path: b"/t/gone".to_vec(),
+            is_dir: false,
+            is_exec: false,
+        });
         assert!(cl.since(Cursor::new(1, 1)).is_empty());
+        assert_eq!(cl.earliest(), Some(Cursor::new(2, 10)));
+    }
+
+    #[test]
+    fn change_log_overrun_is_visible_from_the_earliest_cursor() {
+        // A subscriber sitting at lsn 1 must be able to tell that the ring no
+        // longer reaches back that far: that is the resync signal.
+        let mut cl = ChangeLog::new(2);
+        for lsn in 1..=4 {
+            cl.push(change(lsn, ChangeKind::Create, "/t/x"));
+        }
+        let cursor = Cursor::new(1, 1);
+        let earliest = cl.earliest().expect("retained changes");
+        assert!(
+            earliest.lsn > cursor.lsn,
+            "a cursor older than the ring must be detectable"
+        );
+        assert_eq!(cl.since(cursor).len(), 2);
+        // What makes the gap exact: four changes were pushed, two survive, so
+        // two were evicted — and a subscriber that had consumed up to three of
+        // them is not asked to resync.
+        assert_eq!(cl.pushed(), 4);
+        assert_eq!(cl.dropped(), 2);
+        assert!(cl.dropped() > 0, "the resync signal");
+        assert!(
+            cl.pushed() >= cl.dropped(),
+            "a fresh subscriber is never behind the evictions"
+        );
+    }
+
+    #[test]
+    fn a_gap_is_an_unread_eviction_not_a_merely_older_cursor() {
+        let mut cl = ChangeLog::new(2);
+        for lsn in 1..=4 {
+            cl.push(change(lsn, ChangeKind::Create, "/t/x"));
+        }
+        // A subscriber that starts now has accounted for every change: its
+        // cursor predates the retained window, and that is not a gap.
+        assert!(!cl.gap(Cursor::new(1, 4), cl.pushed(), 1));
+        // One that stopped at index 1 missed two changes that were evicted.
+        assert!(cl.gap(Cursor::new(1, 4), 1, 1));
+        // A generation bump remaps ids, whatever the indices say.
+        assert!(cl.gap(Cursor::new(1, 4), cl.pushed(), 2));
     }
 
     #[test]

@@ -669,18 +669,42 @@ impl Client {
         Ok(ExitCode::SUCCESS)
     }
 
+    /// Follow the daemon's change feed, printing one line per change until the
+    /// process is interrupted or the daemon closes the connection.
+    ///
+    /// `subscribe` is a stream since protocol 6: it opens with `Meta` and has no
+    /// terminal record, so this cannot go through [`send`](Self::send), which
+    /// waits for one. A daemon that predates the stream refuses the op, which
+    /// surfaces here as a protocol error rather than a silent exit.
     pub fn watch(&mut self, q: &str) -> Result<ExitCode, CliError> {
-        let resp = self.send(&Request::Subscribe {
+        let req = Request::Subscribe {
             name: Some("ff-watch".into()),
             cursor: None,
-        })?;
-        for r in resp {
+            q: q.to_string(),
+            case_sensitive: None,
+        };
+        let line = serde_json::to_string(&req).map_err(|e| CliError::Protocol(e.to_string()))?;
+        writeln!(self.stream, "{line}").map_err(|e| CliError::Io(e.to_string()))?;
+        self.stream
+            .flush()
+            .map_err(|e| CliError::Io(e.to_string()))?;
+        let reader = BufReader::new(
+            self.stream
+                .try_clone()
+                .map_err(|e| CliError::Io(e.to_string()))?,
+        );
+        for line in reader.lines() {
+            let line = line.map_err(|e| CliError::Io(e.to_string()))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let r: Response = serde_json::from_str(&line)
+                .map_err(|e| CliError::Protocol(format!("{e}: {line}")))?;
             match r {
                 Response::Meta { gen, lsn, .. } => {
                     eprintln!("# watching from c:{gen}:{lsn} q={q:?}")
                 }
                 Response::Event { path, action, .. } => println!("{action} {path}"),
-                Response::Done { .. } => {}
                 Response::Error { message } => return Err(CliError::Protocol(message)),
                 _ => {}
             }

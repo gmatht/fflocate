@@ -725,11 +725,6 @@ fn process_alive(pid: i32) -> bool {
 }
 
 
-/// Is this a query-shaped request (one whose handler streams Hits)?
-fn is_query(req: &Request) -> bool {
-    matches!(req, Request::Query { .. })
-}
-
 /// Has the peer gone away (FIN or RST received), without consuming anything?
 ///
 /// Zero-timeout `poll` for `POLLIN|POLLHUP|POLLERR`, then a `MSG_PEEK` read:
@@ -873,6 +868,9 @@ fn respond_streaming(ctx: &ServerCtx, req: &Request, writer: &mut Stream) -> boo
         // the two holes passive detection alone leaves. The engines poll it
         // per 4096-entry chunk (~4 ms of scan), so the worst overshoot after
         // a disconnect is one chunk.
+        // The engines read this as "keep going" (see `ScanAbort`), so it is
+        // liveness, not gone-ness — the opposite polarity of the subscribe
+        // loop's `gone_poll` below.
         let abort_poll = move || {
             #[cfg(unix)]
             {
@@ -942,7 +940,53 @@ fn respond_streaming(ctx: &ServerCtx, req: &Request, writer: &mut Stream) -> boo
         };
         return closed;
     }
-    let _ = is_query;
+    // A subscription is a connection, not a request: it streams until the
+    // client goes away, so it needs the same disconnect poll the scans use.
+    if let Request::Subscribe {
+        cursor,
+        q,
+        case_sensitive,
+        ..
+    } = req
+    {
+        #[cfg(unix)]
+        let writer_fd = {
+            use std::os::unix::io::AsRawFd;
+            writer.as_raw_fd()
+        };
+        // The subscribe loop reads this as "stop", so it is gone-ness.
+        let gone_poll = move || {
+            #[cfg(unix)]
+            {
+                client_gone_fd(writer_fd)
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+        let mut closed = false;
+        let mut emit = |r: Response| {
+            if closed {
+                return false;
+            }
+            if writeln!(writer, "{}", r.to_line()).is_err() {
+                closed = true;
+                return false;
+            }
+            let _ = writer.flush();
+            true
+        };
+        let alive = fflocate::server::handle_subscribe_streaming(
+            ctx,
+            cursor.as_deref(),
+            q,
+            *case_sensitive == Some(true),
+            &mut emit,
+            &gone_poll,
+        );
+        return !alive || closed;
+    }
     let responses = handle_request(ctx, req);
     let mut closed = false;
     for r in &responses {
