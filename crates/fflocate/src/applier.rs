@@ -21,7 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::event::{FsEvent, RescanCause};
 use crate::health::{ChangeKind, Health};
-use crate::index::{EntryFlags, Index, ROOT_ID};
+use crate::index::{EntryFlags, Index, CREATED_UNKNOWN, ROOT_ID};
 use crate::journal::Record;
 use crate::pending::{Pending, PushOutcome, WorkItem};
 use crate::persist::{apply_record, Store};
@@ -70,10 +70,10 @@ pub struct DirItem {
     /// every link); always false for directories (`type:exec` answers "is
     /// this file executable"). Unstatable entries read false.
     pub is_exec: bool,
-    /// Creation (birth) time in whole minutes since the unix epoch, `0` when
-    /// the filesystem has none or the entry is unstatable. Captured from the
-    /// same `stat` that decides `is_exec`, so the crawl does not pay a second
-    /// syscall for it.
+    /// Creation (birth) time in whole minutes since the unix epoch, or
+    /// [`CREATED_UNKNOWN`] when the filesystem has none or the entry is
+    /// unstatable. Captured from the same `stat` that decides `is_exec`, so the
+    /// crawl does not pay a second syscall for it.
     pub created_min: u32,
 }
 
@@ -84,8 +84,8 @@ pub struct StatInfo {
     /// `st_dev`/`st_ino`; zero when unavailable.
     pub dev: u64,
     pub ino: u64,
-    /// Creation (birth) time in whole minutes since the unix epoch; `0` when
-    /// unknown.
+    /// Creation (birth) time in whole minutes since the unix epoch;
+    /// [`CREATED_UNKNOWN`] when unknown.
     pub created_min: u32,
 }
 
@@ -211,34 +211,30 @@ pub fn fs_facts(path: &Path, is_dir: bool, _is_symlink: bool) -> (bool, u32) {
                 !is_dir && md.is_file() && md.mode() & 0o111 != 0,
                 created_minutes(&md),
             ),
-            Err(_) => (false, 0),
+            Err(_) => (false, CREATED_UNKNOWN),
         }
     }
     #[cfg(not(unix))]
     {
         let _ = (path, is_dir);
-        (false, 0)
+        (false, CREATED_UNKNOWN)
     }
 }
 
 /// A metadata entry's creation (birth) time as whole minutes since the unix
-/// epoch, or 0 when the platform/filesystem does not record one.
+/// epoch, or [`CREATED_UNKNOWN`] when the platform/filesystem does not record
+/// one.
 fn created_minutes(md: &std::fs::Metadata) -> u32 {
     match md.created() {
         Ok(t) => created_minutes_at(t),
-        Err(_) => 0,
+        Err(_) => CREATED_UNKNOWN,
     }
 }
 
-/// A timestamp as whole minutes since the unix epoch, saturating at `u32::MAX`
-/// (year 10136 — the field is 32 bits, not a 1970-2106 `time_t`). A time before
-/// the epoch, or a clock that cannot be related to it, reads as unknown (0).
-pub fn created_minutes_at(t: SystemTime) -> u32 {
-    match t.duration_since(UNIX_EPOCH) {
-        Ok(d) => u32::try_from(d.as_secs() / 60).unwrap_or(u32::MAX),
-        Err(_) => 0,
-    }
-}
+/// The ingestion half of the stored creation-time scale. It is defined once,
+/// in [`crate::index`] beside the `u32`-minutes field it writes, and re-exported
+/// here because the crawl (which owns the `stat`) is its only caller.
+pub use crate::index::created_minutes_at;
 
 /// The shared, query-visible state. Readers take this lock; the applier is the
 /// only writer.
@@ -488,6 +484,18 @@ pub struct Applier {
     /// path instead of replaying on every boot (the old build-time fold,
     /// deferred until the ids are live and serving).
     replay_compaction_credit: u64,
+    /// Directories the OS refused to let us read (macOS TCC, or a plain
+    /// `chmod 000`), keyed by absolute path.
+    ///
+    /// Retrying cannot succeed, and on macOS **every retry re-raises the
+    /// "fflocated would like to access files in your Desktop folder" dialog** — so a
+    /// refused folder plus a watcher that keeps reporting its contents becomes
+    /// an endless prompt loop (list → refuse → event → list again). A refusal
+    /// is therefore remembered for the life of the process and the folder is
+    /// never touched again: no listing, no `stat` of its children, no watch
+    /// request. Entries already indexed stay indexed — "may not look" is not
+    /// "deleted".
+    denied_dirs: std::collections::HashSet<Vec<u8>>,
     /// Wall ms when the startup replay tail began draining. `None` when there
     /// is no tail. Feeds the daemon's lag floor: a replaying daemon is behind
     /// by however long it has been replaying.
@@ -567,6 +575,28 @@ impl Applier {
             pending_replay: std::collections::VecDeque::new(),
             replay_compaction_credit: 0,
             pending_replay_started_ms: None,
+            denied_dirs: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Has the OS already refused this directory? Checked before every syscall
+    /// on it, because the syscall itself is what re-prompts on macOS.
+    fn is_denied(&self, abs: &Path) -> bool {
+        self.denied_dirs.contains(&os_str_bytes(abs.as_os_str()))
+    }
+
+    /// Remember (once) that `abs` cannot be read, and say so in the daemon log.
+    fn note_denied(&mut self, abs: &Path) {
+        const HINT: &str = if cfg!(target_os = "macos") {
+            " (grant Full Disk Access in System Settings → Privacy & Security to index it)"
+        } else {
+            ""
+        };
+        if self.denied_dirs.insert(os_str_bytes(abs.as_os_str())) {
+            eprintln!(
+                "fflocated: not indexing {}: permission denied{HINT}; not retrying",
+                abs.display()
+            );
         }
     }
 
@@ -606,6 +636,11 @@ impl Applier {
     /// recorded, but it is never descended into, watched, or queued — its own
     /// root (if indexed at all) covers it.
     fn may_descend(&self, dir: u32, abs: &std::path::Path) -> bool {
+        // A folder the OS refused is never opened again, not even to confirm
+        // the refusal: on macOS the open is exactly what raises the dialog.
+        if self.is_denied(abs) {
+            return false;
+        }
         self.root_dir_ids.contains(&dir) || !self.is_mountpoint(abs)
     }
 
@@ -1136,6 +1171,17 @@ impl Applier {
         if !parent_known {
             return;
         }
+        // An event under a folder we may not read would make us `stat` a path
+        // inside it, which raises the macOS permission dialog again. The
+        // watcher reports those folders happily (FSEvents needs no TCC grant),
+        // so the event is dropped before any syscall.
+        if self
+            .abs_path_for(parent)
+            .map(|p| self.is_denied(&p))
+            .unwrap_or(false)
+        {
+            return;
+        }
         let _ = self.abs_path_for(parent);
         // The exec bit is statted now rather than defaulting false: a fresh
         // file that arrives via event (not crawl) must carry its real bit
@@ -1153,7 +1199,7 @@ impl Applier {
                     false,
                 )
             })
-            .unwrap_or((false, 0));
+            .unwrap_or((false, CREATED_UNKNOWN));
         let flags = EntryFlags::EMPTY.with_dir(is_dir_hint).with_exec(exec_hint);
         let mut ix = self.shared.index.write().unwrap();
         let lookup = ix.lookup(parent, &name);
@@ -1173,7 +1219,9 @@ impl Applier {
                 // "unknown" (a filesystem that does not report birth times),
                 // and only when it actually changed: a create event for an
                 // unchanged file must not grow the journal.
-                let refreshed = if created_min != 0 && ix.created_min(id) != Some(created_min) {
+                let refreshed = if created_min != CREATED_UNKNOWN
+                    && ix.created_min(id) != Some(created_min)
+                {
                     ix.set_created(id, created_min);
                     // The *live* flags, not the event's hint: this id already
                     // carries IS_SYMLINK / IS_ROOT_DIR bits the hint omits, and
@@ -1257,7 +1305,29 @@ impl Applier {
         }
     }
 
-    /// Re-read one entry's exec bit after a metadata change (`chmod`), correcting
+    /// Drop the entries an index written by an older build kept beneath a file
+    /// or a symlink, and return how many went.
+    ///
+    /// Nothing current descends into a symlink, so nothing current inserts
+    /// beneath one; a store that does hold such entries was written before that
+    /// rule. The case that bites is Wine's `dosdevices/z:` → `/`: a walked
+    /// prefix carries one alias of the whole filesystem (`…/z:/tmp/x`) beside
+    /// the real `/tmp/x`, which turns one search hit into forty. No crawl or
+    /// rescan ever visits them again (there is no directory there to enumerate
+    /// and no parent entry to diff), so the sweep at startup is the only thing
+    /// that can remove them.
+    pub fn drop_entries_under_non_dirs(&mut self) -> usize {
+        let orphaned: Vec<u32> = {
+            let ix = self.shared.index.read().unwrap();
+            ix.entries_under_non_dirs()
+        };
+        for id in orphaned.iter().rev() {
+            self.emit(Record::Del { id: *id });
+        }
+        orphaned.len()
+    }
+
+    /// Re-read one entry's exec bit after a metadata change (`chmod`), correcting    /// Re-read one entry's exec bit after a metadata change (`chmod`), correcting
     /// the flag in place.
     ///
     /// Deliberately journal-free: the bit is derived state, re-derivable from the
@@ -1344,6 +1414,13 @@ impl Applier {
         }
         let items = match self.fs.read_dir(&abs) {
             Ok(v) => v,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                // macOS TCC / an unreadable folder: permanent for this process.
+                // Counting it as a transient error and retrying is what makes
+                // the permission dialog appear again and again.
+                self.note_denied(&abs);
+                return;
+            }
             Err(_) => {
                 self.shared.health.write().unwrap().read_dir_errors += 1;
                 return;
@@ -1532,6 +1609,14 @@ impl Applier {
         // 2. Enumerate reality.
         let real = match self.fs.read_dir(abs) {
             Ok(v) => v,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                // Not a deletion: we simply may not look. Dropping the subtree
+                // here deleted every indexed file under a TCC-protected folder
+                // on each rescan, and the next crawl re-read the folder — one
+                // more dialog. Keep what we have and stop asking.
+                self.note_denied(abs);
+                return;
+            }
             Err(_) => {
                 // Dir vanished: drop the subtree.
                 self.drop_subtree(dir);
@@ -1624,9 +1709,11 @@ impl Applier {
                         };
                         let created_changed = matches!(
                             prev_created,
-                            Some(prev) if it.created_min != 0 && prev != it.created_min
+                            Some(prev)
+                                if it.created_min != CREATED_UNKNOWN && prev != it.created_min
                         );
-                        let created_learned = prev_created.is_none() && it.created_min != 0;
+                        let created_learned =
+                            prev_created.is_none() && it.created_min != CREATED_UNKNOWN;
                         if created_changed || created_learned {
                             self.shared
                                 .index
@@ -2115,6 +2202,148 @@ pub fn descendants(ix: &Index, dir: u32) -> Vec<u32> {
 mod tests {
     use super::*;
 
+    /// macOS TCC: the first listing of a protected folder (Desktop, Documents,
+    /// Downloads) raises the "would like to access files…" dialog, and
+    /// dismissing it makes the listing fail with `PermissionDenied`. Retrying
+    /// is what turns one refusal into an endless dialog loop, so the refusal is
+    /// remembered: the folder is never listed again, paths inside it are never
+    /// statted, and what was already indexed is not mistaken for a deletion.
+    #[test]
+    fn a_permission_denied_directory_is_never_touched_again() {
+        use crate::event::{DirKey, FsEvent, RescanCause};
+        use crate::modelfs::{ModelFs, Node};
+
+        let d = tempfile::tempdir().unwrap();
+        let store = Store::open(&d.path().join("state")).unwrap();
+        let mut ix = Index::new();
+        let r0 = ix.insert(
+            ROOT_ID,
+            b"/model",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        let shared = Shared::new(ix, vec![Root::new(0, PathBuf::from("/model"))]);
+        let model = ModelFs::with([
+            (
+                "Desktop",
+                Node::dir(&[b"notes.txt".as_slice(), b"todo.txt".as_slice()]),
+            ),
+            ("keep.txt", Node::File),
+        ]);
+        let listed = Arc::new(AtomicUsize::new(0));
+        let statted = Arc::new(AtomicUsize::new(0));
+        let view: Arc<dyn FsView> = Arc::new(DeniedFs {
+            inner: model,
+            denied: PathBuf::from("/model/Desktop"),
+            listed: listed.clone(),
+            statted: statted.clone(),
+        });
+        let mut a = Applier::new(shared.clone(), store, view, SyncRegistry::new());
+        a.rebuild_dir_cache();
+        a.pending_mut().enqueue_crawl(r0);
+        a.drain();
+
+        assert_eq!(
+            listed.load(Ordering::SeqCst),
+            1,
+            "the folder must be attempted exactly once, not once per pass"
+        );
+        let desktop = {
+            let ix = shared.index.read().unwrap();
+            let desktop = ix
+                .lookup(r0, b"Desktop")
+                .expect("the parent listing still indexes the folder itself");
+            assert!(
+                ix.children(desktop).is_empty(),
+                "a folder we may not read has no indexed children"
+            );
+            assert!(ix.lookup(r0, b"keep.txt").is_some());
+            desktop
+        };
+        assert_eq!(
+            shared.health.read().unwrap().read_dir_errors,
+            0,
+            "a refusal is permanent, not a transient read error"
+        );
+
+        // A rescan must not read "may not look" as "deleted", and must not ask
+        // again.
+        a.pending_mut().enqueue_rescan(r0, RescanCause::Manual);
+        a.drain();
+        assert_eq!(
+            listed.load(Ordering::SeqCst),
+            1,
+            "rescan re-opened the denied folder"
+        );
+        {
+            let ix = shared.index.read().unwrap();
+            assert!(
+                ix.lookup(r0, b"Desktop").is_some(),
+                "the denied folder was dropped as vanished"
+            );
+            assert!(ix.lookup(r0, b"keep.txt").is_some());
+        }
+
+        // The watcher reports those folders even when we may not read them
+        // (FSEvents needs no TCC grant). Such an event must be dropped before
+        // the `stat` that would raise the dialog again.
+        let before = statted.load(Ordering::SeqCst);
+        a.apply_event(FsEvent::upsert(
+            DirKey::new(desktop),
+            b"notes.txt".to_vec(),
+            false,
+        ));
+        assert_eq!(
+            statted.load(Ordering::SeqCst),
+            before,
+            "an event under a denied folder statted a path inside it"
+        );
+        assert_eq!(
+            shared.index.read().unwrap().lookup(desktop, b"notes.txt"),
+            None
+        );
+
+        // And a fresh crawl re-walks the tree without opening it again.
+        a.pending_mut().enqueue_crawl(r0);
+        a.drain();
+        assert_eq!(
+            listed.load(Ordering::SeqCst),
+            1,
+            "crawl re-opened the denied folder"
+        );
+    }
+
+    /// A view that refuses one directory the way macOS refuses a TCC-protected
+    /// folder: `PermissionDenied` on every attempt, counted so a retry shows up
+    /// as a second permission dialog.
+    struct DeniedFs {
+        inner: crate::modelfs::ModelFs,
+        denied: PathBuf,
+        listed: Arc<AtomicUsize>,
+        statted: Arc<AtomicUsize>,
+    }
+
+    impl FsView for DeniedFs {
+        fn read_dir(&self, abs_path: &Path) -> io::Result<Vec<DirItem>> {
+            if abs_path == self.denied {
+                self.listed.fetch_add(1, Ordering::SeqCst);
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "operation not permitted",
+                ));
+            }
+            self.inner.read_dir(abs_path)
+        }
+
+        fn stat(&self, abs_path: &Path) -> io::Result<Option<StatInfo>> {
+            self.inner.stat(abs_path)
+        }
+
+        fn facts(&self, abs_path: &Path, is_dir: bool, is_symlink: bool) -> (bool, u32) {
+            self.statted.fetch_add(1, Ordering::SeqCst);
+            self.inner.facts(abs_path, is_dir, is_symlink)
+        }
+    }
+
     #[test]
     fn descendants_walk() {
         let mut ix = Index::new();
@@ -2129,6 +2358,68 @@ mod tests {
         ix.insert(b, b"y", EntryFlags::EMPTY);
         let d = descendants(&ix, r);
         assert_eq!(d.len(), 4);
+    }
+
+    /// A `dosdevices/z:` that points at `/` was walked once in a real index: the
+    /// store holds a whole filesystem of aliases (`…/z:/tmp/x`) under an entry
+    /// that is a symlink. Nothing descends there again, so the startup sweep is
+    /// what removes them.
+    #[test]
+    fn the_startup_sweep_drops_entries_under_a_symlink() {
+        use crate::modelfs::{model_root, ModelFs, Node};
+        use crate::persist::Store;
+        use crate::roots::Root;
+        use crate::sync::SyncRegistry;
+        use std::sync::Arc;
+
+        let model = ModelFs::with([("z", Node::dir(&["alias.txt"])), ("real.txt", Node::File)]);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("state")).unwrap();
+        let mut ix = Index::new();
+        let r0 = ix.insert(
+            ROOT_ID,
+            b"/model",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        let shared = Shared::new(ix, vec![Root::new(0, model_root())]);
+        let mut a = Applier::new(
+            shared.clone(),
+            store,
+            Arc::new(model.clone()),
+            SyncRegistry::new(),
+        );
+        a.rebuild_dir_cache();
+        a.pending_mut().enqueue_crawl(r0);
+        a.drain();
+        {
+            let ix = shared.index.read().unwrap();
+            let z = ix.lookup(r0, b"z").expect("z is indexed");
+            assert!(
+                ix.lookup(z, b"alias.txt").is_some(),
+                "the crawl indexes a real directory's children"
+            );
+        }
+
+        // What an older build left behind: `z` is a symlink and the directory's
+        // children are still filed under it.
+        {
+            let mut ix = shared.index.write().unwrap();
+            let z = ix.lookup(r0, b"z").expect("z is indexed");
+            let f = ix.entry(z).unwrap().flags();
+            ix.entry_mut(z).flags = f.with_symlink(true).with_dir(false).0;
+        }
+        assert_eq!(a.drop_entries_under_non_dirs(), 1, "one orphaned child");
+
+        let ix = shared.index.read().unwrap();
+        let z = ix.lookup(r0, b"z").expect("the symlink itself stays indexed");
+        assert!(
+            ix.lookup(z, b"alias.txt").is_none(),
+            "a symlink cannot keep the children the directory had"
+        );
+        assert!(
+            ix.lookup(r0, b"real.txt").is_some(),
+            "a file under a real directory is not an orphan"
+        );
     }
 
     #[test]
@@ -2439,8 +2730,7 @@ mod replay_tests {
         // Leak the tempdir: the store borrows its path, and the applier
         // outlives this frame only via the returned value — the dir must
         // outlive the test. `Box::leak` is the honest one-liner.
-        let dir: &'static std::path::Path =
-            Box::leak(Box::new(dir.into_path()));
+        let dir: &'static std::path::Path = Box::leak(Box::new(dir.keep()));
         let store = Store::open(&dir.join("state")).unwrap();
         let mut ix = Index::new();
         let r0 = ix.insert(
@@ -2665,9 +2955,12 @@ mod replay_tests {
         );
         assert_eq!(
             super::created_minutes_at(UNIX_EPOCH - Duration::from_secs(60)),
-            0,
-            "before the epoch reads as unknown, not as a giant number"
+            CREATED_UNKNOWN,
+            "before the epoch reads as unknown, not as a giant number or 1970"
         );
+        // The first minute of 1970 is a real, storable time, distinct from the
+        // unknown sentinel: a file created at 59 s is not an undated file.
+        assert_ne!(super::created_minutes_at(UNIX_EPOCH + Duration::from_secs(59)), CREATED_UNKNOWN);
     }
 
     #[test]
@@ -2677,7 +2970,7 @@ mod replay_tests {
         let p = d.path().join("dated.txt");
         std::fs::write(&p, b"x").unwrap();
         let (_, created) = super::fs_facts(&p, false, false);
-        if created == 0 {
+        if created == CREATED_UNKNOWN {
             // No birth time on this filesystem/kernel: the documented
             // degradation is "unknown", and there is nothing to assert beyond
             // that it did not invent a time.
@@ -2749,7 +3042,7 @@ mod replay_clock_tests {
     #[test]
     fn shared_clock_is_monotonic_under_interleave() {
         let dir = tempfile::tempdir().unwrap();
-        let dir: &'static std::path::Path = Box::leak(Box::new(dir.into_path()));
+        let dir: &'static std::path::Path = Box::leak(Box::new(dir.keep()));
         let store = Store::open(&dir.join("state")).unwrap();
         let mut ix = Index::new();
         let r0 = ix.insert(
@@ -2810,7 +3103,8 @@ mod replay_clock_tests {
     /// A view whose entries carry creation minutes and exec bits the test can
     /// change, so a create event can report a *new* birth time (a file deleted
     /// and recreated under the same name) without waiting a minute on a real
-    /// disk, and without the model's "no clock" reading 0.
+    /// disk. An entry with no date carries [`CREATED_UNKNOWN`], exactly as a
+    /// real filesystem without birth times reports it.
     struct DatedFs {
         inner: crate::modelfs::ModelFs,
         /// name -> (created minute, exec)
@@ -3029,7 +3323,7 @@ mod replay_clock_tests {
                 ("c.txt", Node::File),
             ]),
             b"a.txt",
-            0,
+            CREATED_UNKNOWN,
             false,
         ));
         let view: Arc<dyn FsView> = fs.clone();
@@ -3101,8 +3395,8 @@ mod replay_clock_tests {
         );
 
         // ... and a filesystem that cannot report a birth time must not erase
-        // one the index already knows: `0` is unknown, not the epoch.
-        fs.set(b"b.txt", 0, false);
+        // one the index already knows: "unknown" is not the epoch.
+        fs.set(b"b.txt", CREATED_UNKNOWN, false);
         a.pending_mut()
             .enqueue_rescan(r0, crate::event::RescanCause::Manual);
         a.drain();

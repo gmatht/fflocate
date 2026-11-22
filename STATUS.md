@@ -504,18 +504,22 @@ These are deliberate and small; each is noted so the design stays honest.
    `stat` (the one already taken for the execute bit) also yields the birth
    time; it is stored as a `u32` of **minutes since the epoch** in a parallel
    array beside the 12-byte entries — 4 bytes per entry, 0 meaning unknown —
-   carried in the journal's `add` record and in snapshot format 3. That makes
+   carried in the journal's `add` record and in the snapshot (format 3 added
+   it; format 4 gives "unknown" its own sentinel, so minute 0 stays a real
+   time). That makes
    `since ... otime`/`oclock` answer from the index (it previously saw `None`
    for every candidate, so it matched nothing), and each hit now reports its
    `created` minute, so the GUI's created-date range filters the page it was
    given instead of `stat`ting every row. A filesystem without birth times, a
    row indexed before the format bump, or a daemon older than protocol v5 all
-   read as "unknown" and fall back to the client's own `stat`. Snapshot format
-   3 is read alongside 2, but the state dir is versioned (`FORMAT_VERSION` 3),
-   so an existing install starts from a fresh crawl — which is also what
-   populates the field. Minute resolution is deliberate: a day range and a
-   coarse `since` boundary do not need seconds, and 32 bits of minutes lasts
-   past the year 10000.
+   read as "unknown" and fall back to the client's own `stat`. Snapshots 2 and
+   3 are read alongside 4 (an old body's `0` is translated to "unknown" on
+   load), and the state directory is no longer versioned: the same path is
+   opened and rewritten in place, so a format bump never abandons the index or
+   moves where the daemon looks. Minute resolution is deliberate: a day range
+   and a coarse `since` boundary do not need seconds, and 32 bits of minutes
+   lasts past the year 10000; a `since` bound is compared against the stored
+   minute's last second, so a bound inside a minute never drops its entries.
 
    Because `oclock` reads that stored minute, a request whose **only**
    predicate is the range — `ff --expr '{"expression":["since",<unix-time>,"oclock"]}'`,

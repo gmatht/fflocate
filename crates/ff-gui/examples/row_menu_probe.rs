@@ -101,7 +101,8 @@ fn main() {
             timeout(hold_ms, Some(quit), std::ptr::null_mut());
         }
     }
-    app.run();
+    // A failed run loop must not look like a clean probe run.
+    app.run().expect("row menu probe: the main loop failed");
 }
 
 #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]

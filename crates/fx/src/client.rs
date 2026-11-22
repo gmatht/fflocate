@@ -27,6 +27,22 @@ impl std::fmt::Display for CliError {
     }
 }
 
+/// One `--json` line.
+///
+/// The daemon reports each hit's creation time as whole **minutes** since the
+/// unix epoch (protocol v5's `created`) — that is the stored representation and
+/// the reason the index stays small. The output boundary is where it becomes an
+/// absolute unix-second timestamp, because a consumer of `--json` compares it
+/// with `date` or another tool's seconds. An undated entry omits the field
+/// entirely: `0` in the store means "unknown", never 1970.
+pub fn hit_json(path: &str, id: u32, created_min: Option<u32>) -> serde_json::Value {
+    let mut obj = serde_json::json!({"path": path, "id": id});
+    if let Some(min) = created_min {
+        obj["created"] = serde_json::json!(fflocate::index::created_secs_from_min(min));
+    }
+    obj
+}
+
 pub struct Client {
     stream: Stream,
     #[allow(dead_code)]
@@ -232,10 +248,10 @@ impl Client {
                         }
                     }
                 }
-                Response::Hit { path, id, .. } => {
+                Response::Hit { path, id, created } => {
                     printed += 1;
                     if json {
-                        let obj = serde_json::json!({"path": path, "id": id});
+                        let obj = hit_json(path, *id, *created);
                         let _ = writeln!(stdout, "{obj}");
                     } else if zero {
                         let _ = stdout.write_all(path.as_bytes());
@@ -918,6 +934,24 @@ fn print_stats(stats: &serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_hits_carry_created_as_absolute_seconds() {
+        // The wire carries minutes; `--json` is the boundary that turns them
+        // into the seconds every other tool compares against.
+        let v = hit_json("/x/y", 7, Some(1));
+        assert_eq!(v["path"], "/x/y");
+        assert_eq!(v["id"], 7);
+        assert_eq!(v["created"], 60, "one stored minute is 60 unix seconds");
+        let v = hit_json("/x/y", 8, Some(29_455_200));
+        assert_eq!(v["created"], 1_767_312_000, "2026-01-02T00:00:00Z");
+        assert_eq!(v["created"], 29_455_200i64 * 60);
+        let v = hit_json("/x/y", 9, None);
+        assert!(
+            v.get("created").is_none(),
+            "an undated hit omits the field instead of claiming 1970"
+        );
+    }
 
     #[test]
     fn folded_query_only_fires_on_uppercase() {

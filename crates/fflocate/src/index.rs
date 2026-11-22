@@ -119,6 +119,72 @@ impl Entry {
     }
 }
 
+/// The stored creation-time scale, defined here and nowhere else: whole
+/// **minutes since the unix epoch**, with [`CREATED_UNKNOWN`] meaning unknown.
+/// Writers convert a `SystemTime` with [`created_minutes_at`], readers convert
+/// back with [`created_secs_from_min`], and the snapshot encoder writes exactly
+/// one `u32` of this per entry — so the crawler, the journal, the snapshot, the
+/// query engine and the output boundary cannot disagree about what a stored
+/// number means.
+pub const SECONDS_PER_MINUTE: i64 = 60;
+
+/// The "unknown" sentinel: no birth time reported, or one before the epoch,
+/// which the field cannot represent.
+///
+/// Deliberately **not** `0`: minute 0 is a real minute — the first minute of
+/// 1970 — so an entry created 0–59 s after the epoch has to be datable, and a
+/// stored `0` must never again stand for two different things at once. This
+/// value lies outside every representable minute because [`created_minutes_at`]
+/// saturates at [`CREATED_LATEST_MINUTE`].
+pub const CREATED_UNKNOWN: u32 = u32::MAX;
+
+/// The largest representable minute: one below [`CREATED_UNKNOWN`], so
+/// saturation can never be mistaken for "unknown". Minute `u32::MAX - 1` falls
+/// in the year 10135, far past any timestamp a filesystem reports.
+pub const CREATED_LATEST_MINUTE: u32 = CREATED_UNKNOWN - 1;
+
+/// A filesystem timestamp as the stored representation.
+///
+/// Seconds are truncated, not rounded: 59 s past the epoch is minute 0 and 60 s
+/// is minute 1, so a stored minute is the *window* `[min*60, min*60 + 59]`, not
+/// a single instant. A lower bound (`since <ts>`) must therefore be compared
+/// against the window's **last** second (see [`created_latest_secs_from_min`]):
+/// a bound anywhere inside a minute includes that minute's entries, which is
+/// what keeps a coarse clock from silently dropping fresh files. A time before
+/// the epoch reads as unknown — the field cannot represent it, and "unknown" is
+/// the honest reading, never a wrapped giant number or 1970. A time past
+/// [`CREATED_LATEST_MINUTE`] saturates there instead of wrapping.
+pub fn created_minutes_at(t: std::time::SystemTime) -> u32 {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => {
+            let mins = d.as_secs() / SECONDS_PER_MINUTE as u64;
+            if mins >= u64::from(CREATED_LATEST_MINUTE) {
+                CREATED_LATEST_MINUTE
+            } else {
+                mins as u32
+            }
+        }
+        Err(_) => CREATED_UNKNOWN,
+    }
+}
+
+/// The start of the stored minute as absolute unix seconds: the instant to
+/// display, never the value a `since` bound is compared against.
+pub fn created_secs_from_min(min: u32) -> i64 {
+    min as i64 * SECONDS_PER_MINUTE
+}
+
+/// The **last** second the stored minute can hold (`min*60 + 59`).
+///
+/// This is the value a lower-bound (`since`) test compares: an entry stored in
+/// minute `m` may have been created anywhere inside that minute, so it belongs
+/// to `since ts` whenever `ts <= m*60 + 59`. Comparing the minute's *start*
+/// instead would drop a file created at `:59` from a query made at `:30` of the
+/// same minute — the truncation would lose a file it should have shown.
+pub fn created_latest_secs_from_min(min: u32) -> i64 {
+    created_secs_from_min(min) + SECONDS_PER_MINUTE - 1
+}
+
 /// The in-memory index.
 ///
 /// Ids index directly into `entries`; slot 0 is the virtual root and is never
@@ -130,7 +196,8 @@ pub struct Index {
     pub names: Vec<u8>,
     pub entries: Vec<Entry>,
     /// Creation (birth) time per entry, in minutes since the unix epoch;
-    /// `0` means unknown (no birth time on this filesystem, or before 1970).
+    /// [`CREATED_UNKNOWN`] means unknown (no birth time on this filesystem, or
+    /// a time before 1970). Minute 0 is a real minute, not a sentinel.
     /// Parallel to `entries`: the two are always the same length, and a caller
     /// that appends an entry must append a slot here. Read through
     /// [`Index::created_min`] so the `0` sentinel never leaks as a real time.
@@ -173,7 +240,7 @@ impl Index {
         };
         // Slot 0: the virtual root. Unnameable, always dead to queries.
         idx.entries.push(Entry::default());
-        idx.created.push(0);
+        idx.created.push(CREATED_UNKNOWN);
         idx.alive_push(false);
         idx
     }
@@ -185,7 +252,9 @@ impl Index {
     /// format that predates creation times decodes with none, which reads as
     /// "unknown" rather than failing to load.
     pub fn new_reconstructed(names: Vec<u8>, entries: Vec<Entry>, mut created: Vec<u32>) -> Self {
-        created.resize(entries.len(), 0);
+        // A short array can only come from a format that carried no times: pad
+        // with "unknown", never with a real minute.
+        created.resize(entries.len(), CREATED_UNKNOWN);
         let mut idx = Index {
             names,
             entries,
@@ -308,10 +377,10 @@ impl Index {
     }
 
     /// Record an entry's creation time, in minutes since the unix epoch.
-    /// `0` clears it back to "unknown".
+    /// [`CREATED_UNKNOWN`] clears it back to "unknown".
     pub fn set_created(&mut self, id: u32, minutes: u32) {
         if self.created.len() < self.entries.len() {
-            self.created.resize(self.entries.len(), 0);
+            self.created.resize(self.entries.len(), CREATED_UNKNOWN);
         }
         if let Some(slot) = self.created.get_mut(id as usize) {
             *slot = minutes;
@@ -319,20 +388,25 @@ impl Index {
     }
 
     /// An entry's creation time in minutes since the epoch, or `None` when the
-    /// index does not know it (stored as 0).
+    /// index does not know it (stored as [`CREATED_UNKNOWN`]).
     pub fn created_min(&self, id: u32) -> Option<u32> {
         self.created
             .get(id as usize)
             .copied()
-            .filter(|m| *m != 0)
+            .filter(|m| *m != CREATED_UNKNOWN)
     }
 
-    /// An entry's creation time in unix seconds, or `None` when unknown.
-    ///
-    /// Minute resolution is deliberate: the stored value *is* the minute, so a
-    /// query comparing seconds sees the start of that minute.
+    /// The start of an entry's creation minute in unix seconds, or `None` when
+    /// unknown. For display; a `since` bound must compare
+    /// [`created_latest_secs_from_min`] instead.
     pub fn created_secs(&self, id: u32) -> Option<i64> {
-        self.created_min(id).map(|m| m as i64 * 60)
+        self.created_min(id).map(created_secs_from_min)
+    }
+
+    /// The last second an entry's creation minute can hold, or `None` when
+    /// unknown. This is the clock a lower-bound (`since`) query compares.
+    pub fn created_latest_secs(&self, id: u32) -> Option<i64> {
+        self.created_min(id).map(created_latest_secs_from_min)
     }
 
     /// The raw creation array, for the snapshot encoder and diagnostics.
@@ -346,6 +420,39 @@ impl Index {
 
     pub fn is_dir(&self, id: u32) -> bool {
         self.is_alive(id) && self.entries[id as usize].flags().is_dir()
+    }
+
+    /// Live entries whose ancestor chain runs through an entry that is not a
+    /// directory — what a store written when a crawl still followed symlinks
+    /// holds beneath Wine's `dosdevices/z:` → `/`.
+    ///
+    /// `children()` answers "what is under this id" by scanning every entry, so
+    /// asking it per entry would be O(entries²). Walking each entry's own parent
+    /// chain answers it in one pass instead. A parent that is dead ends the
+    /// chain too: an entry a tombstone cannot be reached through is not a hit
+    /// either. The depth cap only bounds a store we could not have written.
+    pub fn entries_under_non_dirs(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        for id in 0..self.entries.len() {
+            if id as u32 == ROOT_ID || !self.alive_get(id) {
+                continue;
+            }
+            let mut parent = self.entries[id].parent;
+            for _ in 0..4096 {
+                if parent == ROOT_ID
+                    || parent as usize >= self.entries.len()
+                    || !self.alive_get(parent as usize)
+                {
+                    break;
+                }
+                if !self.entries[parent as usize].flags().is_dir() {
+                    out.push(id as u32);
+                    break;
+                }
+                parent = self.entries[parent as usize].parent;
+            }
+        }
+        out
     }
 
     /// Find a live child of `parent` with `name` (exact byte match).
@@ -382,7 +489,7 @@ impl Index {
             parent,
             flags: flags.0,
         });
-        self.created.push(0);
+        self.created.push(CREATED_UNKNOWN);
         self.alive_push(!flags.is_tombstone());
         if !flags.is_tombstone() {
             self.live_count += 1;
@@ -446,7 +553,7 @@ impl Index {
                     parent: ROOT_ID,
                     flags: flags::TOMBSTONE,
                 });
-                self.created.push(0);
+                self.created.push(CREATED_UNKNOWN);
                 self.alive_push(false);
             }
         }
@@ -604,7 +711,10 @@ impl Index {
             // `.get` rather than `[]`: a hand-built index (tests, a future
             // loader) may carry a short array, and "unknown" is the safe
             // reading of a missing slot rather than a panic mid-compaction.
-            out.set_created(id, self.created.get(old).copied().unwrap_or(0));
+            out.set_created(
+                id,
+                self.created.get(old).copied().unwrap_or(CREATED_UNKNOWN),
+            );
             map[old] = id;
         }
         out.set_next_id(self.next_id);
@@ -869,6 +979,16 @@ mod tests {
         assert_eq!(ix.created_secs(dated), Some(minutes as i64 * 60));
         // A fresh entry is "unknown", never the epoch itself.
         assert_eq!(ix.created_min(undated), None);
+        assert_eq!(
+            ix.created_array()[undated as usize],
+            super::CREATED_UNKNOWN,
+            "unknown is its own sentinel, not minute 0"
+        );
+        // Minute 0 is a real, datable minute: the first minute of 1970.
+        ix.set_created(undated, 0);
+        assert_eq!(ix.created_min(undated), Some(0));
+        assert_eq!(ix.created_secs(undated), Some(0));
+        assert_eq!(ix.created_latest_secs(undated), Some(59));
         assert_eq!(ix.created_array().len(), ix.len(), "parallel to entries");
 
         // Compaction renumbers ids; the time must follow the file, not the slot.
@@ -881,6 +1001,63 @@ mod tests {
         let (c2, map2) = ix.compacted();
         assert_eq!(map2[undated as usize], 0);
         assert_eq!(c2.created_min(moved), Some(minutes));
+    }
+
+    /// The two conversions are inverses at the boundaries that matter, and the
+    /// scale has no second opinion: what the crawler stores is what a query
+    /// compares and what the output boundary prints.
+    #[test]
+    fn creation_minutes_round_trip_across_the_edges() {
+        use std::time::{Duration, UNIX_EPOCH};
+        // Whole minutes only, and the truncation boundary is 60 s, not "about".
+        assert_eq!(super::created_minutes_at(UNIX_EPOCH), 0, "the epoch is minute 0");
+        assert_eq!(
+            super::created_minutes_at(UNIX_EPOCH + Duration::from_secs(59)),
+            0,
+            "59 s truncates down to minute 0"
+        );
+        assert_eq!(
+            super::created_minutes_at(UNIX_EPOCH + Duration::from_secs(60)),
+            1,
+            "exactly 60 s is minute 1"
+        );
+        assert_eq!(
+            super::created_minutes_at(UNIX_EPOCH + Duration::from_secs(119)),
+            1
+        );
+        // Before the epoch cannot be represented; it reads as unknown rather
+        // than wrapping to a huge minute — and "unknown" is not minute 0, so a
+        // file from 1969 never claims to be from 1970.
+        assert_eq!(
+            super::created_minutes_at(UNIX_EPOCH - Duration::from_secs(1)),
+            super::CREATED_UNKNOWN
+        );
+        // Far future saturates below the sentinel instead of wrapping: minute
+        // u32::MAX - 1 is year 10135, well past any timestamp a filesystem
+        // reports, and saturation can never read back as "unknown".
+        assert_eq!(
+            super::created_minutes_at(UNIX_EPOCH + Duration::from_secs(u64::MAX / 2)),
+            super::CREATED_LATEST_MINUTE
+        );
+        assert_ne!(super::CREATED_LATEST_MINUTE, super::CREATED_UNKNOWN);
+        // The first minute of 1970 is representable and distinct from unknown:
+        // this is the collision the old `0`-means-unknown rule had.
+        assert_eq!(
+            super::created_minutes_at(UNIX_EPOCH + Duration::from_secs(1)),
+            0
+        );
+        // And back out again: the stored minute is the start of that minute,
+        // while a lower bound compares its last second.
+        assert_eq!(super::created_secs_from_min(0), 0);
+        assert_eq!(super::created_latest_secs_from_min(0), 59);
+        assert_eq!(super::created_latest_secs_from_min(1), 119);
+        assert_eq!(super::created_secs_from_min(1), 60);
+        assert_eq!(super::created_secs_from_min(29_455_200), 1_767_312_000);
+        assert_eq!(
+            super::created_secs_from_min(u32::MAX),
+            u32::MAX as i64 * 60,
+            "the top of the range converts without overflowing i64"
+        );
     }
 
     #[test]

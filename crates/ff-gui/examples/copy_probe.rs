@@ -127,7 +127,8 @@ fn main() {
         }
     }
     println!("copy probe: running the main loop for {hold}s");
-    app.run();
+    // A failed run loop must not look like a clean probe run.
+    app.run().expect("copy probe: the main loop failed");
 }
 
 #[cfg(not(all(feature = "gtk", target_os = "linux", not(feature = "zork"))))]

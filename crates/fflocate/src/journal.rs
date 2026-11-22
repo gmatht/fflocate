@@ -48,7 +48,10 @@ impl OpKind {
 pub enum Record {
     /// Insert/upsert a child under a parent. `name` is raw bytes (never UTF-8
     /// coerced). `id` is the id the applier assigned. `created` is the entry's
-    /// creation time in minutes since the unix epoch, 0 when unknown.
+    /// creation time in minutes since the unix epoch, [`CREATED_UNKNOWN`] when
+    /// unknown. This build always writes the current sentinel; a journal from
+    /// format 3 or older wrote `0`, which replay translates (see
+    /// [`crate::persist`]) because `0` now means the real minute 0.
     Add {
         id: u32,
         parent: u32,
@@ -128,7 +131,7 @@ impl Record {
                 // A journal written before the field existed ends after the
                 // name: read the absent creation time as "unknown" rather than
                 // rejecting every old record.
-                let created = r.u32().unwrap_or(0);
+                let created = r.u32().unwrap_or(crate::index::CREATED_UNKNOWN);
                 Record::Add {
                     id,
                     parent,
@@ -448,7 +451,11 @@ mod tests {
         match Record::decode_payload(OpKind::Add, &p).expect("old payload decodes") {
             Record::Add { id, created, .. } => {
                 assert_eq!(id, 7);
-                assert_eq!(created, 0, "an absent creation field means unknown");
+                assert_eq!(
+                    created,
+                    crate::index::CREATED_UNKNOWN,
+                    "an absent creation field means unknown"
+                );
             }
             other => panic!("wrong record: {other:?}"),
         }
@@ -533,7 +540,7 @@ mod tests {
             parent: 1,
             name: name.clone(),
             flags: 0,
-            created: 0,
+            created: crate::index::CREATED_UNKNOWN,
         })
         .unwrap();
         j.sync().unwrap();

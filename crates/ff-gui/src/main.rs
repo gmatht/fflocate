@@ -445,16 +445,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
+    // Each root's health as the daemon last reported it, filled by the startup
+    // probe's `stats` (which asks with roots enabled). Shared with the pump and
+    // the render so a `[stale roots: …]` suffix can carry the daemon's own
+    // reason instead of leaving the user with a path and no cause.
+    let roots_health: Rc<RefCell<Vec<ff_gui::RootHealth>>> = Rc::new(RefCell::new(Vec::new()));
+
     let render: RenderFn = {
         let status = status.clone();
         let results = results.clone();
         let current = current.clone();
+        let roots_health = roots_health.clone();
         let opt_count = opt_count.clone();
         let last_total = last_total.clone();
         let want_full = want_full.clone();
         let created_range = created_range.clone();
         Rc::new(move |outcome| match outcome {
             Ok(mut outcome) => {
+                // A reply names the stale roots, never why they are stale; the
+                // daemon's own state words come from the `stats` the startup
+                // probe already ran.
+                outcome.roots_health = roots_health.borrow().clone();
                 let count_only = opt_count.is_active();
                 last_total.set(outcome.total);
                 // The created range is applied to the page the daemon returned,
@@ -653,10 +664,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     //    Done the status line is provisional ("connecting…"), and
                     //    searches still work — they just report their own errors.
                     if !startup.borrow().is_done() {
-                        match startup.borrow_mut().poll() {
+                        // Stepped into a binding first: a `match` on the borrow
+                        // holds the `RefMut` for every arm, and the Done arm
+                        // reads the probe again for the roots it parsed.
+                        let polled = startup.borrow_mut().poll();
+                        match polled {
                             StartupPoll::Pending => {}
-                            StartupPoll::Note(line) | StartupPoll::Done(line) => {
-                                startup_status.set_text(&line)
+                            StartupPoll::Note(line) => startup_status.set_text(&line),
+                            StartupPoll::Done(line) => {
+                                startup_status.set_text(&line);
+                                *roots_health.borrow_mut() = startup.borrow().root_health().to_vec();
                             }
                         }
                     }
@@ -1426,7 +1443,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         Ok(s) => {
                             let entries = s.get("entries").and_then(|v| v.as_u64()).unwrap_or(0);
                             let backend = s.get("backend").and_then(|v| v.as_str()).unwrap_or("?");
-                            format!("connected ({entries} entries, {backend})")
+                            let mut body = format!("connected ({entries} entries, {backend})");
+                            // Per-root health, with the daemon's reason: this is
+                            // where to look when the status line says a root is
+                            // stale and the user asks what that means.
+                            if let Ok(roots) = DaemonClient::new().roots_health() {
+                                for root in &roots {
+                                    match root.degraded_reason() {
+                                        Some(why) => body.push_str(&format!(
+                                            "\n{}: degraded — {why}",
+                                            root.path
+                                        )),
+                                        None => body.push_str(&format!("\n{}: ok", root.path)),
+                                    }
+                                }
+                            }
+                            body
                         }
                         Err(e) => format!("{e}"),
                     };

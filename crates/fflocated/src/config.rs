@@ -106,10 +106,6 @@ impl BackendChoice {
     }
 }
 
-/// The on-disk format version. Bumping it migrates or recrawls instead of
-/// corrupting (§15).
-pub const FORMAT_VERSION: u32 = fflocate::config_paths::FORMAT_VERSION;
-
 pub fn runtime_dir() -> PathBuf {
     fflocate::config_paths::runtime_dir()
 }
@@ -183,14 +179,16 @@ impl Config {
                 // /Library/Application Support, which root owns.
                 self.socket_path = PathBuf::from("/var/run/fflocated.sock");
                 self.pidfile = PathBuf::from("/var/run/fflocated.pid");
-                self.state_dir =
-                    PathBuf::from(format!("/Library/Application Support/fflocate/{FORMAT_VERSION}"));
+                self.state_dir = fflocate::config_paths::resolve_state_dir(Path::new(
+                    "/Library/Application Support/fflocate",
+                ));
             }
             #[cfg(not(target_os = "macos"))]
             {
                 self.socket_path = PathBuf::from("/run/fflocated.sock");
                 self.pidfile = PathBuf::from("/run/fflocated.pid");
-                self.state_dir = PathBuf::from(format!("/var/lib/fflocate/{FORMAT_VERSION}"));
+                self.state_dir =
+                    fflocate::config_paths::resolve_state_dir(Path::new("/var/lib/fflocate"));
             }
         }
         self
@@ -324,12 +322,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn state_dir_is_versioned() {
-        let d = state_dir();
-        assert!(
-            d.to_string_lossy().contains(&FORMAT_VERSION.to_string()),
-            "state dir must carry the format version: {d:?}"
+    fn state_dir_is_stable_and_reused_in_place() {
+        // The path is not derived from the format version: a fresh root gets the
+        // stable store name, and an existing version-named store is reused where
+        // it is, so a format bump neither abandons nor relocates the index.
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            fflocate::config_paths::resolve_state_dir(root.path()),
+            root.path().join(fflocate::config_paths::STORE_DIR_NAME)
         );
+        let old = root.path().join("3");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("snapshot.fnx"), b"v3").unwrap();
+        assert_eq!(fflocate::config_paths::resolve_state_dir(root.path()), old);
     }
 
     #[test]

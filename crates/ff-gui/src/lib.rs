@@ -261,6 +261,7 @@ impl DaemonClient {
             total,
             fresh,
             stale_roots: stale,
+            roots_health: Vec::new(),
             catching_up,
             lag_ms,
             elapsed_ms,
@@ -307,10 +308,16 @@ impl DaemonClient {
     pub fn connected_status_line(socket: &Path, stats: &serde_json::Value) -> String {
         let entries = stats.get("entries").and_then(|v| v.as_u64()).unwrap_or(0);
         let backend = stats.get("backend").and_then(|v| v.as_str()).unwrap_or("?");
-        format!(
+        let mut line = format!(
             "connected to fflocated at {} ({entries} entries, {backend})",
             socket.display()
-        )
+        );
+        // A daemon that is up but half-blind is not a healthy one: say which
+        // root and why, at the moment the window opens.
+        if let Some(suffix) = degraded_suffix(&parse_root_health(stats)) {
+            line.push_str(&suffix);
+        }
+        line
     }
 
     /// Build the `rescan` request for one root. Pure like `query_request`, so
@@ -345,6 +352,16 @@ impl DaemonClient {
         Ok(Vec::new())
     }
 
+    /// Every root's health, including the daemon's state word for it.
+    pub fn roots_health(&self) -> Result<Vec<RootHealth>, GuiError> {
+        let resp = self.request(&Request::Stats { roots: true })?;
+        for r in &resp {
+            if let Response::Stats { stats } = r {
+                return Ok(parse_root_health(stats));
+            }
+        }
+        Ok(Vec::new())
+    }
 }
 
 /// What one [`StartupProbe::poll`] step reports.
@@ -386,6 +403,9 @@ pub struct StartupProbe {
     pending: Option<PendingRequest>,
     deadline: std::time::Instant,
     finished: bool,
+    /// Each root's health from the `stats` reply, kept so later renders can
+    /// name the reason behind a `[stale roots: …]` suffix.
+    root_health: Vec<RootHealth>,
 }
 
 impl StartupProbe {
@@ -398,7 +418,14 @@ impl StartupProbe {
             pending: None,
             deadline: std::time::Instant::now() + grace,
             finished: false,
+            root_health: Vec::new(),
         }
+    }
+
+    /// Each root's health, as last reported by the daemon (`empty` until the
+    /// first `stats` reply lands).
+    pub fn root_health(&self) -> &[RootHealth] {
+        &self.root_health
     }
 
     /// True once this process spawned the daemon during this probe run.
@@ -461,7 +488,10 @@ impl StartupProbe {
             // (Re)connect. A unix-socket `connect` to an absent path fails
             // immediately (ENOENT) rather than blocking; to a live daemon it
             // succeeds at once. Either way this does not stall the pump.
-            let line = match encode_request(&Request::Stats { roots: false }) {
+            // Roots enabled: the same round trip then also carries each root's
+            // state (and, when degraded, the daemon's reason for it), which is
+            // what lets the GUI say *why* rather than only *that*.
+            let line = match encode_request(&Request::Stats { roots: true }) {
                 Ok(l) => l,
                 Err(e) => return self.done(format!("{e}")),
             };
@@ -534,6 +564,7 @@ impl StartupProbe {
         for r in &recs {
             match r {
                 Response::Stats { stats } => {
+                    self.root_health = parse_root_health(stats);
                     let line = DaemonClient::connected_status_line(&self.socket, stats);
                     return self.done(line);
                 }
@@ -548,6 +579,101 @@ impl StartupProbe {
         // retry next tick rather than declaring anything.
         StartupPoll::Pending
     }
+}
+
+/// One root's health, as `stats` reports it: the path and the daemon's own
+/// state word for it (`ok`, or `degraded(<reason>)`).
+///
+/// The reason is the daemon's, not the client's: a root that could not be
+/// watched says so (`degraded(watch_failed: Permission denied (os error 13))`),
+/// and the GUI repeats it rather than inventing a cause or staying silent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootHealth {
+    pub path: String,
+    pub state: String,
+}
+
+impl RootHealth {
+    /// The reason inside `degraded(...)`, or `None` for a healthy root.
+    ///
+    /// A state word this build does not know is reported verbatim: an unknown
+    /// non-`ok` state is still something the user should see, and calling it
+    /// healthy would be the one answer that cannot be right.
+    pub fn degraded_reason(&self) -> Option<&str> {
+        let state = self.state.trim();
+        if let Some(inner) = state
+            .strip_prefix("degraded(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            return Some(inner);
+        }
+        match state {
+            "" | "ok" => None,
+            "degraded" => Some("degraded"),
+            other => Some(other),
+        }
+    }
+
+    pub fn is_degraded(&self) -> bool {
+        self.degraded_reason().is_some()
+    }
+}
+
+/// Pull each root's path and state out of a stats payload. Pure so the shape
+/// is testable without a daemon; unknown shapes yield no roots, never a panic.
+pub fn parse_root_health(stats: &serde_json::Value) -> Vec<RootHealth> {
+    stats
+        .get("roots")
+        .and_then(|v| v.as_array())
+        .map(|roots| {
+            roots
+                .iter()
+                .filter_map(|r| {
+                    let path = r.get("path").and_then(|v| v.as_str())?;
+                    let state = r.get("state").and_then(|v| v.as_str()).unwrap_or("");
+                    Some(RootHealth {
+                        path: path.to_string(),
+                        state: state.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `"  [degraded roots: / (watch_failed: …)]"`, or `None` when every root is
+/// healthy. The daemon's own reason rides along, because "degraded" without a
+/// cause tells the user nothing they can act on.
+pub fn degraded_suffix(roots: &[RootHealth]) -> Option<String> {
+    let broken: Vec<String> = roots
+        .iter()
+        .filter_map(|r| {
+            r.degraded_reason()
+                .map(|why| format!("{} ({why})", r.path))
+        })
+        .collect();
+    if broken.is_empty() {
+        return None;
+    }
+    let noun = if broken.len() == 1 { "root" } else { "roots" };
+    Some(format!("  [degraded {noun}: {}]", broken.join("; ")))
+}
+
+/// The `[stale roots: …]` suffix, with the daemon's reason for each root when
+/// `stats` reported one. A reply only names the paths, so a reason is shown
+/// when the client has fetched it and omitted otherwise — never guessed.
+pub fn stale_roots_suffix(stale: &[String], health: &[RootHealth]) -> String {
+    let named: Vec<String> = stale
+        .iter()
+        .map(|path| match health.iter().find(|r| &r.path == path) {
+            Some(root) => match root.degraded_reason() {
+                Some(why) => format!("{path} ({why})"),
+                None => path.clone(),
+            },
+            None => path.clone(),
+        })
+        .collect();
+    format!("  [stale roots: {}]", named.join(", "))
 }
 
 /// Pull root paths out of a stats payload. Pure so the shape is testable
@@ -1443,6 +1569,10 @@ pub struct SearchOutcome {
     pub fresh: bool,
     /// Roots the daemon reports as degraded/behind.
     pub stale_roots: Vec<String>,
+    /// Each root's health (path + the daemon's state word), from `stats`.
+    /// Empty until the client has fetched it; the status line then shows a
+    /// stale root's reason, and stays quiet rather than guessing one.
+    pub roots_health: Vec<RootHealth>,
     /// The daemon is still replaying its journal / initial crawl.
     pub catching_up: bool,
     /// How far the daemon is behind the filesystem: the age of its oldest
@@ -1495,7 +1625,7 @@ impl SearchOutcome {
             s.push_str(&suffix);
         }
         if !self.stale_roots.is_empty() {
-            s.push_str(&format!("  [stale roots: {}]", self.stale_roots.join(", ")));
+            s.push_str(&stale_roots_suffix(&self.stale_roots, &self.roots_health));
         }
         // A first search against a cold daemon (crawl + trigram build) can
         // take seconds server-side while the status line sat on "searching…".
@@ -2953,6 +3083,109 @@ mod tests {
     }
 
     #[test]
+    fn root_health_carries_the_daemons_own_reason() {
+        let stats = serde_json::json!({
+            "roots": [
+                {"path": "/", "state": "degraded(watch_failed: Permission denied (os error 13))"},
+                {"path": "/home", "state": "ok"},
+                {"path": "/swap"},
+            ]
+        });
+        let roots = parse_root_health(&stats);
+        assert_eq!(roots.len(), 3);
+        assert_eq!(
+            roots[0].degraded_reason(),
+            Some("watch_failed: Permission denied (os error 13)")
+        );
+        assert!(!roots[1].is_degraded());
+        // No state at all is not a degraded one: an old daemon must not be
+        // reported as broken for saying nothing.
+        assert!(!roots[2].is_degraded());
+        assert_eq!(
+            degraded_suffix(&roots).as_deref(),
+            Some("  [degraded root: / (watch_failed: Permission denied (os error 13))]")
+        );
+        assert_eq!(degraded_suffix(&roots[1..]), None);
+        assert!(parse_root_health(&serde_json::Value::Null).is_empty());
+
+        // A state word this build does not know is repeated, not hidden.
+        let odd = RootHealth {
+            path: "/x".to_string(),
+            state: "watch_dropped".to_string(),
+        };
+        assert_eq!(odd.degraded_reason(), Some("watch_dropped"));
+        assert_eq!(
+            degraded_suffix(&[odd]).as_deref(),
+            Some("  [degraded root: /x (watch_dropped)]")
+        );
+    }
+
+    #[test]
+    fn connected_status_line_names_a_degraded_root_and_why() {
+        let stats = serde_json::json!({
+            "entries": 45712,
+            "backend": "inotify",
+            "roots": [
+                {"path": "/", "state": "degraded(watch_failed: Permission denied (os error 13))"},
+                {"path": "/home", "state": "ok"},
+            ]
+        });
+        let line = DaemonClient::connected_status_line(
+            Path::new("/run/user/1000/fflocate.sock"),
+            &stats,
+        );
+        assert_eq!(
+            line,
+            "connected to fflocated at /run/user/1000/fflocate.sock (45712 entries, inotify)  \
+             [degraded root: / (watch_failed: Permission denied (os error 13))]"
+        );
+        // A healthy daemon says nothing extra: no invented "all good" suffix.
+        let healthy = serde_json::json!({
+            "entries": 3,
+            "backend": "inotify",
+            "roots": [{"path": "/home", "state": "ok"}]
+        });
+        assert_eq!(
+            DaemonClient::connected_status_line(Path::new("/s"), &healthy),
+            "connected to fflocated at /s (3 entries, inotify)"
+        );
+    }
+
+    #[test]
+    fn stale_roots_suffix_shows_the_reason_only_when_it_was_fetched() {
+        let health = vec![
+            RootHealth {
+                path: "/".to_string(),
+                state: "degraded(watch_failed: Permission denied)".to_string(),
+            },
+            RootHealth {
+                path: "/home".to_string(),
+                state: "ok".to_string(),
+            },
+        ];
+        assert_eq!(
+            stale_roots_suffix(&["/".to_string()], &health),
+            "  [stale roots: / (watch_failed: Permission denied)]"
+        );
+        // Nothing fetched (or a root the daemon did not mention): the path
+        // alone. A missing reason is never invented.
+        assert_eq!(
+            stale_roots_suffix(&["/".to_string()], &[]),
+            "  [stale roots: /]"
+        );
+        assert_eq!(
+            stale_roots_suffix(&["/mnt/x".to_string()], &health),
+            "  [stale roots: /mnt/x]"
+        );
+        // A healthy root named stale is a lagging view, not a broken watch: no
+        // reason is added for it.
+        assert_eq!(
+            stale_roots_suffix(&["/home".to_string()], &health),
+            "  [stale roots: /home]"
+        );
+    }
+
+    #[test]
     fn menubar_model_covers_every_action_exactly_once() {
         use MenuAction::*;
         let model = menubar_model();
@@ -4321,7 +4554,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn the_debounce_waits_for_its_window_and_rearms_on_a_new_keystroke() {
         // A long window: "not due yet" must not depend on how fast the runner is.
         let slow = Debounce::new(std::time::Duration::from_secs(30));
@@ -4354,6 +4586,7 @@ mod tests {
         assert!(short.due(), "a 5ms window had not elapsed after 60ms");
     }
 
+    #[test]
     fn query_request_opts_into_scan_progress() {
         // The GUI asks for Progress; `ff` never does (its output must stay
         // byte-identical, and old daemons ignore the unknown field anyway).

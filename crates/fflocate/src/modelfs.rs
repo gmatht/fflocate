@@ -139,7 +139,7 @@ impl FsView for ModelFs {
                     is_symlink: node.is_symlink(),
                     is_exec: node.is_exec(),
                     // The model has no clock; every entry is undated.
-                    created_min: 0,
+                    created_min: crate::index::CREATED_UNKNOWN,
                 })
                 .collect());
         }
@@ -158,7 +158,7 @@ impl FsView for ModelFs {
                 is_dir: node.is_dir(),
                 is_symlink: node.is_symlink(),
                 is_exec: node.is_exec(),
-                created_min: 0,
+                created_min: crate::index::CREATED_UNKNOWN,
             })
             .collect())
     }

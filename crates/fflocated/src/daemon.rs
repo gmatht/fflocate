@@ -590,6 +590,17 @@ impl Daemon {
 
     /// Install watches on the root dirs and start the watcher thread.
     pub fn start(&mut self) -> anyhow::Result<()> {
+        // A store written while a crawl still followed symlinks keeps aliases of
+        // whatever the link pointed at (Wine's `dosdevices/z:` → `/` leaves a
+        // copy of the whole filesystem per prefix). Neither the crawl nor a
+        // rescan can reach those entries again, so drop them before the
+        // directory cache is derived from the healed index.
+        let healed = self.applier.drop_entries_under_non_dirs();
+        if healed > 0 {
+            eprintln!(
+                "fflocated: dropped {healed} entries a symlink walk had left in the store"
+            );
+        }
         self.applier.rebuild_dir_cache();
 
         // Warm the trigram accelerator off the user's critical path (§10, §17).
@@ -1455,9 +1466,6 @@ mod replay_integration_tests {
     /// without any manual `rescan`.
     #[test]
     fn corrupt_tail_enqueues_journal_corrupt_rescans() {
-        use fflocate::journal::Record;
-        use fflocate::persist::Store;
-
         let d = tempfile::tempdir().unwrap();
         let root = d.path().join("tree");
         std::fs::create_dir_all(&root).unwrap();

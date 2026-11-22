@@ -368,7 +368,13 @@ depend on a checkout outside this repository.
 * Results come from the daemon's `query` op; the consistency metadata
   (`fresh`, `stale_roots`, `catching_up`, and the daemon's own `phase` with crawl
   progress) is shown in the status line, so a stale view is never presented as an
-  empty one and a slow search names what the daemon is actually doing.
+  empty one and a slow search names what the daemon is actually doing. A stale
+  root also carries **why**: the startup probe asks for `stats` with roots
+  enabled, so the line reads `[stale roots: / (watch_failed: Permission denied
+  (os error 13))]` — the daemon's own state word, never a guessed cause. The
+  connection line says the same at startup, and *Daemon status* lists every root
+  with its state. A root whose reason has not been fetched yet shows its path
+  alone rather than inventing one.
 * **Live mode** (the *Live: follow changes* toggle in Advanced Search) opens a
   `subscribe` connection and leaves it open. The daemon filters the feed with the
   same query the boxes hold, so only relevant creates/deletes are sent, each as

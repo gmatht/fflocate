@@ -41,7 +41,8 @@ USAGE:
 
 OPTIONS:
     -c, --count         print only the number of matches
-    -j, --json          emit one JSON object per hit
+    -j, --json          emit one JSON object per hit (`created` in unix seconds
+                        when the index knows the entry's creation time)
     -0                  separate paths with NUL (for xargs -0)
     -l, --limit N       stop after N results (0 = unlimited)
     -s, --sync          settle the index before searching (cookie sync)

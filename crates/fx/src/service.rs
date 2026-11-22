@@ -12,6 +12,9 @@ use fflocate::config_paths::{socket_path, state_dir};
 
 /// `dev.fflocate.fflocated` is the label the plist is registered under; keep it
 /// and the filename in sync (launchd does not read the Label, but users do).
+/// macOS-only: the Linux path writes a systemd unit and never names a launchd
+/// job, so the constant does not exist there.
+#[cfg(target_os = "macos")]
 pub const LAUNCHD_LABEL: &str = "com.fflocate.fflocated";
 
 pub fn run(args: &[String]) -> Result<std::process::ExitCode, CliError> {

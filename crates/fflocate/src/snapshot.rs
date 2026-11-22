@@ -24,13 +24,17 @@
 //! ...     ...   entries (entry_count * 12 bytes: name_off u32, name_len u16,
 //!                              parent u32, flags u8)
 //! ...     ...   created (entry_count * 4 bytes: minutes since the epoch, u32,
-//!                              0 = unknown; version 3 and later)
+//!                              CREATED_UNKNOWN = unknown; version 3 and later)
 //! EOF-4   4     crc32 of everything before it
 //! ```
 //!
-//! Version 3 adds the `created` array. A version-2 snapshot still loads (its
-//! entries read as "creation time unknown") so a format bump never has to
-//! throw away data it can still understand; the next write is version 3.
+//! Version 3 adds the `created` array. Version 4 changes what its sentinel
+//! means: versions 3 and older stored `0` for "unknown", which collided with
+//! the real minute 0 (the first minute of 1970), so version 4 writes
+//! [`CREATED_UNKNOWN`] instead and a stored `0` now means exactly 00:00:00Z
+//! 1970. Older snapshots still load — their sentinel is translated on read, so
+//! an upgrade never turns "unknown" into "1970" — and the next write is
+//! version 4. A version-2 snapshot carries no times at all and reads as unknown.
 //!
 //! On load we prefer a real `mmap` (MAP_PRIVATE) so a 10 M-entry snapshot does
 //! not block on a copy; the returned [`LoadedSnapshot`] owns the mapping. The
@@ -40,16 +44,20 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::index::{Entry, Index, ROOT_ID};
+use crate::index::{Entry, Index, CREATED_UNKNOWN, ROOT_ID};
 use crate::roots::{MountCaps, Root};
 use crate::util::crc32;
 
 pub const MAGIC: &[u8; 4] = b"FNX2";
 /// Oldest snapshot version this build can read. Version 2 had no creation
-/// times; version 3 appends a `u32`-per-entry created array.
+/// times; version 3 appends a `u32`-per-entry created array; version 4 gives
+/// "unknown" its own sentinel so minute 0 is a real time.
 pub const MIN_VERSION: u32 = 2;
 /// Version this build writes.
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
+/// First version whose created array uses [`CREATED_UNKNOWN`] instead of `0`
+/// for "unknown". Read-side only: it decides how to interpret an old `0`.
+pub const CREATED_SENTINEL_VERSION: u32 = 4;
 const ENTRY_SIZE: usize = 12;
 
 /// A loaded snapshot, either memory-mapped or owned (write path/tests).
@@ -114,7 +122,13 @@ pub fn encode(index: &Index, roots: &[Root]) -> Vec<u8> {
     // a short block).
     let created = index.created_array();
     for i in 0..index.entries.len() {
-        out.extend_from_slice(&created.get(i).copied().unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(
+            &created
+                .get(i)
+                .copied()
+                .unwrap_or(CREATED_UNKNOWN)
+                .to_le_bytes(),
+        );
     }
     let sum = crc32(&out);
     out.extend_from_slice(&sum.to_le_bytes());
@@ -250,7 +264,15 @@ pub fn decode(bytes: &[u8]) -> io::Result<(Index, Vec<Root>)> {
     let mut created = Vec::with_capacity(entry_count);
     if version >= 3 {
         for _ in 0..entry_count {
-            created.push(r.u32()?);
+            let stored = r.u32()?;
+            // Versions 3 and older wrote `0` for "unknown". Translate that
+            // sentinel on read: without this, every undated entry in an
+            // upgraded store would answer "created in 1970".
+            created.push(if version < CREATED_SENTINEL_VERSION && stored == 0 {
+                CREATED_UNKNOWN
+            } else {
+                stored
+            });
         }
     }
     if r.remaining() != 0 {
@@ -418,6 +440,52 @@ mod tests {
     }
 
     #[test]
+    fn version_three_snapshot_reads_its_zero_sentinel_as_unknown() {
+        // Version 3 wrote `0` for "unknown", which is also the real minute 0.
+        // Loading one must keep those entries unknown (not 1970) while a
+        // genuine minute 0 written as version 4 stays a real time.
+        let mut ix = Index::new();
+        let r = ix.insert(
+            ROOT_ID,
+            b"proj",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        let epoch_minute = ix.insert(r, b"epoch.txt", EntryFlags::EMPTY);
+        let undated = ix.insert(r, b"undated.txt", EntryFlags::EMPTY);
+        ix.set_created(epoch_minute, 0);
+        ix.set_created(undated, CREATED_UNKNOWN);
+
+        // Encode as version 4, then rewrite the created block the way version 3
+        // would have: both entries stored as 0.
+        let bytes = encode(&ix, &[]);
+        let n = bytes.len();
+        let entry_count = u64::from_le_bytes(bytes[28..36].try_into().unwrap()) as usize;
+        let created_start = n - 4 - entry_count * 4;
+        let mut body = bytes[..n - 4].to_vec();
+        assert_eq!(
+            u32::from_le_bytes(body[created_start + epoch_minute as usize * 4..][..4].try_into().unwrap()),
+            0
+        );
+        for slot in 0..entry_count {
+            body[created_start + slot * 4..][..4].copy_from_slice(&0u32.to_le_bytes());
+        }
+        body[4..8].copy_from_slice(&3u32.to_le_bytes());
+        let sum = crc32(&body);
+        body.extend_from_slice(&sum.to_le_bytes());
+
+        let (ix3, _) = decode(&body).expect("a version-3 snapshot must still load");
+        assert_eq!(ix3.created_min(epoch_minute), None, "v3's 0 meant unknown");
+        assert_eq!(ix3.created_min(undated), None);
+        assert_eq!(ix3.created_array()[epoch_minute as usize], CREATED_UNKNOWN);
+
+        // The version-4 write of the same index keeps minute 0 datable.
+        let (ix4, _) = decode(&encode(&ix, &[])).unwrap();
+        assert_eq!(ix4.created_min(epoch_minute), Some(0));
+        assert_eq!(ix4.created_secs(epoch_minute), Some(0));
+        assert_eq!(ix4.created_min(undated), None);
+    }
+
+    #[test]
     fn version_two_snapshot_still_loads_with_unknown_creation_times() {
         // The format bump must not make an older store unreadable: drop the
         // created block from a version-3 file, mark it version 2, and decode it.
@@ -432,12 +500,30 @@ mod tests {
         let sum = crc32(&body);
         body.extend_from_slice(&sum.to_le_bytes());
 
-        let (ix2, _) = decode(&body).expect("a version-2 snapshot must still load");
+        let (ix2, roots2) = decode(&body).expect("a version-2 snapshot must still load");
         assert_eq!(ix2.entries, ix.entries, "names and ids are untouched");
         assert_eq!(ix2.created_array().len(), ix2.len());
         for id in 0..ix2.len() as u32 {
             assert_eq!(ix2.created_min(id), None, "v2 carried no creation time");
         }
+        // The point of "unknown" rather than a default: a created-time query on
+        // an upgraded store must match nothing, never answer "created in 1970".
+        use crate::expr::{ClockSpec, Expr, SinceField};
+        let root_paths: Vec<(u32, Vec<u8>)> = roots2
+            .iter()
+            .map(|r| {
+                (
+                    crate::applier::root_dir_id(&ix2, r),
+                    r.path.to_string_lossy().into_owned().into_bytes(),
+                )
+            })
+            .collect();
+        let since_epoch = Expr::Since {
+            spec: ClockSpec::Timestamp(0),
+            field: SinceField::Oclock,
+        };
+        let hits = crate::query::execute_expr(&ix2, &root_paths, b"", &since_epoch, 0, false);
+        assert_eq!(hits.total, 0, "an undated (upgraded) entry is not 1970");
     }
 
     #[test]

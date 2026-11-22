@@ -1538,9 +1538,13 @@ pub fn execute_expr(
             // Sizes and the other clocks are still not carried; the one
             // timestamp the index does hold is each entry's creation time, so
             // `since ... otime`/`oclock` answers from the index rather than
-            // from a `stat` per candidate.
+            // from a `stat` per candidate. The clock is the *last second* of
+            // the stored minute, not its start: an entry could have been
+            // created at any second inside that minute, so a bound anywhere in
+            // it must keep the entry instead of dropping a file the query
+            // actually satisfies.
             size: None,
-            otime: index.created_secs(id),
+            otime: index.created_latest_secs(id),
             ctime: None,
             mtime: None,
             fs_case_insensitive: false,
@@ -1649,7 +1653,7 @@ pub fn execute_expr_emit(
             is_symlink: entry.flags().is_symlink(),
             is_exec: entry.flags().is_exec(),
             size: None,
-            otime: index.created_secs(id),
+            otime: index.created_latest_secs(id),
             ctime: None,
             mtime: None,
             fs_case_insensitive: false,
@@ -1680,7 +1684,7 @@ pub fn execute_expr_emit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{EntryFlags, ROOT_ID};
+    use crate::index::{EntryFlags, CREATED_UNKNOWN, ROOT_ID};
     #[cfg(feature = "trigram")]
     use crate::trigram::TrigramIndex;
 
@@ -1730,9 +1734,19 @@ mod tests {
             "the whole set, including the one dated file"
         );
 
-        // One second past the stored minute excludes it: the comparison is
-        // minute-resolution, and the stored value is the start of that minute.
-        let expr = since_otime(jan2_secs + 1);
+        // A bound anywhere inside the stored minute still keeps it: the
+        // comparison is against the minute's last second, so truncating a time
+        // to minutes never drops a file from a `since` it satisfies.
+        let expr = since_otime(jan2_secs + 59);
+        assert_eq!(
+            paths(&execute_expr(&ix, &roots, b"", &expr, 0, false)),
+            vec!["/home/me/proj/src/main.rs"],
+            "a bound at :59 of the stored minute still includes it"
+        );
+
+        // The next minute's first second excludes it: that is the boundary at
+        // which the stored minute really ends.
+        let expr = since_otime(jan2_secs + 60);
         assert!(paths(&execute_expr(&ix, &roots, b"", &expr, 0, false)).is_empty());
 
         // An undated entry never matches, even against the epoch: "unknown"
@@ -1841,6 +1855,202 @@ mod tests {
         };
         execute_expr_emit(&ix, &roots, b"", &since(0), 0, false, &mut emit, None, false);
         assert_eq!(streamed, got, "streaming returns the same time-only set");
+    }
+
+    /// Created-time filtering at the minute boundaries, end to end through the
+    /// stored `u32`: ingest → snapshot bytes in a temp dir → decode → filter.
+    ///
+    /// A stored minute is the window `[min*60, min*60 + 59]`; a `since` bound is
+    /// compared against the window's **last** second, so 59 s and 60 s land on
+    /// the right sides and a bound anywhere inside a minute keeps that minute's
+    /// entries. An unknown birth time is its own sentinel, never minute 0, and
+    /// the hits come back in the query path's visit (index) order — never a
+    /// sort by time.
+    #[test]
+    fn created_minute_boundaries_select_exactly_and_keep_index_order() {
+        use crate::expr::{parse_expression, Expr};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // Ingest through the crawler's own converter, so the value stored here
+        // is exactly what a real crawl stores for that birth time.
+        let at = |secs: i64| {
+            let t = if secs >= 0 {
+                UNIX_EPOCH + Duration::from_secs(secs as u64)
+            } else {
+                UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs())
+            };
+            crate::applier::created_minutes_at(t)
+        };
+
+        let mut ix = Index::new();
+        let root = ix.insert(
+            ROOT_ID,
+            b"corpus",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        // Deliberately ingested out of chronological order, with undated
+        // entries interleaved: result order below is the query path's visit
+        // order, so a time sort would show up as a failure.
+        let plan: [(&[u8], Option<i64>); 8] = [
+            (b"s120.txt", Some(120)),
+            (b"preepoch.txt", Some(-1)),
+            (b"s059.txt", Some(59)),
+            (b"undated.txt", None),
+            (b"epoch.txt", Some(0)),
+            (b"s119.txt", Some(119)),
+            (b"s001.txt", Some(1)),
+            (b"s060.txt", Some(60)),
+        ];
+        let mut ids = Vec::new();
+        for (name, secs) in plan {
+            let id = ix.insert(root, name, EntryFlags::EMPTY);
+            if let Some(s) = secs {
+                ix.set_created(id, at(s));
+            }
+            ids.push(id);
+        }
+
+        // What actually gets stored: 120 s → minute 2; 119 s and 60 s → 1;
+        // the epoch, 1 s and 59 s → real minute 0; the pre-epoch and missing
+        // birth times → the unknown sentinel.
+        let stored: Vec<u32> = ids
+            .iter()
+            .map(|&id| ix.created_array()[id as usize])
+            .collect();
+        assert_eq!(
+            stored,
+            vec![2, CREATED_UNKNOWN, 0, CREATED_UNKNOWN, 0, 1, 0, 1],
+            "minute per ingested birth time"
+        );
+
+        // Read them back through the snapshot format, in an isolated temp dir,
+        // so the filters below see the bytes a restart would see.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.snap");
+        crate::snapshot::write_atomic(&path, &ix, &[]).unwrap();
+        let (ix, _) = crate::snapshot::decode(&std::fs::read(&path).unwrap()).unwrap();
+        let roots = vec![(root, b"/corpus".to_vec())];
+
+        let names = |e: &Expr| -> Vec<String> {
+            paths(&execute_expr(&ix, &roots, b"", e, 0, false))
+                .into_iter()
+                .map(|p| p.rsplit('/').next().unwrap().to_string())
+                .collect()
+        };
+        let since = |ts: i64| {
+            parse_expression(&serde_json::json!(["since", ts, "oclock"]), true).unwrap()
+        };
+        // A range is `since(from) and not since(to)` in this expression
+        // language; both edges are minute-granular, like the stored value.
+        let range = |from: i64, to: i64| {
+            parse_expression(
+                &serde_json::json!([
+                    "allof",
+                    ["since", from, "oclock"],
+                    ["not", ["since", to, "oclock"]]
+                ]),
+                true,
+            )
+            .unwrap()
+        };
+
+        // A bound at the epoch keeps every dated entry in index order. The
+        // pre-epoch and undated entries are not 1970 and never appear.
+        assert_eq!(
+            names(&since(0)),
+            vec![
+                "s120.txt",
+                "s059.txt",
+                "epoch.txt",
+                "s119.txt",
+                "s001.txt",
+                "s060.txt",
+            ]
+        );
+        // 59 s is inside minute 0: the same set, minute 0 included.
+        assert_eq!(names(&since(59)), names(&since(0)));
+        // Exactly 60 s — minute 1's first second — drops minute 0, and keeps
+        // both minute 1 (60 s) and minute 2 (120 s).
+        assert_eq!(
+            names(&since(60)),
+            vec!["s120.txt", "s119.txt", "s060.txt"]
+        );
+        // 119 s is inside minute 1: still the same set.
+        assert_eq!(names(&since(119)), names(&since(60)));
+        // Exactly 120 s drops minute 1; 179 s is still minute 2's last second.
+        assert_eq!(names(&since(120)), vec!["s120.txt"]);
+        assert_eq!(names(&since(179)), vec!["s120.txt"]);
+        assert!(names(&since(180)).is_empty(), "past the last stored minute");
+        // Unknown entries are not epoch time: not even a bound before the
+        // epoch can select them.
+        let before_epoch_bound = names(&since(-1));
+        assert_eq!(before_epoch_bound.len(), 6);
+        assert!(!before_epoch_bound.contains(&"undated.txt".to_string()));
+        assert!(!before_epoch_bound.contains(&"preepoch.txt".to_string()));
+
+        // Ranges: minute 0, minute 1 and minute 2 exactly, each in index order
+        // (119 s is returned before 60 s — nothing sorts by time).
+        assert_eq!(
+            names(&range(0, 60)),
+            vec!["s059.txt", "epoch.txt", "s001.txt"]
+        );
+        assert_eq!(names(&range(60, 120)), vec!["s119.txt", "s060.txt"]);
+        assert_eq!(names(&range(120, 180)), vec!["s120.txt"]);
+        assert_eq!(
+            names(&range(0, 180)),
+            vec![
+                "s120.txt",
+                "s059.txt",
+                "epoch.txt",
+                "s119.txt",
+                "s001.txt",
+                "s060.txt",
+            ]
+        );
+        assert!(names(&range(60, 60)).is_empty(), "an empty range");
+
+        // The streaming engine (what the daemon uses) agrees, in order.
+        let mut streamed = Vec::new();
+        let mut emit = |ev: ScanEvent| {
+            if let ScanEvent::Hit(h) = ev {
+                streamed.push(
+                    String::from_utf8_lossy(&h.path)
+                        .rsplit('/')
+                        .next()
+                        .unwrap()
+                        .to_string(),
+                );
+            }
+            true
+        };
+        execute_expr_emit(
+            &ix,
+            &roots,
+            b"",
+            &range(60, 120),
+            0,
+            false,
+            &mut emit,
+            None,
+            false,
+        );
+        assert_eq!(streamed, names(&range(60, 120)));
+
+        // Each hit carries the stored minute; the display boundary converts it
+        // back exactly once (60 s is minute 1 → 60 s out).
+        let hits = execute_expr(&ix, &roots, b"", &range(60, 120), 0, false);
+        assert_eq!(hits.hits.len(), 2);
+        let s060 = hits
+            .hits
+            .iter()
+            .find(|h| String::from_utf8_lossy(&h.path).ends_with("s060.txt"))
+            .expect("the 60 s entry is in minute 1");
+        assert_eq!(s060.created_min, Some(1));
+        assert_eq!(
+            s060.created_min.map(crate::index::created_secs_from_min),
+            Some(60)
+        );
+        assert_eq!(hits.total, 2, "the count is the same membership");
     }
 
     #[test]
