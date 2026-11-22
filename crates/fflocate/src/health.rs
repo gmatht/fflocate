@@ -401,6 +401,25 @@ mod tests {
     }
 
     #[test]
+    fn resyncing_onto_a_full_ring_does_not_gap_again() {
+        let mut cl = ChangeLog::new(2);
+        for lsn in 1..=10 {
+            cl.push(change(lsn, ChangeKind::Create, "/t/x"));
+        }
+        // A resynced subscriber has accounted for everything recorded, most of
+        // which is already evicted. That is caught up, not behind.
+        let caught_up = cl.pushed();
+        assert_eq!(cl.dropped(), 8);
+        assert!(!cl.gap(Cursor::new(1, 10), caught_up, 1));
+        // The next change evicts one more. Taking `dropped` as its mark would
+        // make it gap here — and on every change after that, forever.
+        cl.push(change(11, ChangeKind::Create, "/t/x"));
+        assert!(!cl.gap(Cursor::new(1, 10), caught_up, 1));
+        // A subscriber that really did stop early is still told.
+        assert!(cl.gap(Cursor::new(1, 10), 8, 1));
+    }
+
+    #[test]
     fn classify_phase_prioritises_replay_then_crawl_then_rescan() {
         // Replay gates everything: even with a crawl and rescans queued, the
         // phase is Replaying.

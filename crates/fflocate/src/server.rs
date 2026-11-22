@@ -1205,11 +1205,12 @@ pub fn handle_subscribe_streaming(
             Some(c) if c.gen == gen => {
                 cur = c;
                 let log = ctx.shared.changes.read().unwrap();
-                // A cursor names no index, so assume the client kept up (a
-                // pessimistic value would resync every resume once anything
-                // had ever been evicted) and refuse only a cursor behind the
-                // retained front, where changes it never saw are already gone.
-                consumed = log.dropped();
+                // A cursor names no index, so assume the client has everything
+                // recorded so far and refuse only a cursor behind the retained
+                // front, where changes it never saw are already gone. Assuming
+                // anything less would gap on the next change, since a full ring
+                // evicts one for every one it keeps.
+                consumed = log.pushed();
                 if log
                     .earliest()
                     .is_some_and(|e| e.gen == c.gen && e.lsn > c.lsn)
@@ -1249,12 +1250,12 @@ pub fn handle_subscribe_streaming(
         if abort() {
             return false;
         }
-        let (batch, gap, dropped) = {
+        let (batch, gap, pushed) = {
             let log = ctx.shared.changes.read().unwrap();
             (
                 log.since(cur),
                 log.gap(cur, consumed, ctx.shared.generation()),
-                log.dropped(),
+                log.pushed(),
             )
         };
         // A gap is the one thing a subscriber is never shown silently. Ask for
@@ -1262,9 +1263,14 @@ pub fn handle_subscribe_streaming(
         // covers it, and replaying a batch from before the gap would leave
         // `consumed` behind the evictions again. Falling through to the sleep
         // below keeps a churning index from spinning this loop.
+        //
+        // Carry on from `pushed`, not from `dropped`: a full ring evicts one
+        // change for every one it keeps, so "caught up" means having accounted
+        // for everything *recorded*, and anything less resyncs again on the very
+        // next change — forever.
         if gap {
             cur = ctx.shared.cursor();
-            consumed = dropped;
+            consumed = pushed;
             if !emit(resync_event(cur.to_string_repr())) {
                 return false;
             }
