@@ -239,6 +239,56 @@ jobs:
             exit 1
           fi
 
+      # Fuzzy search must answer the same question the GUI asks. The Basic box
+      # quotes what is typed, so the GUI sends `"FreeBiff"`; the daemon used to
+      # charge the quotes to the edit budget and to score smart-case needles
+      # case-sensitively, so the GUI found nothing where the CLI found the file.
+      # A plain Rust test, so it also runs here on every platform.
+      - name: Fuzzy search, quoted and folded queries
+        shell: bash
+        run: |
+          status=0
+          cargo test -p fflocate --test fuzzy_gui_quoting > fuzzy-quoting.log 2>&1 || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=fuzzy quoting::exit ${status}: $(tail -c 1800 fuzzy-quoting.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            exit 1
+          fi
+          echo "::notice title=fuzzy quoting::$(grep -E '^test result' fuzzy-quoting.log | tr '\n' '|')"
+
+      # The foldout's own widgets -> the request the GUI sends -> the daemon's
+      # answer: `FreeBiff` typed in the Basic box, Fuzzy ticked, the distance row
+      # as the app builds it. `fuzzy_gui_quoting` above proves the daemon's half
+      # and `distance_row_*` the row's buttons; this is the piece between them,
+      # and the one whose absence let a widget-level regression read as "no
+      # matches". Headless with `zork`, so it runs in this step rather than
+      # behind Xvfb (the GTK walk of the same foldout is in the Xvfb step).
+      - name: Foldout fuzzy search (headless)
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          status=0
+          : > foldout-fuzzy.log
+          # The `ff-gui` tests above already built the zork configuration, so
+          # these are runs, not second builds. `distance_row_zork` is the same
+          # foldout row this walk reads (its `-`/`+` buttons, which are the only
+          # way to change the budget on macOS), and it needs no display either.
+          cargo test -p ff-gui --no-default-features --features zork \
+            --test foldout_fuzzy_request -- --nocapture > foldout-fuzzy.log 2>&1 || status=$?
+          cargo test -p ff-gui --no-default-features --features zork \
+            --test distance_row_zork -- --nocapture >> foldout-fuzzy.log 2>&1 || status=$?
+          lines=$(grep -E '^foldout:' foldout-fuzzy.log | tr '\n' '|' | cut -c1-3500)
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=foldout fuzzy search (${RUNNER_OS})::exit ${status}: $(tail -c 1800 foldout-fuzzy.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            exit 1
+          fi
+          # A run that skipped, or a filter that matched nothing, would still
+          # exit 0; the test's own line is the post-condition.
+          if ! grep -q '^foldout: FreeBiff, Fuzzy' foldout-fuzzy.log; then
+            echo "::error title=foldout fuzzy search (${RUNNER_OS})::the walk did not run: ${lines}"
+            exit 1
+          fi
+          echo "::notice title=foldout fuzzy search (${RUNNER_OS})::${lines}"
+
       # The menu bar, read back out of AppKit and chosen through its target:
       # its own step so its result is reported alone, with the binary's ok line
       # required (a run that skipped for want of AppKit would still exit 0).
@@ -280,6 +330,29 @@ jobs:
           fi
           echo "::notice title=live mode (macOS)::$(grep '^live_mac:' live.log | tr '\n' '|' | cut -c1-3900)"
 
+      # The macOS half: the foldout's real AppKit widgets, the row's `-`/`+`
+      # pressed with `-performClick:` (on AppKit the field may take no
+      # keystrokes inside a stack view and the backend wires no wheel), and the
+      # request each state produces. Its own step with the binary's ok line
+      # required, because a run that skipped for want of AppKit would still exit
+      # 0 — and fuzzy search on macOS is exactly what this was reported for.
+      - name: Foldout fuzzy search (macOS)
+        if: ${{ runner.os == 'macOS' && !cancelled() }}
+        shell: bash
+        run: |
+          ulimit -c 0 || true
+          status=0
+          cargo test -p ff-gui --test foldout_fuzzy_mac > foldout-fuzzy-mac.log 2>&1 || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=foldout fuzzy search (macOS)::exit ${status}: $(tail -c 1800 foldout-fuzzy-mac.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            exit 1
+          fi
+          if ! grep -q '^foldout_fuzzy_mac: ok' foldout-fuzzy-mac.log; then
+            echo "::error title=foldout fuzzy search (macOS)::the walk did not run: $(grep -E '^foldout' foldout-fuzzy-mac.log | tr '\n' '|' | cut -c1-1200)"
+            exit 1
+          fi
+          echo "::notice title=foldout fuzzy search (macOS)::$(grep -E '^foldout' foldout-fuzzy-mac.log | tr '\n' '|' | cut -c1-3900)"
+
       # The build step's own annotations can be dropped when it fails, so a
       # failed build is also reported from its log file by this step.
       - name: GUI build log (macOS)
@@ -313,18 +386,28 @@ jobs:
           # GTK main loop, and two of them in one session have been seen to wait
           # on each other. Each is bounded so a hang fails the job instead of
           # stalling it.
-          for t in row_menu_gtk interaction_gtk typing_gtk reflow_gtk menubar_gtk daemon_pixels_gtk created_range_gtk live_gtk; do
+          # `distance_row_gtk` is the foldout's fuzzy-budget row: its `-`/`+`
+          # buttons are what make the value reachable on macOS, where the entry
+          # may take no keystrokes inside a stack view and no wheel at all.
+          for t in row_menu_gtk interaction_gtk typing_gtk reflow_gtk menubar_gtk daemon_pixels_gtk created_range_gtk distance_row_gtk live_gtk; do
             printf '=== %s ===\n' "$t" >> interaction.log
             xvfb-run -a -s "-screen 0 1280x1024x24" \
               timeout 180 cargo test -p ff-gui --test "$t" -- --nocapture >> interaction.log 2>&1 \
               || status=1
           done
           echo "interaction tests: exit ${status}; $(grep -E 'test result' interaction.log | tr '\n' '|')"
-          lines=$(grep -E 'row menu:|row menu on a row:|clipboard holds|pixels:|created range:|interaction:|typing:|reflow:|menu bar:|test result' interaction.log | tr '\n' '|' | cut -c1-3500)
+          lines=$(grep -E 'row menu:|row menu on a row:|clipboard holds|pixels:|created range:|distance row:|interaction:|typing:|reflow:|menu bar:|test result' interaction.log | tr '\n' '|' | cut -c1-3500)
           if [ "$status" -eq 0 ]; then
+            # A walk that skipped has to fail the job, not pass it: Xvfb is up
+            # and this step builds nothing else, so a missing line means the
+            # check silently did nothing. The distance row is the foldout's
+            # `-`/`+` buttons — the way a macOS user changes the fuzzy budget.
+            if ! grep -q '^distance row: buttons stepped' interaction.log; then
+              echo "::error title=distance row (Linux)::the buttons did not step the budget: $(grep -E '^distance row:' interaction.log | tr '\n' '|' | cut -c1-800)"
+              exit 1
+            fi
             # The pixel check must have run, not skipped for want of a display
-            # or a daemon: Xvfb is up and this step builds nothing else, so a
-            # missing line means it silently did nothing.
+            # or a daemon.
             if ! grep -q '^pixels: ok' interaction.log; then
               echo "::error title=daemon pixels (Linux)::the pixel check did not run: $(grep -E '^(pixels|daemon_pixels_gtk):' interaction.log | tr '\n' '|' | cut -c1-1200)"
               exit 1
@@ -500,6 +583,11 @@ jobs:
             echo "::notice title=list interaction (macOS, probe)::$(grep -E '^probe: (list canvas|clicks selected|header click sorted|click selected|list interaction)' probe.log | tr '\n' '|')"
             # The knob drag and the resize reflow, likewise in their own notice.
             echo "::notice title=drag and reflow (macOS, probe)::$(grep -E '^probe: (drag/reflow|reflow|knob dragged)' probe.log | tr '\n' '|')"
+            # The layout: the bands of a window-sized column, which must not
+            # overlap and must leave the list the leftover height. Its own notice
+            # because it is long, and because a regression here (the status line
+            # drawn over the column headers) is not visible in the generic line.
+            echo "::notice title=layout bands (macOS, probe)::$(grep -E '^probe: (bands top to bottom|list .*tall)' probe.log | tr '\n' '|' | cut -c1-3900)"
             # The row menu and the pasteboard, from the probe's popup path too,
             # in a notice of their own so the generic one's cap cannot hide them.
             echo "::notice title=row menu and clipboard (macOS, probe)::$(grep -E '^probe: (row menu|choosing|pasteboard|clipboard|row menu popped)' probe.log | tr '\n' '|')"
@@ -557,6 +645,19 @@ jobs:
           if ! grep -q '^pixels: ok' pixels.log; then
             echo "::error title=daemon pixels (macOS)::the pixel check did not run: $(grep -E '^pixels:|daemon_pixels_mac:' pixels.log | tr '\n' '|' | cut -c1-1200)"
             failures="${failures} daemon_pixels_mac(no-pixels)"
+          fi
+          # The daemon binary this step just built must be the one that speaks
+          # the GUI's fuzzy dialect: a stale `fflocated` on PATH (a release
+          # install answering on the same socket) is how "the GUI found nothing
+          # on macOS" can happen with a current GUI.
+          printf '=== daemon_fuzzy_mac ===\n' >> pixels.log
+          cargo test -p ff-gui --test daemon_fuzzy_mac -- --nocapture >> pixels.log 2>&1 || \
+            failures="${failures} daemon_fuzzy_mac"
+          if ! grep -q '^daemon fuzzy: ok' pixels.log; then
+            echo "::error title=daemon fuzzy (macOS)::the daemon the GUI would talk to does not answer FreeBiff -> FreeBuff: $(grep -E '^(daemon fuzzy|pixels):' pixels.log | tr '\n' '|' | cut -c1-1200)"
+            failures="${failures} daemon_fuzzy_mac(no-walk)"
+          else
+            echo "::notice title=daemon fuzzy (macOS)::$(grep -E '^daemon fuzzy' pixels.log | tr '\n' '|' | cut -c1-3900)"
           fi
 
           # Last, deliberately: this is where the pre-existing knob-geometry

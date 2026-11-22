@@ -20,7 +20,7 @@ it is a status note.
 | §9 Snapshot + journal + cursors + compaction | done | `crates/fflocate/src/{snapshot,journal,persist,cursor}.rs` |
 | §10 Query engine | done | `crates/fflocate/src/query.rs` |
 | §10/§17 **v2 trigram accelerator** | done | `crates/fflocate/src/trigram.rs`, `query.rs` (`execute_with_trigram`), `applier.rs` (`Shared::trigram_index`); tests `tests/trigram_differential.rs`; bench `examples/trigram_bench.rs` |
-| §10 **fuzzy search** | done | `crates/fflocate/src/fuzzy.rs`, `query.rs` (`execute_fuzzy`), `proto.rs`/`server.rs`/`fx` (`--fuzzy`, `--distance`) |
+| §10 **fuzzy search** | done | `crates/fflocate/src/fuzzy.rs`, `query.rs` (`execute_fuzzy`, `matches_fuzzy_filter`), `trigram.rs` (generator), `proto.rs`/`server.rs` (`unquote_fuzzy_literals`)/`fx` (`--fuzzy`, `--distance`), GUI `ff_gui::distance_ui` (`-`/`+` budget row); `crates/fflocate/tests/fuzzy_gui_quoting.rs` |
 | §11 IPC protocol v2 (wire v5: `Hit.created`, the entry's creation minute; v4: daemon `phase` + crawl progress in `Meta`/`stats`) | done | `crates/fflocate/src/proto.rs`, `server.rs`, `health.rs` |
 | §12 CLI | done | `crates/fx/src/{main,client,service}.rs` (binary `ff`; the `fx` name collides with the snap JSON viewer. Crate dir kept as `crates/fx`.) |
 | §13 Concurrency model | done | `crates/fflocate/src/applier.rs`, `crates/fflocated/src/daemon.rs` |
@@ -126,6 +126,83 @@ Ranking is by the summed per-needle distance (an integer), then path — a total
 deterministic order. One consequence is worth knowing before writing a test:
 fuzzy emits a **ranked list**, so its order differs from a plain query's index
 order even at `k = 0`, where the two select the same set.
+
+**A drain pass is now bounded in items, not just in time.** `DRAIN_TIME_BUDGET`
+is checked *between* work items, so it only bounds a pass when an item is not
+itself cheap. An item that does nothing and re-queues itself is not cheap at
+scale: a directory that re-requests its own walk keeps the queue refilled, and
+the pass then runs the whole budget with nothing to show for it, every tick.
+Observed live as one core pinned with the applier inside `crawl_dir` and no
+file indexed. `DRAIN_MAX_ITEMS` (256 work items) and `DRAIN_MAX_EVENTS` (4096
+events) per pass make the budget mean what it says; the remainder keeps its
+FIFO place for the next tick, so ordering and the escalation rules are
+unchanged. Pinned by `pending::tests::popping_a_crawl_frees_it_to_be_queued_again`
+(a popped crawl must be queueable again) and the live measurement below.
+
+**Daemon wakeups / CPU while idle.** `Pending::oldest_queued_ms` (the daemon's
+own "am I behind?" signal, which gates `Meta.catching_up` and `Meta.lag_ms`)
+read only the `events` and `work` queues. The queued-rescan set is a separate
+structure whose entries are the *only* record of a rescan once a collapse has
+folded its work item away, so with rescans outstanding the function could
+return `None` — the daemon then said it was caught up, and its "growing"
+detector never saw a stable count because the queue kept being refilled and
+drained within one tick. The applier tick therefore never reported idle and the
+5 ms idle sleep never ran: the loop spun, ~30k applier ticks per 8 s (≈60 % of a
+core) and ~200 context switches a second. Fixed by stamping `rescan_queued`
+with the enqueue time (inherited across a collapse) and folding it into the
+watermark; `tests::pending::a_queued_rescan_is_lag_even_before_it_became_work`
+pins it. Measured after the fix: ~0.5 % of a core idle on the same tree.
+
+The GUI's budget control is `ff_gui::distance_ui` (the foldout row):
+`-` / field / `+`, each click arming the same debounced search a keystroke
+does, the value saturating at 0 and 99. The buttons are not ornament — on
+AppKit an `NSTextField` inside the foldout's `NSStackView` may take no
+keystrokes (the field editor never becomes first responder) and the backend
+wires **no** wheel to an entry, so typing and wheeling both failed there and
+the edit distance could not be changed at all. The field also stays typeable
+with Fuzzy unticked (a disabled `NSTextField` drops input) and the label says
+`max distance: (fuzzy off)` instead. Asserted by `tests/distance_row_gtk.rs`
+(real GTK `clicked` signals under Xvfb), `tests/distance_row_zork.rs` (headless,
+so it runs on every platform's CI) and the `menubar_mac` probe
+(`-[NSButton performClick:]` plus a read-back).
+
+What those two do **not** cover is the value the row hands the request:
+`ff_gui::gather_options` is now public (the binary calls it with the widgets'
+values), `tests/foldout_fuzzy_request.rs` drives the foldout's real widgets ->
+`gather_options` -> `DaemonClient::query_request` -> a real `ServerCtx`, and
+pins both failure modes as empty lists (Fuzzy unticked; a budget of 0) so a
+regression names which one came back. `tests/foldout_fuzzy_mac.rs` is its AppKit
+half (`-performClick:` on `+`, the request each state produces), and
+`tests/daemon_fuzzy_mac.rs` starts the **`fflocated` this checkout built** and
+asks it the same question over the socket — the in-process tests cannot see a
+stale daemon binary, which is one of the ways "the GUI found nothing on macOS"
+can happen with a current GUI. The headless walk runs in CI's "Foldout fuzzy
+search (headless)" step, the other two on the macOS runner.
+
+Three fuzzy-search defects were found by asking the daemon the same question
+the GUI asks (`"FreeBiff"`), and are fixed and pinned by
+`crates/fflocate/tests/fuzzy_gui_quoting.rs`:
+
+* **Quoting was charged to the budget.** The Basic box quotes what is typed, so
+  fuzzy received `"FreeBiff"` and spent two of a default budget of two edits on
+  quote characters — empty list, while `--fuzzy FreeBiff` (unquoted, `k=1`…)
+  found the file. A whole plain term now loses its outer quotes before it
+  becomes a needle (`unquote_fuzzy_literals`); `ext:`/`path:`/negation/`case:`
+  keep their own quoting.
+* **Smart case was a distance, not a filter.** `FreeBiff` (capital `B`) was
+  scored case-*sensitively* and the trigram generator was asked for `bif`/`iff`,
+  trigrams no name holds, so it answered "no candidates" — `freebiff` matched
+  `FreeBuff` and `FreeBiff` did not, at every budget. Plain terms are now
+  matched **case-folded** by the fuzzy filter (`Query::matches_fuzzy_filter`),
+  so the distance decides; `FreeBiff` finds `FreeBuff` at `k≥1` and `k=0` stays
+  exact. Plain (non-fuzzy) search keeps smart case unchanged.
+* **The accelerator could narrow the answer to nothing.**
+  `candidates_sharing_at_least` returned the counted map when a pattern trigram
+  was absent from the whole index — a claim that the count was complete, when
+  the trigram only needs to *exist* under a positive budget. That is the same
+  bug as the first two, seen from the generator's side. An absent trigram, or a
+  pattern made only of common trigrams, now yields "no constraint" and the query
+  scans; `Some(empty)` is reserved for "nothing shares enough".
 
 The trigram index's only role is candidate generation, via the same sound bound
 the design gives (`t − 3k` shared trigrams); when that bound is vacuous the query

@@ -19,11 +19,44 @@ This is an implementation of [`DESIGN.md`](DESIGN.md) (v1 scope).
 flows through *one* pending collection owned by one applier thread — one
 ordering domain, which is what makes the sync guarantee provable.
 
+## The GUI
+
+`ff --gui` (or the `ff-gui` binary) is a thin client over the same NDJSON
+protocol the CLI speaks — no private API, no second index:
+
+![fflocate's search window on Linux, showing 100 of 629 665 matches](docs/screenshots/gui-linux.png)
+
+*629 665 matches answered in 1.7 s of server time, while the daemon was still
+crawling (`daemon crawling — 3 644 935 entries, 501 dirs left`).*
+
+The status line is the protocol made visible: the match count, whether the view
+is fresh, crawl progress, the stale roots (named individually, so an answer that
+may not reflect the newest events says so, rather than quietly looking current),
+and the server's own elapsed time.
+
+Results are a virtualised three-column list (Icon / Name / Path) drawn on a
+canvas, so any number of rows scrolls and the icon column paints a pictogram per
+file kind on GTK and AppKit alike. Clicking a header sorts **every** match, not
+the page on screen. Fuzzy search has its own edit-distance control in the
+foldout row.
+
+![Live search results while the daemon is still crawling](docs/screenshots/gui-linux-while-crawling.png)
+
+*The same daemon earlier in its crawl, answering `bash` from an index that is
+still filling. Results are usable before the crawl finishes: the status line
+says how much is left, and a re-run query converges as more is indexed.*
+
+The screenshots are real captures rather than mockups, so the tree they show is
+one machine's filesystem and the counts are that machine's index. See
+[`crates/ff-gui/README.md`](crates/ff-gui/README.md) for the widgets, the
+sort/limit behaviour and the measured costs.
+
 ## Build
 
 ```sh
 cargo build --release
 # binaries: target/release/fflocated and target/release/ff
+cargo build --release -p ff-gui   # optional: the GUI, i.e. `ff --gui`
 ```
 
 Requires a recent stable Rust (edition 2021). The realtime backend is per
@@ -78,13 +111,30 @@ Notes and limits:
 * TCC-protected directories (Desktop, Documents, Mail, …) are only listed by a
   process with Full Disk Access.
 * APFS stores decomposed names; the index normalizes to NFC so a typed
-  precomposed query still matches.
+  precomposed query still matches, though the crawl path currently has a gap
+  (see `MACOS.md` → Open issues).
 * `ff --gui` builds and runs on macOS through the AppKit backend. Because the
   merged widget toolkit dropped `TreeView`/`Expander`/`ContextMenu`, the GUI
   takes them from `rswidgets`' compat layer on **both** platforms: the results
   list is canvas-drawn (no themed icons, no click-to-sort headers), right-click
   reports that the popup menu is unavailable, and drag-and-drop is off. The
   daemon and CLI are unaffected; see `crates/ff-gui/README.md`.
+
+**[`MACOS.md`](MACOS.md)** covers the platform in depth: the FSEvents flag
+mapping, mount discovery through `getmntinfo`, why a TCC refusal is permanent,
+`LOCAL_PEERCRED` and system mode, the launchd plist, and the known gaps.
+
+## Windows
+
+A Windows port (`x86_64-pc-windows-msvc`) is merged and builds, but it is the
+minimally supported target: **no real-time watcher** (the default backend is
+`fake`, so the index refreshes on `ff rescan` / `ff update`), **no `--system`**
+mode, **no service installation**, and **no CI coverage**. IPC uses TCP loopback
+(`127.0.0.1:18923`) rather than a unix socket, and the default root is
+`%USERPROFILE%` unless a drive is indexed explicitly.
+
+**[`WINDOWS.md`](WINDOWS.md)** is the honest status: what works, what works with
+caveats, what is refused loudly, and the open gaps.
 
 ## Releases
 
