@@ -430,13 +430,67 @@ impl Query {
     pub fn approx_needles(&self) -> Vec<&[u8]> {
         let mut out = Vec::new();
         for t in &self.terms {
-            if let Term::Substr { needle, case } = t {
-                if !*case {
-                    out.push(needle.as_slice());
-                }
+            if let Term::Substr { needle, .. } = t {
+                out.push(needle.as_slice());
             }
         }
         out
+    }
+
+    /// The **filter** half of a fuzzy query: everything a plain query requires,
+    /// except that a plain term is folded when compared.
+    ///
+    /// `FreeBiff` typed into the box must find `FreeBuff`, which is two edits
+    /// away — exactly what the lower-case `freebiff` finds — and smart case
+    /// would otherwise filter the name out before the edit distance is ever
+    /// measured. Smart case is a *filter* rule for plain search; a fuzzy query
+    /// measures the distance case-folded (the index is folded), so the filter
+    /// folds with it. `ext:`, `path:`, glob, regex and their negations still
+    /// filter exactly.
+    pub fn matches_fuzzy_filter<F>(
+        &self,
+        name: &[u8],
+        is_dir: bool,
+        is_exec: bool,
+        mut path_provider: F,
+    ) -> bool
+    where
+        F: FnMut() -> Option<Vec<u8>>,
+    {
+        let mut path_cache: Option<Option<Vec<u8>>> = None;
+        for t in &self.terms {
+            let ok = match t {
+                // The plain terms are the ranking's business (scored at the
+                // budget below), so they are not re-checked for containment.
+                Term::Substr { .. } => continue,
+                Term::Not(inner) => match &**inner {
+                    // A negated plain term is, though, and folded the same way:
+                    // `-"FreeBiff"` must exclude `FreeBuff` if a positive
+                    // `FreeBiff` would have found it.
+                    Term::Substr { needle, .. } => !contains(name, needle, false),
+                    other => !self.match_inner(
+                        other,
+                        name,
+                        is_dir,
+                        is_exec,
+                        &mut path_cache,
+                        &mut path_provider,
+                    ),
+                },
+                other => self.match_inner(
+                    other,
+                    name,
+                    is_dir,
+                    is_exec,
+                    &mut path_cache,
+                    &mut path_provider,
+                ),
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
     }
 
     /// Evaluate every term **except** the approximate ones (see
@@ -904,7 +958,15 @@ pub fn execute_fuzzy_abortable(
 ) -> Option<Results> {
     use crate::fuzzy::substring_within;
 
-    let needles: Vec<Vec<u8>> = q.approx_needles().iter().map(|n| n.to_vec()).collect();
+    // Every plain substring term, folded. Smart case decides the *filter* for a
+    // plain query; a fuzzy one measures the distance case-folded, so `FreeBiff`
+    // is two edits from `FreeBuff` and finds it — exactly as `freebiff` does.
+    // See `matches_fuzzy_filter` below.
+    let needles: Vec<Vec<u8>> = q
+        .approx_needles()
+        .iter()
+        .map(|n| n.iter().map(|b| b.to_ascii_lowercase()).collect())
+        .collect();
     // No approximate terms at all: this is just the exact query.
     if needles.is_empty() {
         return Some(match trigram {
@@ -919,10 +981,17 @@ pub fn execute_fuzzy_abortable(
     // one cannot (too short, or the edit budget makes the bound vacuous) we fall
     // back to a full scan for the whole query. That keeps the generator a
     // superset filter in all cases — it may do more work than needed, never less.
+    //
+    // The needles here are the **case-folded** ones, which is what the trigram
+    // index holds: generating from a capitalised spelling used to ask for
+    // trigrams (`bif`, `iff` for `FreeBiff`) that no name contains, and then
+    // claim "no candidates" at a positive budget, where the pattern may match
+    // without sharing a single trigram.
     let candidates: Option<Vec<u32>> = match trigram {
         Some(tg) if tg.is_useful() => {
-            let mut acc: Option<Vec<u32>> = None;
+            // Every needle must be constrainable; if one is not, scan everything.
             let mut all_constrained = true;
+            let mut acc: Vec<Option<Vec<u32>>> = Vec::with_capacity(needles.len());
             for n in &needles {
                 let constrained = crate::trigram::TrigramIndex::literal_trigrams(n, false)
                     .and_then(|tris| {
@@ -933,12 +1002,7 @@ pub fn execute_fuzzy_abortable(
                         tg.candidates_sharing_at_least(&tris, need)
                     });
                 match constrained {
-                    Some(ids) => {
-                        acc = Some(match acc {
-                            None => ids,
-                            Some(prev) => crate::trigram::intersect(&prev, &ids),
-                        });
-                    }
+                    Some(ids) => acc.push(Some(ids)),
                     None => {
                         all_constrained = false;
                         break;
@@ -946,7 +1010,18 @@ pub fn execute_fuzzy_abortable(
                 }
             }
             if all_constrained {
-                acc // Some(list); empty means genuinely unsatisfiable
+                // Intersect the terms that do constrain; every needle
+                // constrained to nothing at all means nothing can match.
+                let lists: Vec<Vec<u32>> = acc.into_iter().flatten().collect();
+                if lists.is_empty() {
+                    Some(Vec::new()) // every needle unsatisfiable
+                } else {
+                    let mut out = lists[0].clone();
+                    for ids in &lists[1..] {
+                        out = crate::trigram::intersect(&out, ids);
+                    }
+                    Some(out)
+                }
             } else {
                 None // scan everything
             }
@@ -981,7 +1056,9 @@ pub fn execute_fuzzy_abortable(
             Some(rp) => rp,
             None => return,
         };
-        if !q.matches_exact_terms(
+        // Everything but the plain terms, filtered exactly — the plain terms
+        // are what the ranking below is for, and it folds them.
+        if !q.matches_fuzzy_filter(
             name,
             entry.flags().is_dir(),
             entry.flags().is_exec(),
@@ -2892,8 +2969,19 @@ mod tests {
             .collect();
         assert_eq!(
             needles,
-            vec!["main.js".to_string()],
-            "only the plain lowercase substring"
+            vec!["main.js".to_string(), "Notes".to_string()],
+            "the plain substrings; `case:Notes` is one (ranked, folded) but `ext:`, \
+             `path:`, the glob and the regex are not"
+        );
+        // The smart-case term is still filtered exactly (`case:Notes`), and the
+        // fuzzy filter relaxes only the plain terms' case.
+        let q = Query::compile("freebif").unwrap();
+        assert_eq!(
+            q.approx_needles()
+                .iter()
+                .map(|n| String::from_utf8_lossy(n).into_owned())
+                .collect::<Vec<_>>(),
+            vec!["freebif".to_string()]
         );
     }
 }

@@ -72,10 +72,13 @@ struct Stamped<T> {
 
 impl<T> Stamped<T> {
     fn now(item: T) -> Self {
-        Stamped {
-            at_ms: crate::applier::now_ms(),
-            item,
-        }
+        Self::at(item, crate::applier::now_ms())
+    }
+    /// Stamp an item with the arrival time of the change that created it — the
+    /// same instant the queue's dedupe set records, so the watermark a rescan
+    /// contributes is the one the queue will age.
+    fn at(item: T, at_ms: u64) -> Self {
+        Stamped { at_ms, item }
     }
 }
 
@@ -85,8 +88,18 @@ pub struct Pending {
     events: VecDeque<Stamped<FsEvent>>,
     work: VecDeque<Stamped<WorkItem>>,
     cookies: VecDeque<Cookie>,
-    /// Dirs with a Rescan already queued, for coalescing.
-    rescan_queued: std::collections::HashSet<u32>,
+    /// Dirs with a Rescan already queued, for coalescing, each with the
+    /// arrival stamp of the enqueue that put it there.
+    ///
+    /// The stamp matters: this set is the *only* record of a queued rescan
+    /// between enqueue and drain (the work item is pushed alongside it, but a
+    /// collapse can fold that item away while the dir stays queued). Without
+    /// its stamp [`Self::oldest_queued_ms`] could read "nothing queued" while
+    /// rescans were outstanding, and the daemon then reported itself caught up
+    /// (`Meta.catching_up` absent) with work still on the books. Kept with the
+    /// rescan through a collapse (the fold inherits the oldest stamp), so a
+    /// storm of them cannot reset the lag to "now".
+    rescan_queued: std::collections::HashMap<u32, u64>,
     /// Dirs with a CrawlDir already queued.
     crawl_queued: std::collections::HashSet<u32>,
     /// Capacity of the event queue; a full queue escalates to a rescan rather
@@ -225,7 +238,7 @@ impl Pending {
     pub fn enqueue_rescan(&mut self, dir: u32, cause: RescanCause) {
         // Already queued: a re-enqueue is a no-op (the rescan re-verifies the
         // whole subtree anyway).
-        if self.rescan_queued.contains(&dir) {
+        if self.rescan_queued.contains_key(&dir) {
             return;
         }
         // Over budget: fold one group of queued siblings into their shared
@@ -237,13 +250,15 @@ impl Pending {
             if self.collapse_one(dir) {
                 // `dir`'s family collapsed (maybe onto `dir` itself): the
                 // earlier `contains` check is stale, re-test.
-                if self.rescan_queued.contains(&dir) {
+                if self.rescan_queued.contains_key(&dir) {
                     return;
                 }
             }
         }
-        if self.rescan_queued.insert(dir) {
-            self.work.push_back(Stamped::now(WorkItem::Rescan { dir, cause }));
+        let at = crate::applier::now_ms();
+        if self.rescan_queued.insert(dir, at).is_none() {
+            self.work
+                .push_back(Stamped::at(WorkItem::Rescan { dir, cause }, at));
         }
     }
 
@@ -290,7 +305,7 @@ impl Pending {
                 _ => {}
             }
         };
-        for &q in self.rescan_queued.iter() {
+        for &q in self.rescan_queued.keys() {
             consider(q, &mut votes);
         }
         consider(dir, &mut votes);
@@ -324,9 +339,11 @@ impl Pending {
         // that arrived then, so the lag must not reset to now.
         let mut evicted = 0u64;
         let mut oldest_ms: Option<u64> = None;
+        let mut oldest_in_set: Option<u64> = None;
         for m in &members {
-            if self.rescan_queued.remove(m) {
+            if let Some(at) = self.rescan_queued.remove(m) {
                 evicted += 1;
+                oldest_in_set = Some(oldest_in_set.map_or(at, |o: u64| o.min(at)));
             }
         }
         self.work.retain(|w| {
@@ -339,8 +356,12 @@ impl Pending {
         });
         // The parent itself may already be queued (voted by another branch):
         // then the folded children are simply covered — no new item.
-        if self.rescan_queued.insert(parent) {
-            let at_ms = oldest_ms.unwrap_or_else(crate::applier::now_ms);
+        let at_ms = oldest_ms
+            .into_iter()
+            .chain(oldest_in_set)
+            .min()
+            .unwrap_or_else(crate::applier::now_ms);
+        if self.rescan_queued.insert(parent, at_ms).is_none() {
             self.work.push_back(Stamped {
                 at_ms,
                 item: WorkItem::Rescan {
@@ -367,7 +388,7 @@ impl Pending {
             if p == ROOT_ID || p == cur {
                 return false;
             }
-            if self.rescan_queued.contains(&p) {
+            if self.rescan_queued.contains_key(&p) {
                 return true;
             }
             cur = p;
@@ -418,20 +439,28 @@ impl Pending {
         w
     }
 
-    /// Arrival wall-ms of the oldest still-queued change (event or work),
-    /// or `None` when both queues are empty.
+    /// Arrival wall-ms of the oldest still-queued change (event, work item or
+    /// a rescan that has not been folded into one yet), or `None` when the
+    /// queues are empty.
     ///
-    /// This is the daemon's lag behind the filesystem: everything older has
-    /// been applied, everything still queued arrived at or after this. The
-    /// server turns it into a saturating age for `Meta.lag_ms`; the GUI
-    /// renders seconds from it.
+    /// This is the daemon's *queue* lag: everything older has been applied,
+    /// everything still queued arrived at or after this. The server turns it
+    /// into a saturating age for `Meta.lag_ms`; the GUI renders seconds from
+    /// it.
+    ///
+    /// The rescan set is part of this for the same reason (see
+    /// [`Self::rescan_queued`]): it holds work that is queued but may not be
+    /// in `work` any more, and reporting `None` there told the daemon — and so
+    /// `Meta.catching_up` — that it was caught up while rescans were still
+    /// outstanding. The stale-roots lesson, in its queue form: loudly behind
+    /// beats silently wrong.
     pub fn oldest_queued_ms(&self) -> Option<u64> {
         let e = self.events.front().map(|s| s.at_ms);
         let w = self.work.front().map(|s| s.at_ms);
-        match (e, w) {
-            (None, None) => None,
-            (Some(a), None) | (None, Some(a)) => Some(a),
-            (Some(a), Some(b)) => Some(a.min(b)),
+        let r = self.rescan_queued.values().copied().min();
+        match (e, w, r) {
+            (None, None, None) => None,
+            (a, b, c) => a.iter().chain(b.iter()).chain(c.iter()).min().copied(),
         }
     }
 
@@ -634,7 +663,7 @@ mod tests {
         // Manual always lands exactly where pointed, even over budget.
         p.enqueue_rescan(RESCAN_BUDGET as u32 + 1, RescanCause::Manual);
         assert!(
-            p.rescan_queued.contains(&(RESCAN_BUDGET as u32 + 1)),
+            p.rescan_queued.contains_key(&(RESCAN_BUDGET as u32 + 1)),
             "manual must not fold"
         );
         assert_eq!(p.rescan_queued.len(), before + 1);

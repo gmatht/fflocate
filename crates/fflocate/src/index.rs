@@ -217,6 +217,22 @@ pub struct Index {
     last_lsn: u64,
     /// Number of non-tombstoned entries (excluding slot 0).
     live_count: u64,
+    /// Live ids per parent, ascending.
+    ///
+    /// `lookup` and `children` are called once per directory entry while
+    /// crawling, so answering them from a whole-index scan made a crawl of N
+    /// entries cost O(N²): measured at 197 µs per lookup with 100k entries and
+    /// 784 µs with 300k, i.e. minutes of one core on a few hundred thousand
+    /// files — with the applier taking the index lock throughout, which is what
+    /// starved a concurrent `stats` reader until `ff` looked frozen.
+    ///
+    /// Only live ids are stored (a tombstone is unlinked by `remove` and
+    /// relinked by `revive`/`apply_add`; `move_entry` moves the link), and each
+    /// list stays sorted by id so `lookup`'s first match is still the lowest-id
+    /// match the old scan returned. It is derived state, never serialized: a
+    /// decoded snapshot rebuilds it in `new_reconstructed`, compaction rebuilds
+    /// it through `insert`.
+    children_of: std::collections::HashMap<u32, Vec<u32>>,
 }
 
 impl Default for Index {
@@ -237,6 +253,7 @@ impl Index {
             generation: 1,
             last_lsn: 0,
             live_count: 0,
+            children_of: std::collections::HashMap::new(),
         };
         // Slot 0: the virtual root. Unnameable, always dead to queries.
         idx.entries.push(Entry::default());
@@ -265,6 +282,7 @@ impl Index {
             generation: 1,
             last_lsn: 0,
             live_count: 0,
+            children_of: std::collections::HashMap::new(),
         };
         idx.alive.reserve((idx.entries.len() + 63) / 64);
         for i in 0..idx.entries.len() {
@@ -273,6 +291,16 @@ impl Index {
                 idx.live_count += 1;
             }
             idx.alive_push(a);
+        }
+        // The child index is derived state, like `alive`: rebuild it from the
+        // decoded entries in one ascending pass, which also leaves each list
+        // sorted by id as `link` maintains it.
+        idx.children_of.reserve(idx.entries.len() / 8);
+        for i in 1..idx.entries.len() {
+            if idx.alive_get(i) {
+                let parent = idx.entries[i].parent;
+                idx.children_of.entry(parent).or_default().push(i as u32);
+            }
         }
         idx
     }
@@ -455,22 +483,39 @@ impl Index {
         out
     }
 
+    /// Link a live id into its parent's child list, keeping the list sorted by
+    /// id (so `lookup` still finds the lowest id first, as the old scan did).
+    fn link(&mut self, id: u32, parent: u32) {
+        let kids = self.children_of.entry(parent).or_default();
+        if let Err(pos) = kids.binary_search(&id) {
+            kids.insert(pos, id);
+        }
+    }
+
+    /// Drop an id from its parent's child list (a tombstone, or a move).
+    fn unlink(&mut self, id: u32, parent: u32) {
+        if let Some(kids) = self.children_of.get_mut(&parent) {
+            if let Some(pos) = kids.iter().position(|&c| c == id) {
+                kids.remove(pos);
+            }
+            if kids.is_empty() {
+                // Don't keep a map entry for every directory that empties out:
+                // a long-lived daemon sees plenty of those.
+                self.children_of.remove(&parent);
+            }
+        }
+    }
+
     /// Find a live child of `parent` with `name` (exact byte match).
     ///
-    /// Linear scan over the sibling chain. For directories with very many
-    /// children this is O(children); a v2 accelerator (per-dir hash index) can
-    /// replace it without changing callers.
+    /// Scans only `parent`'s own children (see [`Index::children_of`]), in
+    /// ascending id order — O(siblings), not O(entries). The former whole-index
+    /// scan made every crawl quadratic; the field's note has the measurements.
     pub fn lookup(&self, parent: u32, name: &[u8]) -> Option<u32> {
-        for id in 0..self.entries.len() {
-            let e = &self.entries[id];
-            if e.parent != parent || e.name_len as usize != name.len() {
-                continue;
-            }
-            if !self.alive_get(id) {
-                continue;
-            }
-            if self.name_of_entry(e) == name {
-                return Some(id as u32);
+        for &id in self.children_of.get(&parent)? {
+            let e = &self.entries[id as usize];
+            if e.name_len as usize == name.len() && self.name_of_entry(e) == name {
+                return Some(id);
             }
         }
         None
@@ -493,6 +538,7 @@ impl Index {
         self.alive_push(!flags.is_tombstone());
         if !flags.is_tombstone() {
             self.live_count += 1;
+            self.link(id, parent);
         }
         id
     }
@@ -521,10 +567,12 @@ impl Index {
             return false;
         }
         let was = self.alive_get(id as usize);
+        let parent = self.entries[id as usize].parent;
         self.entries[id as usize].flags |= flags::TOMBSTONE;
         self.alive_set(id as usize, false);
         if was {
             self.live_count -= 1;
+            self.unlink(id, parent);
         }
         was
     }
@@ -557,6 +605,13 @@ impl Index {
                 self.alive_push(false);
             }
         }
+        // A replay re-add can land on a slot that is already live: unlink it
+        // from its *old* parent before the record re-points it.
+        let was_live = self.alive_get(id as usize);
+        if was_live {
+            let old_parent = self.entries[id as usize].parent;
+            self.unlink(id, old_parent);
+        }
         let off = self.names.len() as u32;
         self.names.extend_from_slice(name);
         let e = &mut self.entries[id as usize];
@@ -564,10 +619,11 @@ impl Index {
         e.name_len = name.len() as u16;
         e.parent = parent;
         e.flags = flags.with_tombstone(false).0;
-        if !self.alive_get(id as usize) {
+        if !was_live {
             self.alive_set(id as usize, true);
             self.live_count += 1;
         }
+        self.link(id, parent);
         if id >= self.next_id {
             self.next_id = id + 1;
         }
@@ -579,29 +635,27 @@ impl Index {
         if id as usize >= self.entries.len() {
             return;
         }
+        let parent = self.entries[id as usize].parent;
         let e = &mut self.entries[id as usize];
         e.flags = flags.with_tombstone(false).0;
         if !self.alive_get(id as usize) {
             self.alive_set(id as usize, true);
             self.live_count += 1;
+            self.link(id, parent);
         }
     }
 
-    /// Live children of `parent` as ids. Used by rescan diffing and by
-    /// directory-rename moves.
+    /// Live children of `parent` as ids, ascending. Used by rescan diffing and
+    /// by directory-rename moves; answered from the child index, so it costs
+    /// O(children) rather than a scan of every entry.
     pub fn children(&self, parent: u32) -> Vec<u32> {
-        let mut out = Vec::new();
-        for id in 0..self.entries.len() {
-            if id as u32 != ROOT_ID && self.entries[id].parent == parent && self.alive_get(id) {
-                out.push(id as u32);
-            }
-        }
-        out
+        self.children_of.get(&parent).cloned().unwrap_or_default()
     }
 
     /// Move a whole directory subtree: re-point the moved entry's parent (and
     /// optionally rename it). O(1) — children are found via their parent id.
     pub fn move_entry(&mut self, id: u32, new_parent: u32, new_name: Option<&[u8]>) {
+        let old_parent = self.entries[id as usize].parent;
         // The borrow dance: mutate name arena first, then the entry.
         let (name_off, name_len) = if let Some(n) = new_name {
             let off = self.names.len() as u32;
@@ -615,6 +669,12 @@ impl Index {
         e.parent = new_parent;
         e.name_off = name_off;
         e.name_len = name_len;
+        // A moved entry changes which child list it belongs to. Its own
+        // children keep pointing at it, so only this one link moves.
+        if old_parent != new_parent && self.alive_get(id as usize) {
+            self.unlink(id, old_parent);
+            self.link(id, new_parent);
+        }
     }
 
     // -------------------------------------------------------------- paths
@@ -1072,5 +1132,92 @@ mod tests {
         for id in 0..ix2.len() as u32 {
             assert_eq!(ix2.created_min(id), None);
         }
+    }
+
+    /// Reference implementation: the whole-index scan that `lookup` and
+    /// `children` used to do. Kept here so every accelerated answer can be
+    /// checked against it after any sequence of mutations.
+    fn brute_lookup(ix: &Index, parent: u32, name: &[u8]) -> Option<u32> {
+        (1..ix.len() as u32).find(|&id| {
+            ix.is_alive(id) && ix.entries[id as usize].parent == parent && ix.name(id) == name
+        })
+    }
+
+    fn brute_children(ix: &Index, parent: u32) -> Vec<u32> {
+        (1..ix.len() as u32)
+            .filter(|&id| ix.is_alive(id) && ix.entries[id as usize].parent == parent)
+            .collect()
+    }
+
+    fn assert_child_index_consistent(ix: &Index) {
+        for parent in 0..ix.len() as u32 {
+            assert_eq!(
+                ix.children(parent),
+                brute_children(ix, parent),
+                "children of {parent}"
+            );
+            for id in ix.children(parent) {
+                let name = ix.name(id).to_vec();
+                assert_eq!(
+                    ix.lookup(parent, &name),
+                    brute_lookup(ix, parent, &name),
+                    "lookup of {:?} under {parent}",
+                    String::from_utf8_lossy(&name)
+                );
+            }
+        }
+        assert_eq!(ix.lookup(ROOT_ID, b"definitely-not-indexed"), None);
+    }
+
+    /// The child index must agree with the entries themselves after every kind
+    /// of mutation — insert, remove, revive, move (rename + reparent), a replay
+    /// re-add over a live slot, compaction, and a decoded snapshot.
+    #[test]
+    fn child_index_survives_every_mutation() {
+        let mut ix = Index::new();
+        let r1 = ix.insert(ROOT_ID, b"a", dir().with_root_dir(true));
+        let r2 = ix.insert(ROOT_ID, b"b", dir().with_root_dir(true));
+        let d1 = ix.insert(r1, b"d1", dir());
+        let mut ids = Vec::new();
+        for i in 0..40 {
+            ids.push(ix.insert(d1, format!("f{i}").as_bytes(), file()));
+        }
+        assert_eq!(ix.lookup(d1, b"f7"), Some(ids[7]));
+        assert_eq!(ix.children(d1).len(), 40);
+
+        // remove + revive keep the id addressable, and only that id.
+        assert!(ix.remove(ids[3]));
+        assert_eq!(ix.lookup(d1, b"f3"), None);
+        assert_eq!(ix.children(d1).len(), 39);
+        ix.revive(ids[3], file());
+        assert_eq!(ix.lookup(d1, b"f3"), Some(ids[3]));
+        assert_eq!(ix.children(d1).len(), 40);
+
+        // A rename + reparent moves exactly one link.
+        let sub = ix.insert(d1, b"sub", dir());
+        ix.move_entry(sub, r2, Some(b"moved"));
+        assert_eq!(ix.lookup(d1, b"sub"), None);
+        assert_eq!(ix.lookup(r2, b"moved"), Some(sub));
+        assert_eq!(ix.children(d1).len(), 40);
+        assert!(!ix.children(r2).contains(&sub) || ix.lookup(r2, b"moved") == Some(sub));
+
+        // A journal re-add over a *live* slot (reparent) and over a tombstone.
+        let x = ix.insert(d1, b"x", file());
+        ix.apply_add(x, r2, b"x", file());
+        assert_eq!(ix.lookup(d1, b"x"), None);
+        assert_eq!(ix.lookup(r2, b"x"), Some(x));
+        ix.remove(ids[9]);
+        ix.apply_add(ids[9], d1, b"f9", file());
+        assert_eq!(ix.lookup(d1, b"f9"), Some(ids[9]));
+
+        assert_child_index_consistent(&ix);
+
+        // Compaction rebuilds ids through `insert`; a decoded snapshot must
+        // rebuild the child index from the entries array alone.
+        let (c, _) = ix.compacted();
+        assert_child_index_consistent(&c);
+        let decoded =
+            Index::new_reconstructed(ix.names.clone(), ix.entries.clone(), ix.created_array().to_vec());
+        assert_child_index_consistent(&decoded);
     }
 }

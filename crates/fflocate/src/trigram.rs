@@ -495,10 +495,19 @@ impl TrigramIndex {
                 assumed += 1;
                 continue;
             }
-            if let Some(list) = self.postings.get(tri) {
-                for id in list.iter() {
-                    *counts.entry(id).or_insert(0) += 1;
-                }
+            // A trigram the whole index does not hold cannot be shared by any
+            // name, so `min_shared` distinct shares are unsatisfiable. Returning
+            // the counted map here would be the opposite claim — "these are all
+            // the candidates" — and it dropped every true match: a pattern
+            // needs its *other* trigrams only up to the edit budget, so
+            // `FreeBiff` (needing `bif`/`iff`, absent from every name) still
+            // matches `FreeBuff` at distance 2. No constraint is the sound
+            // answer (`None`, scan everything).
+            let Some(list) = self.postings.get(tri) else {
+                return None;
+            };
+            for id in list.iter() {
+                *counts.entry(id).or_insert(0) += 1;
             }
         }
         let need = (min_shared as u32).saturating_sub(assumed);
@@ -770,14 +779,21 @@ mod tests {
                     truth.push(id);
                 }
             }
+            let cands = tg.candidates_sharing_at_least(&tris, need);
             if need == 0 {
                 assert!(
-                    tg.candidates_sharing_at_least(&tris, need).is_none(),
+                    cands.is_none(),
                     "pattern {pattern:?} k={k}: expected 'no constraint', not a candidate list"
                 );
                 continue; // no constraint => the caller scans; nothing to check
             }
-            let cands = tg.candidates_sharing_at_least(&tris, need).unwrap();
+            // `None` is also a sound answer at a positive budget: a trigram the
+            // whole index lacks makes the count unusable, so the caller scans
+            // (`freebiff` needs `bif`/`iff`, which no name has, and still matches
+            // `FreeBuff` at k=2). A *list* is the only answer that may narrow.
+            let Some(cands) = cands else {
+                continue;
+            };
             let cand_set: std::collections::HashSet<u32> = cands.iter().copied().collect();
             for id in &truth {
                 assert!(

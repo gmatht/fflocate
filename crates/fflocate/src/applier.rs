@@ -518,6 +518,26 @@ pub struct Applier {
 /// preserved; only the rate changes.
 const DRAIN_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Most work items one `drain` pass will run.
+///
+/// `DRAIN_TIME_BUDGET` is checked *between* items, which is only a bound if an
+/// item is not itself cheap: a work item that does nothing and re-enqueues
+/// itself (`crawl_dir` on an already-known directory — see `crawl_dir`) costs a
+/// few microseconds, so a queue made entirely of those can run for the full
+/// budget with nothing to show for it, every tick, forever. That is a spin at
+/// the daemon's own pace: observed live as one core pegged at 100 % with the
+/// thread inside `crawl_dir` and no file ever indexed. A hard cap makes the
+/// budget mean what it says; the remainder keeps its FIFO place for next tick.
+const DRAIN_MAX_ITEMS: usize = 256;
+
+/// Most events one `drain` pass will apply.
+///
+/// The event loop drains until empty, deliberately — an event flood escalates
+/// to a rescan — but "until empty" with a producer that refills faster than we
+/// apply is the same spin, one level up. Bounding it keeps a tick finite; the
+/// leftovers are still queued (and the capacity escalation is unchanged).
+const DRAIN_MAX_EVENTS: usize = 4096;
+
 /// One entry's worth of trigram-postings maintenance, snapshotted under the
 /// index guard and published after it is released (see the lock-discipline
 /// note on [`Shared::trigram`]). Owned bytes throughout: nothing borrows the
@@ -680,11 +700,11 @@ impl Applier {
     /// `/model` root-dir, while the root added for `/model/a` is a top-level
     /// entry named `/model/a`. Path is the identity the roots table is keyed
     /// by (see [`crate::roots::root_entry_name`]), so that is what is compared
-    /// — byte-normalized through the same function, so a trailing slash or a
-    /// `\\` separator in the configuration cannot miss.
+    /// — byte-normalized the same way, so a trailing slash or a `\` separator
+    /// in the configuration cannot miss.
     ///
-    /// The root `dir` itself belongs to is not a boundary: a walk into its own
-    /// root's configured path is what a crawl of that root *is*.
+    /// `dir`'s own root path is deliberately *not* excluded: the boundary is
+    /// any root's configured path that is not where this walk started.
     fn is_foreign_root(&self, dir: u32, abs: &std::path::Path) -> bool {
         if self.root_abs.is_empty() {
             return false;
@@ -1937,18 +1957,25 @@ impl Applier {
             // queue is undrained, so no sync can claim a stale settle.
             return n;
         }
+        let mut items = 0usize;
+        let mut events = 0usize;
         loop {
             let mut progressed = false;
-            while let Some(ev) = self.pending.pop_event() {
+            while events < DRAIN_MAX_EVENTS {
+                let Some(ev) = self.pending.pop_event() else {
+                    break;
+                };
                 self.apply_event(ev);
                 n += 1;
+                events += 1;
                 progressed = true;
             }
-            if t0.elapsed() >= DRAIN_TIME_BUDGET {
+            if t0.elapsed() >= DRAIN_TIME_BUDGET || items >= DRAIN_MAX_ITEMS {
                 break;
             }
             if let Some(w) = self.pending.pop_work() {
                 let progressed_this = self.run_work(w);
+                items += 1;
                 if !progressed_this {
                     // A deferred rescan: stop this drain pass so we don't spin.
                     // The item is re-queued and retried on a later tick.
@@ -2935,6 +2962,8 @@ mod replay_tests {
         );
         // Bulk insert + bulk delete through the real event funnel: tombstone
         // ratio crosses 20% with 10k+ dead slots, journal still quiet.
+        // Bounded per pass (`DRAIN_MAX_EVENTS`): one `drain` no longer empties
+        // an arbitrarily long queue, so pump until the backlog is applied.
         for i in 0..12_000 {
             a.push(crate::event::FsEvent::upsert(
                 crate::event::DirKey::new(r0),
@@ -2942,14 +2971,14 @@ mod replay_tests {
                 false,
             ));
         }
-        a.drain();
+        while a.drain() > 0 {}
         for i in 0..12_000 {
             a.push(crate::event::FsEvent::remove(
                 crate::event::DirKey::new(r0),
                 format!("bulk_{i:05}.rs").into_bytes(),
             ));
         }
-        a.drain();
+        while a.drain() > 0 {}
         let tombs = shared.index.read().unwrap().tombstone_count();
         assert!(tombs >= 10_000, "test must build real tombstone pressure, got {tombs}");
         assert!(a.maybe_compact(), "ratio arm must fire on 10k+ tombstones at >20%");
