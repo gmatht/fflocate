@@ -98,7 +98,9 @@ pkgbuild --root "$root" \
     "$component"
 
 # pkgbuild can exit 0 with an empty payload; the installed files are the point.
-payload=$(pkgutil --payload-files "$component" | sed 's|^/||')
+# `pkgutil --payload-files` prints a leading `.` and then `./`-prefixed paths
+# (an older form used a leading `/`), so both are stripped before comparing.
+payload=$(pkgutil --payload-files "$component" | sed -e 's|^\./||' -e 's|^/||')
 for f in usr/local/bin/ff usr/local/bin/fflocated usr/local/bin/ff-gui \
          Applications/fflocate.app/Contents/Info.plist \
          Applications/fflocate.app/Contents/MacOS/ff-gui; do

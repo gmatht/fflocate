@@ -208,7 +208,9 @@ STUBS = {
         [ -d "$root" ] || exit 1
         # `! -type d`, not `-type f`: /usr/local/bin/ff-gui is a symlink into the
         # app bundle, and a payload listing that drops it is the check failing.
-        ( cd "$root" && find . ! -type d | cut -c3- ) > "$1"
+        # The `./` prefixes are the real `pkgutil --payload-files` shape, so the
+        # packaging script's normalisation is exercised rather than assumed.
+        ( cd "$root" && find . ! -type d ) > "$1"
         cp "$1" "${STUB_LOG}.payload"
         """,
     "pkgutil": """
@@ -275,7 +277,8 @@ def mode_mac(wf, triggers):
     # The payload is what the installer puts on the disk: the GUI has to arrive
     # as a launchable bundle in /Applications, with the CLI names still on PATH.
     payload_file = Path(str(log) + ".payload")
-    files = payload_file.read_text().splitlines() if payload_file.is_file() else []
+    files = [line[2:] if line.startswith("./") else line
+             for line in payload_file.read_text().splitlines()] if payload_file.is_file() else []
     ok = check("the .app bundle is in the payload",
                "Applications/fflocate.app/Contents/Info.plist" in files
                and "Applications/fflocate.app/Contents/MacOS/ff-gui" in files,

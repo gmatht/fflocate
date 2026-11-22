@@ -49,8 +49,12 @@ install -m 0755 "$bindir/ff-gui" "$app/Contents/MacOS/ff-gui"
 
 # ---- icon ------------------------------------------------------------------
 # AppIcon.icns is the only form Finder and the Dock read before the app runs.
+# It is a nicety, not a precondition: the binary paints its own Dock icon at
+# runtime, so a bundle without one still works. Hence the `if build_icon`: a
+# command whose failure is tested does not abort the script under `set -e`,
+# which keeps a misbehaving sips/iconutil from failing a release.
 icon_key=
-if [ -f "$icon_src" ] && command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
+build_icon() {
     iconset=$(mktemp -d)/AppIcon.iconset
     mkdir -p "$iconset"
     for spec in \
@@ -63,12 +67,18 @@ if [ -f "$icon_src" ] && command -v sips >/dev/null 2>&1 && command -v iconutil 
         set -- $spec
         sips -z "$1" "$1" "$icon_src" --out "$iconset/icon_$2.png" >/dev/null
     done
-    if iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns" >/dev/null 2>&1; then
+    iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns" >/dev/null 2>&1
+    status=$?
+    rm -rf "$(dirname -- "$iconset")"
+    return $status
+}
+
+if [ -f "$icon_src" ] && command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
+    if build_icon; then
         icon_key='  <key>CFBundleIconFile</key><string>AppIcon</string>'
     else
-        echo "$0: iconutil could not build AppIcon.icns; packaging without it" >&2
+        echo "$0: could not build AppIcon.icns; packaging without a Finder icon" >&2
     fi
-    rm -rf "$(dirname -- "$iconset")"
 fi
 
 # ---- Info.plist ------------------------------------------------------------
