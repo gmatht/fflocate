@@ -1053,16 +1053,57 @@ fn handle_since(ctx: &ServerCtx, cursor: &str, q: &str) -> Vec<Response> {
     out
 }
 
+/// How long a read-only diagnostic may wait for the index before answering
+/// with what it already has.
+///
+/// A crawl or rescan takes the write lock in short bursts, but `ff stats` is a
+/// question about the daemon, not a job for it: blocking behind the crawl is
+/// what made it look hung (no output at all until `^C`). Fifty milliseconds is
+/// long enough to ride out an ordinary insert and short enough that a human
+/// never sees a pause.
+const SHORT_LOCK_WAIT: Duration = Duration::from_millis(50);
+
+/// Take `lock` for reading, waiting at most `wait`. `None` means a writer held
+/// it for the whole window, so the caller must report a partial answer rather
+/// than invent a number.
+fn read_within<'a, T>(
+    lock: &'a std::sync::RwLock<T>,
+    wait: Duration,
+) -> Option<std::sync::RwLockReadGuard<'a, T>> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match lock.try_read() {
+            Ok(g) => return Some(g),
+            Err(_) if Instant::now() >= deadline => return None,
+            Err(_) => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+}
+
 fn handle_stats(ctx: &ServerCtx, per_root: bool) -> Vec<Response> {
     let h: Health = ctx.shared.health.read().unwrap().clone();
-    let ix = ctx.shared.index.read().unwrap();
-    let roots = ctx.shared.roots.read().unwrap();
+    let ix = read_within(&ctx.shared.index, SHORT_LOCK_WAIT);
+    let roots = read_within(&ctx.shared.roots, SHORT_LOCK_WAIT);
     let mut stats = h.as_json();
     let obj = stats.as_object_mut().unwrap();
     obj.insert("gen".into(), serde_json::json!(ctx.shared.generation()));
     obj.insert("lsn".into(), serde_json::json!(ctx.shared.snapshot_lsn()));
-    obj.insert("entries".into(), serde_json::json!(ix.live_count()));
-    obj.insert("tombstones".into(), serde_json::json!(ix.tombstone_count()));
+    match &ix {
+        Some(ix) => {
+            obj.insert("entries".into(), serde_json::json!(ix.live_count()));
+            obj.insert("tombstones".into(), serde_json::json!(ix.tombstone_count()));
+        }
+        // No count is better than a made-up one: `Health` mirrors no entry
+        // total, and last tick's figure would read as this instant's. The
+        // client turns `partial` into a warning, so the absence is explained.
+        None => {
+            obj.insert("partial".into(), serde_json::json!(true));
+            obj.insert(
+                "partial_reason".into(),
+                serde_json::json!("index busy (crawl or rescan in progress)"),
+            );
+        }
+    }
     obj.insert("backend".into(), serde_json::json!(ctx.backend));
     // Why the backend is what it is (§4: a mis-probed choice should be visible,
     // not mysterious). Only meaningful on Linux; elsewhere it says so.
@@ -1074,7 +1115,21 @@ fn handle_stats(ctx: &ServerCtx, per_root: bool) -> Vec<Response> {
         }),
     );
     if per_root {
+        // An empty list would read as "no roots configured", which is a
+        // different (and wrong) statement than "the roots table is busy".
+        if roots.is_none() {
+            if ix.is_some() {
+                obj.insert("partial".into(), serde_json::json!(true));
+                obj.insert(
+                    "partial_reason".into(),
+                    serde_json::json!("roots table busy (a crawl is adding roots)"),
+                );
+            }
+            return vec![Response::Stats { stats }];
+        }
         let roots_json: Vec<serde_json::Value> = roots
+            .as_ref()
+            .unwrap()
             .iter()
             .map(|r| {
                 serde_json::json!({
@@ -2029,6 +2084,38 @@ mod tests {
                 assert_eq!(*gen, 9);
             }
             _ => panic!("expected meta"),
+        }
+    }
+
+    /// A crawl holds the index's write lock; `stats` must answer anyway, and
+    /// must not dress a stale mirror up as a live count.
+    #[test]
+    fn stats_answers_partially_instead_of_blocking_on_a_busy_index() {
+        let (ctx, _d, _s) = ctx_with_tree();
+        let held = ctx.shared.index.write().unwrap();
+        let t0 = Instant::now();
+        let out = handle_request(&ctx, &Request::Stats { roots: true });
+        let waited = t0.elapsed();
+        drop(held);
+        assert!(
+            waited < Duration::from_secs(1),
+            "stats waited {waited:?} on a held index lock"
+        );
+        match &out[0] {
+            Response::Stats { stats } => {
+                assert_eq!(stats["partial"], serde_json::json!(true));
+                assert!(
+                    stats.get("entries").is_none(),
+                    "a busy daemon must not report a fabricated count: {stats}"
+                );
+                assert!(
+                    stats.get("tombstones").is_none(),
+                    "a busy daemon must not report a fabricated count: {stats}"
+                );
+                let why = stats["partial_reason"].as_str().unwrap_or_default();
+                assert!(why.contains("busy"), "the reason must say why: {why:?}");
+            }
+            other => panic!("expected Stats, got {other:?}"),
         }
     }
 
