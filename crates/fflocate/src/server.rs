@@ -5,14 +5,14 @@
 //! in-process fallback and the fake-backend model tests use exactly the same
 //! code paths.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::{Duration, Instant};
 
 use crate::applier::{now_ms, Shared};
 use crate::health::Health;
 use crate::proto::{Request, Response};
 use crate::query::{self, Query};
-use crate::roots::RootState;
+use crate::roots::{Root, RootState};
 use crate::sync::{self, SyncRegistry, SyncStatus};
 
 /// Everything a handler needs.
@@ -1066,17 +1066,16 @@ const SHORT_LOCK_WAIT: Duration = Duration::from_millis(50);
 /// Take `lock` for reading, waiting at most `wait`. `None` means a writer held
 /// it for the whole window, so the caller must report a partial answer rather
 /// than invent a number.
-fn read_within<'a, T>(
-    lock: &'a std::sync::RwLock<T>,
-    wait: Duration,
-) -> Option<std::sync::RwLockReadGuard<'a, T>> {
+fn read_within<'a, T>(lock: &'a RwLock<T>, wait: Duration) -> Option<RwLockReadGuard<'a, T>> {
     let deadline = Instant::now() + wait;
     loop {
-        match lock.try_read() {
-            Ok(g) => return Some(g),
-            Err(_) if Instant::now() >= deadline => return None,
-            Err(_) => std::thread::sleep(Duration::from_millis(1)),
+        if let Ok(guard) = lock.try_read() {
+            return Some(guard);
         }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -1088,21 +1087,9 @@ fn handle_stats(ctx: &ServerCtx, per_root: bool) -> Vec<Response> {
     let obj = stats.as_object_mut().unwrap();
     obj.insert("gen".into(), serde_json::json!(ctx.shared.generation()));
     obj.insert("lsn".into(), serde_json::json!(ctx.shared.snapshot_lsn()));
-    match &ix {
-        Some(ix) => {
-            obj.insert("entries".into(), serde_json::json!(ix.live_count()));
-            obj.insert("tombstones".into(), serde_json::json!(ix.tombstone_count()));
-        }
-        // No count is better than a made-up one: `Health` mirrors no entry
-        // total, and last tick's figure would read as this instant's. The
-        // client turns `partial` into a warning, so the absence is explained.
-        None => {
-            obj.insert("partial".into(), serde_json::json!(true));
-            obj.insert(
-                "partial_reason".into(),
-                serde_json::json!("index busy (crawl or rescan in progress)"),
-            );
-        }
+    if let Some(ix) = &ix {
+        obj.insert("entries".into(), serde_json::json!(ix.live_count()));
+        obj.insert("tombstones".into(), serde_json::json!(ix.tombstone_count()));
     }
     obj.insert("backend".into(), serde_json::json!(ctx.backend));
     // Why the backend is what it is (§4: a mis-probed choice should be visible,
@@ -1114,51 +1101,58 @@ fn handle_stats(ctx: &ServerCtx, per_root: bool) -> Vec<Response> {
             "note": crate::mount::fanotify_availability_note(),
         }),
     );
+    // Per-root detail only when the table was readable: an empty list would
+    // read as "no roots configured", which is a different claim than "busy".
     if per_root {
-        // An empty list would read as "no roots configured", which is a
-        // different (and wrong) statement than "the roots table is busy".
-        if roots.is_none() {
-            if ix.is_some() {
-                obj.insert("partial".into(), serde_json::json!(true));
-                obj.insert(
-                    "partial_reason".into(),
-                    serde_json::json!("roots table busy (a crawl is adding roots)"),
-                );
-            }
-            return vec![Response::Stats { stats }];
+        if let Some(roots) = &roots {
+            obj.insert("roots".into(), serde_json::json!(roots_json(roots)));
         }
-        let roots_json: Vec<serde_json::Value> = roots
-            .as_ref()
-            .unwrap()
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "path": r.key(),
-                    "enabled": r.enabled,
-                    "owner": r.owner_os,
-                    "local": r.is_local(),
-                    "drive": r.drive.as_ref().map(|d| serde_json::json!({
-                        "disk_serial": d.disk_serial,
-                        "volume_uuid": d.volume_uuid,
-                    })).unwrap_or(serde_json::Value::Null),
-                    "state": r.state.label(),
-                    "recrawl_count": r.recrawl_count,
-                    "last_rescan_cause": r.last_rescan_cause.map(|c| c.as_str()),
-                    "pending_items": r.pending_items,
-                    "caps": {
-                        "file_handles": r.caps.file_handles,
-                        "dtype_unreliable": r.caps.dtype_unreliable,
-                        "case_insensitive": r.caps.case_insensitive,
-                        "writable": r.caps.writable,
-                        "watch_time_ignore": r.caps.watch_time_ignore,
-                        "fstype": r.caps.fstype,
-                    },
-                })
-            })
-            .collect();
-        obj.insert("roots".into(), serde_json::json!(roots_json));
+    }
+    // What is missing, said once: a missing count beats a stale one dressed up
+    // as current, and the client turns `partial` into a warning.
+    let missing = if ix.is_none() {
+        Some("index busy (crawl or rescan in progress)")
+    } else if per_root && roots.is_none() {
+        Some("roots table busy (a crawl is adding roots)")
+    } else {
+        None
+    };
+    if let Some(why) = missing {
+        obj.insert("partial".into(), serde_json::json!(true));
+        obj.insert("partial_reason".into(), serde_json::json!(why));
     }
     vec![Response::Stats { stats }]
+}
+
+/// The per-root table behind `ff stats --roots`.
+fn roots_json(roots: &[Root]) -> Vec<serde_json::Value> {
+    roots
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "path": r.key(),
+                "enabled": r.enabled,
+                "owner": r.owner_os,
+                "local": r.is_local(),
+                "drive": r.drive.as_ref().map(|d| serde_json::json!({
+                    "disk_serial": d.disk_serial,
+                    "volume_uuid": d.volume_uuid,
+                })).unwrap_or(serde_json::Value::Null),
+                "state": r.state.label(),
+                "recrawl_count": r.recrawl_count,
+                "last_rescan_cause": r.last_rescan_cause.map(|c| c.as_str()),
+                "pending_items": r.pending_items,
+                "caps": {
+                    "file_handles": r.caps.file_handles,
+                    "dtype_unreliable": r.caps.dtype_unreliable,
+                    "case_insensitive": r.caps.case_insensitive,
+                    "writable": r.caps.writable,
+                    "watch_time_ignore": r.caps.watch_time_ignore,
+                    "fstype": r.caps.fstype,
+                },
+            })
+        })
+        .collect()
 }
 
 fn handle_rescan(ctx: &ServerCtx, root: &str) -> Vec<Response> {
@@ -2114,6 +2108,32 @@ mod tests {
                 );
                 let why = stats["partial_reason"].as_str().unwrap_or_default();
                 assert!(why.contains("busy"), "the reason must say why: {why:?}");
+            }
+            other => panic!("expected Stats, got {other:?}"),
+        }
+    }
+
+    /// The roots table is the other bounded read: a busy one must leave the
+    /// list out (not empty) and say so, without making the counts look partial.
+    #[test]
+    fn stats_says_why_the_roots_list_is_missing() {
+        let (ctx, _d, _s) = ctx_with_tree();
+        let held = ctx.shared.roots.write().unwrap();
+        let out = handle_request(&ctx, &Request::Stats { roots: true });
+        drop(held);
+        match &out[0] {
+            Response::Stats { stats } => {
+                assert!(
+                    stats.get("roots").is_none(),
+                    "no list at all, not an empty one: {stats}"
+                );
+                assert_eq!(stats["partial"], serde_json::json!(true));
+                let why = stats["partial_reason"].as_str().unwrap_or_default();
+                assert!(why.contains("roots"), "the reason must name the table: {why:?}");
+                assert!(
+                    stats.get("entries").is_some(),
+                    "the index was readable, so the counts stay: {stats}"
+                );
             }
             other => panic!("expected Stats, got {other:?}"),
         }
