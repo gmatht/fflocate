@@ -574,7 +574,14 @@ mod macos_adapter {
         ///
         /// The same registry as the iOS `CorroIosTarget`, so a single
         /// dispatch path exists on both Apple platforms.
-        pub fn on_click(&self, f: impl FnMut() + Send + 'static) -> Result<u64, Error> {
+        ///
+        /// No `Send`: the registry stores main-thread closures and makes that
+        /// assertion once, in `backends::apple::StoredCallback`, because every
+        /// callback here arrives from AppKit's action dispatch on the main
+        /// thread. Demanding it of each caller rejected the widgets a click
+        /// has to act on (a closure holding an `Entry` or a `BoxWidget`), and
+        /// `Canvas::on_click` never asked for it.
+        pub fn on_click(&self, f: impl FnMut() + 'static) -> Result<u64, Error> {
             let id = core_apple::register_callback(Box::new(f));
             self.attach_target(id);
             Ok(id)

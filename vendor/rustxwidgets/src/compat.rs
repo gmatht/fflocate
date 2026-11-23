@@ -1842,6 +1842,18 @@ impl Expander {
         }
         self.expanded.get()
     }
+
+    /// The canvas that draws the header band, where there is one.
+    ///
+    /// `None` on GTK, where the native expander's header is the widget's own,
+    /// and on a backend with no canvas (there the header is a label and the
+    /// menu is the only toggle). Exposed so a test can address the band a
+    /// person clicks, instead of trusting that it is there to click.
+    pub fn header_handle(&self) -> Option<*mut c_void> {
+        use crate::core::Widget as _;
+        let canvas = self.stand_in.as_ref()?.canvas.as_ref()?;
+        Some(canvas.inner.raw_handle())
+    }
 }
 
 /// The backend's own disclosure widget, where it has one.

@@ -35,6 +35,19 @@ use ff_gui::{
     DEFAULT_MAX_DISTANCE_VALUE,
 };
 
+/// Whether the foldout's widgets cannot be built in this run.
+///
+/// The `zork` build is headless and is the one CI runs here; the default build
+/// on Linux is GTK, which aborts inside the toolkit when there is no display,
+/// so the `cargo test -p ff-gui` step (no Xvfb) has to skip instead.
+fn no_display() -> bool {
+    if cfg!(all(feature = "gtk", target_os = "linux", not(feature = "zork"))) {
+        return std::env::var_os("DISPLAY").is_none()
+            && std::env::var_os("WAYLAND_DISPLAY").is_none();
+    }
+    false
+}
+
 /// A daemon whose only interesting entry is the name the typo is aimed at.
 fn daemon_with(dir: &std::path::Path) -> ServerCtx {
     std::fs::create_dir_all(dir.join("FreeBuff")).expect("create FreeBuff");
@@ -83,6 +96,10 @@ fn ask(ctx: &ServerCtx, req: &Request) -> Result<Vec<String>, String> {
 
 #[test]
 fn the_foldout_as_built_finds_freebuff_for_freebiff() {
+    if no_display() {
+        println!("foldout fuzzy request: skipped (no display)");
+        return;
+    }
     let dir = tempfile::tempdir().expect("tempdir");
     let ctx = daemon_with(dir.path());
 
@@ -156,6 +173,10 @@ fn the_foldout_as_built_finds_freebuff_for_freebiff() {
 
 #[test]
 fn a_wider_budget_still_finds_the_typo_through_the_request() {
+    if no_display() {
+        println!("foldout fuzzy request: skipped (no display)");
+        return;
+    }
     // The row's buttons are how a macOS user changes the budget without a
     // keyboard (AppKit's entry may take no keystrokes inside a stack view and
     // wires no wheel), so the value they produce must also survive the request
