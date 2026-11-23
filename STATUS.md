@@ -37,7 +37,9 @@ All of the following were exercised against real binaries and a real temp tree:
 * **Live inotify**: create a file → visible without `--sync`; rename it (MOVED
   pair) → new name visible, old name gone; delete it → gone. This is real
   kernel inotify, not the fake backend.
-* `ff stats --roots` — gen/lsn/entries/tombstones, per-root state/fstype/caps.
+* `ff stats --roots` — gen/lsn/entries/tombstones, per-root state/fstype/caps;
+  a busy index or roots table answers `partial` with a reason rather than
+  blocking (see the freeze under *Known gaps*).
 * `ff rescan <root>`, `ff --since <cursor>` (cursor is `c:<gen>:<lsn>`).
 * Daemon restart: the index came back from **journal replay** without a
   recrawl — the snapshot serves immediately with `catching_up: true` while
@@ -47,8 +49,9 @@ All of the following were exercised against real binaries and a real temp tree:
   *and* the initial crawl drain.)
 * Cookie files are cleaned up on completion and on timeout (no leaks).
 
-`cargo test` runs 377 tests, all green, including a 120-step random
-differential test against a from-scratch filesystem walk.
+`cargo test --workspace` runs 607 tests across 48 suites, all green, including
+a 120-step random differential test against a from-scratch filesystem walk and
+the format-3 → current created-time migration (`tests/created_migration.rs`).
 
 Zero-hit `ff` string queries with an uppercase letter get a case-folded
 "did you mean" rerun (bounded, stderr only; stdout/exit codes untouched).
@@ -822,6 +825,37 @@ fails at exactly that watchdog).
   `None`), and the GUI's `catching_up_suffix_*` / `*_line_shows_lag_seconds` /
   `outcome_from_records_carries_lag`. Verified live against a real daemon:
   a churning queue reports a rising age, and a settled one omits the field.
+
+* **`ff stats` froze behind a crawl (the "nothing until ^C" report).**
+  `handle_stats` took the index read lock unconditionally, so while the applier
+  held the writer to apply a crawl item the command printed nothing — and the
+  wait was not an instant, because one `crawl_dir` item is indivisible
+  (`DRAIN_TIME_BUDGET` paces *between* items, never within one), so the guard
+  came back only after the whole directory diff. On a daemon still doing its
+  initial `/` crawl that is the common case, which is why `ff stats` looked
+  hung rather than slow. Now both reads it needs are bounded (`read_within`,
+  `SHORT_LOCK_WAIT` = 50 ms) and whatever is missing is named: `partial` plus
+  `partial_reason` ("index busy …" / "roots table busy …"), with the entry
+  counts omitted rather than filled in from a stale tick. The roots list is
+  omitted too when its table is busy — an empty list would claim "no roots
+  configured", a different and wrong statement. The client already rendered
+  `partial` as a warning; nothing had ever sent it. Pinned by
+  `server::stats_answers_partially_instead_of_blocking_on_a_busy_index` and
+  `server::stats_says_why_the_roots_list_is_missing`; measured at 22 ms against
+  a daemon mid-crawl.
+* **Nested roots indexed the same files once per root.** With `/`, `/home` and
+  `/home/john` all configured, the crawl knew only *mountpoints* as boundaries,
+  so each root's walk descended into the next and one file got an entry under
+  every root that contained it (the repro tree: 3 identical hits, 9 entries,
+  where 1 hit / 6 entries is correct — each root still carries its own parent
+  chain). `may_descend` now refuses another root's absolute path
+  (`is_foreign_root`), matching on the path rather than the root id because the
+  entry reached from `/` is not the same entry as the root's own root-dir
+  entry; a directory that *is* a root is still descended, so the root itself is
+  crawled. Stores crawled before this keep the duplicates until their parent is
+  rescanned (`a_rescan_of_the_parent_heals_entries_crawled_before_the_nested_root_existed`).
+  Pinned by `tests/mount_boundary.rs` — `nested_roots_index_the_same_file_exactly_once`
+  and `a_restart_re_crawl_does_not_descend_into_a_nested_root` among the seven.
 
 ## Reproducing the checks
 
