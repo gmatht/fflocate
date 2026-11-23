@@ -1050,17 +1050,26 @@ pub fn now_secs() -> i64 {
 /// date is rarely the question — "what have I made recently?" is.
 pub const CREATED_LAST_24_HOURS: &str = "24 hours ago";
 
-/// The dropdown's options, in increasing reach.
+/// The dropdown's options, in increasing reach: every row is older than the one
+/// above it, from a minute to a year, so the list reads as a scale.
 ///
 /// Offered as whole units rather than an arbitrary count, because the field
 /// beside the dropdown is what types a count ("3 days ago"); the list is the
-/// fast path for the common answers. [`CREATED_LAST_24_HOURS`] is deliberately
-/// the first entry: it is both the default and the narrowest useful window.
+/// fast path for the common answers. Minutes are on it because they are the
+/// reach that is otherwise only reachable by typing, at the point where a
+/// keyboard count is least welcome. [`CREATED_LAST_24_HOURS`] is spelled in
+/// hours rather than as "1 day ago" because that is the window a bare clock
+/// time widens to, and a row that names the same window twice is worse than a
+/// scale that steps from hours to days. `any time` ends the list: it is the
+/// empty window, not a duration.
 pub const CREATED_AGE_OPTIONS: &[&str] = &[
-    CREATED_LAST_24_HOURS,
+    "1 minute ago",
+    "5 minutes ago",
+    "10 minutes ago",
+    "30 minutes ago",
     "1 hour ago",
     "6 hours ago",
-    "1 day ago",
+    CREATED_LAST_24_HOURS,
     "3 days ago",
     "1 week ago",
     "2 weeks ago",
@@ -1150,7 +1159,7 @@ impl AgoAge {
 /// Parse an age expression: `n minute|hour|day|week|month|year ago`.
 ///
 /// Accepts the plural and singular forms, any amount of whitespace, and is
-/// case-insensitive, so `1 day ago` (the dropdown's spelling) and `2 DAYS AGO`
+/// case-insensitive, so `24 hours ago` (the dropdown's spelling) and `2 DAYS AGO`
 /// both parse. `any time` is the empty window and comes back as `Ok(None)` so a
 /// cleared dropdown means "no lower bound" rather than an error.
 ///
@@ -6592,6 +6601,40 @@ mod created_time_tests {
         }
         assert_eq!(created_ui::age_text_at(0).as_deref(), Some(""));
         assert_eq!(created_ui::index_of_age("not an option"), 0);
+    }
+
+    /// The list is a scale, so it has to read as one: each row reaches further
+    /// back than the one above it, and the minute scale is on it rather than
+    /// only reachable by typing. `any time` is the empty window, not a
+    /// duration, so it ends the list.
+    #[test]
+    fn the_dropdown_is_ordered_by_reach() {
+        assert_eq!(CREATED_AGE_OPTIONS.last(), Some(&"any time"));
+        let reaches: Vec<i64> = CREATED_AGE_OPTIONS
+            .iter()
+            .filter(|option| **option != "any time")
+            .map(|option| {
+                let range = parse_created_range_at(option, "", NOW)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{option}: the empty window, not an age"));
+                range.from.expect(option)
+            })
+            .collect();
+        assert!(
+            reaches.windows(2).all(|pair| pair[0] > pair[1]),
+            "each row must reach further back than the one above it: {reaches:?}"
+        );
+        for minute in [
+            "1 minute ago",
+            "5 minutes ago",
+            "10 minutes ago",
+            "30 minutes ago",
+        ] {
+            assert!(
+                CREATED_AGE_OPTIONS.contains(&minute),
+                "{minute} must be offered"
+            );
+        }
     }
 
     #[test]
