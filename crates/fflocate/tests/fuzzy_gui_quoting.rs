@@ -23,7 +23,6 @@
 //! a socket client.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use fflocate::index::{EntryFlags, Index, ROOT_ID};
 use fflocate::proto::{Request, Response};
