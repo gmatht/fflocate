@@ -124,8 +124,25 @@ fn the_foldout_as_built_finds_freebuff_for_freebiff() {
     );
 
     // What a user does: tick Fuzzy, then search the typo.
+    //
+    // A backend whose widgets were never built is indistinguishable from an
+    // unticked box at the assertion below, so say what the control reads at
+    // each step: on macOS this is the difference between "the app's request is
+    // wrong" and "nothing was built to tick".
+    println!(
+        "foldout fuzzy request: at launch fuzzy {} (box reads {}), distance {:?}",
+        launched.fuzzy,
+        fuzzy.is_active(),
+        distance.field.get_text()
+    );
     fuzzy.set_active(true);
     let opts = read(fuzzy.is_active());
+    println!(
+        "foldout fuzzy request: after set_active(true) the box reads {} -> options fuzzy {} max distance {:?}",
+        fuzzy.is_active(),
+        opts.fuzzy,
+        opts.max_distance
+    );
     println!(
         "foldout: fuzzy {} max distance {:?} -> {:?}",
         opts.fuzzy, opts.max_distance, request_for("FreeBiff", &opts)

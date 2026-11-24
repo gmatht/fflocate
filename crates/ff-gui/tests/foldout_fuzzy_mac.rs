@@ -201,6 +201,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Each of these is a way the same window can come back empty; naming them
     // here means a future regression reports *which* one came back, instead of
     // just "no matches".
+    // Untick the box first: `options` reads the live control, so the request
+    // below is only the Fuzzy-off one once the box is off. It was left ticked
+    // by the step above, which is what made this assert fail on macOS.
+    fuzzy.set_active(false);
     let fuzzy_off = options(false, &fuzzy, false, &distance);
     assert!(
         !fuzzy_off.fuzzy && fuzzy_off.max_distance.is_none(),
