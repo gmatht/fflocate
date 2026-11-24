@@ -762,13 +762,35 @@ mod gtk_adapter {
     /// Show a built menu at the pointer.
     pub fn context_menu_show(
         handle: usize,
-        _widget: *mut c_void,
-        _event: *mut c_void,
+        widget: *mut c_void,
+        event: *mut c_void,
     ) -> Result<(), Error> {
         let loader = crate::backends::gtk::loader()
             .ok_or_else(|| Error::Backend("GTK is not initialised".to_string()))?;
-        // Button 3: GTK positions the unanchored menu at that button's press.
-        if gtk_dynamic_loader::popup_context_menu(&loader, handle as u64, 3, 0) {
+        let _ = widget;
+        // The click the menu is for: the event's own root coordinates are the
+        // screen point GTK positions a menu with, so the menu opens where the
+        // press was rather than wherever the pointer happens to be. Dropping
+        // the event would leave an unanchored popup — the same place for a real
+        // right-click, a different one for a synthesized press or a menu opened
+        // from the keyboard — and the app passes the event so it is used.
+        let point = if event.is_null() {
+            None
+        } else {
+            // SAFETY: the event is the live `GdkEvent` of the press that asked
+            // for the menu.
+            unsafe { gtk_dynamic_loader::gdk_event_get_root_coords(&loader, event) }
+                .map(|(x, y)| (x.round() as i32, y.round() as i32))
+        };
+        // Button 3, at the event's own point; without one, GTK's own placement
+        // at the button's last press is all there is to go on.
+        let shown = match point {
+            Some((x, y)) => {
+                gtk_dynamic_loader::popup_context_menu_at(&loader, handle as u64, x, y, 3, 0)
+            }
+            None => gtk_dynamic_loader::popup_context_menu(&loader, handle as u64, 3, 0),
+        };
+        if shown {
             Ok(())
         } else {
             Err(Error::Backend(

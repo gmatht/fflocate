@@ -2845,6 +2845,138 @@ pub fn popup_context_menu(loader: &Arc<Loader>, id: u64, button: u32, time: u32)
     true
 }
 
+/// Show a built menu with its top-left at a **screen** point.
+///
+/// [`popup_context_menu`] leaves the position to GTK, which puts an unanchored
+/// menu at the pointer. That is right for a real right-click — the pointer is
+/// where the click was — and wrong for every other route into it: a press whose
+/// coordinates the pointer never visited (a synthesized event, a menu opened
+/// from the keyboard) would show the menu wherever the pointer happens to be.
+/// The position function is GTK3's own hook for saying where the menu goes, and
+/// the event that asked for the menu already carries the point.
+///
+/// Returns false on GTK4, which has no such hook on this path, and when the
+/// menu or the symbol is missing: the caller then falls back to
+/// [`popup_context_menu`] rather than failing.
+pub fn popup_context_menu_at(
+    loader: &Arc<Loader>,
+    id: u64,
+    screen_x: i32,
+    screen_y: i32,
+    button: u32,
+    time: u32,
+) -> bool {
+    if loader.version != crate::loader::Version::Gtk3 {
+        return false;
+    }
+    let menu = context_menus()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&id).map(|s| s.menu));
+    let Some(menu) = menu else {
+        return false;
+    };
+    let Some(popup) = loader.symbols.gtk_menu_popup else {
+        return false;
+    };
+
+    /// The corner `place` reads: GTK calls the position function *after*
+    /// `gtk_menu_popup` returns, while laying the menu out, so the value it
+    /// reads cannot be a stack local of this call. It is not freed either —
+    /// GTK may call the function more than once — and a menu is shown on the
+    /// main thread one at a time, so one cell is all that is needed.
+    static WANTED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+    /// GTK's `GtkMenuPositionFunc`. It must not unwind, so nothing here can
+    /// fail; the clamp keeps the menu off the top-left edge.
+    unsafe extern "C" fn place(
+        _menu: *mut c_void,
+        x: *mut i32,
+        y: *mut i32,
+        _push_in: *mut i32,
+        _data: *mut c_void,
+    ) {
+        let packed = WANTED.load(std::sync::atomic::Ordering::Relaxed);
+        let want_x = (packed >> 32) as i32;
+        let want_y = packed as i32;
+        if !x.is_null() {
+            unsafe { *x = want_x.max(0) };
+        }
+        if !y.is_null() {
+            unsafe { *y = want_y.max(0) };
+        }
+    }
+
+    WANTED.store(
+        ((screen_x as i64) << 32) | (screen_y as i64 & 0xffff_ffff),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    // SAFETY: `menu` is one this module built and still owns; the position
+    // function only reads the atomic above.
+    unsafe {
+        popup(
+            menu,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            place as *mut c_void,
+            std::ptr::null_mut(),
+            button,
+            time,
+        );
+    }
+    true
+}
+
+/// Root (screen) coordinates of a `GdkEvent`, as `(x, y)`.
+///
+/// Unlike [`gdk_event_get_coords`], which is relative to the event's own
+/// window, this is the space a menu is positioned in — and it needs no widget
+/// pointer, which matters because the compat layer hands its callers an opaque
+/// handle rather than a `GtkWidget*`.
+pub unsafe fn gdk_event_get_root_coords(
+    loader: &Arc<Loader>,
+    event: *mut c_void,
+) -> Option<(f64, f64)> {
+    type GetRootCoords = unsafe extern "C" fn(*mut std::ffi::c_void, *mut f64, *mut f64) -> i32;
+    let get_root = loader
+        .libs
+        .get("libgdk")
+        .and_then(|gdk_lib| unsafe {
+            gdk_lib
+                .get::<GetRootCoords>(b"gdk_event_get_root_coords")
+                .ok()
+                .map(|s| *s)
+        })
+        .or_else(|| {
+            loader.libs.get("libgtk").and_then(|gtk_lib| unsafe {
+                gtk_lib
+                    .get::<GetRootCoords>(b"gdk_event_get_root_coords")
+                    .ok()
+                    .map(|s| *s)
+            })
+        });
+    let get_root = get_root?;
+    let mut x: f64 = 0.0;
+    let mut y: f64 = 0.0;
+    if unsafe { get_root(event, &mut x as *mut f64, &mut y as *mut f64) } != 0 {
+        return Some((x, y));
+    }
+    None
+}
+
+/// Screen-space origin of a menu built by [`build_context_menu`], by its id.
+///
+/// The id is the opaque handle the compat layer passes around; this is how a
+/// caller — the right-click walk — reads where the menu actually opened.
+pub fn context_menu_screen_origin(loader: &Arc<Loader>, id: u64) -> Option<(i32, i32)> {
+    let menu = context_menus()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&id).map(|s| s.menu))?;
+    // SAFETY: the menu is one this module built and still owns.
+    unsafe { widget_screen_origin(loader, menu) }
+}
+
 /// Screen-space origin of `widget`'s top-left corner, as `(x, y)`.
 ///
 /// Needed to turn a widget-relative click position (what GTK hands an event

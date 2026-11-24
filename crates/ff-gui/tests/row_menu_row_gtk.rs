@@ -294,6 +294,47 @@ fn right_clicking_a_row_opens_its_menu_and_copy_path_reaches_the_clipboard() {
         "",
         "the right-click reported a failure instead of opening a menu"
     );
+
+    // --- A menu asked for at a point opens at that point ---
+    //
+    // GTK's unanchored popup places a menu at the pointer, and a synthesized
+    // press never moves the pointer: this is exactly the case where dropping
+    // the event's coordinates would send the menu somewhere else. The app's
+    // real right-click carries the event, so the backend positions with it;
+    // check that positioning against GTK's own idea of where the menu landed.
+    {
+        let mut anchored = ContextMenu::new();
+        anchored.append_item("Copy path", Box::new(|| {}));
+        let anchored_handle = anchored.build().expect("the anchored menu was not built");
+        let at = (320, 240);
+        assert!(
+            gtk_dynamic_loader::popup_context_menu_at(
+                &loader,
+                anchored_handle as u64,
+                at.0,
+                at.1,
+                3,
+                0
+            ),
+            "GTK3 would not show a menu at a point"
+        );
+        pump(&loader, 20);
+        let got = gtk_dynamic_loader::context_menu_screen_origin(&loader, anchored_handle as u64)
+            .expect("the anchored menu never got a window, so it was not shown");
+        eprintln!(
+            "row menu on a row: asked for ({}, {}) and the menu opened at ({}, {})",
+            at.0, at.1, got.0, got.1
+        );
+        assert!(
+            (got.0 - at.0).abs() <= 8 && (got.1 - at.1).abs() <= 8,
+            "the menu was asked for at ({}, {}) and opened at ({}, {})",
+            at.0,
+            at.1,
+            got.0,
+            got.1
+        );
+    }
+
     assert_eq!(
         list.selected_path(2).as_deref(),
         Some(paths[clicked].as_str()),
