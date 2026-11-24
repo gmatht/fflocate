@@ -166,14 +166,18 @@ jobs:
           fi
           # Three lines after each match: an assertion's message is the line
           # after its `panicked at`, and that message is the diagnosis.
-          msg=$(grep -A3 -E '^(error|failures:)|panicked at|^ *---- ' gui-test.log | head -40 | tr '\n' '|' | cut -c1-3000)
+          # `grep -m`, never `| head`: this shell runs with `-e -o pipefail`, so
+          # `head` closing the pipe leaves `grep` with status 141 and aborts the
+          # step before a single annotation is emitted — which is how a failing
+          # run came back with no diagnostics at all.
+          msg=$(grep -m 20 -A3 -E '^(error|failures:)|panicked at|^ *---- ' gui-test.log | tr '\n' '|' | cut -c1-3000)
           # The tail as well as the grepped lines: a linker error or a `cargo`
           # failure with no `error:` line would otherwise be reported blank.
           echo "::notice title=gui-test tail (${RUNNER_OS})::$(tail -c 1500 gui-test.log | tr -cd '[:print:]\n' | tr '\n' '|')"
           # The foldout tests print what their widgets read just before they
           # assert; those lines are the difference between "the app's request is
           # wrong" and "the backend built nothing to read".
-          echo "::notice title=foldout lines (${RUNNER_OS})::$(grep -E '^(foldout|foldout fuzzy request)' gui-test.log | head -40 | tr '\n' '|' | cut -c1-3900)"
+          echo "::notice title=foldout lines (${RUNNER_OS})::$(grep -m 40 -E '^(foldout|foldout fuzzy request)' gui-test.log | tr '\n' '|' | cut -c1-3900)"
           echo "::error title=GUI build/test failure (${RUNNER_OS})::${msg}"
           exit 1
 
@@ -365,6 +369,34 @@ jobs:
             exit 1
           fi
           echo "::notice title=foldout fuzzy search (macOS)::$(grep -E '^foldout' foldout-fuzzy-mac.log | tr '\n' '|' | cut -c1-3900)"
+
+      # The foldout's request on its own: it builds the app's own controls and
+      # reads the request they produce, and on AppKit those controls only exist
+      # once a window does — a control built before one reads back unticked and
+      # an entry reads back empty, which is not a wrong request but no widgets.
+      # Its own step so its result and its `foldout:` lines are reported on
+      # their own instead of inside the aggregate run, where the annotations
+      # were dropped entirely.
+      - name: Foldout fuzzy request (macOS)
+        if: ${{ runner.os == 'macOS' && !cancelled() }}
+        shell: bash
+        run: |
+          ulimit -c 0 || true
+          status=0
+          cargo test -p ff-gui --test foldout_fuzzy_request > foldout-request.log 2>&1 || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::notice title=foldout request lines (macOS)::$(grep -m 40 -E '^(foldout|foldout fuzzy request)' foldout-request.log | tr '\n' '|' | cut -c1-3900)"
+            echo "::error title=foldout fuzzy request (macOS)::exit ${status}: $(tail -c 1800 foldout-request.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            exit 1
+          fi
+          # A run that skipped for want of a display passes without building
+          # anything; this is macOS, and the line below is printed after the
+          # widgets were built and read.
+          if ! grep -q '^foldout fuzzy request: at launch' foldout-request.log; then
+            echo "::error title=foldout fuzzy request (macOS)::the widgets were never read: $(grep -E '^(foldout|test result|running)' foldout-request.log | tr '\n' '|' | cut -c1-1200)"
+            exit 1
+          fi
+          echo "::notice title=foldout fuzzy request (macOS)::$(grep -E '^(foldout|test result)' foldout-request.log | tr '\n' '|' | cut -c1-3900)"
 
       # The build step's own annotations can be dropped when it fails, so a
       # failed build is also reported from its log file by this step.
@@ -760,6 +792,7 @@ jobs:
             menubar.log
             live.log
             foldout-fuzzy-mac.log
+            foldout-request.log
             macos-*.log
             gui-test.log
             test.log
