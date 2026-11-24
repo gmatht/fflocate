@@ -174,6 +174,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let v0 = viewport();
     let f0 = canvas_frame();
     let geo0 = list.layout(f0.w, v0.h, v0.y);
+    let k0 = knob();
+
+    // Every number the knob comparison below rests on, printed *before* it
+    // asserts: that assertion is the one that fails on the runner, and a panic
+    // leaves nothing but its own message in the log. With the document AppKit
+    // actually scrolls (`documentView`), the clip it shows, the slot the knob is
+    // derived in and the geometry the painter derives all on one line, a failing
+    // run says which side is wrong instead of needing a second one to find out.
+    let doc = send0(scroll_view, "documentView");
+    let doc_frame = if doc.is_null() {
+        Rect::default()
+    } else {
+        send_rect(doc, "frame")
+    };
+    let scroll_view_frame = send_rect(scroll_view, "frame");
+    let scroller_frame = send_rect(scroller, "frame");
+    // NSScrollerKnobSlot is part 0: the groove the knob travels in, which is
+    // AppKit's own track height rather than the painter's.
+    let slot = send_rect_i(scroller, "rectForPart:", 0);
+    let visible = send_rect(clip, "documentVisibleRect");
+    println!(
+        "drag: geometry — canvas {:.0}x{:.0} at y {:.0}, clip {:.0}x{:.0} (visible {:.0}x{:.0} at y {:.0}), scroll view {:.0}x{:.0}, document {:.0}x{:.0}, scroller {:.0}x{:.0} style {} (0 overlay, 1 legacy); layout width {:.0}, viewport {:.0}, content {:.0}, track {:.0}, thumb {:.0} at {:.0} ({:.1}%); appkit slot {:.0}x{:.0}, knob {:.0}x{:.0} at ({:.0}, {:.0}) — {:.1}% of the track, {:.1}% of the slot; {count} rows",
+        f0.w,
+        f0.h,
+        f0.y,
+        v0.w,
+        v0.h,
+        visible.w,
+        visible.h,
+        visible.y,
+        scroll_view_frame.w,
+        scroll_view_frame.h,
+        doc_frame.w,
+        doc_frame.h,
+        scroller_frame.w,
+        scroller_frame.h,
+        send0i(scroller, "scrollerStyle"),
+        geo0.width,
+        geo0.viewport_height,
+        geo0.content_height,
+        geo0.track_height,
+        geo0.thumb_height,
+        geo0.thumb_top,
+        geo0.thumb_height / geo0.track_height * 100.0,
+        slot.w,
+        slot.h,
+        k0.w,
+        k0.h,
+        k0.x,
+        k0.y,
+        k0.h / geo0.track_height * 100.0,
+        if slot.h > 0.0 {
+            k0.h / slot.h * 100.0
+        } else {
+            0.0
+        }
+    );
+
     assert!(
         geo0.content_height > geo0.viewport_height + 1.0,
         "{count} rows are not taller than the {}pt viewport",
@@ -185,7 +243,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         geo0.thumb_height,
         geo0.track_height
     );
-    let k0 = knob();
     assert!(
         k0.w > 0.0 && k0.h > 0.0,
         "the scroller would not say where its knob is: {}x{}",
@@ -199,15 +256,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let agrees = |knob_h: f64, thumb: f64, track: f64| (knob_h - thumb).abs() <= track * 0.05;
     assert!(
         agrees(k0.h, geo0.thumb_height, geo0.track_height),
-        "AppKit's knob covers {:.1}% of the track but the layout derived {:.1}% ({}pt vs {}pt)",
+        "AppKit's knob covers {:.1}% of the track but the layout derived {:.1}% (knob {}pt, thumb {}pt, layout track {}pt, viewport {}pt, content {}pt, {count} rows)",
         k0.h / geo0.track_height * 100.0,
         geo0.thumb_height / geo0.track_height * 100.0,
         k0.h,
-        geo0.thumb_height
+        geo0.thumb_height,
+        geo0.track_height,
+        geo0.viewport_height,
+        geo0.content_height
     );
     println!(
-        "drag: canvas {:.0}x{:.0}, viewport {:.0}pt, knob {:.0}x{:.0}pt at ({:.0}, {:.0}), {count} rows",
-        f0.w, f0.h, v0.h, k0.w, k0.h, k0.x, k0.y
+        "drag: canvas {:.0}x{:.0}, viewport {:.0}pt, knob {:.0}x{:.0}pt at ({:.0}, {:.0}), {count} rows, header {:.0}pt",
+        f0.w,
+        f0.h,
+        v0.h,
+        k0.w,
+        k0.h,
+        k0.x,
+        k0.y,
+        geo0.header_height
     );
 
     // --- The knob, dragged the way a mouse drags it ---
