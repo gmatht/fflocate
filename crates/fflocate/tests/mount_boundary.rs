@@ -25,7 +25,7 @@ fn mps(paths: &[&str]) -> HashSet<Vec<u8>> {
 /// installed. Returns the applier, shared state, tempdir guard and the
 /// resolved root-dir ids in root order.
 fn harness(
-    model: ModelFs,
+    model: impl fflocate::applier::FsView + 'static,
     root_paths: &[&str],
     mountpoints: HashSet<Vec<u8>>,
 ) -> (Applier, Arc<Shared>, tempfile::TempDir, Vec<u32>) {
@@ -296,6 +296,89 @@ fn a_rescan_of_the_parent_heals_entries_crawled_before_the_nested_root_existed()
     // Nothing was duplicated: the parent's rescan neither kept its own copy
     // nor invented a second one under the nested root's id.
     assert_eq!(count_f_rs(), 1, "one file on disk, one index entry");
+}
+
+/// A `ModelFs` presented at `/` instead of `/model`, so a test can use the
+/// real-world layout (`/`, `/home`, `/home/john`) as configured roots.
+struct AtFilesystemRoot(ModelFs);
+
+impl fflocate::applier::FsView for AtFilesystemRoot {
+    fn read_dir(&self, abs: &std::path::Path) -> std::io::Result<Vec<fflocate::applier::DirItem>> {
+        let rel = abs.strip_prefix("/").unwrap_or(abs);
+        self.0.read_dir(&std::path::Path::new("/model").join(rel))
+    }
+    fn stat(
+        &self,
+        abs: &std::path::Path,
+    ) -> std::io::Result<Option<fflocate::applier::StatInfo>> {
+        let rel = abs.strip_prefix("/").unwrap_or(abs);
+        self.0.stat(&std::path::Path::new("/model").join(rel))
+    }
+}
+
+/// A real home tree under three configured roots: `/`, `/home` and
+/// `/home/john`. Each level is its own root, so each level's crawl must stop
+/// at the next and the deepest one must still be indexed and watched.
+fn home_tree_model() -> AtFilesystemRoot {
+    let mut work = std::collections::BTreeMap::new();
+    work.insert(b"deep.txt".to_vec(), Node::File);
+    let mut john = std::collections::BTreeMap::new();
+    john.insert(b"notes.txt".to_vec(), Node::File);
+    john.insert(b"work".to_vec(), Node::Dir(work));
+    let mut other = std::collections::BTreeMap::new();
+    other.insert(b"x.txt".to_vec(), Node::File);
+    let mut home = std::collections::BTreeMap::new();
+    home.insert(b"john".to_vec(), Node::Dir(john));
+    home.insert(b"other".to_vec(), Node::Dir(other));
+    let mut etc = std::collections::BTreeMap::new();
+    etc.insert(b"hosts".to_vec(), Node::File);
+    AtFilesystemRoot(ModelFs::with([
+        ("etc", Node::Dir(etc)),
+        ("home", Node::Dir(home)),
+    ]))
+}
+
+#[test]
+fn slash_home_and_home_root_each_index_their_own_level() {
+    let (mut a, shared, _d, rids) = harness(
+        home_tree_model(),
+        &["/", "/home", "/home/john"],
+        mps(&[]),
+    );
+    for rid in rids.clone() {
+        assert_ne!(rid, ROOT_ID, "every configured root must resolve to an entry");
+        a.pending_mut().enqueue_crawl(rid);
+    }
+    a.drain();
+
+    // The deepest root owns its subtree: its files are indexed under it.
+    let john = index_paths_under(&shared, b"/home/john");
+    assert_eq!(
+        john.get("/home/john/notes.txt"),
+        Some(&false),
+        "the deepest root must be crawled: {john:?}"
+    );
+    assert_eq!(john.get("/home/john/work/deep.txt"), Some(&false), "{john:?}");
+    // ... and its own directories are watched, or the daemon is blind to every
+    // change below it. (The root itself is watched by the daemon, not by the
+    // crawl, so the crawl's request names the subdirectory.)
+    let watches: Vec<String> = a
+        .take_watch_requests()
+        .iter()
+        .map(|(_, p)| p.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        watches.iter().any(|p| p == "/home/john/work"),
+        "the deepest root's subtree must be walked and watched: {watches:?}"
+    );
+
+    // Each level is indexed exactly once, under its own root.
+    let ix = shared.index.read().unwrap();
+    let notes = ix
+        .iter_live()
+        .filter(|(id, e)| !e.flags().is_root_dir() && ix.name(*id) == b"notes.txt")
+        .count();
+    assert_eq!(notes, 1, "one file on disk, one index entry");
 }
 
 #[test]
