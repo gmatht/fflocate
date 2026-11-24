@@ -342,6 +342,13 @@ impl Index {
         self.alive.len() * std::mem::size_of::<u64>()
     }
 
+    /// Test-only: link `id` under `parent` without touching `entries`, which
+    /// reproduces the stale child-index state an older store could carry.
+    #[cfg(test)]
+    pub fn link_stale_for_test(&mut self, id: u32, parent: u32) {
+        self.link(id, parent);
+    }
+
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -513,7 +520,13 @@ impl Index {
     /// scan made every crawl quadratic; the field's note has the measurements.
     pub fn lookup(&self, parent: u32, name: &[u8]) -> Option<u32> {
         for &id in self.children_of.get(&parent)? {
-            let e = &self.entries[id as usize];
+            // A link with no slot is skipped, never indexed. `children_of` is
+            // derived state, but every crawl and every startup root lookup
+            // runs through here, so a stale id in it must cost a miss, not a
+            // panic that takes the daemon down before it serves anything.
+            let Some(e) = self.entries.get(id as usize) else {
+                continue;
+            };
             if e.name_len as usize == name.len() && self.name_of_entry(e) == name {
                 return Some(id);
             }
@@ -524,8 +537,19 @@ impl Index {
     /// Create a brand-new entry and return its (fresh) id. The parent must
     /// exist and be live; callers ensure that.
     pub fn insert(&mut self, parent: u32, name: &[u8], flags: EntryFlags) -> u32 {
-        let id = self.next_id;
-        self.next_id += 1;
+        // The id *is* the slot (`entries[id]`), so it must be the slot about to
+        // be appended to — not `next_id`, which is only a high-water mark and
+        // can run ahead of the array. It does exactly that after a compaction:
+        // compaction renumbers live entries densely but keeps the old next id.
+        // Using it here linked an id past the end of `entries`, so
+        // `children_of` held a slot that did not exist and the next `lookup`
+        // through it panicked (`index out of bounds: the len is 3705012 but
+        // the index is 3733663` — a store written before this invariant was
+        // restored, which crashed every startup that added a root).
+        let id = self.entries.len() as u32;
+        if id >= self.next_id {
+            self.next_id = id + 1;
+        }
         let off = self.names.len() as u32;
         self.names.extend_from_slice(name);
         self.entries.push(Entry {
@@ -649,7 +673,18 @@ impl Index {
     /// by directory-rename moves; answered from the child index, so it costs
     /// O(children) rather than a scan of every entry.
     pub fn children(&self, parent: u32) -> Vec<u32> {
-        self.children_of.get(&parent).cloned().unwrap_or_default()
+        // Links past the end are dropped here too (see [`Index::lookup`]): the
+        // callers of `children` index entries with what they get back, and a
+        // stale id must not travel further than this boundary.
+        self.children_of
+            .get(&parent)
+            .map(|kids| {
+                kids.iter()
+                    .copied()
+                    .filter(|id| (*id as usize) < self.entries.len())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Move a whole directory subtree: re-point the moved entry's parent (and
@@ -856,6 +891,47 @@ mod tests {
     }
     fn file() -> EntryFlags {
         EntryFlags::EMPTY
+    }
+
+    /// A store whose `next_id` ran ahead of its array (compaction renumbers
+    /// densely but keeps the high-water mark) must still append at slots that
+    /// exist: the id *is* the slot, and the next lookup goes through it.
+    #[test]
+    fn insert_lands_in_range_when_next_id_ran_ahead() {
+        let mut ix = Index::new();
+        let root = ix.insert(ROOT_ID, b"p", dir().with_root_dir(true));
+        ix.insert(root, b"a", file());
+        ix.set_next_id(1_000_000);
+
+        let before = ix.len();
+        let second = ix.insert(ROOT_ID, b"/home/me", dir().with_root_dir(true));
+        assert_eq!(
+            second as usize, before,
+            "the id must be the slot that was appended, not next_id"
+        );
+        assert_eq!(ix.lookup(ROOT_ID, b"/home/me"), Some(second));
+        assert_eq!(ix.lookup(ROOT_ID, b"p"), Some(root));
+        for id in ix.children(ROOT_ID) {
+            assert!((id as usize) < ix.len(), "child {id} has no slot");
+        }
+    }
+
+    /// A stale link in the child index is a miss, never a panic: every crawl
+    /// and every startup root lookup answers through `lookup`.
+    #[test]
+    fn lookup_skips_a_stale_child_link() {
+        let mut ix = Index::new();
+        let root = ix.insert(ROOT_ID, b"p", dir().with_root_dir(true));
+        let a = ix.insert(root, b"a", file());
+        let stale = ix.len() as u32 + 5;
+        ix.link_stale_for_test(stale, root);
+
+        assert_eq!(ix.lookup(root, b"zzz"), None, "scanning past the stale id");
+        assert_eq!(ix.lookup(root, b"a"), Some(a));
+        assert!(
+            !ix.children(root).contains(&stale),
+            "a link with no slot must not be handed out"
+        );
     }
 
     #[test]

@@ -439,6 +439,53 @@ mod tests {
         assert_eq!(r2[0].last_full_crawl, crate::cursor::Cursor::new(4, 90));
     }
 
+    /// The load path of a store written before `insert` kept its ids in range:
+    /// the decoder rebuilds the child index from the entries, and the root
+    /// entries a daemon adds at open land on slots that exist, so the startup
+    /// lookup that follows cannot panic.
+    #[test]
+    fn decoding_a_compacted_snapshot_rebuilds_the_child_index() {
+        let mut ix = Index::new();
+        let root = ix.insert(
+            ROOT_ID,
+            b"/home/me",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        ix.insert(root, b"keep.txt", EntryFlags::EMPTY);
+        let gone = ix.insert(root, b"gone.txt", EntryFlags::EMPTY);
+        ix.remove(gone);
+        // Compaction renumbers the live slots densely but keeps the old
+        // high-water next id — the exact shape that used to make `insert` link
+        // a slot past the end of the array.
+        let (compacted, _) = ix.compacted();
+        assert!(
+            compacted.next_id() > compacted.len() as u32,
+            "the fixture must carry a next id ahead of its array"
+        );
+
+        let bytes = encode(&compacted, &[]);
+        let (mut loaded, _) = decode(&bytes).unwrap();
+        // Derived state, so a decoded snapshot has to rebuild it: without the
+        // rebuild every lookup after a restart answers "not indexed".
+        assert_eq!(loaded.lookup(ROOT_ID, b"/home/me"), Some(root));
+        assert!(
+            loaded.lookup(root, b"keep.txt").is_some(),
+            "the rebuilt child index must reach the subtree"
+        );
+
+        // A root entry for a newly configured root, as `Daemon::build` inserts
+        // it, then the lookup that follows (which is where the old store
+        // panicked).
+        let added = loaded.insert(
+            ROOT_ID,
+            b"/home/other",
+            EntryFlags::EMPTY.with_dir(true).with_root_dir(true),
+        );
+        assert!((added as usize) < loaded.len(), "the id must name a real slot");
+        assert_eq!(loaded.lookup(ROOT_ID, b"/home/other"), Some(added));
+        assert_eq!(loaded.lookup(ROOT_ID, b"/home/me"), Some(root));
+    }
+
     #[test]
     fn version_three_snapshot_reads_its_zero_sentinel_as_unknown() {
         // Version 3 wrote `0` for "unknown", which is also the real minute 0.
