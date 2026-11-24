@@ -36,6 +36,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use fflocate::applier::{Applier, FsView, RealFs, Shared};
 use fflocate::event::{FsEvent, RescanCause};
 use fflocate::index::{EntryFlags, Index, ROOT_ID};
+use fflocate::journal::Record;
 use fflocate::mount;
 use fflocate::persist::Store;
 use fflocate::roots::Root;
@@ -123,6 +124,25 @@ fn is_ancestor_path(parent: &str, path: &str) -> bool {
         return path.len() > 1 && path.starts_with('/');
     }
     path.len() > parent.len() && path.starts_with(parent) && path.as_bytes()[parent.len()] == b'/'
+}
+
+/// The first id in `tail` below `first_free`: a journal record naming a slot
+/// this store's open already owns.
+///
+/// Root-dir entries are never journaled — they are the store's structure,
+/// created when it opens. So a tail written against a store with *fewer* roots
+/// numbers its first crawl entry where this build has just put a root entry.
+/// Replaying such a record would overwrite that root's anchor with a file, and
+/// the root would then resolve to nothing: never crawled, never watched, its
+/// whole tree silently missing.
+fn tail_record_below(tail: &[(u64, Record)], first_free: u32) -> Option<u32> {
+    tail.iter().find_map(|(_, rec)| {
+        let id = match rec {
+            Record::Add { id, .. } | Record::Del { id } | Record::Move { id, .. } => *id,
+            Record::Fence | Record::Mark { .. } => return None,
+        };
+        (id < first_free).then_some(id)
+    })
 }
 
 /// The backend shared between the watcher thread (poll) and the applier loop
@@ -356,7 +376,26 @@ impl Daemon {
         // prefix is replayed from the snapshot, and the suffix is healed by
         // the JournalCorrupt rescans queued below.
         let snapshot_lsn = index.last_lsn();
-        let (tail, replay) = store.read_tail(snapshot_lsn)?;
+        let (mut tail, mut replay) = store.read_tail(snapshot_lsn)?;
+        // A tail only means anything against the index its writer had. With no
+        // snapshot there is no base state, and the root-dir entries above were
+        // just created at the first slots, so a record naming one of those
+        // slots belongs to a different root set. Drop the tail and take the
+        // journal-corrupt path, which re-crawls every root: a recrawl costs
+        // time, a clobbered root costs correctness (it is silently never
+        // crawled or watched, which looked like an empty `/home/john` when a
+        // one-root store was upgraded to `/`, `/home` and `/home/john`).
+        if !had_snapshot {
+            if let Some(id) = tail_record_below(&tail, index.entries.len() as u32) {
+                eprintln!(
+                    "fflocated: journal id {id} collides with a root entry this store needs \
+                     (the journal was written for a different root set); discarding the journal \
+                     tail and re-crawling every root"
+                );
+                tail.clear();
+                replay.corrupt_tail = true;
+            }
+        }
         let tail_len = tail.len() as u64;
 
         // Cross-OS handoff: old cursors must not silently apply to a new
