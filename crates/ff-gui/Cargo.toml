@@ -104,6 +104,16 @@ name = "daemon_pixels_gtk"
 path = "tests/daemon_pixels_gtk.rs"
 harness = false
 
+# The foldout's controls only exist on AppKit once a window does, and a window
+# has to be built on the main thread: as a `#[test]` this binary created it on
+# a worker thread and AppKit threw a foreign exception, which Rust cannot catch
+# and which aborts the process (SIGABRT). Its own main also keeps the one
+# `App::init` per process the other GUI tests rely on.
+[[test]]
+name = "foldout_fuzzy_request"
+path = "tests/foldout_fuzzy_request.rs"
+harness = false
+
 [features]
 # Backend selection. On Linux the GUI defaults to the real widget toolkit
 # (GTK), which is what a user expects from `ff --gui`. The `zork` backend is a

@@ -23,6 +23,11 @@
 //! CI, GTK under Xvfb). The failure modes are pinned as failures too: Fuzzy
 //! unticked sends no fuzzy query, and a budget of 0 cannot match a two-edit
 //! typo — so a future regression reports *which* one came back.
+//!
+//! AppKit needs the main thread, so this target has `harness = false` and its
+//! own `fn main`: the controls only exist once a window does, and a window
+//! built from a `#[test]`'s worker thread throws a foreign exception that Rust
+//! cannot catch. Two tests in one harness also meant two `App::init`s racing.
 
 use fflocate::applier::Shared;
 use fflocate::index::{EntryFlags, Index, ROOT_ID};
@@ -94,11 +99,10 @@ fn ask(ctx: &ServerCtx, req: &Request) -> Result<Vec<String>, String> {
     Ok(hits)
 }
 
-#[test]
-fn the_foldout_as_built_finds_freebuff_for_freebiff() {
+fn the_foldout_as_built_finds_freebuff_for_freebiff() -> bool {
     if no_display() {
         println!("foldout fuzzy request: skipped (no display)");
-        return;
+        return false;
     }
     let dir = tempfile::tempdir().expect("tempdir");
     let ctx = daemon_with(dir.path());
@@ -200,13 +204,13 @@ fn the_foldout_as_built_finds_freebuff_for_freebiff() {
         "a budget of 0 matched {no_edits:?}: at 0 nothing is relaxed, so this test no longer \
          shows that a field reading 0 is the empty list"
     );
+    true
 }
 
-#[test]
-fn a_wider_budget_still_finds_the_typo_through_the_request() {
+fn a_wider_budget_still_finds_the_typo_through_the_request() -> bool {
     if no_display() {
         println!("foldout fuzzy request: skipped (no display)");
-        return;
+        return false;
     }
     // The row's buttons are how a macOS user changes the budget without a
     // keyboard (AppKit's entry may take no keystrokes inside a stack view and
@@ -228,4 +232,26 @@ fn a_wider_budget_still_finds_the_typo_through_the_request() {
         hits.iter().any(|p| p.ends_with("/FreeBuff")),
         "a widened budget did not find FreeBuff: {hits:?}"
     );
+    true
+}
+
+/// Run both walks in order, on the thread `main` gets.
+///
+/// AppKit builds a window only on the main thread, and the foldout's controls
+/// only exist once one does; the budget walk is pure arithmetic and rides along
+/// so the binary still covers it on a backend with no window at all. A run that
+/// skipped says so instead of reporting work it did not do — and the macOS CI
+/// step requires the first walk's own line, so a skip there fails the job.
+fn main() {
+    let built = the_foldout_as_built_finds_freebuff_for_freebiff();
+    let budget = a_wider_budget_still_finds_the_typo_through_the_request();
+    if built && budget {
+        println!(
+            "foldout fuzzy request: ok — the foldout's own controls build the request the daemon \
+             answers, a wider budget still finds the typo, and Fuzzy off / budget 0 are the empty \
+             lists"
+        );
+    } else {
+        println!("foldout fuzzy request: skipped (no display)");
+    }
 }
