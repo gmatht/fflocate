@@ -164,10 +164,16 @@ jobs:
           ) 2>&1 | tee gui-test.log; then
             exit 0
           fi
-          msg=$(grep -E '^(error|failures:)|panicked at|^ *---- ' gui-test.log | head -20 | tr '\n' '|' | cut -c1-3000)
+          # Three lines after each match: an assertion's message is the line
+          # after its `panicked at`, and that message is the diagnosis.
+          msg=$(grep -A3 -E '^(error|failures:)|panicked at|^ *---- ' gui-test.log | head -40 | tr '\n' '|' | cut -c1-3000)
           # The tail as well as the grepped lines: a linker error or a `cargo`
           # failure with no `error:` line would otherwise be reported blank.
           echo "::notice title=gui-test tail (${RUNNER_OS})::$(tail -c 1500 gui-test.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+          # The foldout tests print what their widgets read just before they
+          # assert; those lines are the difference between "the app's request is
+          # wrong" and "the backend built nothing to read".
+          echo "::notice title=foldout lines (${RUNNER_OS})::$(grep -E '^(foldout|foldout fuzzy request)' gui-test.log | head -40 | tr '\n' '|' | cut -c1-3900)"
           echo "::error title=GUI build/test failure (${RUNNER_OS})::${msg}"
           exit 1
 
