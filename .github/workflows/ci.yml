@@ -197,6 +197,13 @@ jobs:
             echo "::notice title=mac gui model test ${name} (macOS)::$(grep -E '^test |test result|^row menu|^clipboard' "$logfile" | tr '\n' '|' | cut -c1-1500)"
           }
           run_model_test macos_gui_parts
+          # A normal `#[test]` binary compiles to zero tests on a build without
+          # AppKit and still exits 0, so its own count is the post-condition
+          # (the floor is the number of tests in the file today; it only grows).
+          if ! grep -qE 'test result: ok\. ([2-9]|[1-9][0-9]+) passed; 0 failed' macos-macos_gui_parts.log; then
+            echo "::error title=mac gui model tests (macOS)::macos_gui_parts ran no tests: $(grep -E 'test result|running' macos-macos_gui_parts.log | tr '\n' '|' | cut -c1-1200)"
+            failures="${failures} macos_gui_parts(no-tests)"
+          fi
           run_model_test row_menu_mac
           # row_menu_mac builds the menu from `row_menu_plan` and reads it back
           # out of a real NSMenu. A binary that cannot load AppKit prints one
@@ -607,7 +614,23 @@ jobs:
             cargo test -p ff-gui --test "$name" > "$logfile" 2>&1 || st=$?
             if [ "$st" -ne 0 ]; then
               echo "::error title=${title} (macOS)::exit ${st}: $(tail -c 1800 "$logfile" | tr -cd '[:print:]\n' | tr '\n' '|')"
+              # The walk's own lines, in their own annotation. The tail above is
+              # capped, so a long panic message would cut off the numbers that
+              # explain it; these binaries print their geometry before asserting
+              # precisely so a failing run reports it.
+              if grep -qE "$pattern" "$logfile"; then
+                echo "::notice title=${title} (macOS, before the failure)::$(grep -E "$pattern" "$logfile" | tr '\n' '|' | cut -c1-3900)"
+              fi
               failures="${failures} ${name}"
+              return 0
+            fi
+            # A binary that cannot reach AppKit prints one line and exits 0, so
+            # a zero status is not evidence the walk ran: its own lines are.
+            # Every caller passes the pattern its walk prints, so an empty match
+            # means this test tested nothing and the job must say so.
+            if ! grep -qE "$pattern" "$logfile"; then
+              echo "::error title=${title} (macOS)::exit 0 but no line matched ${pattern}: $(tail -c 900 "$logfile" | tr -cd '[:print:]\n' | tr '\n' '|')"
+              failures="${failures} ${name}(no-walk)"
               return 0
             fi
             echo "::notice title=${title} (macOS)::$(grep -E "$pattern" "$logfile" | tr '\n' '|')"
@@ -675,6 +698,35 @@ jobs:
             exit 1
           fi
           exit 0
+
+      # The raw logs, not only the annotations: each annotation is capped near
+      # 4096 chars and only a handful per step survive, so a run with several
+      # failing binaries can drop the numbers the annotations exist to carry.
+      # `drag_reflow_mac` prints its knob, slot, document and layout geometry
+      # before it asserts for exactly this reason; this keeps the whole thing.
+      # Failure-only: a green run has nothing to collect.
+      - name: AppKit logs (macOS)
+        if: ${{ runner.os == 'macOS' && failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-gui-logs
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            probe.log
+            drag.log
+            list.log
+            rowmenu.log
+            row-menu-row.log
+            pixels.log
+            clipboard.log
+            typing.log
+            menubar.log
+            live.log
+            foldout-fuzzy-mac.log
+            macos-*.log
+            gui-test.log
+            test.log
 
       # A picture of the AppKit window, so parity with the GTK build can be
       # checked by looking at it rather than only by reading assertions. The PNG
