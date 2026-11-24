@@ -683,21 +683,51 @@ jobs:
             echo "::notice title=daemon fuzzy (macOS)::$(grep -E '^daemon fuzzy' pixels.log | tr '\n' '|' | cut -c1-3900)"
           fi
 
-          # Last, deliberately: this is where the pre-existing knob-geometry
-          # failure lives (`AppKit's knob covers 39.4% of the track but the
-          # layout derived 24.1%`), and it must be reported without stopping any
-          # of the binaries above. The assertion is not weakened or skipped; the
-          # job still fails here.
-          # The knob drag and the resize reflow: a real NSScroller's tracking
-          # loop and AppKit's layout pass, so a drag that never reaches the
-          # scroller or a list that keeps its old geometry fails the job.
-          run_appkit drag_reflow_mac drag.log "drag and reflow" "^(drag|reflow):"
+          # (The knob drag and the resize reflow have their own step below.)
 
           if [ -n "$failures" ]; then
-            echo "::error title=macOS GUI tests::failed:${failures} (drag_reflow_mac's knob geometry is the pre-existing one)"
+            echo "::error title=macOS GUI tests::failed:${failures}"
             exit 1
           fi
           exit 0
+
+      # The knob drag and the resize reflow, in a step of their own.
+      #
+      # It used to run inside the interactivity step above, as the eleventh
+      # `::notice`. GitHub keeps only the first ten annotations of a step, so
+      # the geometry the knob assertion is read against never reached the run
+      # page — the one diagnosis this binary exists to produce. Its own step is
+      # its own budget.
+      - name: Drag and reflow (macOS)
+        if: ${{ runner.os == 'macOS' && !cancelled() }}
+        shell: bash
+        run: |
+          ulimit -c 0 || true
+          status=0
+          cargo test -p ff-gui --test drag_reflow_mac > drag.log 2>&1 || status=$?
+          # The geometry first, whatever the outcome: it is printed before the
+          # assertion that fails, and it is what a knob comparison has to be
+          # read against.
+          if grep -q '^drag: geometry' drag.log; then
+            echo "::notice title=drag geometry (macOS)::$(grep '^drag: geometry' drag.log | tr '\n' '|' | cut -c1-3900)"
+          else
+            echo "::error title=drag geometry (macOS)::the walk printed no geometry, so a knob comparison has nothing to be read against: $(tail -c 900 drag.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            status=1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error title=drag and reflow (macOS)::exit ${status}: $(tail -c 1800 drag.log | tr -cd '[:print:]\n' | tr '\n' '|')"
+            exit 1
+          fi
+          # A binary that cannot reach AppKit prints one line and exits 0, so
+          # the walk's own ok lines are the post-condition — both halves, since
+          # the drag and the reflow assert separately.
+          for line in '^drag: ok' '^reflow: ok'; do
+            if ! grep -q "$line" drag.log; then
+              echo "::error title=drag and reflow (macOS)::the walk did not finish: $(grep -E '^(drag|reflow):' drag.log | tr '\n' '|' | cut -c1-1200)"
+              exit 1
+            fi
+          done
+          echo "::notice title=drag and reflow (macOS)::$(grep -E '^(drag|reflow):' drag.log | grep -v '^drag: geometry' | tr '\n' '|' | cut -c1-3900)"
 
       # The raw logs, not only the annotations: each annotation is capped near
       # 4096 chars and only a handful per step survive, so a run with several
