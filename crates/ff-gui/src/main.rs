@@ -127,6 +127,30 @@ fn trace_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("FF_GUI_TRACE").is_some())
 }
 
+/// Whether this build's label backend parses Pango markup.
+///
+/// GTK does. AppKit and iOS flatten markup to its words themselves, so either
+/// path reads correctly there. `zork`, NWG, Android and the curses fallbacks
+/// store or draw the string as-is, so a terminal or a Win32 `STATIC` would show
+/// the tags literally — those get the plain wording instead.
+const LABELS_PARSE_MARKUP: bool = cfg!(all(
+    feature = "gtk",
+    target_os = "linux",
+    not(feature = "zork")
+));
+
+/// Put one of the alert lines on a label: bold red where the backend parses
+/// Pango markup, the plain words where it would otherwise show the tags.
+macro_rules! set_alert {
+    ($label:expr, $text:expr) => {
+        if LABELS_PARSE_MARKUP {
+            $label.set_markup(&ff_gui::alert_markup($text));
+        } else {
+            $label.set_text($text);
+        }
+    };
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("ff-gui {} (backend: {BACKEND})", env!("CARGO_PKG_VERSION"));
@@ -379,6 +403,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // boxes, so a reply is never filtered by a half-typed date, and the pump's
     // streaming rows are filtered by the same range the final render uses.
     let created_range: Rc<RefCell<Option<CreatedRange>>> = Rc::new(RefCell::new(None));
+    // True while the reply being rendered is the fuzzy follow-up a zero-hit
+    // exact search asked for (`ff_gui::wants_suggestion`): the status line then
+    // carries the alert line (`ff_gui::suggestion_line`) instead of a count.
+    let suggesting: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
     // The daemon check is deferred past first paint: it rides the timer pump
     // (see `StartupProbe`), so the window appears immediately even when the
@@ -462,6 +490,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let last_total = last_total.clone();
         let want_full = want_full.clone();
         let created_range = created_range.clone();
+        let suggesting = suggesting.clone();
         Rc::new(move |outcome| match outcome {
             Ok(mut outcome) => {
                 // A reply names the stale roots, never why they are stale; the
@@ -480,7 +509,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut line =
                     outcome.status_line_opts(outcome.paths.len().min(MAX_ROWS), count_only);
                 line.push_str(&note);
-                status.set_text(&line);
+                if suggesting.get() {
+                    // The rows below are the fuzzy follow-up, so the line says
+                    // why they are not the query: bold red, as asked for. A
+                    // follow-up that found nothing either says so plainly
+                    // instead of asking "did you mean…" over an empty list.
+                    set_alert!(status, ff_gui::suggestion_line(&outcome));
+                } else {
+                    status.set_text(&line);
+                }
                 if count_only {
                     // No paths come back: show the number, not an empty list that
                     // would read as "no matches".
@@ -600,6 +637,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let want_full = want_full.clone();
             let loaded_column = loaded_column.clone();
             let created_range = created_range.clone();
+            let suggesting = suggesting.clone();
             // Live mode: the runner, the user's intent, and the controls the
             // subscription key is built from. The socket is resolved once, so a
             // changed FFLOCATE_SOCKET cannot leave the feed pointing elsewhere
@@ -723,8 +761,70 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 o
                             })
                         });
+                        // A zero-hit exact search is not a dead end: the same
+                        // question runs again fuzzy at one edit, and the status
+                        // says so in bold red (`ff_gui::wants_suggestion`).
+                        // Decided before the render so the red line replaces
+                        // "0 matches", and issued here because this is where
+                        // the pump owns the gate and the socket.
+                        let was_suggestion = suggesting.get();
+                        let mut suggest: Option<(String, SearchOptions)> = None;
                         if let Some(outcome) = gate.borrow_mut().finish(seq, outcome) {
+                            if !was_suggestion {
+                                if let (Ok(o), Some((q, opts))) =
+                                    (&outcome, last_search.borrow().clone())
+                                {
+                                    if ff_gui::wants_suggestion(o, opts) {
+                                        suggest = Some((q, ff_gui::suggestion_options(opts)));
+                                    }
+                                }
+                            }
                             render(outcome);
+                        }
+                        suggesting.set(false);
+                        if let Some((q, opts)) = suggest {
+                            // A whole-set load belongs to the query that just
+                            // answered with nothing.
+                            *sort_load.borrow_mut() = None;
+                            loaded_column.set(None);
+                            want_full.set(false);
+                            // Remember the follow-up, not the exact question: a
+                            // header click's full-set load must re-ask what is
+                            // on screen.
+                            *last_search.borrow_mut() = Some((q.clone(), opts));
+                            if let Some(ticket) = gate.borrow_mut().begin() {
+                                let req = DaemonClient::query_request(&q, FETCH_LIMIT, &opts);
+                                match encode_request(&req).and_then(|line| {
+                                    let stream = connect_stream()?;
+                                    PendingRequest::start(stream, &line)
+                                }) {
+                                    Ok(p) => {
+                                        suggesting.set(true);
+                                        set_alert!(startup_status, ff_gui::NO_EXACT_MATCHES);
+                                        *pending.borrow_mut() = Some((
+                                            ticket.seq,
+                                            p,
+                                            std::time::Instant::now(),
+                                            q,
+                                            0,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                            None,
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        // The follow-up never started, so it can
+                                        // never finish: release the gate's slot.
+                                        if let Some(outcome) =
+                                            gate.borrow_mut().finish(ticket.seq, Err(e))
+                                        {
+                                            render(outcome);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -835,11 +935,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     // invented "starting" wording — the daemon's
                                     // phase, if it has one, speaks for itself.
                                     let _ = (phase, crawl_entries, crawl_dirs_pending);
-                                    startup_status.set_text(&streaming_status_line(
-                                        fresh_hits.len(),
-                                        elapsed,
-                                        pct,
-                                    ));
+                                    // The suggestion's own progress stays behind
+                                    // its red line: the words are the answer to
+                                    // "no exact matches", not a search log.
+                                    if !suggesting.get() {
+                                        startup_status.set_text(&streaming_status_line(
+                                            fresh_hits.len(),
+                                            elapsed,
+                                            pct,
+                                        ));
+                                    }
                                 }
                             } else if hits.is_empty() {
                                 let label_owned = label.clone();
@@ -861,7 +966,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     crawl_entries,
                                     crawl_dirs_pending,
                                 );
-                                startup_status.set_text(&line);
+                                // Same rule as above: a suggestion's reply keeps
+                                // the red line rather than narrating itself.
+                                if !suggesting.get() {
+                                    startup_status.set_text(&line);
+                                }
                             }
                         }
                     }
@@ -1074,6 +1183,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         *sort_load.borrow_mut() = None;
                         loaded_column.set(None);
                         want_full.set(false);
+                        suggesting.set(false);
                         render(Ok(SearchOutcome {
                             catching_up: remembered.is_some(),
                             lag_ms: remembered,
@@ -1085,6 +1195,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         return true;
                     };
                     debounce.clear();
+                    // A fresh query is not a suggestion; the red line goes away.
+                    suggesting.set(false);
 
                     // The display label is read now (main thread owns the boxes):
                     // by the time the reply lands the user may have typed on.
@@ -1140,11 +1252,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let render = render.clone();
             let quick_box = query.clone();
             let adv_box = advanced_query.clone();
+            let suggesting = suggesting.clone();
             entry
                 .connect_changed(move || {
                     let quick = quick_box.get_text().unwrap_or_default();
                     let adv = adv_box.get_text().unwrap_or_default();
                     if box_change_clears(&quick, &adv) {
+                        suggesting.set(false);
                         render(Ok(SearchOutcome::default()));
                         return;
                     }
@@ -1166,6 +1280,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // debounce; with Fuzzy unticked the value changes but the search it
         // would affect is off anyway, and `gather_options` ignores it.
         ff_gui::distance_ui::wire(&distance, arm.clone());
+
+        // A setting that shapes the request refreshes the rows it shaped:
+        // ticking Fuzzy (or Case sensitive, or Count only) with a query on
+        // screen re-asks that query through the same debounce a keystroke arms,
+        // instead of leaving rows computed without the option until the next
+        // keypress. With both boxes empty there is nothing to re-ask, and an
+        // empty query would match everything (`ff_gui::setting_change_refreshes`).
+        ff_gui::settings_ui::wire(
+            &[&opt_case, &opt_fuzzy, &opt_count],
+            &query,
+            &advanced_query,
+            arm.clone(),
+        );
     }
 
     // The Live toggle records intent only; the pump above owns the socket, so

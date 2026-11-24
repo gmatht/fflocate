@@ -1879,6 +1879,76 @@ pub mod distance_ui {
     }
 }
 
+/// The foldout's request-shaping checkboxes — Case sensitive, Fuzzy matching and
+/// Count only — wired so that ticking one re-runs the search on screen.
+///
+/// A setting changes what a query returns, so the grid cannot be filtered in
+/// place: the same query has to be asked again with the new option. The wiring
+/// lives here rather than in `main.rs` for the same reason [`created_ui`] does:
+/// `main.rs` is a binary, so only widgets the library wires can be driven by the
+/// GTK test.
+pub mod settings_ui {
+    /// The foldout's concrete widget types on this backend, mirroring
+    /// `main.rs`'s `widget_traits`.
+    #[cfg(all(feature = "gtk", target_os = "linux", not(feature = "zork")))]
+    mod widgets {
+        pub type Check = rswidgets::backends_gtk_adapter::CheckButton;
+        pub type Entry = rswidgets::backends_gtk_adapter::Entry;
+    }
+    #[cfg(feature = "zork")]
+    mod widgets {
+        pub type Check = rswidgets::backends_zork_adapter::CheckButton;
+        pub type Entry = rswidgets::backends_zork_adapter::Entry;
+    }
+    #[cfg(all(windows, not(feature = "zork")))]
+    mod widgets {
+        pub type Check = rswidgets::backends_nwg_adapter::CheckButton;
+        pub type Entry = rswidgets::backends_nwg_adapter::Entry;
+    }
+    #[cfg(all(target_arch = "wasm32", not(feature = "zork")))]
+    mod widgets {
+        pub type Check = rswidgets::backends_wasm_adapter::CheckButton;
+        pub type Entry = rswidgets::backends_wasm_adapter::Entry;
+    }
+    #[cfg(all(target_os = "macos", not(feature = "zork")))]
+    mod widgets {
+        pub type Check = rswidgets::backends_macos_adapter::CheckButton;
+        pub type Entry = rswidgets::backends_macos_adapter::Entry;
+    }
+
+    use widgets::{Check, Entry};
+
+    /// Arm `arm` when one of `toggles` changes and the boxes hold a query.
+    ///
+    /// `quick` and `advanced` are the app's two query boxes: the decision is
+    /// [`super::setting_change_refreshes`], so a tick with both boxes empty
+    /// neither searches nor clears the list, and a tick while a query is on
+    /// screen re-asks it through the same debounce a keystroke uses — one path,
+    /// so a setting and a keystroke cannot disagree about when to search.
+    pub fn wire(
+        toggles: &[&Check],
+        quick: &Entry,
+        advanced: &Entry,
+        arm: impl Fn() + Clone + 'static,
+    ) {
+        for toggle in toggles {
+            let arm = arm.clone();
+            let quick = quick.clone();
+            let advanced = advanced.clone();
+            let toggle = (*toggle).clone();
+            toggle
+                .connect_toggled(move || {
+                    let q = quick.get_text().unwrap_or_default();
+                    let a = advanced.get_text().unwrap_or_default();
+                    if super::setting_change_refreshes(&q, &a) {
+                        arm();
+                    }
+                })
+                .ok();
+        }
+    }
+}
+
 /// The foldout's **Live** toggle: a checkbox, built here for the same reason
 /// [`created_ui`] is — `main.rs` is a binary, so the GTK test can only drive
 /// widgets the library builds.
@@ -2679,6 +2749,59 @@ pub fn gather_options(
     }
 }
 
+/// The line a zero-hit exact search shows while its fuzzy follow-up runs.
+pub const NO_EXACT_MATCHES: &str = "No exact matches, did you mean…";
+
+/// The line the same search shows when the distance-one follow-up found
+/// nothing either: there is no suggestion left to make, so it states the fact
+/// instead of asking a question the retry already answered.
+pub const NO_APPROXIMATE_MATCHES: &str = "No exact or approximate matches.";
+
+/// `text` as Pango markup: bold and red.
+///
+/// `set_markup` is the portable styling primitive here — GTK renders the weight
+/// and the colour, and the other backends keep the words (AppKit's
+/// `NSTextField` flattens markup; see the widget layer). Backends that would
+/// draw the tags verbatim are handed [`text`] with `set_text` instead; that
+/// choice is made where the label is, in `main.rs`.
+pub fn alert_markup(text: &str) -> String {
+    format!("<b><span foreground=\"red\">{text}</span></b>")
+}
+
+/// The search a zero-hit exact search falls back to: the same question, fuzzy,
+/// with an edit budget of one.
+pub fn suggestion_options(exact: SearchOptions) -> SearchOptions {
+    SearchOptions {
+        fuzzy: true,
+        max_distance: Some(1),
+        count_only: false,
+        ..exact
+    }
+}
+
+/// Whether `outcome` is an exact search that found nothing — the case that
+/// earns [`NO_EXACT_MATCHES`] and a [`suggestion_options`] follow-up.
+///
+/// A fuzzy search that finds nothing gets no follow-up (there is nothing left
+/// to loosen), a count-only search gets none (it asked for a number, not rows),
+/// and the daemon's *total* must be zero: a list a created-date range filtered
+/// down to nothing still had exact matches.
+pub fn wants_suggestion(outcome: &SearchOutcome, opts: SearchOptions) -> bool {
+    !opts.fuzzy && !opts.count_only && outcome.total == 0 && outcome.paths.is_empty()
+}
+
+/// The status wording for the fuzzy follow-up now on screen: the did-you-mean
+/// line while it has rows, and [`NO_APPROXIMATE_MATCHES`] when it came back
+/// empty too — "did you mean…" over an empty list asks for a meaning that does
+/// not exist.
+pub fn suggestion_line(outcome: &SearchOutcome) -> &'static str {
+    if outcome.total == 0 && outcome.paths.is_empty() {
+        NO_APPROXIMATE_MATCHES
+    } else {
+        NO_EXACT_MATCHES
+    }
+}
+
 /// Whether an edit to either box should clear the list at once instead of
 /// searching.
 ///
@@ -2694,6 +2817,23 @@ pub fn box_change_clears(quick: &str, advanced: &str) -> bool {
         // Unquotable: do not clear; let the search report it.
         None => false,
     }
+}
+
+/// Whether changing a setting that shapes the request should re-run the search
+/// that is already on screen.
+///
+/// Case sensitive, Fuzzy matching, Count only and the fuzzy distance all change
+/// what a query *returns*, not how a reply is displayed, so the only way to
+/// refresh the rows is to ask the daemon the same query again. That is only
+/// meaningful while a query exists: with both boxes empty the list is empty
+/// because nothing was typed, and arming a search would send an empty query —
+/// which matches everything, the trap [`box_change_clears`] exists for. Text the
+/// Basic box cannot quote has no query behind it either; the search itself
+/// reports that error, and a settings tick must not start one.
+pub fn setting_change_refreshes(quick: &str, advanced: &str) -> bool {
+    effective_query(quick, advanced)
+        .map(|q| query_is_searchable(&q))
+        .unwrap_or(false)
 }
 
 /// The max edit distance the foldout offers before the user changes it.
@@ -3721,6 +3861,66 @@ pub fn render_count(total: u64) -> String {
 mod tests {
     use super::*;
 
+    /// A zero-hit exact search earns one fuzzy follow-up at exactly one edit;
+    /// a fuzzy or count-only search, and any search with hits, earns none.
+    #[test]
+    fn a_zero_hit_exact_search_asks_for_a_distance_one_retry() {
+        let exact = SearchOptions::default();
+        let empty = SearchOutcome::default();
+        assert!(wants_suggestion(&empty, exact));
+
+        let next = suggestion_options(SearchOptions {
+            count_only: true,
+            case_sensitive: true,
+            ..exact
+        });
+        assert!(next.fuzzy, "the follow-up is the fuzzy search");
+        assert_eq!(next.max_distance, Some(1), "one edit, not the daemon default");
+        assert!(!next.count_only, "a suggestion asks for rows, not a number");
+        assert!(next.case_sensitive, "the user's case choice still stands");
+
+        assert!(!wants_suggestion(&empty, SearchOptions { fuzzy: true, ..exact }));
+        assert!(!wants_suggestion(
+            &empty,
+            SearchOptions { count_only: true, ..exact }
+        ));
+        let hit = SearchOutcome {
+            total: 1,
+            paths: vec!["/a".to_string()],
+            ..Default::default()
+        };
+        assert!(!wants_suggestion(&hit, exact));
+    }
+
+    /// The line itself: the requested wording, in bold red markup.
+    #[test]
+    fn the_no_exact_matches_line_is_bold_and_red() {
+        assert_eq!(NO_EXACT_MATCHES, "No exact matches, did you mean…");
+        let markup = alert_markup(NO_EXACT_MATCHES);
+        assert!(markup.contains("<b>") && markup.contains("</b>"), "{markup}");
+        assert!(markup.contains("foreground=\"red\""), "{markup}");
+        assert!(markup.contains(NO_EXACT_MATCHES), "{markup}");
+        let plain = alert_markup(NO_APPROXIMATE_MATCHES);
+        assert!(plain.contains(NO_APPROXIMATE_MATCHES), "{plain}");
+    }
+
+    /// A follow-up that found nothing stops asking: the empty list gets a
+    /// statement, not another "did you mean…".
+    #[test]
+    fn an_empty_follow_up_says_there_are_no_approximate_matches() {
+        assert_eq!(NO_APPROXIMATE_MATCHES, "No exact or approximate matches.");
+        assert_eq!(
+            suggestion_line(&SearchOutcome::default()),
+            NO_APPROXIMATE_MATCHES
+        );
+        let hit = SearchOutcome {
+            total: 1,
+            paths: vec!["/a".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(suggestion_line(&hit), NO_EXACT_MATCHES);
+    }
+
     #[test]
     fn rescan_request_names_the_root() {
         match DaemonClient::rescan_request("/home/me/src") {
@@ -4159,6 +4359,21 @@ mod tests {
             !box_change_clears("say \"hi\"", "ext:rs"),
             "unquotable must not clear"
         );
+    }
+
+    #[test]
+    fn a_setting_change_refreshes_only_a_query_that_exists() {
+        // A tick re-asks the query on screen; with nothing typed there is no
+        // query, and arming one would search for "" (which matches everything).
+        assert!(!setting_change_refreshes("", ""));
+        assert!(!setting_change_refreshes("  ", "\t"));
+        // Either box alone is a query, and so is an advanced expression.
+        assert!(setting_change_refreshes("report", ""));
+        assert!(setting_change_refreshes("", "ext:rs"));
+        assert!(setting_change_refreshes("report", "ext:rs"));
+        // Unquotable Basic text has no query behind it: the search reports it,
+        // and a settings tick must not start one just to show the same error.
+        assert!(!setting_change_refreshes("say \"hi\"", ""));
     }
 
     #[test]
