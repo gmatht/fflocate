@@ -105,10 +105,24 @@ fn the_foldout_as_built_finds_freebuff_for_freebiff() {
 
     // --- The foldout as the app builds it ---
     let app = rswidgets::prelude::App::init().expect("a widget backend");
+    // A window first, the way `main.rs` builds one before it builds anything
+    // else. AppKit's widget factories return inert handles until a root view
+    // exists — `init_with_root` runs when the first window is created — so a
+    // checkbox built without one reads back unticked however often it is
+    // ticked, and every entry reads back empty. GTK is indifferent, which is
+    // why this only failed on macOS.
+    let win = app.create_window().expect("a window");
     let fuzzy = app.create_checkbutton("Fuzzy matching").expect("checkbox");
     fuzzy.set_active(false);
     let distance = ff_gui::distance_ui::build(&app, DEFAULT_MAX_DISTANCE).expect("distance row");
     distance.set_controls_sensitive(false);
+    let column = app
+        .create_box(rswidgets::prelude::Orientation::Vertical, 2)
+        .expect("a column");
+    column.append(&fuzzy);
+    column.append(&distance.row);
+    win.set_child(&column);
+    win.present();
 
     // Exactly the values `gather_options` is handed in `main.rs`: each control
     // read back, the distance as text.

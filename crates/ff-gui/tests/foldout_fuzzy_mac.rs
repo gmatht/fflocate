@@ -237,6 +237,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // backend wires no wheel to an entry, so the buttons are how a macOS user
     // changes this value. `-performClick:` is the click a press sends.
     {
+        // Fuzzy back on: this section is about the budget a fuzzy search uses,
+        // and the assertion below is that the wider budget still finds the
+        // name. The box is off here because the Fuzzy-off check above turned it
+        // off, which is what made this section search exactly.
+        fuzzy.set_active(true);
         let press = |btn: *mut std::ffi::c_void| {
             let f: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) =
                 unsafe { std::mem::transmute(rswidgets::backends::apple::msg_shim()) };
