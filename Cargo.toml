@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/fflocate", "crates/fflocated", "crates/fx", "crates/ff-gui"]
+members = [
+    "crates/fflocate",
+    "crates/fflocated",
+    "crates/fx",
+    "crates/ff-gui",
+    "crates/ffbusy",
+]
 # Vendored third-party code: usable as a path dependency, but not a workspace
 # member (keeps workspace-wide clippy/test runs to first-party code).
 exclude = ["vendor/rustxwidgets", "vendor/gtk_dynamic_loader"]
@@ -25,7 +31,21 @@ serde_json = "1"
 anyhow = "1"
 tempfile = "3"
 
+# Speed over size, measured on the real store (871 k entries, `ff -c` = one
+# full scan of the index, 50 runs):
+#
+#   opt-level = 3  .text 2.48 MB   p50 46 ms  p99 54 ms
+#   opt-level = "s" .text 2.14 MB   p50 71 ms  p99 85 ms
+#
+# The smaller code saved ~0.45 MB of resident text and cost 25 ms on every
+# scan — 450 kB is not worth a quarter of the 99 ms budget. One codegen unit
+# stays: it shrank .text as well (2.69 MB at the default 16 units) and is the
+# better inlining shape for the scan loop.
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 panic = "abort"
+codegen-units = 1
+# Drop symbol names from shipped binaries; override with
+# `CARGO_PROFILE_RELEASE_STRIP=none` when you need to symbolise a crash.
+strip = "symbols"

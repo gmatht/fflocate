@@ -1,0 +1,22 @@
+[package]
+name = "ffbusy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ffbusy: one multi-call binary for ff, fflocated and ff-gui."
+
+[[bin]]
+name = "ffbusy"
+path = "src/main.rs"
+
+[features]
+# The window is a large, self-contained half of the image; a server build can
+# drop it with `--no-default-features`.
+default = ["gui"]
+gui = ["dep:ff-gui"]
+
+[dependencies]
+ff = { path = "../fx" }
+fflocated = { path = "../fflocated" }
+ff-gui = { path = "../ff-gui", optional = true }

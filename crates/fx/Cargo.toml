@@ -13,8 +13,15 @@ default-run = "ff"
 name = "ff"
 path = "src/main.rs"
 
+[lib]
+# A distinct library name: `ff` is already the binary target, and the
+# multi-call binary (`ffbusy`) links this crate as `ff_cli`.
+name = "ff_cli"
+path = "src/lib.rs"
+
 [features]
-default = ["trigram"]
+# Off by default, like fflocate's: build with `--features trigram`.
+default = []
 # Passthrough for fflocate's §17 v2 trigram accelerator.
 trigram = ["fflocate/trigram"]
 

@@ -181,6 +181,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ffbusy"
+version = "0.1.1-rc1"
+dependencies = [
+ "ff",
+ "ff-gui",
+ "fflocated",
+]
+
+[[package]]
 name = "fflocate"
 version = "0.1.1-rc1"
 dependencies = [

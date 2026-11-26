@@ -33,6 +33,9 @@ pub use fflocate::proto::Response as WireResponse;
 /// how each backend is handed it.
 pub mod icon;
 
+/// The window: a rustxWidgets surface over the same daemon protocol.
+pub mod ui;
+
 /// Errors surfaced to the status line.
 #[derive(Debug)]
 pub enum GuiError {
